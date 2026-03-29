@@ -1808,6 +1808,69 @@ TEST_CASE("Regression: Issue238|DoubleFree", "[issue238]") {
       out_rgba = nullptr;
     }
   }
+}
+
+// Multipart variant: LoadEXRMultipartImageFromMemory failure must not leak or
+// double-free when the caller calls FreeEXRImage on each part after failure.
+TEST_CASE("Regression: Issue238|DoubleFree|Multipart", "[issue238]") {
+  std::string filepath = "./regression/issue-238-double-free-multipart.exr";
+
+  std::ifstream f(filepath.c_str(), std::ifstream::binary);
+  REQUIRE(f.good());
+
+  f.seekg(0, f.end);
+  size_t sz = static_cast<size_t>(f.tellg());
+  f.seekg(0, f.beg);
+
+  std::vector<unsigned char> data(sz);
+  f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(sz));
+  f.close();
+
+  EXRVersion exr_version;
+  int ret = ParseEXRVersionFromMemory(&exr_version, data.data(), data.size());
+  REQUIRE(TINYEXR_SUCCESS == ret);
+  REQUIRE(true == exr_version.multipart);
+
+  EXRHeader** headers = nullptr;
+  int num_headers = 0;
+  const char* err = nullptr;
+  ret = ParseEXRMultipartHeaderFromMemory(&headers, &num_headers, &exr_version,
+                                          data.data(), data.size(), &err);
+  REQUIRE(TINYEXR_SUCCESS == ret);
+  REQUIRE(2 == num_headers);
+
+  std::vector<EXRImage> images(static_cast<size_t>(num_headers));
+  for (int j = 0; j < num_headers; j++) {
+    InitEXRImage(&images[static_cast<size_t>(j)]);
+  }
+
+  ret = LoadEXRMultipartImageFromMemory(
+      images.data(), const_cast<const EXRHeader**>(headers),
+      static_cast<unsigned int>(num_headers), data.data(), data.size(), &err);
+  // Loading must fail: pixel data is absent/truncated.
+  REQUIRE(TINYEXR_SUCCESS != ret);
+  if (err) {
+    FreeEXRErrorMessage(err);
+    err = nullptr;
+  }
+
+  // Free each image after failure — must not double-free.
+  for (int j = 0; j < num_headers; j++) {
+    FreeEXRImage(&images[static_cast<size_t>(j)]);
+  }
+
+  // Second FreeEXRImage call must be safe (idempotency).
+  for (int j = 0; j < num_headers; j++) {
+    FreeEXRImage(&images[static_cast<size_t>(j)]);
+  }
+
+  for (int j = 0; j < num_headers; j++) {
+    FreeEXRHeader(headers[static_cast<size_t>(j)]);
+    free(headers[static_cast<size_t>(j)]);
+  }
+  free(headers);
+}
+
 // PIZ huffman decode bug (issue 160)
 TEST_CASE("Regression: Issue160|Piz", "[issue160]") {
   std::string filepath = "./regression/issue-160-piz-decode.exr";
