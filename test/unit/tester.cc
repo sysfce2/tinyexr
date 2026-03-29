@@ -1744,6 +1744,50 @@ TEST_CASE("Regression: Issue194|Piz", "[issue194]") {
   FreeEXRImage(&image);
 }
 
+TEST_CASE("Regression: Issue238|DoubleFree", "[issue238]") {
+  // Regression test for double-free when DecodeChunk fails inside
+  // DecodeEXRImage. The file has a valid header but truncated pixel data,
+  // causing DecodeChunk to fail after allocating exr_image->images.
+  // FreeEXRImage is called internally on failure; the caller must also be
+  // able to call FreeEXRImage safely without a double-free crash.
+  std::string filepath = "./regression/issue-238-double-free.exr";
+
+  std::ifstream f(filepath.c_str(), std::ifstream::binary);
+  REQUIRE(f.good());
+
+  f.seekg(0, f.end);
+  size_t sz = static_cast<size_t>(f.tellg());
+  f.seekg(0, f.beg);
+
+  std::vector<unsigned char> data(sz);
+  f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(sz));
+  f.close();
+
+  EXRVersion exr_version;
+  int ret = ParseEXRVersionFromMemory(&exr_version, data.data(), data.size());
+  REQUIRE(TINYEXR_SUCCESS == ret);
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+  const char* err = nullptr;
+  ret = ParseEXRHeaderFromMemory(&header, &exr_version, data.data(), data.size(), &err);
+  REQUIRE(TINYEXR_SUCCESS == ret);
+
+  EXRImage image;
+  InitEXRImage(&image);
+  ret = LoadEXRImageFromMemory(&image, &header, data.data(), data.size(), &err);
+  // Loading must fail because pixel data is truncated.
+  REQUIRE(TINYEXR_SUCCESS != ret);
+  if (err) {
+    FreeEXRErrorMessage(err);
+    err = nullptr;
+  }
+
+  FreeEXRHeader(&header);
+  // Calling FreeEXRImage after a failed load must not cause a double-free.
+  FreeEXRImage(&image);
+}
+
 // ----------------------------------------------------------------
 // Spectral EXR API tests
 // ----------------------------------------------------------------

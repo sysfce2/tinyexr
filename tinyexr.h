@@ -10097,16 +10097,19 @@ int FreeEXRImage(EXRImage *exr_image) {
   if (exr_image->next_level) {
     FreeEXRImage(exr_image->next_level);
     delete exr_image->next_level;
+    exr_image->next_level = NULL;
   }
 
   for (int i = 0; i < exr_image->num_channels; i++) {
     if (exr_image->images && exr_image->images[i]) {
       free(exr_image->images[i]);
+      exr_image->images[i] = NULL;
     }
   }
 
   if (exr_image->images) {
     free(exr_image->images);
+    exr_image->images = NULL;
   }
 
   if (exr_image->tiles) {
@@ -10114,14 +10117,20 @@ int FreeEXRImage(EXRImage *exr_image) {
       for (int i = 0; i < exr_image->num_channels; i++) {
         if (exr_image->tiles[tid].images && exr_image->tiles[tid].images[i]) {
           free(exr_image->tiles[tid].images[i]);
+          exr_image->tiles[tid].images[i] = NULL;
         }
       }
       if (exr_image->tiles[tid].images) {
         free(exr_image->tiles[tid].images);
+        exr_image->tiles[tid].images = NULL;
       }
     }
     free(exr_image->tiles);
+    exr_image->tiles = NULL;
   }
+
+  exr_image->num_channels = 0;
+  exr_image->num_tiles = 0;
 
   return TINYEXR_SUCCESS;
 }
