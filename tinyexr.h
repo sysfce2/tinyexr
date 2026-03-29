@@ -5468,6 +5468,9 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
           for (size_t u = 0; u < static_cast<size_t>(width); u++) {
             tinyexr::FP16 hf;
             tinyexr::cpy2(&(hf.u), line_ptr + u);
+            // B44 stream stores data in little-endian order (same as the
+            // encoder's buf); reverse the byte swap the encoder applied.
+            tinyexr::swap2(reinterpret_cast<unsigned short *>(&hf.u));
 
             if (requested_pixel_types[c] == TINYEXR_PIXELTYPE_HALF) {
               unsigned short *image =
@@ -5509,6 +5512,7 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
           for (size_t u = 0; u < static_cast<size_t>(width); u++) {
             unsigned int val;
             tinyexr::cpy4(&val, line_ptr + u);
+            tinyexr::swap4(&val);
 
             unsigned int *image =
                 reinterpret_cast<unsigned int **>(out_images)[c];
@@ -5533,6 +5537,7 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
           for (size_t u = 0; u < static_cast<size_t>(width); u++) {
             float val;
             tinyexr::cpy4(&val, line_ptr + u);
+            tinyexr::swap4(reinterpret_cast<unsigned int *>(&val));
 
             float *image = reinterpret_cast<float **>(out_images)[c];
             if (line_order == 0) {
