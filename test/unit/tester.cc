@@ -1800,8 +1800,13 @@ TEST_CASE("Regression: Issue238|DoubleFree", "[issue238]") {
     REQUIRE(TINYEXR_SUCCESS != ret);
     if (err) {
       FreeEXRErrorMessage(err);
+      err = nullptr;
     }
-    // out_rgba is NULL on failure; nothing to free.
+    // Be robust to implementations that may allocate out_rgba before failing.
+    if (out_rgba) {
+      free(out_rgba);
+      out_rgba = nullptr;
+    }
   }
 }
 
