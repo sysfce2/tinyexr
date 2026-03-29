@@ -1808,6 +1808,45 @@ TEST_CASE("Regression: Issue238|DoubleFree", "[issue238]") {
       out_rgba = nullptr;
     }
   }
+// PIZ huffman decode bug (issue 160)
+TEST_CASE("Regression: Issue160|Piz", "[issue160]") {
+  std::string filepath = "./regression/issue-160-piz-decode.exr";
+
+  const char* err = nullptr;
+  int width, height;
+  float* image;
+  int ret = LoadEXR(&image, &width, &height, filepath.c_str(), &err);
+  if (err) {
+    std::cerr << "issue160 err " << err << std::endl;
+    FreeEXRErrorMessage(err);
+  }
+  REQUIRE(TINYEXR_SUCCESS == ret);
+  REQUIRE(420 == width);
+  REQUIRE(32 == height);
+
+  // Verify known pixel values set explicitly during EXR generation.
+  // Pixels are stored as RGBA; the source file has no alpha so A=1.
+  // row 24, col 410: R=1, G=1, B=1
+  REQUIRE(1.0f == Approx(image[(24 * width + 410) * 4 + 0]));
+  REQUIRE(1.0f == Approx(image[(24 * width + 410) * 4 + 1]));
+  REQUIRE(1.0f == Approx(image[(24 * width + 410) * 4 + 2]));
+
+  // row 28, col 412: R=1, G=1, B=1
+  REQUIRE(1.0f == Approx(image[(28 * width + 412) * 4 + 0]));
+  REQUIRE(1.0f == Approx(image[(28 * width + 412) * 4 + 1]));
+  REQUIRE(1.0f == Approx(image[(28 * width + 412) * 4 + 2]));
+
+  // row 28, col 418: R=1, G=1, B=1
+  REQUIRE(1.0f == Approx(image[(28 * width + 418) * 4 + 0]));
+  REQUIRE(1.0f == Approx(image[(28 * width + 418) * 4 + 1]));
+  REQUIRE(1.0f == Approx(image[(28 * width + 418) * 4 + 2]));
+
+  // row 30, col 417: R=0, G=1, B=1 (the triggering pixel for the issue)
+  REQUIRE(0.0f == Approx(image[(30 * width + 417) * 4 + 0]));
+  REQUIRE(1.0f == Approx(image[(30 * width + 417) * 4 + 1]));
+  REQUIRE(1.0f == Approx(image[(30 * width + 417) * 4 + 2]));
+
+  free(image);
 }
 
 // ----------------------------------------------------------------
