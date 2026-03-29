@@ -1,2 +1,6 @@
 output.exr
 test_tinyexr
+*.o
+test/unit/tester
+test/unit/tester-v3
+test/unit/*.exr
