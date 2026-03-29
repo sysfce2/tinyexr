@@ -8727,9 +8727,27 @@ static bool EncodePixelData(/* out */ std::vector<unsigned char>& out_data,
     bool is_b44a = (compression_type == TINYEXR_COMPRESSIONTYPE_B44A);
     std::vector<unsigned char> block;
 
+    // CompressB44 expects per-channel sequential layout, but buf is
+    // scanline-interleaved: within each row, channels are stored contiguously
+    // (channel_offset_list[c] * width bytes into the row), and rows are
+    // stacked.  Convert to per-channel sequential before compressing.
+    std::vector<unsigned char> seq_buf(buf_size);
+    unsigned char *seq_p = seq_buf.data();
+    for (size_t c = 0; c < channels.size(); c++) {
+      int file_type = channels[c].requested_pixel_type;
+      // HALF is 2 bytes; FLOAT and UINT are both 4 bytes
+      size_t ch_size = (file_type == TINYEXR_PIXELTYPE_HALF) ? 2 : 4;
+      for (int y = 0; y < num_lines; y++) {
+        const unsigned char *src =
+            &buf[y * pixel_data_size * width + channel_offset_list[c] * width];
+        memcpy(seq_p, src, static_cast<size_t>(width) * ch_size);
+        seq_p += static_cast<size_t>(width) * ch_size;
+      }
+    }
+
     if (!tinyexr::CompressB44(block,
-                         reinterpret_cast<const unsigned char *>(&buf.at(0)),
-                         buf.size(), width, num_lines,
+                         reinterpret_cast<const unsigned char *>(seq_buf.data()),
+                         seq_buf.size(), width, num_lines,
                          channels.size(), channels, is_b44a)) {
       if (err) {
         (*err) += "B44 compression failed.\n";
