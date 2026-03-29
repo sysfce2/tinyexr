@@ -1763,29 +1763,46 @@ TEST_CASE("Regression: Issue238|DoubleFree", "[issue238]") {
   f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(sz));
   f.close();
 
-  EXRVersion exr_version;
-  int ret = ParseEXRVersionFromMemory(&exr_version, data.data(), data.size());
-  REQUIRE(TINYEXR_SUCCESS == ret);
+  // Test 1: LoadEXRImageFromMemory + explicit FreeEXRImage (low-level API path)
+  {
+    EXRVersion exr_version;
+    int ret = ParseEXRVersionFromMemory(&exr_version, data.data(), data.size());
+    REQUIRE(TINYEXR_SUCCESS == ret);
 
-  EXRHeader header;
-  InitEXRHeader(&header);
-  const char* err = nullptr;
-  ret = ParseEXRHeaderFromMemory(&header, &exr_version, data.data(), data.size(), &err);
-  REQUIRE(TINYEXR_SUCCESS == ret);
+    EXRHeader header;
+    InitEXRHeader(&header);
+    const char* err = nullptr;
+    ret = ParseEXRHeaderFromMemory(&header, &exr_version, data.data(), data.size(), &err);
+    REQUIRE(TINYEXR_SUCCESS == ret);
 
-  EXRImage image;
-  InitEXRImage(&image);
-  ret = LoadEXRImageFromMemory(&image, &header, data.data(), data.size(), &err);
-  // Loading must fail because pixel data is truncated.
-  REQUIRE(TINYEXR_SUCCESS != ret);
-  if (err) {
-    FreeEXRErrorMessage(err);
-    err = nullptr;
+    EXRImage image;
+    InitEXRImage(&image);
+    ret = LoadEXRImageFromMemory(&image, &header, data.data(), data.size(), &err);
+    // Loading must fail because pixel data is truncated.
+    REQUIRE(TINYEXR_SUCCESS != ret);
+    if (err) {
+      FreeEXRErrorMessage(err);
+      err = nullptr;
+    }
+
+    FreeEXRHeader(&header);
+    // Calling FreeEXRImage after a failed load must not cause a double-free.
+    FreeEXRImage(&image);
   }
 
-  FreeEXRHeader(&header);
-  // Calling FreeEXRImage after a failed load must not cause a double-free.
-  FreeEXRImage(&image);
+  // Test 2: LoadEXRFromMemory (high-level API, the exact crash site in the issue report).
+  // This function calls FreeEXRImage internally on failure, which must be safe.
+  {
+    float* out_rgba = nullptr;
+    int width = 0, height = 0;
+    const char* err = nullptr;
+    int ret = LoadEXRFromMemory(&out_rgba, &width, &height, data.data(), data.size(), &err);
+    REQUIRE(TINYEXR_SUCCESS != ret);
+    if (err) {
+      FreeEXRErrorMessage(err);
+    }
+    // out_rgba is NULL on failure; nothing to free.
+  }
 }
 
 // ----------------------------------------------------------------
