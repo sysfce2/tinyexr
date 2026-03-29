@@ -3881,6 +3881,20 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
   (void)is_b44a;  // Flat block detection doesn't depend on B44/B44A for decoding
   InitB44Tables();
 
+  // Validate that the output buffer is large enough for the decoded data.
+  {
+    size_t expected_out = 0;
+    for (size_t c = 0; c < num_channels; c++) {
+      int xs = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+      int ys = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+      size_t cw = static_cast<size_t>((data_width  + xs - 1) / xs);
+      size_t ch = static_cast<size_t>((num_lines   + ys - 1) / ys);
+      size_t bpp = (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) ? 2u : 4u;
+      expected_out += cw * ch * bpp;
+    }
+    if (expected_out > outBufSize) return false;
+  }
+
   const unsigned char* in_p = inPtr;
   const unsigned char* in_end = inPtr + inLen;
 
