@@ -1,7 +1,7 @@
 output.exr
 test_tinyexr
 test/unit/tester
+test/unit/tester-v2
 test/unit/tester-v3
-test/unit/miniz.o
-test/unit/miniz-v3.o
-test/unit/tinyexr_c_impl.o
+test/unit/*.o
+test/unit/issue40.exr
