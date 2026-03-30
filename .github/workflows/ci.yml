@@ -2,21 +2,105 @@ name: CI
 
 on:
   push:
-    branches: [ "release", "master" ]
+    branches: ["release", "master"]
   pull_request:
-    branches: [ "release", "master" ]
+    branches: ["release", "master"]
 
 jobs:
-  build-and-test:
-    runs-on: ${{ matrix.os }}
+  unit-tests:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        compiler: [gcc, clang]
-        exclude:
-          - os: macos-latest
-            compiler: gcc
+        include:
+          - name: linux-x64-gcc
+            runs_on: ubuntu-latest
+            family: posix
+            cc: gcc
+            cxx: g++
+            cflags: -O2
+            cxxflags: -std=c++11 -O2
+            apt_packages: ""
+            run_tests: true
+            experimental: false
+
+          - name: linux-x64-clang
+            runs_on: ubuntu-latest
+            family: posix
+            cc: clang
+            cxx: clang++
+            cflags: -O2
+            cxxflags: -std=c++11 -O2
+            apt_packages: ""
+            run_tests: true
+            experimental: false
+
+          - name: linux-x86-gcc
+            runs_on: ubuntu-latest
+            family: posix
+            cc: gcc
+            cxx: g++
+            cflags: -O2 -m32
+            cxxflags: -std=c++11 -O2 -m32
+            apt_packages: gcc-multilib g++-multilib libc6-dev-i386
+            run_tests: true
+            experimental: false
+
+          - name: linux-arm64-gcc
+            runs_on: ubuntu-24.04-arm
+            family: posix
+            cc: gcc
+            cxx: g++
+            cflags: -O2
+            cxxflags: -std=c++11 -O2
+            apt_packages: ""
+            run_tests: true
+            experimental: false
+
+          - name: macos-arm64-clang
+            runs_on: macos-latest
+            family: posix
+            cc: clang
+            cxx: clang++
+            cflags: -O2
+            cxxflags: -std=c++11 -O2
+            apt_packages: ""
+            run_tests: true
+            experimental: false
+
+          - name: windows-x64-msvc
+            runs_on: windows-latest
+            family: windows
+            msvc_arch: amd64
+            apt_packages: ""
+            run_tests: true
+            experimental: false
+
+          - name: windows-x86-msvc
+            runs_on: windows-latest
+            family: windows
+            msvc_arch: amd64_x86
+            apt_packages: ""
+            run_tests: true
+            experimental: false
+
+          - name: windows-arm64-msvc
+            runs_on: windows-11-arm
+            family: windows
+            msvc_arch: amd64_arm64
+            apt_packages: ""
+            run_tests: true
+            experimental: false
+
+          - name: windows-arm32-msvc-build
+            runs_on: windows-11-arm
+            family: windows
+            msvc_arch: amd64_arm
+            apt_packages: ""
+            run_tests: false
+            experimental: true
 
     steps:
       - name: Checkout
@@ -24,68 +108,54 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up compiler (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          if [ "${{ matrix.compiler }}" = "gcc" ]; then
-            echo "CC=gcc" >> $GITHUB_ENV
-            echo "CXX=g++" >> $GITHUB_ENV
-          else
-            echo "CC=clang" >> $GITHUB_ENV
-            echo "CXX=clang++" >> $GITHUB_ENV
-          fi
+      # GitHub-hosted Windows runners currently provide a native arm64 image
+      # (`windows-11-arm`), but ARM32 test execution is not viable there.
+      # Windows on Arm has moved away from AArch32/ARM32 app support, so the
+      # ARM32 matrix entry is build-only and marked experimental.
 
-      - name: Set up compiler (macOS)
-        if: runner.os == 'macOS'
+      - name: Install Linux multilib toolchain
+        if: runner.os == 'Linux' && matrix.apt_packages
         run: |
-          echo "CC=clang" >> $GITHUB_ENV
-          echo "CXX=clang++" >> $GITHUB_ENV
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
 
-      - name: Build miniz
+      - name: Set up POSIX compiler
+        if: matrix.family == 'posix'
+        run: |
+          echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+          echo "CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+          echo "CFLAGS=${{ matrix.cflags }}" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=${{ matrix.cxxflags }}" >> "$GITHUB_ENV"
+
+      - name: Build and run POSIX unit tests
+        if: matrix.family == 'posix' && matrix.run_tests
         working-directory: test/unit
         run: |
-          $CC -O2 -c -I../../deps/miniz ../../deps/miniz/miniz.c -o miniz.o
-
-      - name: Build V1 tester
-        working-directory: test/unit
-        run: |
-          $CXX -std=c++11 -O2 -I../../ -I../../deps/miniz -o tester tester.cc miniz.o
-
-      - name: Run V1 tests (spectral, fuzzing)
-        working-directory: test/unit
-        run: |
+          $CC $CFLAGS -I../../deps/miniz -c ../../deps/miniz/miniz.c -o miniz.o
+          $CXX $CXXFLAGS -I../../ -I../../deps/miniz -o tester tester.cc miniz.o
           ./tester "[spectral],[fuzzing]"
-
-      - name: Build V2 tester
-        working-directory: test/unit
-        run: |
-          $CXX -std=c++11 -O2 -I../../ -I../../deps/miniz -o tester-v2 tester-v2.cc miniz.o
-
-      - name: Run V2 tests (excluding PIZ and openexr-images)
-        working-directory: test/unit
-        run: |
+          $CXX $CXXFLAGS -I../../ -I../../deps/miniz -o tester-v2 tester-v2.cc miniz.o
           ./tester-v2 "~[PIZ]"
 
-  windows-build:
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
       - name: Setup MSVC Developer Command Prompt
+        if: matrix.family == 'windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.msvc_arch }}
 
-      - name: Build and test with MSVC
+      - name: Build Windows unit tests
+        if: matrix.family == 'windows'
         working-directory: test/unit
         shell: cmd
         run: |
           cl.exe /EHsc /O2 /I..\..\deps\miniz /c ..\..\deps\miniz\miniz.c
           cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester.cc miniz.obj /Fe:tester.exe
-          tester.exe "[spectral],[fuzzing]"
           cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester-v2.cc miniz.obj /Fe:tester-v2.exe
+
+      - name: Run Windows unit tests
+        if: matrix.family == 'windows' && matrix.run_tests
+        working-directory: test/unit
+        shell: cmd
+        run: |
+          tester.exe "[spectral],[fuzzing]"
           tester-v2.exe "~[PIZ]"
