@@ -1181,9 +1181,9 @@ inline void reverse_delta_predictor(uint8_t* data, size_t count) {
 #define TINYEXR_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
 #elif defined(_MSC_VER)
 #include <intrin.h>
-#define TINYEXR_PREFETCH(addr) ((void)0)
+#define TINYEXR_PREFETCH(addr) (void)(addr)
 #else
-#define TINYEXR_PREFETCH(addr) ((void)0)
+#define TINYEXR_PREFETCH(addr) (void)(addr)
 #endif
 #endif
 
