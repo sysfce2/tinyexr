@@ -74,7 +74,6 @@ jobs:
             runs_on: windows-latest
             family: windows
             msvc_arch: amd64
-            build_legacy_tester: true
             apt_packages: ""
             run_tests: true
             experimental: false
@@ -83,7 +82,6 @@ jobs:
             runs_on: windows-latest
             family: windows
             msvc_arch: amd64_x86
-            build_legacy_tester: true
             apt_packages: ""
             run_tests: true
             experimental: false
@@ -92,7 +90,6 @@ jobs:
             runs_on: windows-11-arm
             family: windows
             msvc_arch: amd64_arm64
-            build_legacy_tester: true
             apt_packages: ""
             run_tests: true
             experimental: false
@@ -101,7 +98,6 @@ jobs:
             runs_on: windows-11-arm
             family: windows
             msvc_arch: amd64_arm
-            build_legacy_tester: false
             apt_packages: ""
             run_tests: false
             experimental: true
@@ -155,18 +151,32 @@ jobs:
           cl.exe /EHsc /O2 /I..\..\deps\miniz /c ..\..\deps\miniz\miniz.c
 
       - name: Build Windows legacy unit tests
-        if: matrix.family == 'windows' && matrix.build_legacy_tester
+        if: matrix.family == 'windows' && matrix.run_tests
         working-directory: test/unit
         shell: cmd
         run: |
           cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester.cc miniz.obj /Fe:tester.exe
 
+      - name: Compile Windows legacy unit tests
+        if: matrix.family == 'windows' && !matrix.run_tests
+        working-directory: test/unit
+        shell: cmd
+        run: |
+          cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz /c tester.cc /Fo:tester.obj
+
       - name: Build Windows v2 unit tests
-        if: matrix.family == 'windows'
+        if: matrix.family == 'windows' && matrix.run_tests
         working-directory: test/unit
         shell: cmd
         run: |
           cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester-v2.cc miniz.obj /Fe:tester-v2.exe
+
+      - name: Compile Windows v2 unit tests
+        if: matrix.family == 'windows' && !matrix.run_tests
+        working-directory: test/unit
+        shell: cmd
+        run: |
+          cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz /c tester-v2.cc /Fo:tester-v2.obj
 
       - name: Run Windows unit tests
         if: matrix.family == 'windows' && matrix.run_tests
