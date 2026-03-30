@@ -3882,6 +3882,8 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
   InitB44Tables();
 
   // Validate that the output buffer is large enough for the decoded data.
+  // Use overflow-safe arithmetic: overflow in any multiplication or accumulation
+  // means the size cannot fit in memory, which is definitely > outBufSize.
   {
     size_t expected_out = 0;
     for (size_t c = 0; c < num_channels; c++) {
@@ -3890,7 +3892,15 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
       size_t cw = static_cast<size_t>((data_width  + xs - 1) / xs);
       size_t ch = static_cast<size_t>((num_lines   + ys - 1) / ys);
       size_t bpp = (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) ? 2u : 4u;
-      expected_out += cw * ch * bpp;
+      // Check cw * ch overflow
+      if (cw != 0 && ch > (SIZE_MAX / cw)) return false;
+      size_t pixels = cw * ch;
+      // Check pixels * bpp overflow
+      if (pixels > (SIZE_MAX / bpp)) return false;
+      size_t ch_total = pixels * bpp;
+      // Check accumulation overflow
+      if (expected_out > SIZE_MAX - ch_total) return false;
+      expected_out += ch_total;
     }
     if (expected_out > outBufSize) return false;
   }
@@ -3991,6 +4001,9 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
       for (int y = 0; y < ch_height; y++) {
         for (int x = 0; x < ch_width; x++) {
           unsigned short val = scratch_buffers[c][static_cast<size_t>(y) * padded_width + x];
+          // Write as little-endian bytes so DecodePixelData's swap2 (LE->host)
+          // works correctly on both little- and big-endian platforms.
+          tinyexr::swap2(&val);
           memcpy(out_p, &val, sizeof(val));
           out_p += sizeof(val);
         }
@@ -8759,8 +8772,20 @@ static bool EncodePixelData(/* out */ std::vector<unsigned char>& out_data,
       for (int y = 0; y < num_lines; y++) {
         const unsigned char *src =
             &buf[y * pixel_data_size * width + channel_offset_list[c] * width];
-        memcpy(seq_p, src, static_cast<size_t>(width) * ch_size);
-        seq_p += static_cast<size_t>(width) * ch_size;
+        size_t row_bytes = static_cast<size_t>(width) * ch_size;
+        memcpy(seq_p, src, row_bytes);
+#if !TINYEXR_LITTLE_ENDIAN
+        // buf has already been byte-swapped to little-endian for file output.
+        // CompressB44 reads HALF values as host-endian unsigned shorts, so
+        // un-swap the bytes back to host-endian for correct B44 encoding.
+        if (file_type == TINYEXR_PIXELTYPE_HALF) {
+          unsigned short *p = reinterpret_cast<unsigned short *>(seq_p);
+          for (int x = 0; x < width; x++) {
+            tinyexr::swap2(p + x);
+          }
+        }
+#endif
+        seq_p += row_bytes;
       }
     }
 
