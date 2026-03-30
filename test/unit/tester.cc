@@ -2720,6 +2720,558 @@ TEST_CASE("B44: Compression round-trip", "[B44]") {
   FreeEXRHeader(&header);
 }
 
+TEST_CASE("Regression: B44 mixed channel types (issue 239)", "[B44][issue239]") {
+  // Regression test for heap-buffer-overflow when B44-compressed EXR has
+  // channels with mixed pixel types (HALF + FLOAT).  The bug manifested as an
+  // out-of-bounds read in DecodePixelData because ch_offset was computed using
+  // the current channel's byte width multiplied by its index rather than
+  // accumulating the actual sizes of all preceding channels.
+  const int width = 32;
+  const int height = 32;
+  // 3 channels: A (FLOAT), G (HALF), R (HALF)
+  // Using mixed types intentionally to trigger the bug.
+  const int num_channels = 3;
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  header.num_channels = num_channels;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * num_channels));
+  header.pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+  header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+
+  // Channels must be in alphabetical order (EXR spec)
+  strncpy(header.channels[0].name, "A", 255);
+  strncpy(header.channels[1].name, "G", 255);
+  strncpy(header.channels[2].name, "R", 255);
+
+  // A channel: stored as FLOAT (uncompressed in B44 stream)
+  header.pixel_types[0] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[0] = TINYEXR_PIXELTYPE_FLOAT;
+  // G channel: stored as HALF (B44 block-compressed)
+  header.pixel_types[1] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[1] = TINYEXR_PIXELTYPE_HALF;
+  // R channel: stored as HALF (B44 block-compressed)
+  header.pixel_types[2] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[2] = TINYEXR_PIXELTYPE_HALF;
+
+  header.compression_type = TINYEXR_COMPRESSIONTYPE_B44;
+
+  EXRImage image;
+  InitEXRImage(&image);
+  image.num_channels = num_channels;
+  image.width = width;
+  image.height = height;
+
+  std::vector<float> ch_a(width * height);
+  std::vector<float> ch_g(width * height);
+  std::vector<float> ch_r(width * height);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      ch_a[idx] = 1.0f;
+      ch_g[idx] = 0.25f;
+      ch_r[idx] = 0.5f;
+    }
+  }
+
+  float* channel_ptrs[3] = { ch_a.data(), ch_g.data(), ch_r.data() };
+  image.images = reinterpret_cast<unsigned char**>(channel_ptrs);
+
+  // Save to memory
+  unsigned char* data = nullptr;
+  size_t data_size = 0;
+  const char* err = nullptr;
+  data_size = SaveEXRImageToMemory(&image, &header, &data, &err);
+  if (err) { INFO("Save error: " << err); free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(data_size > 0);
+  REQUIRE(data != nullptr);
+
+  // Load back
+  EXRVersion version2;
+  int ret = ParseEXRVersionFromMemory(&version2, data, data_size);
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  EXRHeader header2;
+  InitEXRHeader(&header2);
+  ret = ParseEXRHeaderFromMemory(&header2, &version2, data, data_size, &err);
+  if (err) { INFO("Header parse error: " << err); free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  // Request all channels back as FLOAT
+  for (int i = 0; i < header2.num_channels; i++) {
+    header2.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+  }
+
+  EXRImage image2;
+  InitEXRImage(&image2);
+  ret = LoadEXRImageFromMemory(&image2, &header2, data, data_size, &err);
+  if (ret != TINYEXR_SUCCESS && err) {
+    INFO("Load error: " << err);
+  }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+  REQUIRE(image2.num_channels == num_channels);
+
+  // Locate each channel by name
+  int a_idx = -1, g_idx = -1, r_idx = -1;
+  for (int i = 0; i < header2.num_channels; i++) {
+    if (strcmp(header2.channels[i].name, "A") == 0) a_idx = i;
+    if (strcmp(header2.channels[i].name, "G") == 0) g_idx = i;
+    if (strcmp(header2.channels[i].name, "R") == 0) r_idx = i;
+  }
+  REQUIRE(a_idx >= 0);
+  REQUIRE(g_idx >= 0);
+  REQUIRE(r_idx >= 0);
+
+  float* loaded_a = reinterpret_cast<float*>(image2.images[a_idx]);
+  float* loaded_g = reinterpret_cast<float*>(image2.images[g_idx]);
+  float* loaded_r = reinterpret_cast<float*>(image2.images[r_idx]);
+
+  // A is FLOAT (lossless); G and R are HALF (lossy B44 -- allow tolerance)
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      REQUIRE(std::abs(loaded_a[idx] - ch_a[idx]) < 1e-5f);
+      REQUIRE(std::abs(loaded_g[idx] - ch_g[idx]) < 0.01f);
+      REQUIRE(std::abs(loaded_r[idx] - ch_r[idx]) < 0.01f);
+    }
+  }
+
+  // Cleanup
+  free(data);
+  FreeEXRImage(&image2);
+  FreeEXRHeader(&header2);
+  FreeEXRHeader(&header);
+}
+
+
+TEST_CASE("Regression: B44 all-FLOAT channels (issue 239 variant)", "[B44][issue239]") {
+  // Regression test: B44 with all-FLOAT channels (all stored uncompressed in
+  // the B44 stream - every channel goes through the non-HALF raw copy path).
+  const int width = 32;
+  const int height = 32;
+  const int num_channels = 3;
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  header.num_channels = num_channels;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * num_channels));
+  header.pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+  header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+
+  strncpy(header.channels[0].name, "B", 255);
+  strncpy(header.channels[1].name, "G", 255);
+  strncpy(header.channels[2].name, "R", 255);
+
+  for (int i = 0; i < num_channels; i++) {
+    header.pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+    header.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+  }
+
+  header.compression_type = TINYEXR_COMPRESSIONTYPE_B44;
+
+  EXRImage image;
+  InitEXRImage(&image);
+  image.num_channels = num_channels;
+  image.width = width;
+  image.height = height;
+
+  std::vector<float> ch_b(width * height);
+  std::vector<float> ch_g(width * height);
+  std::vector<float> ch_r(width * height);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      ch_b[idx] = static_cast<float>(x) / width;
+      ch_g[idx] = static_cast<float>(y) / height;
+      ch_r[idx] = 0.75f;
+    }
+  }
+
+  float* channel_ptrs[3] = { ch_b.data(), ch_g.data(), ch_r.data() };
+  image.images = reinterpret_cast<unsigned char**>(channel_ptrs);
+
+  unsigned char* data = nullptr;
+  size_t data_size = 0;
+  const char* err = nullptr;
+  data_size = SaveEXRImageToMemory(&image, &header, &data, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(data_size > 0);
+  REQUIRE(data != nullptr);
+
+  EXRVersion version2;
+  int ret = ParseEXRVersionFromMemory(&version2, data, data_size);
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  EXRHeader header2;
+  InitEXRHeader(&header2);
+  ret = ParseEXRHeaderFromMemory(&header2, &version2, data, data_size, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  for (int i = 0; i < header2.num_channels; i++) {
+    header2.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+  }
+
+  EXRImage image2;
+  InitEXRImage(&image2);
+  ret = LoadEXRImageFromMemory(&image2, &header2, data, data_size, &err);
+  if (ret != TINYEXR_SUCCESS && err) { INFO("Load error: " << err); }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  int b_idx = -1, g_idx = -1, r_idx = -1;
+  for (int i = 0; i < header2.num_channels; i++) {
+    if (strcmp(header2.channels[i].name, "B") == 0) b_idx = i;
+    if (strcmp(header2.channels[i].name, "G") == 0) g_idx = i;
+    if (strcmp(header2.channels[i].name, "R") == 0) r_idx = i;
+  }
+  REQUIRE(b_idx >= 0);
+  REQUIRE(g_idx >= 0);
+  REQUIRE(r_idx >= 0);
+
+  float* loaded_b = reinterpret_cast<float*>(image2.images[b_idx]);
+  float* loaded_g = reinterpret_cast<float*>(image2.images[g_idx]);
+  float* loaded_r = reinterpret_cast<float*>(image2.images[r_idx]);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      // FLOAT channels are stored uncompressed in B44 stream - must be exact
+      REQUIRE(loaded_b[idx] == ch_b[idx]);
+      REQUIRE(loaded_g[idx] == ch_g[idx]);
+      REQUIRE(loaded_r[idx] == ch_r[idx]);
+    }
+  }
+
+  free(data);
+  FreeEXRImage(&image2);
+  FreeEXRHeader(&header2);
+  FreeEXRHeader(&header);
+}
+
+TEST_CASE("Regression: B44 UINT+HALF mixed channels (issue 239 variant)", "[B44][issue239]") {
+  // Regression test: B44 with UINT (uncompressed in stream) and HALF channels.
+  const int width = 16;
+  const int height = 16;
+  const int num_channels = 2;
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  header.num_channels = num_channels;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * num_channels));
+  header.pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+  header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+
+  // A: UINT channel (stored uncompressed in B44 stream)
+  // B: input is FLOAT, converted to HALF and block-compressed by B44
+  strncpy(header.channels[0].name, "A", 255);
+  strncpy(header.channels[1].name, "B", 255);
+
+  header.pixel_types[0] = TINYEXR_PIXELTYPE_UINT;
+  header.requested_pixel_types[0] = TINYEXR_PIXELTYPE_UINT;
+  header.pixel_types[1] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[1] = TINYEXR_PIXELTYPE_HALF;
+
+  header.compression_type = TINYEXR_COMPRESSIONTYPE_B44;
+
+  EXRImage image;
+  InitEXRImage(&image);
+  image.num_channels = num_channels;
+  image.width = width;
+  image.height = height;
+
+  std::vector<unsigned int> ch_a(width * height);
+  std::vector<float>        ch_b(width * height);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      ch_a[idx] = static_cast<unsigned int>(y * width + x);
+      ch_b[idx] = 0.5f;
+    }
+  }
+
+  void* channel_ptrs[2] = { ch_a.data(), ch_b.data() };
+  image.images = reinterpret_cast<unsigned char**>(channel_ptrs);
+
+  unsigned char* data = nullptr;
+  size_t data_size = 0;
+  const char* err = nullptr;
+  data_size = SaveEXRImageToMemory(&image, &header, &data, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(data_size > 0);
+  REQUIRE(data != nullptr);
+
+  EXRVersion version2;
+  int ret = ParseEXRVersionFromMemory(&version2, data, data_size);
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  EXRHeader header2;
+  InitEXRHeader(&header2);
+  ret = ParseEXRHeaderFromMemory(&header2, &version2, data, data_size, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  // Request A as UINT, B as FLOAT
+  for (int i = 0; i < header2.num_channels; i++) {
+    if (header2.channels[i].pixel_type == TINYEXR_PIXELTYPE_UINT)
+      header2.requested_pixel_types[i] = TINYEXR_PIXELTYPE_UINT;
+    else
+      header2.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+  }
+
+  EXRImage image2;
+  InitEXRImage(&image2);
+  ret = LoadEXRImageFromMemory(&image2, &header2, data, data_size, &err);
+  if (ret != TINYEXR_SUCCESS && err) { INFO("Load error: " << err); }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  int a_idx = -1, b_idx = -1;
+  for (int i = 0; i < header2.num_channels; i++) {
+    if (strcmp(header2.channels[i].name, "A") == 0) a_idx = i;
+    if (strcmp(header2.channels[i].name, "B") == 0) b_idx = i;
+  }
+  REQUIRE(a_idx >= 0);
+  REQUIRE(b_idx >= 0);
+
+  unsigned int* loaded_a = reinterpret_cast<unsigned int*>(image2.images[a_idx]);
+  float*        loaded_b = reinterpret_cast<float*>(image2.images[b_idx]);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      // UINT is stored uncompressed in B44 stream - must be exact
+      REQUIRE(loaded_a[idx] == ch_a[idx]);
+      // B channel is HALF (lossy) - allow tolerance
+      REQUIRE(std::abs(loaded_b[idx] - ch_b[idx]) < 0.01f);
+    }
+  }
+
+  free(data);
+  FreeEXRImage(&image2);
+  FreeEXRHeader(&header2);
+  FreeEXRHeader(&header);
+}
+
+TEST_CASE("Regression: B44A mixed channel types (issue 239 variant)", "[B44A][issue239]") {
+  // Same as the B44 mixed-type test but using B44A compression.
+  const int width = 32;
+  const int height = 32;
+  const int num_channels = 3;
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  header.num_channels = num_channels;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * num_channels));
+  header.pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+  header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+
+  strncpy(header.channels[0].name, "A", 255);
+  strncpy(header.channels[1].name, "G", 255);
+  strncpy(header.channels[2].name, "R", 255);
+
+  header.pixel_types[0] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[0] = TINYEXR_PIXELTYPE_FLOAT;
+  header.pixel_types[1] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[1] = TINYEXR_PIXELTYPE_HALF;
+  header.pixel_types[2] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[2] = TINYEXR_PIXELTYPE_HALF;
+
+  header.compression_type = TINYEXR_COMPRESSIONTYPE_B44A;
+
+  EXRImage image;
+  InitEXRImage(&image);
+  image.num_channels = num_channels;
+  image.width = width;
+  image.height = height;
+
+  std::vector<float> ch_a(width * height, 1.0f);
+  std::vector<float> ch_g(width * height, 0.25f);
+  std::vector<float> ch_r(width * height, 0.5f);
+
+  float* channel_ptrs[3] = { ch_a.data(), ch_g.data(), ch_r.data() };
+  image.images = reinterpret_cast<unsigned char**>(channel_ptrs);
+
+  unsigned char* data = nullptr;
+  size_t data_size = 0;
+  const char* err = nullptr;
+  data_size = SaveEXRImageToMemory(&image, &header, &data, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(data_size > 0);
+  REQUIRE(data != nullptr);
+
+  EXRVersion version2;
+  int ret = ParseEXRVersionFromMemory(&version2, data, data_size);
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  EXRHeader header2;
+  InitEXRHeader(&header2);
+  ret = ParseEXRHeaderFromMemory(&header2, &version2, data, data_size, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  for (int i = 0; i < header2.num_channels; i++) {
+    header2.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+  }
+
+  EXRImage image2;
+  InitEXRImage(&image2);
+  ret = LoadEXRImageFromMemory(&image2, &header2, data, data_size, &err);
+  if (ret != TINYEXR_SUCCESS && err) { INFO("Load error: " << err); }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  int a_idx = -1, g_idx = -1, r_idx = -1;
+  for (int i = 0; i < header2.num_channels; i++) {
+    if (strcmp(header2.channels[i].name, "A") == 0) a_idx = i;
+    if (strcmp(header2.channels[i].name, "G") == 0) g_idx = i;
+    if (strcmp(header2.channels[i].name, "R") == 0) r_idx = i;
+  }
+  REQUIRE(a_idx >= 0);
+  REQUIRE(g_idx >= 0);
+  REQUIRE(r_idx >= 0);
+
+  float* loaded_a = reinterpret_cast<float*>(image2.images[a_idx]);
+  float* loaded_g = reinterpret_cast<float*>(image2.images[g_idx]);
+  float* loaded_r = reinterpret_cast<float*>(image2.images[r_idx]);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      REQUIRE(std::abs(loaded_a[idx] - ch_a[idx]) < 1e-5f);
+      REQUIRE(std::abs(loaded_g[idx] - ch_g[idx]) < 0.01f);
+      REQUIRE(std::abs(loaded_r[idx] - ch_r[idx]) < 0.01f);
+    }
+  }
+
+  free(data);
+  FreeEXRImage(&image2);
+  FreeEXRHeader(&header2);
+  FreeEXRHeader(&header);
+}
+
+
+TEST_CASE("Regression: B44 non-power-of-2 dimensions (issue 239)", "[B44][issue239]") {
+  // Test B44 with non-power-of-2 dimensions (13x7) to exercise partial block
+  // handling at image edges. This catches mismatches between DecompressB44's
+  // subsampled layout and DecodePixelData's buffer indexing.
+  const int width = 13;
+  const int height = 7;
+  const int num_channels = 3;
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+
+  header.num_channels = num_channels;
+  header.channels = static_cast<EXRChannelInfo*>(
+      malloc(sizeof(EXRChannelInfo) * num_channels));
+  header.pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+  header.requested_pixel_types = static_cast<int*>(malloc(sizeof(int) * num_channels));
+
+  strncpy(header.channels[0].name, "A", 255);
+  strncpy(header.channels[1].name, "G", 255);
+  strncpy(header.channels[2].name, "R", 255);
+
+  // Channel A: FLOAT (stored uncompressed in B44 stream)
+  header.pixel_types[0] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[0] = TINYEXR_PIXELTYPE_FLOAT;
+  // Channels G, R: HALF (B44 block-compressed)
+  header.pixel_types[1] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[1] = TINYEXR_PIXELTYPE_HALF;
+  header.pixel_types[2] = TINYEXR_PIXELTYPE_FLOAT;
+  header.requested_pixel_types[2] = TINYEXR_PIXELTYPE_HALF;
+
+  header.compression_type = TINYEXR_COMPRESSIONTYPE_B44;
+
+  EXRImage image;
+  InitEXRImage(&image);
+  image.num_channels = num_channels;
+  image.width = width;
+  image.height = height;
+
+  // Use varied values so partial-block edge replication is exercised
+  std::vector<float> ch_a(width * height);
+  std::vector<float> ch_g(width * height);
+  std::vector<float> ch_r(width * height);
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      ch_a[idx] = static_cast<float>(idx) * 0.01f;
+      ch_g[idx] = 0.25f;
+      ch_r[idx] = 0.5f;
+    }
+  }
+
+  float* channel_ptrs[3] = { ch_a.data(), ch_g.data(), ch_r.data() };
+  image.images = reinterpret_cast<unsigned char**>(channel_ptrs);
+
+  unsigned char* data = nullptr;
+  size_t data_size = 0;
+  const char* err = nullptr;
+  data_size = SaveEXRImageToMemory(&image, &header, &data, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(data_size > 0);
+  REQUIRE(data != nullptr);
+
+  EXRVersion version2;
+  int ret = ParseEXRVersionFromMemory(&version2, data, data_size);
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  EXRHeader header2;
+  InitEXRHeader(&header2);
+  ret = ParseEXRHeaderFromMemory(&header2, &version2, data, data_size, &err);
+  if (err) { free(const_cast<char*>(err)); err = nullptr; }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  for (int i = 0; i < header2.num_channels; i++) {
+    header2.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+  }
+
+  EXRImage image2;
+  InitEXRImage(&image2);
+  ret = LoadEXRImageFromMemory(&image2, &header2, data, data_size, &err);
+  if (ret != TINYEXR_SUCCESS && err) { INFO("Load error: " << err); }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  int a_idx = -1, g_idx = -1, r_idx = -1;
+  for (int i = 0; i < header2.num_channels; i++) {
+    if (strcmp(header2.channels[i].name, "A") == 0) a_idx = i;
+    if (strcmp(header2.channels[i].name, "G") == 0) g_idx = i;
+    if (strcmp(header2.channels[i].name, "R") == 0) r_idx = i;
+  }
+  REQUIRE(a_idx >= 0);
+  REQUIRE(g_idx >= 0);
+  REQUIRE(r_idx >= 0);
+
+  float* loaded_a = reinterpret_cast<float*>(image2.images[a_idx]);
+  float* loaded_g = reinterpret_cast<float*>(image2.images[g_idx]);
+  float* loaded_r = reinterpret_cast<float*>(image2.images[r_idx]);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int idx = y * width + x;
+      // FLOAT channel: exact match
+      REQUIRE(std::abs(loaded_a[idx] - ch_a[idx]) < 1e-5f);
+      // HALF channels: B44 lossy tolerance
+      REQUIRE(std::abs(loaded_g[idx] - ch_g[idx]) < 0.01f);
+      REQUIRE(std::abs(loaded_r[idx] - ch_r[idx]) < 0.01f);
+    }
+  }
+
+  free(data);
+  FreeEXRImage(&image2);
+  FreeEXRHeader(&header2);
+  FreeEXRHeader(&header);
+}
+
 TEST_CASE("B44A: Flat block compression", "[B44A]") {
   // Test B44A compression with flat (constant) regions
   const int width = 16;

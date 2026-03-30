@@ -3881,11 +3881,39 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
   (void)is_b44a;  // Flat block detection doesn't depend on B44/B44A for decoding
   InitB44Tables();
 
+  // Validate that the output buffer is large enough for the decoded data.
+  // Use overflow-safe arithmetic: overflow in any multiplication or accumulation
+  // means the size cannot fit in memory, which is definitely > outBufSize.
+  {
+    size_t expected_out = 0;
+    for (size_t c = 0; c < num_channels; c++) {
+      int xs = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+      int ys = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+      size_t cw = static_cast<size_t>((data_width  + xs - 1) / xs);
+      size_t ch = static_cast<size_t>((num_lines   + ys - 1) / ys);
+      size_t bpp = (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) ? 2u : 4u;
+      // Check cw * ch overflow
+      if (cw != 0 && ch > (SIZE_MAX / cw)) return false;
+      size_t pixels = cw * ch;
+      // Check pixels * bpp overflow
+      if (pixels > (SIZE_MAX / bpp)) return false;
+      size_t ch_total = pixels * bpp;
+      // Check accumulation overflow
+      if (expected_out > SIZE_MAX - ch_total) return false;
+      expected_out += ch_total;
+    }
+    if (expected_out > outBufSize) return false;
+  }
+
   const unsigned char* in_p = inPtr;
   const unsigned char* in_end = inPtr + inLen;
 
-  // First pass: decompress all channels into scratch buffers
+  // First pass: decompress all channels into scratch buffers.
+  // For non-HALF channels, save the pointer and byte count so we can copy
+  // the raw data to the output buffer in the second pass.
   std::vector<std::vector<unsigned short>> scratch_buffers(num_channels);
+  std::vector<const unsigned char *> nonhalf_ptrs(num_channels, nullptr);
+  std::vector<size_t> nonhalf_sizes(num_channels, 0);
 
   for (size_t c = 0; c < num_channels; c++) {
     // Compute per-channel dimensions based on sampling
@@ -3896,7 +3924,7 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
 
     // B44 only works with HALF pixel types
     if (channels[c].pixel_type != TINYEXR_PIXELTYPE_HALF) {
-      // For non-HALF channels, data is stored uncompressed
+      // For non-HALF channels, data is stored uncompressed; record position
       size_t ch_bytes = static_cast<size_t>(ch_width) * ch_height;
       if (channels[c].pixel_type == TINYEXR_PIXELTYPE_UINT ||
           channels[c].pixel_type == TINYEXR_PIXELTYPE_FLOAT) {
@@ -3905,6 +3933,8 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
         ch_bytes *= 2;
       }
       if (in_p + ch_bytes > in_end) return false;
+      nonhalf_ptrs[c] = in_p;
+      nonhalf_sizes[c] = ch_bytes;
       in_p += ch_bytes;
       continue;
     }
@@ -3956,9 +3986,9 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
     }
   }
 
-  // Second pass: copy from scratch buffers to output in per-channel format
+  // Second pass: copy from scratch buffers to output in per-channel format.
   // Output format: all data for channel 0, then all data for channel 1, etc.
-  // This matches what DecodePixelData expects (ch_offset = c * width * num_lines * bytes)
+  // ch_offset in DecodePixelData is accumulated per preceding channel sizes.
   unsigned char* out_p = outPtr;
   for (size_t c = 0; c < num_channels; c++) {
     int x_sampling = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
@@ -3971,14 +4001,20 @@ static bool DecompressB44(unsigned char *outPtr, size_t outBufSize,
       for (int y = 0; y < ch_height; y++) {
         for (int x = 0; x < ch_width; x++) {
           unsigned short val = scratch_buffers[c][static_cast<size_t>(y) * padded_width + x];
+          // Write as little-endian bytes so DecodePixelData's swap2 (LE->host)
+          // works correctly on both little- and big-endian platforms.
+          tinyexr::swap2(&val);
           memcpy(out_p, &val, sizeof(val));
           out_p += sizeof(val);
         }
       }
     } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_UINT ||
                channels[c].pixel_type == TINYEXR_PIXELTYPE_FLOAT) {
-      // Non-HALF data was already skipped during decompression
-      // Copy the uncompressed data directly (handled by DecodePixelData separately)
+      // Non-HALF data is stored uncompressed; copy from saved pointer
+      if (nonhalf_sizes[c] > 0) {
+        memcpy(out_p, nonhalf_ptrs[c], nonhalf_sizes[c]);
+        out_p += nonhalf_sizes[c];
+      }
     }
   }
 
@@ -5419,9 +5455,19 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
     // B44 is a lossy block compression for HALF data (4x4 blocks -> 14 bytes)
     bool is_b44a = (compression_type == TINYEXR_COMPRESSIONTYPE_B44A);
 
-    std::vector<unsigned char> outBuf(static_cast<size_t>(width) *
-                                      static_cast<size_t>(num_lines) *
-                                      pixel_data_size);
+    // Compute outBuf size matching DecompressB44's output layout: per-channel
+    // sequential data using subsampled dimensions for each channel.
+    size_t b44_out_size = 0;
+    for (size_t c = 0; c < static_cast<size_t>(num_channels); c++) {
+      int xs = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+      int ys = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+      size_t cw = static_cast<size_t>((width     + xs - 1) / xs);
+      size_t ch = static_cast<size_t>((num_lines + ys - 1) / ys);
+      size_t bpp = (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) ? 2u : 4u;
+      b44_out_size += cw * ch * bpp;
+    }
+
+    std::vector<unsigned char> outBuf(b44_out_size);
 
     if (!tinyexr::DecompressB44(
             reinterpret_cast<unsigned char *>(&outBuf.at(0)), outBuf.size(),
@@ -5431,18 +5477,28 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
       return false;
     }
 
-    // Process decompressed data - B44 returns data organized per channel
+    // Process decompressed data - B44 returns data organized per channel,
+    // using subsampled dimensions (ch_width/ch_height based on x/y_sampling).
+    // Accumulate ch_offset based on actual subsampled sizes of preceding
+    // channels to handle mixed channel types and subsampling correctly.
+    size_t ch_offset = 0;
     for (size_t c = 0; c < static_cast<size_t>(num_channels); c++) {
-      size_t ch_offset = c * static_cast<size_t>(width) * num_lines *
-                         ((channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) ? 2 : 4);
+      int xs = channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+      int ys = channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+      size_t ch_width  = static_cast<size_t>((width     + xs - 1) / xs);
+      size_t ch_height = static_cast<size_t>((num_lines + ys - 1) / ys);
+      size_t ch_bytes = (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) ? 2 : 4;
 
       if (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) {
-        for (size_t v = 0; v < static_cast<size_t>(num_lines); v++) {
+        for (size_t v = 0; v < ch_height; v++) {
           const unsigned short *line_ptr = reinterpret_cast<unsigned short *>(
-              &outBuf.at(ch_offset + v * static_cast<size_t>(width) * 2));
-          for (size_t u = 0; u < static_cast<size_t>(width); u++) {
+              &outBuf.at(ch_offset + v * ch_width * 2));
+          for (size_t u = 0; u < ch_width; u++) {
             tinyexr::FP16 hf;
             tinyexr::cpy2(&(hf.u), line_ptr + u);
+            // B44 stream stores data in little-endian order (same as the
+            // encoder's buf); reverse the byte swap the encoder applied.
+            tinyexr::swap2(reinterpret_cast<unsigned short *>(&hf.u));
 
             if (requested_pixel_types[c] == TINYEXR_PIXELTYPE_HALF) {
               unsigned short *image =
@@ -5478,12 +5534,13 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
       } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_UINT) {
         TINYEXR_CHECK_AND_RETURN_C(requested_pixel_types[c] == TINYEXR_PIXELTYPE_UINT, false);
 
-        for (size_t v = 0; v < static_cast<size_t>(num_lines); v++) {
+        for (size_t v = 0; v < ch_height; v++) {
           const unsigned int *line_ptr = reinterpret_cast<unsigned int *>(
-              &outBuf.at(ch_offset + v * static_cast<size_t>(width) * 4));
-          for (size_t u = 0; u < static_cast<size_t>(width); u++) {
+              &outBuf.at(ch_offset + v * ch_width * 4));
+          for (size_t u = 0; u < ch_width; u++) {
             unsigned int val;
             tinyexr::cpy4(&val, line_ptr + u);
+            tinyexr::swap4(&val);
 
             unsigned int *image =
                 reinterpret_cast<unsigned int **>(out_images)[c];
@@ -5502,12 +5559,13 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
         }
       } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_FLOAT) {
         TINYEXR_CHECK_AND_RETURN_C(requested_pixel_types[c] == TINYEXR_PIXELTYPE_FLOAT, false);
-        for (size_t v = 0; v < static_cast<size_t>(num_lines); v++) {
+        for (size_t v = 0; v < ch_height; v++) {
           const float *line_ptr = reinterpret_cast<float *>(
-              &outBuf.at(ch_offset + v * static_cast<size_t>(width) * 4));
-          for (size_t u = 0; u < static_cast<size_t>(width); u++) {
+              &outBuf.at(ch_offset + v * ch_width * 4));
+          for (size_t u = 0; u < ch_width; u++) {
             float val;
             tinyexr::cpy4(&val, line_ptr + u);
+            tinyexr::swap4(reinterpret_cast<unsigned int *>(&val));
 
             float *image = reinterpret_cast<float **>(out_images)[c];
             if (line_order == 0) {
@@ -5526,6 +5584,7 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
       } else {
         return false;
       }
+      ch_offset += ch_width * ch_height * ch_bytes;
     }
   } else if (compression_type == TINYEXR_COMPRESSIONTYPE_NONE) {
     for (size_t c = 0; c < num_channels; c++) {
@@ -8715,9 +8774,39 @@ static bool EncodePixelData(/* out */ std::vector<unsigned char>& out_data,
     bool is_b44a = (compression_type == TINYEXR_COMPRESSIONTYPE_B44A);
     std::vector<unsigned char> block;
 
+    // CompressB44 expects per-channel sequential layout, but buf is
+    // scanline-interleaved: within each row, channels are stored contiguously
+    // (channel_offset_list[c] * width bytes into the row), and rows are
+    // stacked.  Convert to per-channel sequential before compressing.
+    std::vector<unsigned char> seq_buf(buf_size);
+    unsigned char *seq_p = seq_buf.data();
+    for (size_t c = 0; c < channels.size(); c++) {
+      int file_type = channels[c].requested_pixel_type;
+      // HALF is 2 bytes; FLOAT and UINT are both 4 bytes
+      size_t ch_size = (file_type == TINYEXR_PIXELTYPE_HALF) ? 2 : 4;
+      for (int y = 0; y < num_lines; y++) {
+        const unsigned char *src =
+            &buf[y * pixel_data_size * width + channel_offset_list[c] * width];
+        size_t row_bytes = static_cast<size_t>(width) * ch_size;
+        memcpy(seq_p, src, row_bytes);
+#if !TINYEXR_LITTLE_ENDIAN
+        // buf has already been byte-swapped to little-endian for file output.
+        // CompressB44 reads HALF values as host-endian unsigned shorts, so
+        // un-swap the bytes back to host-endian for correct B44 encoding.
+        if (file_type == TINYEXR_PIXELTYPE_HALF) {
+          unsigned short *p = reinterpret_cast<unsigned short *>(seq_p);
+          for (int x = 0; x < width; x++) {
+            tinyexr::swap2(p + x);
+          }
+        }
+#endif
+        seq_p += row_bytes;
+      }
+    }
+
     if (!tinyexr::CompressB44(block,
-                         reinterpret_cast<const unsigned char *>(&buf.at(0)),
-                         buf.size(), width, num_lines,
+                         reinterpret_cast<const unsigned char *>(seq_buf.data()),
+                         seq_buf.size(), width, num_lines,
                          channels.size(), channels, is_b44a)) {
       if (err) {
         (*err) += "B44 compression failed.\n";
