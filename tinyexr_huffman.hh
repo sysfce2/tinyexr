@@ -111,11 +111,19 @@
 #ifndef TINYEXR_PREFETCH
 #if defined(__GNUC__) || defined(__clang__)
 #define TINYEXR_PREFETCH(addr) __builtin_prefetch(addr)
-#elif defined(_MSC_VER)
+#elif defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
 #include <intrin.h>
 #define TINYEXR_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+#elif defined(_MSC_VER)
+#define TINYEXR_PREFETCH(addr) \
+  do {                         \
+    (void)(addr);              \
+  } while (0)
 #else
-#define TINYEXR_PREFETCH(addr) ((void)0)
+#define TINYEXR_PREFETCH(addr) \
+  do {                         \
+    (void)(addr);              \
+  } while (0)
 #endif
 #endif
 
