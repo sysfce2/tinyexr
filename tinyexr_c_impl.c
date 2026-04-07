@@ -13,6 +13,11 @@
 #include "tinyexr_c.h"
 #include "tinyexr_crt.h"
 
+#ifdef __cplusplus
+#include <vector>
+#include "tinyexr_piz.hh"
+#endif
+
 /* Atomics: C11 stdatomic, MSVC Interlocked, or C++ std::atomic fallback */
 #if defined(_MSC_VER) && !defined(__cplusplus)
 /* MSVC C mode doesn't support C11 atomics, use Windows Interlocked functions */
@@ -888,6 +893,9 @@ void exr_image_destroy(ExrImage image) {
     if (!exr_image_is_valid(image)) return;
 
     ExrContext ctx = image->ctx;
+    if (image->decoder && image->decoder->image == image) {
+        image->decoder->image = NULL;
+    }
     image->magic = 0;
 
     /* Free parts */
@@ -1772,6 +1780,16 @@ ExrResult exr_cmd_request_full_image(ExrCommandBuffer cmd,
  * Compression/Decompression Support
  * ============================================================================ */
 
+#if !defined(TINYEXR_DFL_INLINE)
+#if defined(__GNUC__) || defined(__clang__)
+#define TINYEXR_DFL_INLINE __attribute__((always_inline)) static inline
+#elif defined(_MSC_VER)
+#define TINYEXR_DFL_INLINE __forceinline static
+#else
+#define TINYEXR_DFL_INLINE static inline
+#endif
+#endif
+
 /* Pure C11 compression implementations */
 #include "tinyexr_deflate.h"
 #include "tinyexr_b44.h"
@@ -2056,12 +2074,6 @@ static void piz_wav2_decode(uint16_t* in, int nx, int ox, int ny, int oy, uint16
     }
 }
 
-/* Huffman table entry */
-typedef struct {
-    uint64_t code;
-    int len;
-} HufCode;
-
 /* PIZ Huffman decoder constants */
 #define HUF_DECBITS 14
 #define HUF_DECSIZE (1 << HUF_DECBITS)
@@ -2078,32 +2090,32 @@ typedef struct {
 } PizHufDec;
 
 /* MSB-first bit reader for PIZ Huffman bitstream */
-static inline void piz_getChar(int64_t* c, int* lc, const uint8_t** in) {
-    *c = (*c << 8) | (int64_t)(**in);
+static inline void piz_getChar(uint64_t* c, int* lc, const uint8_t** in) {
+    *c = (*c << 8) | (uint64_t)(**in);
     (*in)++;
     *lc += 8;
 }
 
 /* Bulk refill: load up to 6 bytes at once into MSB-first bit buffer */
-static inline void piz_refill(int64_t* c, int* lc, const uint8_t** in,
+static inline void piz_refill(uint64_t* c, int* lc, const uint8_t** in,
                                const uint8_t* end) {
     /* Only refill when we have room for at least one byte */
     while (*lc <= 48 && *in < end) {
-        *c = (*c << 8) | (int64_t)(**in);
+        *c = (*c << 8) | (uint64_t)(**in);
         (*in)++;
         *lc += 8;
     }
 }
 
-static inline int64_t piz_getBits(int nBits, int64_t* c, int* lc,
+static inline uint64_t piz_getBits(int nBits, uint64_t* c, int* lc,
                                    const uint8_t** in) {
     while (*lc < nBits) {
-        *c = (*c << 8) | (int64_t)(**in);
+        *c = (*c << 8) | (uint64_t)(**in);
         (*in)++;
         *lc += 8;
     }
     *lc -= nBits;
-    return (*c >> *lc) & ((1LL << nBits) - 1);
+    return (*c >> *lc) & ((UINT64_C(1) << nBits) - 1u);
 }
 
 /* Build canonical Huffman code table from code lengths.
@@ -2132,7 +2144,7 @@ static bool piz_huf_unpack_enc_table(const uint8_t** pcode, int ni,
     exr_memset(hcode, 0, sizeof(int64_t) * PIZ_HUF_ENCSIZE);
 
     const uint8_t* p = *pcode;
-    int64_t c = 0;
+    uint64_t c = 0;
     int lc = 0;
 
     for (; im <= iM; im++) {
@@ -2162,7 +2174,11 @@ static bool piz_huf_unpack_enc_table(const uint8_t** pcode, int ni,
 
 /* Build decoding table from encoding table */
 static bool piz_huf_build_dec_table(const int64_t* hcode, int im, int iM,
-                                     PizHufDec* hdecod) {
+                                     PizHufDec* hdecod,
+                                     uint32_t** long_code_storage) {
+    uint32_t counts[HUF_DECSIZE];
+    exr_memset(counts, 0, sizeof(counts));
+
     for (int i = 0; i < HUF_DECSIZE; i++) {
         hdecod[i].len = 0;
         hdecod[i].lit = 0;
@@ -2170,7 +2186,7 @@ static bool piz_huf_build_dec_table(const int64_t* hcode, int im, int iM,
     }
 
     for (; im <= iM; im++) {
-        int64_t code_val = hcode[im] >> 6;
+        uint64_t code_val = ((uint64_t)hcode[im]) >> 6;
         int l = (int)(hcode[im] & 63);
 
         if (l == 0) continue;
@@ -2178,43 +2194,70 @@ static bool piz_huf_build_dec_table(const int64_t* hcode, int im, int iM,
 
         if (l > HUF_DECBITS) {
             /* Long code: add to secondary list indexed by top HUF_DECBITS */
-            PizHufDec* pl = &hdecod[code_val >> (l - HUF_DECBITS)];
+            size_t base = (size_t)(code_val >> (l - HUF_DECBITS));
+            PizHufDec* pl = &hdecod[base];
             if (pl->len) return false;  /* Collision with short code */
-
-            pl->lit++;
-            uint32_t* new_p = (uint32_t*)EXR_CRT_MALLOC(pl->lit * sizeof(uint32_t));
-            if (!new_p) return false;
-            if (pl->p) {
-                exr_memcpy(new_p, pl->p, (pl->lit - 1) * sizeof(uint32_t));
-                EXR_CRT_FREE(pl->p);
-            }
-            pl->p = new_p;
-            pl->p[pl->lit - 1] = (uint32_t)im;
+            counts[base]++;
         } else {
             /* Short code: fill all matching entries */
-            PizHufDec* pl = &hdecod[code_val << (HUF_DECBITS - l)];
-            int64_t fill = 1LL << (HUF_DECBITS - l);
-            for (int64_t i = 0; i < fill; i++, pl++) {
+            size_t base = (size_t)(code_val << (HUF_DECBITS - l));
+            PizHufDec* pl = &hdecod[base];
+            size_t fill = (size_t)1u << (HUF_DECBITS - l);
+            for (size_t i = 0; i < fill; i++, pl++) {
+                if (counts[base + i] != 0) return false;  /* Collision */
                 if (pl->len || pl->p) return false;  /* Collision */
                 pl->len = (uint32_t)l;
                 pl->lit = (uint32_t)im;
             }
         }
     }
+
+    size_t total_long_codes = 0;
+    for (int i = 0; i < HUF_DECSIZE; i++) {
+        if (total_long_codes > SIZE_MAX - counts[i]) return false;
+        total_long_codes += counts[i];
+    }
+
+    *long_code_storage = NULL;
+    if (total_long_codes > 0) {
+        uint32_t* storage =
+            (uint32_t*)EXR_CRT_MALLOC(total_long_codes * sizeof(uint32_t));
+        if (!storage) return false;
+        *long_code_storage = storage;
+
+        for (int i = 0; i < HUF_DECSIZE; i++) {
+            if (counts[i] != 0) {
+                hdecod[i].p = storage;
+                hdecod[i].lit = counts[i];
+                storage += counts[i];
+                counts[i] = 0;
+            }
+        }
+    }
+
+    for (int sym = im; sym <= iM; sym++) {
+        uint64_t code_val = ((uint64_t)hcode[sym]) >> 6;
+        int l = (int)(hcode[sym] & 63);
+        if (l > HUF_DECBITS) {
+            size_t base = (size_t)(code_val >> (l - HUF_DECBITS));
+            hdecod[base].p[counts[base]++] = (uint32_t)sym;
+        }
+    }
+
     return true;
 }
 
-static void piz_huf_free_dec_table(PizHufDec* hdecod) {
+static void piz_huf_free_dec_table(PizHufDec* hdecod, uint32_t* long_code_storage) {
+    if (long_code_storage) {
+        EXR_CRT_FREE(long_code_storage);
+    }
     for (int i = 0; i < HUF_DECSIZE; i++) {
-        if (hdecod[i].p) {
-            EXR_CRT_FREE(hdecod[i].p);
-            hdecod[i].p = NULL;
-        }
+        hdecod[i].p = NULL;
     }
 }
 
 /* Decode and handle RLE symbol */
-static bool piz_huf_get_code(int po, int rlc, int64_t* c, int* lc,
+static bool piz_huf_get_code(int po, int rlc, uint64_t* c, int* lc,
                               const uint8_t** in, const uint8_t* in_end,
                               uint16_t** out, const uint16_t* ob,
                               const uint16_t* oe) {
@@ -2224,7 +2267,7 @@ static bool piz_huf_get_code(int po, int rlc, int64_t* c, int* lc,
             piz_getChar(c, lc, in);
         }
         *lc -= 8;
-        uint8_t cs = (uint8_t)(*c >> *lc);
+        uint8_t cs = (uint8_t)((*c >> *lc) & 0xFFu);
         if (*out + cs > oe) return false;
         if ((*out - 1) < ob) return false;
         uint16_t s = (*out)[-1];
@@ -2272,14 +2315,15 @@ static bool piz_huf_uncompress(const uint8_t* in, size_t in_len,
 
     /* Build decoding table */
     PizHufDec hdecod[HUF_DECSIZE];
-    if (!piz_huf_build_dec_table(hcode, im, iM, hdecod)) {
-        piz_huf_free_dec_table(hdecod);
+    uint32_t* long_code_storage = NULL;
+    if (!piz_huf_build_dec_table(hcode, im, iM, hdecod, &long_code_storage)) {
+        piz_huf_free_dec_table(hdecod, long_code_storage);
         return false;
     }
 
     /* Decode */
     int rlc = iM;  /* RLE symbol is the max symbol */
-    int64_t c = 0;
+    uint64_t c = 0;
     int lc = 0;
     uint16_t* outb = out;
     uint16_t* outp = out;
@@ -2304,12 +2348,12 @@ static bool piz_huf_uncompress(const uint8_t* in, size_t in_len,
                 lc -= (int)pl->len;
                 if (!piz_huf_get_code((int)pl->lit, rlc, &c, &lc,
                                        &ptr, ie, &outp, outb, oe)) {
-                    piz_huf_free_dec_table(hdecod);
+                    piz_huf_free_dec_table(hdecod, long_code_storage);
                     return false;
                 }
             } else {
                 if (!pl->p) {
-                    piz_huf_free_dec_table(hdecod);
+                    piz_huf_free_dec_table(hdecod, long_code_storage);
                     return false;
                 }
 
@@ -2321,12 +2365,13 @@ static bool piz_huf_uncompress(const uint8_t* in, size_t in_len,
                         piz_getChar(&c, &lc, &ptr);
 
                     if (lc >= l) {
-                        int64_t code_val = hcode[pl->p[j]] >> 6;
-                        if (code_val == ((c >> (lc - l)) & ((1LL << l) - 1))) {
+                        uint64_t code_val = ((uint64_t)hcode[pl->p[j]]) >> 6;
+                        if (code_val ==
+                            ((c >> (lc - l)) & ((UINT64_C(1) << l) - 1u))) {
                             lc -= l;
                             if (!piz_huf_get_code((int)pl->p[j], rlc, &c, &lc,
                                                    &ptr, ie, &outp, outb, oe)) {
-                                piz_huf_free_dec_table(hdecod);
+                                piz_huf_free_dec_table(hdecod, long_code_storage);
                                 return false;
                             }
                             break;
@@ -2334,7 +2379,7 @@ static bool piz_huf_uncompress(const uint8_t* in, size_t in_len,
                     }
                 }
                 if (j == pl->lit) {
-                    piz_huf_free_dec_table(hdecod);
+                    piz_huf_free_dec_table(hdecod, long_code_storage);
                     return false;
                 }
             }
@@ -2358,17 +2403,17 @@ static bool piz_huf_uncompress(const uint8_t* in, size_t in_len,
                 lc -= (int)pl->len;
                 if (!piz_huf_get_code((int)pl->lit, rlc, &c, &lc,
                                        &ptr, ie, &outp, outb, oe)) {
-                    piz_huf_free_dec_table(hdecod);
+                    piz_huf_free_dec_table(hdecod, long_code_storage);
                     return false;
                 }
             } else {
-                piz_huf_free_dec_table(hdecod);
+                piz_huf_free_dec_table(hdecod, long_code_storage);
                 return false;
             }
         }
     }
 
-    piz_huf_free_dec_table(hdecod);
+    piz_huf_free_dec_table(hdecod, long_code_storage);
     return true;
 }
 
@@ -2386,12 +2431,33 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
         return EXR_SUCCESS;
     }
 
+#ifdef __cplusplus
+    std::vector<tinyexr::v2::Channel> v2_channels((size_t)num_channels);
+    for (int c = 0; c < num_channels; c++) {
+        v2_channels[(size_t)c].name = channels[c].name;
+        v2_channels[(size_t)c].pixel_type = (int)channels[c].pixel_type;
+        v2_channels[(size_t)c].p_linear = (channels[c].p_linear != 0);
+        v2_channels[(size_t)c].x_sampling = channels[c].x_sampling;
+        v2_channels[(size_t)c].y_sampling = channels[c].y_sampling;
+    }
+
+    auto piz_result = tinyexr::piz::DecompressPizV2(
+        dst, dst_size, src, src_size, num_channels, v2_channels.data(),
+        data_width, num_lines);
+    if (!piz_result.success) {
+        (void)ctx;
+        return EXR_ERROR_DECOMPRESSION_FAILED;
+    }
+    *out_size = dst_size;
+    return EXR_SUCCESS;
+#endif
+
     /* PIZ decompression:
      * 1. Read bitmap (marks which 16-bit values appear)
-     * 2. Build forward/reverse LUT from bitmap
+     * 2. Build reverse LUT from bitmap
      * 3. Huffman decompress the data
-     * 4. Apply reverse LUT (expand range)
-     * 5. Wavelet decode per channel
+     * 4. Wavelet decode per channel/subcomponent
+     * 5. Apply reverse LUT (expand range)
      * 6. Reorder into output layout
      */
     if (src_size < 8) return EXR_ERROR_INVALID_DATA;
@@ -2423,31 +2489,24 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
         }
     }
 
-    /* Build forward LUT from bitmap */
-    uint16_t fwd_lut[PIZ_USHORT_RANGE];
     uint16_t rev_lut[PIZ_USHORT_RANGE];
 
     uint16_t maxValue = piz_reverse_lut_from_bitmap(bitmap, rev_lut);
 
-    /* Build forward LUT */
-    {
-        int k = 0;
-        for (int i = 0; i < PIZ_USHORT_RANGE; i++) fwd_lut[i] = 0;
-        for (int i = 0; i < PIZ_USHORT_RANGE; i++) {
-            if (i == 0 || (bitmap[i >> 3] & (1 << (i & 7)))) {
-                fwd_lut[i] = (uint16_t)k++;
-            }
-        }
-    }
-
     /* Calculate total number of uint16 samples (with overflow checks) */
     size_t total_samples = 0;
+    if (num_channels <= 0 || num_channels > 128) {
+        return EXR_ERROR_INVALID_DATA;
+    }
     for (int c = 0; c < num_channels; c++) {
         if (channels[c].x_sampling <= 0 || channels[c].y_sampling <= 0) {
             return EXR_ERROR_INVALID_DATA;
         }
         int ch_width = data_width / channels[c].x_sampling;
         int ch_height = num_lines / channels[c].y_sampling;
+        if (ch_width < 0 || ch_height < 0) {
+            return EXR_ERROR_INVALID_DATA;
+        }
         int bpp = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
         size_t ch_samples = (size_t)ch_width * (size_t)ch_height * (size_t)bpp;
         /* Check for overflow */
@@ -2489,12 +2548,8 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
         return EXR_ERROR_DECOMPRESSION_FAILED;
     }
 
-    /* Apply forward LUT (compress range) */
-    piz_apply_lut(fwd_lut, tmp, (int)total_samples);
-
     /* Build per-channel metadata and wavelet decode */
     PizChannelData cd[128];
-    if (num_channels > 128) { ctx->allocator.free(ctx->allocator.userdata, tmp, tmp_alloc_size); return EXR_ERROR_INVALID_DATA; }
 
     uint16_t* chan_ptr = tmp;
     size_t bytes_per_scanline = 0;
@@ -2507,7 +2562,7 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
 
         cd[c].start = chan_ptr;
         cd[c].end = chan_ptr + ch_samples;
-        cd[c].nx = ch_width * bpp;
+        cd[c].nx = ch_width;
         cd[c].ny = ch_height;
         cd[c].size = bpp;
 
@@ -2516,7 +2571,10 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
     }
 
     for (int c = 0; c < num_channels; c++) {
-        piz_wav2_decode(cd[c].start, cd[c].nx, 1, cd[c].ny, cd[c].nx, maxValue);
+        for (int lane = 0; lane < cd[c].size; lane++) {
+            piz_wav2_decode(cd[c].start + lane, cd[c].nx, cd[c].size,
+                            cd[c].ny, cd[c].nx * cd[c].size, maxValue);
+        }
     }
 
     /* Apply reverse LUT (expand range) */
@@ -2535,10 +2593,12 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
             }
 
             int ch_line = line / channels[c].y_sampling;
-            uint16_t* line_data = cd[c].start + (size_t)ch_line * cd[c].nx;
+            int line_samples = cd[c].nx * cd[c].size;
+            uint16_t* line_data =
+                cd[c].start + (size_t)ch_line * (size_t)line_samples;
             uint8_t* dst_line = dst + (size_t)line * bytes_per_scanline + ch_byte_offset;
 
-            for (int x = 0; x < cd[c].nx; x++) {
+            for (int x = 0; x < line_samples; x++) {
                 uint16_t val = line_data[x];
                 dst_line[x * 2] = (uint8_t)(val & 0xFF);
                 dst_line[x * 2 + 1] = (uint8_t)(val >> 8);
@@ -2737,10 +2797,10 @@ static ExrResult decompress_pxr24(const uint8_t* src, size_t src_size,
  * `data_width` and `data_height` are the pixel dimensions of the data block
  * (image width + num_lines for scanlines, tile_width + tile_height for tiles). */
 static ExrResult decompress_chunk_data(ExrContext ctx, ExrPartData* part,
-                                        const uint8_t* compressed, size_t data_size,
-                                        uint8_t* decompressed, size_t expected_size,
-                                        size_t* out_decompressed_size,
-                                        int data_width, int data_height,
+                                       const uint8_t* compressed, size_t data_size,
+                                       uint8_t* decompressed, size_t expected_size,
+                                       size_t* out_decompressed_size,
+                                       int data_width, int data_height,
                                         uint64_t offset) {
     ExrResult result;
     size_t decompressed_size = 0;
@@ -2819,6 +2879,22 @@ static ExrResult decompress_chunk_data(ExrContext ctx, ExrPartData* part,
     return EXR_SUCCESS;
 }
 
+static bool exr_mul_size_checked(size_t a, size_t b, size_t* out) {
+    if (a != 0 && b > SIZE_MAX / a) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+static bool exr_add_size_checked(size_t a, size_t b, size_t* out) {
+    if (a > SIZE_MAX - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
 /* Read and decompress a single chunk */
 static ExrResult read_chunk(ExrDecoder decoder, ExrPartData* part, uint32_t chunk_index,
                             uint8_t** out_data, size_t* out_size,
@@ -2858,14 +2934,18 @@ static ExrResult read_chunk(ExrDecoder decoder, ExrPartData* part, uint32_t chun
 
     size_t bytes_per_line = 0;
     for (uint32_t c = 0; c < part->num_channels; c++) {
-        size_t ch_bytes = (size_t)part->width * get_bytes_per_pixel(part->channels[c].pixel_type);
-        if (part->width > 0 && ch_bytes / (size_t)part->width != (size_t)get_bytes_per_pixel(part->channels[c].pixel_type)) {
+        size_t ch_bytes = 0;
+        if (!exr_mul_size_checked((size_t)part->width,
+                                  get_bytes_per_pixel(part->channels[c].pixel_type),
+                                  &ch_bytes)) {
             return EXR_ERROR_OUT_OF_MEMORY; /* overflow */
         }
-        bytes_per_line += ch_bytes;
+        if (!exr_add_size_checked(bytes_per_line, ch_bytes, &bytes_per_line)) {
+            return EXR_ERROR_OUT_OF_MEMORY; /* overflow */
+        }
     }
-    size_t expected_size = bytes_per_line * (size_t)num_lines;
-    if (num_lines > 0 && expected_size / (size_t)num_lines != bytes_per_line) {
+    size_t expected_size = 0;
+    if (!exr_mul_size_checked(bytes_per_line, (size_t)num_lines, &expected_size)) {
         return EXR_ERROR_OUT_OF_MEMORY; /* overflow */
     }
 
@@ -3082,12 +3162,26 @@ static ExrResult read_tile(ExrDecoder decoder, ExrPartData* part,
 
     int tile_width = tile_end_x - tile_start_x;
     int tile_height = tile_end_y - tile_start_y;
+    if (tile_width <= 0 || tile_height <= 0) {
+        return EXR_ERROR_INVALID_DATA;
+    }
 
     size_t bytes_per_line = 0;
     for (uint32_t c = 0; c < part->num_channels; c++) {
-        bytes_per_line += (size_t)tile_width * get_bytes_per_pixel(part->channels[c].pixel_type);
+        size_t ch_bytes = 0;
+        if (!exr_mul_size_checked((size_t)tile_width,
+                                  get_bytes_per_pixel(part->channels[c].pixel_type),
+                                  &ch_bytes)) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+        if (!exr_add_size_checked(bytes_per_line, ch_bytes, &bytes_per_line)) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
     }
-    size_t expected_size = bytes_per_line * tile_height;
+    size_t expected_size = 0;
+    if (!exr_mul_size_checked(bytes_per_line, (size_t)tile_height, &expected_size)) {
+        return EXR_ERROR_OUT_OF_MEMORY;
+    }
 
     /* Allocate compressed data buffer */
     uint8_t* compressed = (uint8_t*)ctx->allocator.alloc(
@@ -3496,6 +3590,35 @@ static ExrResult execute_full_image_read(ExrDecoder decoder, ExrFullImageReadCmd
         calc_level_size(part, 0, 0, &level_width, &level_height, &num_x_tiles, &num_y_tiles);
 
         size_t bytes_per_pixel_out = get_bytes_per_pixel(cmd->output_pixel_type);
+        size_t output_stride = 0;
+        size_t required_output = 0;
+        size_t max_conv_size = 0;
+
+        if (!exr_mul_size_checked((size_t)level_width, (size_t)part->num_channels,
+                                  &output_stride) ||
+            !exr_mul_size_checked(output_stride, bytes_per_pixel_out, &output_stride) ||
+            !exr_mul_size_checked(output_stride, (size_t)level_height, &required_output)) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+
+        if (required_output > cmd->output_size) {
+            return EXR_ERROR_BUFFER_TOO_SMALL;
+        }
+
+        if (!exr_mul_size_checked((size_t)part->tile_size_x,
+                                  (size_t)part->tile_size_y, &max_conv_size) ||
+            !exr_mul_size_checked(max_conv_size, (size_t)part->num_channels,
+                                  &max_conv_size) ||
+            !exr_mul_size_checked(max_conv_size, bytes_per_pixel_out,
+                                  &max_conv_size)) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+
+        uint8_t* converted = (uint8_t*)ctx->allocator.alloc(
+            ctx->allocator.userdata, max_conv_size, EXR_DEFAULT_ALIGNMENT);
+        if (!converted) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
 
         /* Read each tile and copy to the correct position in output */
         for (int ty = 0; ty < num_y_tiles; ty++) {
@@ -3507,6 +3630,7 @@ static ExrResult execute_full_image_read(ExrDecoder decoder, ExrFullImageReadCmd
                 ExrResult result = read_tile(decoder, part, tx, ty, 0, 0,
                                               &tile_data, &tile_size, &tile_width, &tile_height);
                 if (EXR_FAILED(result)) {
+                    ctx->allocator.free(ctx->allocator.userdata, converted, max_conv_size);
                     return result;
                 }
 
@@ -3514,12 +3638,21 @@ static ExrResult execute_full_image_read(ExrDecoder decoder, ExrFullImageReadCmd
                 int tile_px_x = tx * (int)part->tile_size_x;
                 int tile_px_y = ty * (int)part->tile_size_y;
 
-                /* Allocate temp buffer for converted tile */
-                size_t conv_size = (size_t)tile_width * tile_height * part->num_channels * bytes_per_pixel_out;
-                uint8_t* converted = (uint8_t*)ctx->allocator.alloc(
-                    ctx->allocator.userdata, conv_size, EXR_DEFAULT_ALIGNMENT);
-                if (!converted) {
+                size_t conv_size = 0;
+                size_t tile_stride = 0;
+                if (!exr_mul_size_checked((size_t)tile_width, (size_t)tile_height,
+                                          &conv_size) ||
+                    !exr_mul_size_checked(conv_size, (size_t)part->num_channels,
+                                          &conv_size) ||
+                    !exr_mul_size_checked(conv_size, bytes_per_pixel_out,
+                                          &conv_size) ||
+                    !exr_mul_size_checked((size_t)tile_width,
+                                          (size_t)part->num_channels,
+                                          &tile_stride) ||
+                    !exr_mul_size_checked(tile_stride, bytes_per_pixel_out,
+                                          &tile_stride)) {
                     ctx->allocator.free(ctx->allocator.userdata, tile_data, tile_size);
+                    ctx->allocator.free(ctx->allocator.userdata, converted, max_conv_size);
                     return EXR_ERROR_OUT_OF_MEMORY;
                 }
 
@@ -3532,19 +3665,16 @@ static ExrResult execute_full_image_read(ExrDecoder decoder, ExrFullImageReadCmd
                 ctx->allocator.free(ctx->allocator.userdata, tile_data, tile_size);
 
                 /* Copy converted tile to the correct position in output */
-                size_t output_stride = (size_t)level_width * part->num_channels * bytes_per_pixel_out;
-                size_t tile_stride = (size_t)tile_width * part->num_channels * bytes_per_pixel_out;
-
                 for (int y = 0; y < tile_height; y++) {
                     uint8_t* dst = (uint8_t*)cmd->output + (tile_px_y + y) * output_stride +
                                    tile_px_x * part->num_channels * bytes_per_pixel_out;
                     const uint8_t* src = converted + y * tile_stride;
                     exr_memcpy(dst, src, tile_stride);
                 }
-
-                ctx->allocator.free(ctx->allocator.userdata, converted, conv_size);
             }
         }
+
+        ctx->allocator.free(ctx->allocator.userdata, converted, max_conv_size);
 
         return EXR_SUCCESS;
     }
@@ -5128,8 +5258,10 @@ resume_parsing:
             return EXR_ERROR_INVALID_DATA;
         }
 
-        ExrPartData* part = &image->parts[image->num_parts];
+        uint32_t part_index = image->num_parts;
+        ExrPartData* part = &image->parts[part_index];
         part->part_type = (image->flags & EXR_IMAGE_TILED) ? EXR_PART_TILED : EXR_PART_SCANLINE;
+        image->num_parts = part_index + 1;
 
         /* Parse all attributes for this part */
         int end_of_header = 0;
@@ -5138,7 +5270,7 @@ resume_parsing:
             if (result == EXR_WOULD_BLOCK) {
                 /* Save state for resume */
                 decoder->current_offset = offset;
-                decoder->current_part_index = image->num_parts;
+                decoder->current_part_index = part_index;
                 return EXR_WOULD_BLOCK;
             }
             if (EXR_FAILED(result)) {
@@ -5159,8 +5291,6 @@ resume_parsing:
         } else if (image->flags & EXR_IMAGE_DEEP) {
             part->part_type = EXR_PART_DEEP_SCANLINE;
         }
-
-        image->num_parts++;
 
         /* For multipart files, check for empty header marking end */
         if (image->flags & EXR_IMAGE_MULTIPART) {
@@ -7914,7 +8044,6 @@ ExrResult exr_decompress_chunk(ExrContext ctx, const ExrDecompressInfo* info) {
                                      &out_size, ctx);
             break;
 
-#if defined(TINYEXR_V3_HAS_PIZ)
         case EXR_COMPRESSION_PIZ:
             if (!info->channels || info->num_channels == 0) {
                 return EXR_ERROR_INVALID_ARGUMENT;
@@ -7945,7 +8074,6 @@ ExrResult exr_decompress_chunk(ExrContext ctx, const ExrDecompressInfo* info) {
                                     info->num_channels * sizeof(ExrChannelData));
             }
             break;
-#endif
 
         /* PXR24 and B44 decompression not exposed through direct chunk API */
         /* Use full decoder API for these compression formats */

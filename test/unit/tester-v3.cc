@@ -467,6 +467,47 @@ static std::vector<uint8_t> read_file(const char* path) {
     return data;
 }
 
+static uint32_t read_le_u32_test(const uint8_t* p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t read_le_u64_test(const uint8_t* p) {
+    return (uint64_t)read_le_u32_test(p) |
+           ((uint64_t)read_le_u32_test(p + 4) << 32);
+}
+
+static bool find_single_part_offset_table_start(const std::vector<uint8_t>& data,
+                                                size_t* out_offset) {
+    if (!out_offset || data.size() < 9) return false;
+
+    size_t pos = 8;  /* Skip magic + version */
+    while (pos < data.size()) {
+        if (data[pos] == 0) {
+            *out_offset = pos + 1;
+            return true;
+        }
+
+        while (pos < data.size() && data[pos] != 0) pos++;
+        if (pos >= data.size()) return false;
+        pos++;  /* attr name terminator */
+
+        while (pos < data.size() && data[pos] != 0) pos++;
+        if (pos >= data.size()) return false;
+        pos++;  /* attr type terminator */
+
+        if (pos + 4 > data.size()) return false;
+        uint32_t attr_size = read_le_u32_test(data.data() + pos);
+        pos += 4;
+        if (pos + attr_size > data.size()) return false;
+        pos += attr_size;
+    }
+
+    return false;
+}
+
 TEST(c_api_parse_invalid_magic) {
     ExrContextCreateInfo ctx_info = {};
     ctx_info.api_version = TINYEXR_C_API_VERSION;
@@ -2026,6 +2067,163 @@ TEST(zip_round_trip_real_file) {
     exr_context_destroy(ctx);
 }
 
+/* ---- PIZ tests ---- */
+
+TEST(piz_chunk_api_issue160_float32) {
+    std::vector<uint8_t> fileData = read_file("../../test/unit/regression/issue-160-piz-decode.exr");
+    if (fileData.empty()) {
+        printf("[SKIPPED - PIZ test file not found] ");
+        return;
+    }
+
+    EXRVersion exr_version;
+    int ret = ParseEXRVersionFromMemory(&exr_version, fileData.data(), fileData.size());
+    REQUIRE_EQ(ret, TINYEXR_SUCCESS);
+
+    EXRHeader header;
+    InitEXRHeader(&header);
+    const char* err = nullptr;
+    ret = ParseEXRHeaderFromMemory(&header, &exr_version, fileData.data(), fileData.size(), &err);
+    REQUIRE_EQ(ret, TINYEXR_SUCCESS);
+    REQUIRE_EQ(header.compression_type, TINYEXR_COMPRESSIONTYPE_PIZ);
+
+    EXRImage v1_image;
+    InitEXRImage(&v1_image);
+    ret = LoadEXRImageFromMemory(&v1_image, &header, fileData.data(), fileData.size(), &err);
+    REQUIRE_EQ(ret, TINYEXR_SUCCESS);
+
+    ExrContext ctx = create_test_context();
+
+    ExrDataSource source = {};
+    ExrResult result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPart part = nullptr;
+    result = exr_image_get_part(image, 0, &part);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPartInfo part_info = {};
+    result = exr_part_get_info(part, &part_info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(part_info.compression, (uint32_t)EXR_COMPRESSION_PIZ);
+
+    std::vector<ExrChannelInfo> channels(part_info.num_channels);
+    for (uint32_t c = 0; c < part_info.num_channels; c++) {
+        result = exr_part_get_channel(part, c, &channels[c]);
+        REQUIRE_EQ(result, EXR_SUCCESS);
+    }
+
+    REQUIRE(!channels.empty());
+    REQUIRE_EQ(channels[0].pixel_type, (uint32_t)EXR_PIXEL_FLOAT);
+
+    size_t offset_table_start = 0;
+    REQUIRE(find_single_part_offset_table_start(fileData, &offset_table_start));
+
+    uint32_t chunk_count = 0;
+    result = exr_part_get_chunk_count(part, &chunk_count);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE(chunk_count > 0);
+    REQUIRE(offset_table_start + chunk_count * sizeof(uint64_t) <= fileData.size());
+
+    uint64_t chunk_offset = read_le_u64_test(fileData.data() + offset_table_start);
+    REQUIRE(chunk_offset + 8 <= fileData.size());
+    uint32_t data_size = read_le_u32_test(fileData.data() + chunk_offset + 4);
+    REQUIRE(chunk_offset + 8 + data_size <= fileData.size());
+
+    int num_lines = part_info.height < 32 ? part_info.height : 32;
+    int bytes_per_pixel = 4;  /* float32 regression */
+    size_t bytes_per_line = (size_t)part_info.width * part_info.num_channels *
+                            (size_t)bytes_per_pixel;
+    size_t expected_size = bytes_per_line * (size_t)num_lines;
+    std::vector<uint8_t> expected(expected_size, 0);
+    std::vector<uint8_t> actual(expected_size, 0);
+
+    for (int y = 0; y < num_lines; y++) {
+        size_t line_offset = (size_t)y * bytes_per_line;
+        size_t channel_offset = 0;
+        for (uint32_t c = 0; c < part_info.num_channels; c++) {
+            const uint8_t* src =
+                reinterpret_cast<const uint8_t*>(v1_image.images[c]) +
+                (size_t)y * (size_t)part_info.width * (size_t)bytes_per_pixel;
+            size_t channel_bytes = (size_t)part_info.width * (size_t)bytes_per_pixel;
+            memcpy(expected.data() + line_offset + channel_offset, src, channel_bytes);
+            channel_offset += channel_bytes;
+        }
+    }
+
+    size_t out_size = 0;
+    ExrDecompressInfo info = {};
+    info.src = fileData.data() + chunk_offset + 8;
+    info.src_size = data_size;
+    info.dst = actual.data();
+    info.dst_capacity = actual.size();
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_PIZ;
+    info.width = part_info.width;
+    info.num_lines = num_lines;
+    info.num_channels = part_info.num_channels;
+    info.channels = channels.data();
+
+    result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, expected_size);
+    REQUIRE(memcmp(expected.data(), actual.data(), expected_size) == 0);
+
+    printf("[chunk %dx%d float32 verified] ", part_info.width, num_lines);
+
+    exr_part_destroy(part);
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+    FreeEXRImage(&v1_image);
+    FreeEXRHeader(&header);
+}
+
+TEST(piz_malformed_huffman_data) {
+    /* Special-case bitmap for all-zero image + truncated Huffman payload. */
+    const uint8_t bad_piz[] = {
+        0xFF, 0xFF, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    ExrChannelInfo channel = {};
+    channel.name = "Y";
+    channel.pixel_type = EXR_PIXEL_HALF;
+    channel.x_sampling = 1;
+    channel.y_sampling = 1;
+
+    ExrContext ctx = create_test_context();
+    uint16_t output = 0;
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = bad_piz;
+    info.src_size = sizeof(bad_piz);
+    info.dst = &output;
+    info.dst_capacity = sizeof(output);
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_PIZ;
+    info.width = 1;
+    info.num_lines = 1;
+    info.num_channels = 1;
+    info.channels = &channel;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_ERROR_DECOMPRESSION_FAILED);
+
+    exr_context_destroy(ctx);
+}
+
 /* ---- NONE compression tests ---- */
 
 TEST(none_passthrough) {
@@ -2674,6 +2872,9 @@ TEST(regression_fuzzer_pocs) {
         ExrImage image = nullptr;
         result = exr_decoder_parse_header(decoder, &image);
         /* We don't care about the result -- just that it doesn't crash */
+        if (image) {
+            exr_image_destroy(image);
+        }
 
         exr_decoder_destroy(decoder);
         exr_context_destroy(ctx);
@@ -2738,6 +2939,8 @@ int main() {
     run_test_zip_zips_uncompressed_passthrough();
     run_test_zip_corrupt_data();
     run_test_zip_round_trip_real_file();
+    run_test_piz_chunk_api_issue160_float32();
+    run_test_piz_malformed_huffman_data();
     run_test_zip_round_trip_large();
 
     printf("\n[Predictor/Reorder Tests]\n");

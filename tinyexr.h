@@ -2281,14 +2281,15 @@ inline void outputBits(int nBits, long long bits, long long &c, int &lc,
   while (lc >= 8) *out++ = static_cast<char>((c >> (lc -= 8)));
 }
 
-inline long long getBits(int nBits, long long &c, int &lc, const char *&in) {
+inline long long getBits(int nBits, unsigned long long &c, int &lc,
+                         const char *&in) {
   while (lc < nBits) {
     c = (c << 8) | *(reinterpret_cast<const unsigned char *>(in++));
     lc += 8;
   }
 
   lc -= nBits;
-  return (c >> lc) & ((1 << nBits) - 1);
+  return static_cast<long long>((c >> lc) & ((1ULL << nBits) - 1ULL));
 }
 
 //
@@ -2605,7 +2606,7 @@ static bool hufUnpackEncTable(
   memset(hcode, 0, sizeof(long long) * HUF_ENCSIZE);
 
   const char *p = *pcode;
-  long long c = 0;
+  unsigned long long c = 0;
   int lc = 0;
 
   for (; im <= iM; im++) {
@@ -2857,10 +2858,10 @@ static int hufEncode            // return: output size (in bits)
 // instead of "inline" functions.
 //
 
-#define getChar(c, lc, in)                   \
-  {                                          \
-    c = (c << 8) | *(unsigned char *)(in++); \
-    lc += 8;                                 \
+#define getChar(c, lc, in)                                    \
+  {                                                           \
+    c = (c << 8) | *(reinterpret_cast<const unsigned char *>(in++)); \
+    lc += 8;                                                  \
   }
 
 #if 0
@@ -2886,7 +2887,8 @@ static int hufEncode            // return: output size (in bits)
     }                                            \
   }
 #else
-static bool getCode(int po, int rlc, long long &c, int &lc, const char *&in,
+static bool getCode(int po, int rlc, unsigned long long &c, int &lc,
+                    const char *&in,
                     const char *in_end, unsigned short *&out,
                     const unsigned short *ob, const unsigned short *oe) {
   (void)ob;
@@ -2903,7 +2905,7 @@ static bool getCode(int po, int rlc, long long &c, int &lc, const char *&in,
 
     lc -= 8;
 
-    unsigned char cs = (c >> lc);
+    unsigned char cs = static_cast<unsigned char>((c >> lc) & 0xffu);
 
     if (out + cs > oe) return false;
 
@@ -2934,7 +2936,7 @@ static bool hufDecode(const long long *hcode,  // i : encoding table
                       int no,  // i : expected output size (in bytes)
                       unsigned short *out)  //  o: uncompressed output buffer
 {
-  long long c = 0;
+  unsigned long long c = 0;
   int lc = 0;
   unsigned short *outb = out;          // begin
   unsigned short *oe = out + no;       // end
@@ -2989,8 +2991,8 @@ static bool hufDecode(const long long *hcode,  // i : encoding table
             getChar(c, lc, in);
 
           if (lc >= l) {
-            if (hufCode(hcode[pl.p[j]]) ==
-                ((c >> (lc - l)) & (((long long)(1) << l) - 1))) {
+            if (static_cast<unsigned long long>(hufCode(hcode[pl.p[j]])) ==
+                ((c >> (lc - l)) & ((1ULL << l) - 1ULL))) {
               //
               // Found : get long code
               //
