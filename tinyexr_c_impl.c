@@ -2292,16 +2292,28 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
         }
     }
 
-    /* Calculate total number of uint16 samples */
+    /* Calculate total number of uint16 samples (with overflow checks) */
     size_t total_samples = 0;
     for (int c = 0; c < num_channels; c++) {
+        if (channels[c].x_sampling <= 0 || channels[c].y_sampling <= 0) {
+            return EXR_ERROR_INVALID_DATA;
+        }
         int ch_width = data_width / channels[c].x_sampling;
         int ch_height = num_lines / channels[c].y_sampling;
         int bpp = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
-        total_samples += (size_t)ch_width * ch_height * bpp;
+        size_t ch_samples = (size_t)ch_width * (size_t)ch_height * (size_t)bpp;
+        /* Check for overflow */
+        if (ch_width > 0 && ch_samples / (size_t)ch_width / (size_t)bpp != (size_t)ch_height) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+        if (total_samples > SIZE_MAX - ch_samples) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+        total_samples += ch_samples;
     }
 
     if (total_samples == 0) return EXR_ERROR_INVALID_DATA;
+    if (total_samples > SIZE_MAX / sizeof(uint16_t)) return EXR_ERROR_OUT_OF_MEMORY;
 
     /* Allocate tmp buffer for decompressed uint16 data */
     uint16_t* tmp = (uint16_t*)EXR_CRT_MALLOC(total_samples * sizeof(uint16_t));
@@ -2641,17 +2653,25 @@ static ExrResult read_chunk(ExrDecoder decoder, ExrPartData* part, uint32_t chun
         }
 
         case EXR_COMPRESSION_PXR24: {
-            /* Calculate expected PXR24 intermediate size */
+            /* Calculate expected PXR24 intermediate size (with overflow checks) */
             size_t pxr24_size = 0;
             for (uint32_t c = 0; c < part->num_channels; c++) {
-                int ch_width = part->width / part->channels[c].x_sampling;
-                int ch_height = num_lines / part->channels[c].y_sampling;
-                int ch_pixels = ch_width * ch_height;
+                size_t ch_width = (size_t)(part->width / part->channels[c].x_sampling);
+                size_t ch_height = (size_t)(num_lines / part->channels[c].y_sampling);
+                size_t bpc; /* bytes per component in PXR24 format */
                 switch (part->channels[c].pixel_type) {
-                    case EXR_PIXEL_UINT:  pxr24_size += (size_t)ch_pixels * 4; break;
-                    case EXR_PIXEL_HALF:  pxr24_size += (size_t)ch_pixels * 2; break;
-                    case EXR_PIXEL_FLOAT: pxr24_size += (size_t)ch_pixels * 3; break;
+                    case EXR_PIXEL_UINT:  bpc = 4; break;
+                    case EXR_PIXEL_HALF:  bpc = 2; break;
+                    case EXR_PIXEL_FLOAT: bpc = 3; break;
+                    default: bpc = 2; break;
                 }
+                size_t ch_size = ch_width * ch_height * bpc;
+                if (ch_width > 0 && ch_size / ch_width / bpc != ch_height) {
+                    ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
+                    ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
+                    return EXR_ERROR_OUT_OF_MEMORY;
+                }
+                pxr24_size += ch_size;
             }
 
             uint8_t* pxr24_buf = (uint8_t*)ctx->allocator.alloc(
@@ -3063,17 +3083,25 @@ static ExrResult read_tile(ExrDecoder decoder, ExrPartData* part,
         }
 
         case EXR_COMPRESSION_PXR24: {
-            /* Calculate expected PXR24 intermediate size for tile */
+            /* Calculate expected PXR24 intermediate size for tile (with overflow checks) */
             size_t pxr24_size = 0;
             for (uint32_t c = 0; c < part->num_channels; c++) {
-                int ch_width = tile_width / part->channels[c].x_sampling;
-                int ch_height = tile_height / part->channels[c].y_sampling;
-                int ch_pixels = ch_width * ch_height;
+                size_t ch_width = (size_t)(tile_width / part->channels[c].x_sampling);
+                size_t ch_height = (size_t)(tile_height / part->channels[c].y_sampling);
+                size_t bpc;
                 switch (part->channels[c].pixel_type) {
-                    case EXR_PIXEL_UINT:  pxr24_size += (size_t)ch_pixels * 4; break;
-                    case EXR_PIXEL_HALF:  pxr24_size += (size_t)ch_pixels * 2; break;
-                    case EXR_PIXEL_FLOAT: pxr24_size += (size_t)ch_pixels * 3; break;
+                    case EXR_PIXEL_UINT:  bpc = 4; break;
+                    case EXR_PIXEL_HALF:  bpc = 2; break;
+                    case EXR_PIXEL_FLOAT: bpc = 3; break;
+                    default: bpc = 2; break;
                 }
+                size_t ch_size = ch_width * ch_height * bpc;
+                if (ch_width > 0 && ch_size / ch_width / bpc != ch_height) {
+                    ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
+                    ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
+                    return EXR_ERROR_OUT_OF_MEMORY;
+                }
+                pxr24_size += ch_size;
             }
 
             uint8_t* pxr24_buf = (uint8_t*)ctx->allocator.alloc(
@@ -4719,11 +4747,15 @@ static ExrResult parse_channel_list(ExrPartData* part, const uint8_t* data, uint
         ch->p_linear = *p;
         p += 4;  /* pLinear + 3 reserved bytes */
 
-        /* Parse sampling */
+        /* Parse and validate sampling */
         ch->x_sampling = read_le_i32(p);
         p += 4;
         ch->y_sampling = read_le_i32(p);
         p += 4;
+
+        if (ch->x_sampling <= 0 || ch->y_sampling <= 0) {
+            return EXR_ERROR_INVALID_DATA;
+        }
     }
 
     return EXR_SUCCESS;

@@ -237,6 +237,9 @@ static bool tinyexr_decompress_b44(uint8_t* dst, size_t expected_size,
     exr_memset(dst, 0, expected_size);
 
     for (int c = 0; c < num_channels; c++) {
+        if (channels[c].x_sampling <= 0 || channels[c].y_sampling <= 0) {
+            return false;
+        }
         int ch_width = width / channels[c].x_sampling;
         int ch_height = num_lines / channels[c].y_sampling;
 
@@ -267,10 +270,19 @@ static bool tinyexr_decompress_b44(uint8_t* dst, size_t expected_size,
         int num_blocks_x = (ch_width + 3) / 4;
         int num_blocks_y = (ch_height + 3) / 4;
 
-        /* Allocate temporary channel buffer */
-        uint16_t* ch_data = (uint16_t*)EXR_CRT_MALLOC((size_t)ch_width * (size_t)ch_height * sizeof(uint16_t));
+        /* Overflow-safe allocation for temporary channel buffer */
+        size_t ch_alloc = (size_t)ch_width * (size_t)ch_height;
+        if (ch_width > 0 && ch_alloc / (size_t)ch_width != (size_t)ch_height) {
+            return false; /* overflow */
+        }
+        if (ch_alloc > SIZE_MAX / sizeof(uint16_t)) {
+            return false; /* overflow */
+        }
+        ch_alloc *= sizeof(uint16_t);
+
+        uint16_t* ch_data = (uint16_t*)EXR_CRT_MALLOC(ch_alloc);
         if (!ch_data) return false;
-        exr_memset(ch_data, 0, (size_t)ch_width * (size_t)ch_height * sizeof(uint16_t));
+        exr_memset(ch_data, 0, ch_alloc);
 
         for (int by = 0; by < num_blocks_y; by++) {
             for (int bx = 0; bx < num_blocks_x; bx++) {
