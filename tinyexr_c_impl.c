@@ -2445,26 +2445,6 @@ static ExrResult decompress_rle(const uint8_t* src, size_t src_size,
     return EXR_SUCCESS;
 }
 
-/* Reconstruct interleaved channels to planar format */
-static void deinterleave_channels(const uint8_t* src, uint8_t* dst,
-                                   int width, int height, int num_channels,
-                                   int bytes_per_channel) {
-    size_t pixel_stride = num_channels * bytes_per_channel;
-    size_t channel_size = (size_t)width * height * bytes_per_channel;
-
-    for (int c = 0; c < num_channels; c++) {
-        uint8_t* channel_dst = dst + c * channel_size;
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                const uint8_t* pixel_src = src + (y * width + x) * pixel_stride;
-                exr_memcpy(channel_dst + (y * width + x) * bytes_per_channel,
-                       pixel_src + c * bytes_per_channel,
-                       bytes_per_channel);
-            }
-        }
-    }
-}
-
 /* PXR24 decompression: zlib inflate + byte-plane delta decode.
  * Shared by both scanline and tiled reading paths. */
 static ExrResult decompress_pxr24(const uint8_t* src, size_t src_size,
@@ -3206,10 +3186,6 @@ static ExrResult execute_scanline_read(ExrDecoder decoder, ExrScanlineReadCmd* c
     int end_y = cmd->y_start + cmd->num_lines;
     int end_chunk = (end_y + lines_per_block - 1) / lines_per_block;
 
-    /* Calculate output stride */
-    size_t bytes_per_pixel_out = get_bytes_per_pixel(cmd->output_pixel_type);
-    size_t output_stride = (size_t)part->width * part->num_channels * bytes_per_pixel_out;
-
     uint8_t* output = (uint8_t*)cmd->output;
     int lines_written = 0;
 
@@ -3348,7 +3324,6 @@ static ExrResult execute_full_image_read(ExrDecoder decoder, ExrFullImageReadCmd
         calc_level_size(part, 0, 0, &level_width, &level_height, &num_x_tiles, &num_y_tiles);
 
         size_t bytes_per_pixel_out = get_bytes_per_pixel(cmd->output_pixel_type);
-        size_t tile_bytes_per_line = (size_t)part->tile_size_x * part->num_channels * bytes_per_pixel_out;
 
         /* Read each tile and copy to the correct position in output */
         for (int ty = 0; ty < num_y_tiles; ty++) {
@@ -4162,7 +4137,6 @@ void exr_deinterleave_rgba(const float* rgba, float* r, float* g, float* b,
 /* EXR magic number: 0x76, 0x2f, 0x31, 0x01 */
 static const uint8_t EXR_MAGIC[4] = { 0x76, 0x2f, 0x31, 0x01 };
 static const size_t EXR_VERSION_SIZE = 8;
-static const size_t EXR_MAX_ATTRIBUTE_NAME = 256;
 static const size_t EXR_MAX_ATTRIBUTES = 128;
 
 /* Parsing sub-states */
@@ -5327,9 +5301,10 @@ ExrResult exr_part_get_deep_sample_counts(
     uint64_t total_samples = 0;
     out_info->sample_offsets[0] = 0;
     for (size_t i = 0; i < num_pixels; i++) {
-        int32_t offset_val = pixel_offsets[i < (size_t)width ? i : width - 1];
-        int32_t prev_offset = (i > 0 && i < (size_t)width) ? pixel_offsets[i - 1] : 0;
-        uint32_t count = (i < (size_t)width) ? (uint32_t)(offset_val - prev_offset) : 0;
+        size_t w = (size_t)width;
+        int32_t offset_val = pixel_offsets[i < w ? i : w - 1];
+        int32_t prev_offset = (i > 0 && i < w) ? pixel_offsets[i - 1] : 0;
+        uint32_t count = (i < w) ? (uint32_t)(offset_val - prev_offset) : 0;
         out_info->sample_counts[i] = count;
         total_samples += count;
         out_info->sample_offsets[i + 1] = total_samples;
@@ -7651,66 +7626,6 @@ ExrResult exr_submit_write(ExrEncoder encoder, const ExrSubmitInfo* submit_info)
 /* ============================================================================
  * Async Suspend/Resume Implementation
  * ============================================================================ */
-
-/* Callback for async fetch completion - called by the data source when data is ready */
-static void async_fetch_complete(void* userdata, ExrResult result, size_t bytes_read) {
-    ExrSuspendState state = (ExrSuspendState)userdata;
-    if (!exr_suspend_is_valid(state)) return;
-
-    state->async_result = result;
-    state->async_bytes_read = bytes_read;
-    state->async_complete = 1;
-}
-
-/* Async-aware fetch that returns EXR_WOULD_BLOCK for async sources */
-static ExrResult async_fetch(ExrDecoder decoder, uint64_t offset, uint64_t size,
-                              void* dst, ExrSuspendState* out_state) {
-    ExrDataSource* src = &decoder->source;
-
-    /* Check if this is an async data source */
-    if (!(src->flags & EXR_DATA_SOURCE_ASYNC)) {
-        /* Synchronous source - fetch directly */
-        return src->fetch(src->userdata, offset, size, dst, NULL, NULL);
-    }
-
-    /* Async source - need to allocate suspend state if not already present */
-    ExrSuspendState state = decoder->suspend_state;
-    if (!state) {
-        ExrContext ctx = decoder->ctx;
-        state = (ExrSuspendState)ctx->allocator.alloc(
-            ctx->allocator.userdata, sizeof(struct ExrSuspendState_T), EXR_DEFAULT_ALIGNMENT);
-        if (!state) {
-            return EXR_ERROR_OUT_OF_MEMORY;
-        }
-        exr_memset(state, 0, sizeof(struct ExrSuspendState_T));
-        state->magic = EXR_SUSPEND_MAGIC;
-        state->decoder = decoder;
-        decoder->suspend_state = state;
-    }
-
-    /* Save pending fetch info */
-    state->fetch_offset = offset;
-    state->fetch_size = size;
-    state->fetch_dst = dst;
-    state->phase = decoder->current_phase;
-    state->offset = decoder->current_offset;
-    state->current_part = decoder->current_part_index;
-    state->current_chunk = decoder->current_chunk_index;
-    state->async_complete = 0;
-
-    /* Initiate async fetch */
-    ExrResult result = src->fetch(src->userdata, offset, size, dst,
-                                   async_fetch_complete, state);
-
-    if (result == EXR_WOULD_BLOCK) {
-        /* Async operation started, caller should wait and call exr_resume */
-        if (out_state) *out_state = state;
-        return EXR_WOULD_BLOCK;
-    }
-
-    /* Synchronous completion (even from async source) */
-    return result;
-}
 
 ExrResult exr_get_suspend_state(ExrDecoder decoder, ExrSuspendState* out_state) {
     if (!exr_decoder_is_valid(decoder)) {

@@ -137,6 +137,9 @@ static int exr_strcmp(const char* a, const char* b) {
     return (int)(uint8_t)*a - (int)(uint8_t)*b;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static int exr_strncmp(const char* a, const char* b, size_t n) {
     if (n == 0) return 0;
     while (n > 1 && *a && *a == *b) { a++; b++; n--; }
