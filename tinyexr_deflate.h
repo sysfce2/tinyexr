@@ -144,10 +144,14 @@ TINYEXR_DFL_INLINE void tinyexr_dfl_br_align(TinyExrDflBitReader* br) {
  * Huffman Table
  * ============================================================================ */
 
+/* 12-bit fast lookup covers the vast majority of deflate codes */
+#define TINYEXR_DFL_FAST_BITS 12
+#define TINYEXR_DFL_FAST_SIZE (1 << TINYEXR_DFL_FAST_BITS)
+
 typedef struct {
-    /* Fast lookup: 10-bit index -> (symbol << 4) | length | 0x8000 */
-    uint16_t fast_table[1024];
-    /* Slow table for codes > 10 bits */
+    /* Fast lookup: 12-bit index -> (symbol << 4) | length | 0x8000 */
+    uint16_t fast_table[TINYEXR_DFL_FAST_SIZE];
+    /* Slow table for codes > 12 bits */
     uint16_t slow_table[640];
     int slow_count;
     int max_bits;
@@ -176,10 +180,10 @@ static void tinyexr_dfl_ht_build_fixed_litlen(TinyExrDflHuffTable* t) {
             rev_code = (rev_code << 1) | ((code >> i) & 1);
         }
 
-        int fill = 1 << (10 - len);
+        int fill = 1 << (TINYEXR_DFL_FAST_BITS - len);
         for (int i = 0; i < fill; i++) {
             int idx = rev_code | (i << len);
-            if (idx < 1024) {
+            if (idx < TINYEXR_DFL_FAST_SIZE) {
                 t->fast_table[idx] = (uint16_t)((sym << 4) | len | 0x8000);
             }
         }
@@ -198,14 +202,23 @@ static void tinyexr_dfl_ht_build_fixed_dist(TinyExrDflHuffTable* t) {
             rev_code = (rev_code << 1) | ((sym >> i) & 1);
         }
 
-        int fill = 1 << (10 - 5);
+        int fill = 1 << (TINYEXR_DFL_FAST_BITS - 5);
         for (int i = 0; i < fill; i++) {
             int idx = rev_code | (i << 5);
-            if (idx < 1024) {
+            if (idx < TINYEXR_DFL_FAST_SIZE) {
                 t->fast_table[idx] = (uint16_t)((sym << 4) | 5 | 0x8000);
             }
         }
     }
+}
+
+/* Reverse `len` bits of `code` (deflate uses LSB-first codes) */
+static inline int tinyexr_dfl_reverse_bits(int code, int len) {
+    int rev = 0;
+    for (int i = 0; i < len; i++) {
+        rev = (rev << 1) | ((code >> i) & 1);
+    }
+    return rev;
 }
 
 static bool tinyexr_dfl_ht_build(TinyExrDflHuffTable* table,
@@ -222,7 +235,6 @@ static bool tinyexr_dfl_ht_build(TinyExrDflHuffTable* table,
     table->max_bits = max_len;
     table->slow_count = 0;
     exr_memset(table->fast_table, 0, sizeof(table->fast_table));
-    exr_memset(table->slow_table, 0, sizeof(table->slow_table));
 
     /* Compute first code for each length */
     int next_code[TINYEXR_DFL_MAX_BITS + 1] = {0};
@@ -232,69 +244,50 @@ static bool tinyexr_dfl_ht_build(TinyExrDflHuffTable* table,
         next_code[bits] = code;
     }
 
-    /* Fill fast table for codes <= 10 bits */
+    /* Single-pass: build both fast and slow tables simultaneously.
+     * Collect slow entries (codes > FAST_BITS) into a temporary buffer
+     * with separate arrays for code, symbol, and length. */
+    uint16_t slow_codes[320];
+    uint16_t slow_syms[320];
+    uint8_t slow_lens[320];
+    int slow_total = 0;
+
     for (int sym = 0; sym < count; sym++) {
         int len = lens[sym];
         if (len == 0) continue;
 
         int code_val = next_code[len]++;
+        int rev_code = tinyexr_dfl_reverse_bits(code_val, len);
 
-        int rev_code = 0;
-        for (int i = 0; i < len; i++) {
-            rev_code = (rev_code << 1) | ((code_val >> i) & 1);
-        }
-
-        if (len <= 10) {
-            int fill = 1 << (10 - len);
+        if (len <= TINYEXR_DFL_FAST_BITS) {
+            /* Fast table: fill all suffix combinations */
+            uint16_t entry = (uint16_t)((sym << 4) | len | 0x8000);
+            int fill = 1 << (TINYEXR_DFL_FAST_BITS - len);
             for (int i = 0; i < fill; i++) {
                 int idx = rev_code | (i << len);
-                if (idx < 1024) {
-                    table->fast_table[idx] = (uint16_t)((sym << 4) | len | 0x8000);
-                }
+                table->fast_table[idx] = entry;
             }
+        } else if (slow_total < 320) {
+            slow_codes[slow_total] = (uint16_t)rev_code;
+            slow_syms[slow_total] = (uint16_t)sym;
+            slow_lens[slow_total] = (uint8_t)len;
+            slow_total++;
         }
     }
 
-    /* Build slow table for codes > 10 bits */
+    /* Build slow table organized by length */
     uint16_t* slow_ptr = table->slow_table;
-    const size_t slow_cap = sizeof(table->slow_table) / sizeof(table->slow_table[0]);
-
-    for (int target_bits = 11; target_bits <= 15; target_bits++) {
-        if ((size_t)(slow_ptr - table->slow_table) >= slow_cap - 1) break;
-
+    for (int bits = TINYEXR_DFL_FAST_BITS + 1; bits <= max_len && bits <= 15; bits++) {
         uint16_t* count_ptr = slow_ptr++;
         uint16_t bit_count = 0;
-
-        /* Reset next_code for this scan */
-        int nc[TINYEXR_DFL_MAX_BITS + 1];
-        code = 0;
-        for (int bits = 1; bits <= max_len; bits++) {
-            code = (code + bl_count[bits - 1]) << 1;
-            nc[bits] = code;
-        }
-
-        for (int sym = 0; sym < count; sym++) {
-            int len = lens[sym];
-            if (len != target_bits) {
-                if (len > 0) nc[len]++;
-                continue;
+        for (int i = 0; i < slow_total; i++) {
+            if (slow_lens[i] == bits) {
+                *slow_ptr++ = slow_codes[i];
+                *slow_ptr++ = slow_syms[i];
+                bit_count++;
+                table->slow_count++;
             }
-
-            if ((size_t)(slow_ptr - table->slow_table) >= slow_cap - 2) break;
-
-            int code_val = nc[len]++;
-
-            int rev_code = 0;
-            for (int i = 0; i < len; i++) {
-                rev_code = (rev_code << 1) | ((code_val >> i) & 1);
-            }
-
-            *slow_ptr++ = (uint16_t)rev_code;
-            *slow_ptr++ = (uint16_t)sym;
-            bit_count++;
-            table->slow_count++;
         }
-
         *count_ptr = bit_count;
     }
 
@@ -313,7 +306,7 @@ static int tinyexr_dfl_decode_symbol_slow(TinyExrDflBitReader* reader,
 
     const uint16_t* ptr = table->slow_table;
 
-    for (int bits = 11; bits <= table->max_bits && bits <= 15; bits++) {
+    for (int bits = TINYEXR_DFL_FAST_BITS + 1; bits <= table->max_bits && bits <= 15; bits++) {
         uint16_t cnt = *ptr++;
         uint32_t code_mask = (1u << bits) - 1;
         uint32_t peeked = tinyexr_dfl_br_peek(reader, bits) & code_mask;
@@ -335,11 +328,11 @@ static int tinyexr_dfl_decode_symbol_slow(TinyExrDflBitReader* reader,
 
 TINYEXR_DFL_INLINE int tinyexr_dfl_decode_symbol(TinyExrDflBitReader* reader,
                                                    const TinyExrDflHuffTable* table) {
-    if (reader->count < 15) {
-        tinyexr_dfl_br_refill(reader);
+    if (TINYEXR_UNLIKELY(reader->count < 15)) {
+        tinyexr_dfl_br_refill_fast(reader);
     }
 
-    uint32_t idx = tinyexr_dfl_br_peek(reader, 10);
+    uint32_t idx = tinyexr_dfl_br_peek(reader, TINYEXR_DFL_FAST_BITS);
     uint16_t entry = table->fast_table[idx];
 
     if (TINYEXR_LIKELY(entry & 0x8000)) {
@@ -468,6 +461,75 @@ static bool tinyexr_dfl_decode_block(TinyExrDflBitReader* reader,
                                       uint8_t* out_start,
                                       uint8_t* out_end) {
     for (;;) {
+        /* Bulk refill: ensures enough bits for symbol + extra bits in one go.
+         * This reduces refill calls from ~2 per symbol to ~1 per 4-5 symbols. */
+        tinyexr_dfl_br_refill_fast(reader);
+
+        /* Fast literal loop: decode consecutive literals without extra refills.
+         * Most deflate data is dominated by literals, so optimizing this inner
+         * loop has a big impact. */
+        while (TINYEXR_LIKELY(reader->count >= 15)) {
+            uint32_t idx = tinyexr_dfl_br_peek(reader, TINYEXR_DFL_FAST_BITS);
+            uint16_t entry = litlen_t->fast_table[idx];
+
+            if (TINYEXR_UNLIKELY(!(entry & 0x8000))) break;  /* slow path needed */
+
+            int sym = (entry >> 4) & 0x7FF;
+            int len = entry & 0xF;
+            tinyexr_dfl_br_consume(reader, len);
+
+            if (TINYEXR_LIKELY(sym < 256)) {
+                if (TINYEXR_UNLIKELY(*out >= out_end)) return false;
+                *(*out)++ = (uint8_t)sym;
+                continue;
+            }
+            if (sym == 256) return true;
+
+            /* Length/distance pair */
+            int length_sym = sym - 257;
+            if (TINYEXR_UNLIKELY(length_sym >= 29)) return false;
+
+            int length = tinyexr_dfl_length_base[length_sym];
+            int extra_bits = tinyexr_dfl_length_extra[length_sym];
+            if (extra_bits > 0) {
+                if (TINYEXR_UNLIKELY(reader->count < extra_bits))
+                    tinyexr_dfl_br_refill_fast(reader);
+                length += (int)tinyexr_dfl_br_read(reader, extra_bits);
+            }
+
+            /* Decode distance inline for fast path */
+            if (TINYEXR_UNLIKELY(reader->count < 15))
+                tinyexr_dfl_br_refill_fast(reader);
+
+            uint32_t didx = tinyexr_dfl_br_peek(reader, TINYEXR_DFL_FAST_BITS);
+            uint16_t dentry = dist_t->fast_table[didx];
+            int dist_sym;
+
+            if (TINYEXR_LIKELY(dentry & 0x8000)) {
+                dist_sym = (dentry >> 4) & 0x7FF;
+                tinyexr_dfl_br_consume(reader, dentry & 0xF);
+            } else {
+                dist_sym = tinyexr_dfl_decode_symbol_slow(reader, dist_t);
+            }
+            if (TINYEXR_UNLIKELY(dist_sym < 0 || dist_sym >= 30)) return false;
+
+            int distance = tinyexr_dfl_dist_base[dist_sym];
+            extra_bits = tinyexr_dfl_dist_extra[dist_sym];
+            if (extra_bits > 0) {
+                if (TINYEXR_UNLIKELY(reader->count < extra_bits))
+                    tinyexr_dfl_br_refill_fast(reader);
+                distance += (int)tinyexr_dfl_br_read(reader, extra_bits);
+            }
+
+            if (TINYEXR_UNLIKELY(*out + length > out_end)) return false;
+            if (TINYEXR_UNLIKELY(*out - out_start < distance)) return false;
+
+            const uint8_t* match = *out - distance;
+            tinyexr_dfl_copy_match(*out, match, length, distance);
+            *out += length;
+        }
+
+        /* Slow fallback for symbols not in the fast table */
         int sym = tinyexr_dfl_decode_symbol(reader, litlen_t);
         if (sym < 0) return false;
 
@@ -483,8 +545,9 @@ static bool tinyexr_dfl_decode_block(TinyExrDflBitReader* reader,
             int length = tinyexr_dfl_length_base[length_sym];
             int extra_bits = tinyexr_dfl_length_extra[length_sym];
             if (extra_bits > 0) {
-                if (reader->count < extra_bits) tinyexr_dfl_br_refill(reader);
-                length += tinyexr_dfl_br_read(reader, extra_bits);
+                if (reader->count < extra_bits)
+                    tinyexr_dfl_br_refill_fast(reader);
+                length += (int)tinyexr_dfl_br_read(reader, extra_bits);
             }
 
             int dist_sym = tinyexr_dfl_decode_symbol(reader, dist_t);
@@ -493,8 +556,9 @@ static bool tinyexr_dfl_decode_block(TinyExrDflBitReader* reader,
             int distance = tinyexr_dfl_dist_base[dist_sym];
             extra_bits = tinyexr_dfl_dist_extra[dist_sym];
             if (extra_bits > 0) {
-                if (reader->count < extra_bits) tinyexr_dfl_br_refill(reader);
-                distance += tinyexr_dfl_br_read(reader, extra_bits);
+                if (reader->count < extra_bits)
+                    tinyexr_dfl_br_refill_fast(reader);
+                distance += (int)tinyexr_dfl_br_read(reader, extra_bits);
             }
 
             if (TINYEXR_UNLIKELY(*out + length > out_end)) return false;

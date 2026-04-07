@@ -32,10 +32,12 @@ extern "C" {
 static uint16_t g_tinyexr_b44_exp_table[65536];
 /* 14-bit log to half-float table */
 static uint16_t g_tinyexr_b44_log_table[16384];
-static int g_tinyexr_b44_tables_initialized = 0;
+/* Thread-safe init flag. Requires ATOMIC_INT/ATOMIC_LOAD/ATOMIC_STORE
+ * macros from tinyexr_c_impl.c (defined before this header is included). */
+static ATOMIC_INT g_tinyexr_b44_tables_initialized;
 
 static void tinyexr_b44_init_tables(void) {
-    if (g_tinyexr_b44_tables_initialized) return;
+    if (ATOMIC_LOAD(g_tinyexr_b44_tables_initialized)) return;
 
     /* Generate expTable: half-float -> 14-bit log */
     for (int i = 0; i < 65536; i++) {
@@ -82,7 +84,7 @@ static void tinyexr_b44_init_tables(void) {
         }
     }
 
-    g_tinyexr_b44_tables_initialized = 1;
+    ATOMIC_STORE(g_tinyexr_b44_tables_initialized, 1);
 }
 
 /* ============================================================================

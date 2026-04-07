@@ -1669,6 +1669,1022 @@ TEST(c_api_verify_tiled) {
 }
 
 /* ============================================================================
+ * Compression Unit Tests
+ *
+ * Tests individual compression codecs through exr_decompress_chunk API.
+ * ============================================================================ */
+
+/* Helper: create a minimal ExrContext for decompression tests */
+static ExrContext create_test_context() {
+    ExrContextCreateInfo ctx_info = {};
+    ctx_info.api_version = TINYEXR_C_API_VERSION;
+    ExrContext ctx = nullptr;
+    ExrResult result = exr_context_create(&ctx_info, &ctx);
+    if (result != EXR_SUCCESS) {
+        throw std::runtime_error("Failed to create test context");
+    }
+    return ctx;
+}
+
+/* Helper: compress data with RLE format (for round-trip testing).
+ * EXR RLE format: predictor encode + byte reorder, then RLE encode.
+ * For simplicity, we'll use exr_compress_chunk if available or construct
+ * test vectors manually. */
+
+/* Build an EXR-RLE compressed payload from raw pixel data.
+ * The EXR post-processing order is:
+ * Compress: reorder -> predictor -> RLE
+ * Decompress: RLE -> predictor -> reorder */
+static std::vector<uint8_t> rle_compress_simple(const uint8_t* data, size_t len) {
+    /* Step 1: Byte reorder (split odd/even bytes) */
+    std::vector<uint8_t> reordered(len);
+    size_t half = (len + 1) / 2;
+    for (size_t i = 0; i < len; i++) {
+        if (i % 2 == 0) {
+            reordered[i / 2] = data[i];
+        } else {
+            reordered[half + i / 2] = data[i];
+        }
+    }
+
+    /* Step 2: Delta predictor encode (backward to preserve data) */
+    std::vector<uint8_t> predicted(reordered);
+    for (size_t i = len; i > 1; i--) {
+        int d = (int)predicted[i - 1] - (int)predicted[i - 2] + 128;
+        predicted[i - 1] = (uint8_t)d;
+    }
+
+    /* Step 3: RLE encode */
+    std::vector<uint8_t> compressed;
+    size_t pos = 0;
+    while (pos < len) {
+        /* Check for a run */
+        size_t run = 1;
+        while (pos + run < len && predicted[pos + run] == predicted[pos] && run < 128) {
+            run++;
+        }
+
+        if (run >= 3) {
+            /* RLE run: non-negative count = repeat (count+1) times */
+            compressed.push_back((uint8_t)(run - 1));
+            compressed.push_back(predicted[pos]);
+            pos += run;
+        } else {
+            /* Literal run: find how many non-repeating bytes */
+            size_t lit_start = pos;
+            while (pos < len) {
+                size_t ahead = 1;
+                while (pos + ahead < len && predicted[pos + ahead] == predicted[pos] && ahead < 128) {
+                    ahead++;
+                }
+                if (ahead >= 3) break;
+                pos++;
+                if (pos - lit_start >= 127) break;
+            }
+            size_t lit_len = pos - lit_start;
+            compressed.push_back((uint8_t)(-(signed char)lit_len));
+            for (size_t i = 0; i < lit_len; i++) {
+                compressed.push_back(predicted[lit_start + i]);
+            }
+        }
+    }
+
+    return compressed;
+}
+
+/* ---- RLE Tests ---- */
+
+TEST(rle_round_trip_basic) {
+    /* Create test pixel data */
+    const uint8_t original[] = { 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 };
+    size_t orig_len = sizeof(original);
+
+    std::vector<uint8_t> compressed = rle_compress_simple(original, orig_len);
+
+    /* Decompress via V3 API */
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> decompressed(orig_len, 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = compressed.data();
+    info.src_size = compressed.size();
+    info.dst = decompressed.data();
+    info.dst_capacity = decompressed.size();
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_RLE;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, orig_len);
+
+    for (size_t i = 0; i < orig_len; i++) {
+        if (original[i] != decompressed[i]) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Mismatch at byte %zu: expected %d, got %d",
+                     i, original[i], decompressed[i]);
+            throw std::runtime_error(msg);
+        }
+    }
+
+    exr_context_destroy(ctx);
+}
+
+TEST(rle_all_repeat) {
+    /* Data that is all the same byte (maximum RLE compression) */
+    std::vector<uint8_t> original(256, 0xAA);
+
+    std::vector<uint8_t> compressed = rle_compress_simple(original.data(), original.size());
+    REQUIRE(compressed.size() < original.size());  /* Should be much smaller */
+
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> decompressed(original.size(), 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = compressed.data();
+    info.src_size = compressed.size();
+    info.dst = decompressed.data();
+    info.dst_capacity = decompressed.size();
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_RLE;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, original.size());
+    REQUIRE(memcmp(original.data(), decompressed.data(), original.size()) == 0);
+
+    exr_context_destroy(ctx);
+}
+
+TEST(rle_uncompressed_passthrough) {
+    /* When src_size == dst_size, RLE should just copy (EXR spec behavior) */
+    const uint8_t data[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    size_t len = sizeof(data);
+
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> output(len, 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = data;
+    info.src_size = len;
+    info.dst = output.data();
+    info.dst_capacity = len;
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_RLE;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, len);
+    REQUIRE(memcmp(data, output.data(), len) == 0);
+
+    exr_context_destroy(ctx);
+}
+
+TEST(rle_truncated_input) {
+    /* Construct an RLE stream that references more data than available */
+    /* Literal run of 5 bytes but only 3 bytes of data follow */
+    uint8_t bad_rle[] = { (uint8_t)-5, 0x01, 0x02, 0x03 };
+
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> output(64, 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = bad_rle;
+    info.src_size = sizeof(bad_rle);
+    info.dst = output.data();
+    info.dst_capacity = output.size();
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_RLE;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE(EXR_FAILED(result));
+
+    exr_context_destroy(ctx);
+}
+
+/* ---- ZIP/Deflate Tests ---- */
+
+TEST(zip_uncompressed_passthrough) {
+    /* When src_size == dst_size, ZIP should just copy */
+    const uint8_t data[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE };
+    size_t len = sizeof(data);
+
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> output(len, 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = data;
+    info.src_size = len;
+    info.dst = output.data();
+    info.dst_capacity = len;
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_ZIP;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, len);
+    REQUIRE(memcmp(data, output.data(), len) == 0);
+
+    exr_context_destroy(ctx);
+}
+
+TEST(zip_zips_uncompressed_passthrough) {
+    /* ZIPS (single scanline ZIP) same passthrough behavior */
+    const uint8_t data[] = { 0x01, 0x02, 0x03, 0x04 };
+    size_t len = sizeof(data);
+
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> output(len, 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = data;
+    info.src_size = len;
+    info.dst = output.data();
+    info.dst_capacity = len;
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_ZIPS;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, len);
+    REQUIRE(memcmp(data, output.data(), len) == 0);
+
+    exr_context_destroy(ctx);
+}
+
+TEST(zip_corrupt_data) {
+    /* Random data that is not valid zlib -- should fail gracefully */
+    uint8_t garbage[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> output(64, 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = garbage;
+    info.src_size = sizeof(garbage);
+    info.dst = output.data();
+    info.dst_capacity = output.size();
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_ZIP;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE(EXR_FAILED(result));
+
+    exr_context_destroy(ctx);
+}
+
+TEST(zip_round_trip_real_file) {
+    /* Load asakusa.exr (ZIP compressed), decompress all chunks via V3 pipeline,
+     * and verify non-zero output. This exercises the full ZIP path including
+     * predictor and reorder. */
+    std::vector<uint8_t> fileData = read_file("../../asakusa.exr");
+    if (fileData.empty()) {
+        printf("[SKIPPED - asakusa.exr not found] ");
+        return;
+    }
+
+    ExrContext ctx = create_test_context();
+
+    ExrDataSource source = {};
+    ExrResult result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPart part = nullptr;
+    result = exr_image_get_part(image, 0, &part);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPartInfo part_info = {};
+    result = exr_part_get_info(part, &part_info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrChannelInfo ch_info = {};
+    result = exr_part_get_channel(part, 0, &ch_info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    int bpp = (ch_info.pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+    size_t buf_size = (size_t)part_info.width * part_info.height *
+                      part_info.num_channels * bpp;
+    std::vector<uint8_t> buffer(buf_size, 0);
+
+    ExrCommandBufferCreateInfo cmd_info = {};
+    cmd_info.decoder = decoder;
+    ExrCommandBuffer cmd = nullptr;
+    result = exr_command_buffer_create(ctx, &cmd_info, &cmd);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    result = exr_command_buffer_begin(cmd);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrFullImageRequest full_req = {};
+    full_req.part = part;
+    full_req.output.data = buffer.data();
+    full_req.output.size = buf_size;
+    full_req.output_pixel_type = ch_info.pixel_type;
+
+    result = exr_cmd_request_full_image(cmd, &full_req);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    result = exr_command_buffer_end(cmd);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrSubmitInfo submit_info = {};
+    ExrCommandBuffer cmd_buffers[] = { cmd };
+    submit_info.command_buffer_count = 1;
+    submit_info.command_buffers = cmd_buffers;
+
+    result = exr_submit(decoder, &submit_info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    /* Verify non-trivial output */
+    bool has_nonzero = false;
+    for (size_t i = 0; i < buffer.size() && !has_nonzero; i++) {
+        if (buffer[i] != 0) has_nonzero = true;
+    }
+    REQUIRE(has_nonzero);
+
+    printf("[%dx%d decompressed OK] ", part_info.width, part_info.height);
+
+    exr_part_destroy(part);
+    exr_command_buffer_destroy(cmd);
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
+/* ---- NONE compression tests ---- */
+
+TEST(none_passthrough) {
+    /* NONE compression just copies data */
+    const uint8_t data[] = { 1, 2, 3, 4, 5 };
+
+    ExrContext ctx = create_test_context();
+    uint8_t output[5] = {};
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = data;
+    info.src_size = sizeof(data);
+    info.dst = output;
+    info.dst_capacity = sizeof(output);
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_NONE;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, sizeof(data));
+    REQUIRE(memcmp(data, output, sizeof(data)) == 0);
+
+    exr_context_destroy(ctx);
+}
+
+TEST(none_buffer_too_small) {
+    const uint8_t data[] = { 1, 2, 3, 4, 5 };
+
+    ExrContext ctx = create_test_context();
+    uint8_t output[3] = {};
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = data;
+    info.src_size = sizeof(data);
+    info.dst = output;
+    info.dst_capacity = sizeof(output);  /* too small */
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_NONE;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE(EXR_FAILED(result));
+
+    exr_context_destroy(ctx);
+}
+
+/* ---- Error path tests ---- */
+
+TEST(decompress_null_args) {
+    ExrContext ctx = create_test_context();
+
+    /* Null info pointer */
+    ExrResult result = exr_decompress_chunk(ctx, nullptr);
+    REQUIRE(EXR_FAILED(result));
+
+    /* Null src */
+    size_t out_size = 0;
+    uint8_t buf[8] = {};
+    ExrDecompressInfo info = {};
+    info.src = nullptr;
+    info.src_size = 4;
+    info.dst = buf;
+    info.dst_capacity = sizeof(buf);
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_NONE;
+
+    result = exr_decompress_chunk(ctx, &info);
+    REQUIRE(EXR_FAILED(result));
+
+    /* Null dst */
+    info.src = buf;
+    info.dst = nullptr;
+    result = exr_decompress_chunk(ctx, &info);
+    REQUIRE(EXR_FAILED(result));
+
+    /* Null out_size */
+    info.dst = buf;
+    info.out_size = nullptr;
+    result = exr_decompress_chunk(ctx, &info);
+    REQUIRE(EXR_FAILED(result));
+
+    /* Zero capacity */
+    info.out_size = &out_size;
+    info.dst_capacity = 0;
+    result = exr_decompress_chunk(ctx, &info);
+    REQUIRE(EXR_FAILED(result));
+
+    exr_context_destroy(ctx);
+}
+
+TEST(decompress_invalid_handle) {
+    /* Null context */
+    size_t out_size = 0;
+    uint8_t buf[8] = {};
+    ExrDecompressInfo info = {};
+    info.src = buf;
+    info.src_size = 4;
+    info.dst = buf;
+    info.dst_capacity = sizeof(buf);
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_NONE;
+
+    ExrResult result = exr_decompress_chunk(nullptr, &info);
+    REQUIRE_EQ(result, EXR_ERROR_INVALID_HANDLE);
+}
+
+/* ---- Predictor / reorder verification via ZIP round-trip ---- */
+
+TEST(zip_predictor_reorder_ramp) {
+    /* Test that predictor + reorder works correctly for a known ramp pattern.
+     * We compress with exr_compress_chunk and decompress, verifying round-trip. */
+    const size_t len = 128;
+    std::vector<uint8_t> original(len);
+    for (size_t i = 0; i < len; i++) {
+        original[i] = (uint8_t)(i & 0xFF);
+    }
+
+    ExrContext ctx = create_test_context();
+
+    /* Compress */
+    std::vector<uint8_t> compressed(len * 2);  /* Plenty of room */
+    size_t comp_size = 0;
+
+    ExrCompressInfo cinfo = {};
+    cinfo.src = original.data();
+    cinfo.src_size = len;
+    cinfo.dst = compressed.data();
+    cinfo.dst_capacity = compressed.size();
+    cinfo.out_size = &comp_size;
+    cinfo.compression = EXR_COMPRESSION_ZIP;
+    cinfo.width = (int32_t)len;
+    cinfo.num_lines = 1;
+
+    ExrResult result = exr_compress_chunk(ctx, &cinfo);
+    if (result != EXR_SUCCESS) {
+        printf("[SKIPPED - compress not implemented] ");
+        exr_context_destroy(ctx);
+        return;
+    }
+
+    /* Decompress */
+    std::vector<uint8_t> decompressed(len, 0);
+    size_t decomp_size = 0;
+
+    ExrDecompressInfo dinfo = {};
+    dinfo.src = compressed.data();
+    dinfo.src_size = comp_size;
+    dinfo.dst = decompressed.data();
+    dinfo.dst_capacity = len;
+    dinfo.out_size = &decomp_size;
+    dinfo.compression = EXR_COMPRESSION_ZIP;
+
+    result = exr_decompress_chunk(ctx, &dinfo);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(decomp_size, len);
+    REQUIRE(memcmp(original.data(), decompressed.data(), len) == 0);
+
+    exr_context_destroy(ctx);
+}
+
+TEST(zip_predictor_reorder_constant) {
+    /* All same value -- tests predictor edge case (all deltas are 128) */
+    const size_t len = 64;
+    std::vector<uint8_t> original(len, 0x80);
+
+    ExrContext ctx = create_test_context();
+
+    std::vector<uint8_t> compressed(len * 2);
+    size_t comp_size = 0;
+
+    ExrCompressInfo cinfo = {};
+    cinfo.src = original.data();
+    cinfo.src_size = len;
+    cinfo.dst = compressed.data();
+    cinfo.dst_capacity = compressed.size();
+    cinfo.out_size = &comp_size;
+    cinfo.compression = EXR_COMPRESSION_ZIP;
+    cinfo.width = (int32_t)len;
+    cinfo.num_lines = 1;
+
+    ExrResult result = exr_compress_chunk(ctx, &cinfo);
+    if (result != EXR_SUCCESS) {
+        printf("[SKIPPED - compress not implemented] ");
+        exr_context_destroy(ctx);
+        return;
+    }
+
+    std::vector<uint8_t> decompressed(len, 0);
+    size_t decomp_size = 0;
+
+    ExrDecompressInfo dinfo = {};
+    dinfo.src = compressed.data();
+    dinfo.src_size = comp_size;
+    dinfo.dst = decompressed.data();
+    dinfo.dst_capacity = len;
+    dinfo.out_size = &decomp_size;
+    dinfo.compression = EXR_COMPRESSION_ZIP;
+
+    result = exr_decompress_chunk(ctx, &dinfo);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(decomp_size, len);
+    REQUIRE(memcmp(original.data(), decompressed.data(), len) == 0);
+
+    exr_context_destroy(ctx);
+}
+
+TEST(zip_predictor_reorder_single_byte) {
+    /* Single byte -- degenerate case for predictor and reorder */
+    const uint8_t original[] = { 0x42 };
+    const size_t len = 1;
+
+    ExrContext ctx = create_test_context();
+
+    std::vector<uint8_t> compressed(64);
+    size_t comp_size = 0;
+
+    ExrCompressInfo cinfo = {};
+    cinfo.src = original;
+    cinfo.src_size = len;
+    cinfo.dst = compressed.data();
+    cinfo.dst_capacity = compressed.size();
+    cinfo.out_size = &comp_size;
+    cinfo.compression = EXR_COMPRESSION_ZIP;
+    cinfo.width = 1;
+    cinfo.num_lines = 1;
+
+    ExrResult result = exr_compress_chunk(ctx, &cinfo);
+    if (result != EXR_SUCCESS) {
+        printf("[SKIPPED - compress not implemented] ");
+        exr_context_destroy(ctx);
+        return;
+    }
+
+    uint8_t decompressed = 0;
+    size_t decomp_size = 0;
+
+    ExrDecompressInfo dinfo = {};
+    dinfo.src = compressed.data();
+    dinfo.src_size = comp_size;
+    dinfo.dst = &decompressed;
+    dinfo.dst_capacity = 1;
+    dinfo.out_size = &decomp_size;
+    dinfo.compression = EXR_COMPRESSION_ZIP;
+
+    result = exr_decompress_chunk(ctx, &dinfo);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(decomp_size, (size_t)1);
+    REQUIRE_EQ(decompressed, (uint8_t)0x42);
+
+    exr_context_destroy(ctx);
+}
+
+/* ---- RLE round-trip with larger data ---- */
+
+TEST(rle_round_trip_large) {
+    /* Larger dataset with mixed patterns (runs and literals) */
+    const size_t len = 4096;
+    std::vector<uint8_t> original(len);
+
+    /* Fill with a pattern that has both runs and varying data */
+    for (size_t i = 0; i < len; i++) {
+        if (i % 64 < 32) {
+            original[i] = 0x55;  /* Runs */
+        } else {
+            original[i] = (uint8_t)(i * 7 + 13);  /* Varying */
+        }
+    }
+
+    std::vector<uint8_t> compressed = rle_compress_simple(original.data(), original.size());
+
+    ExrContext ctx = create_test_context();
+    std::vector<uint8_t> decompressed(len, 0);
+    size_t out_size = 0;
+
+    ExrDecompressInfo info = {};
+    info.src = compressed.data();
+    info.src_size = compressed.size();
+    info.dst = decompressed.data();
+    info.dst_capacity = decompressed.size();
+    info.out_size = &out_size;
+    info.compression = EXR_COMPRESSION_RLE;
+
+    ExrResult result = exr_decompress_chunk(ctx, &info);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(out_size, len);
+    REQUIRE(memcmp(original.data(), decompressed.data(), len) == 0);
+
+    printf("[%zu -> %zu bytes] ", len, compressed.size());
+    exr_context_destroy(ctx);
+}
+
+/* ---- ZIP round-trip with large random-ish data ---- */
+
+TEST(zip_round_trip_large) {
+    const size_t len = 16384;
+    std::vector<uint8_t> original(len);
+    for (size_t i = 0; i < len; i++) {
+        original[i] = (uint8_t)((i * 31 + 17) ^ (i >> 8));
+    }
+
+    ExrContext ctx = create_test_context();
+
+    std::vector<uint8_t> compressed(len * 2);
+    size_t comp_size = 0;
+
+    ExrCompressInfo cinfo = {};
+    cinfo.src = original.data();
+    cinfo.src_size = len;
+    cinfo.dst = compressed.data();
+    cinfo.dst_capacity = compressed.size();
+    cinfo.out_size = &comp_size;
+    cinfo.compression = EXR_COMPRESSION_ZIP;
+    cinfo.width = (int32_t)len;
+    cinfo.num_lines = 1;
+
+    ExrResult result = exr_compress_chunk(ctx, &cinfo);
+    if (result != EXR_SUCCESS) {
+        printf("[SKIPPED - compress not implemented] ");
+        exr_context_destroy(ctx);
+        return;
+    }
+
+    std::vector<uint8_t> decompressed(len, 0);
+    size_t decomp_size = 0;
+
+    ExrDecompressInfo dinfo = {};
+    dinfo.src = compressed.data();
+    dinfo.src_size = comp_size;
+    dinfo.dst = decompressed.data();
+    dinfo.dst_capacity = len;
+    dinfo.out_size = &decomp_size;
+    dinfo.compression = EXR_COMPRESSION_ZIP;
+
+    result = exr_decompress_chunk(ctx, &dinfo);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE_EQ(decomp_size, len);
+    REQUIRE(memcmp(original.data(), decompressed.data(), len) == 0);
+
+    printf("[%zu -> %zu -> %zu] ", len, comp_size, decomp_size);
+    exr_context_destroy(ctx);
+}
+
+/* ---- B44 tests via real file ---- */
+
+TEST(b44_real_file) {
+    /* Load B44-compressed file if available and verify decompression */
+    const char* b44_paths[] = {
+        "../../../openexr-images/Tiles/GoldenGate.exr",
+        "../../test/unit/regression/tiled_half_1x1_alpha.exr",
+    };
+
+    std::vector<uint8_t> fileData;
+    const char* used_path = nullptr;
+    for (size_t i = 0; i < sizeof(b44_paths) / sizeof(b44_paths[0]); i++) {
+        fileData = read_file(b44_paths[i]);
+        if (!fileData.empty()) {
+            used_path = b44_paths[i];
+            break;
+        }
+    }
+
+    if (fileData.empty()) {
+        printf("[SKIPPED - no B44 test file] ");
+        return;
+    }
+
+    /* Just try to parse and load it through V3 */
+    ExrContext ctx = create_test_context();
+
+    ExrDataSource source = {};
+    ExrResult result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    printf("[parsed %s] ", used_path);
+
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
+/* ---- Multi-part test ---- */
+
+TEST(multipart_parse) {
+    /* Try to find and parse a multipart EXR */
+    const char* multipart_paths[] = {
+        "../../../openexr-images/Beachball/multipart.0001.exr",
+        "../../test/unit/regression/issue-238-double-free-multipart.exr",
+    };
+
+    std::vector<uint8_t> fileData;
+    for (size_t i = 0; i < sizeof(multipart_paths) / sizeof(multipart_paths[0]); i++) {
+        fileData = read_file(multipart_paths[i]);
+        if (!fileData.empty()) break;
+    }
+
+    if (fileData.empty()) {
+        printf("[SKIPPED - no multipart file] ");
+        return;
+    }
+
+    ExrContext ctx = create_test_context();
+
+    ExrDataSource source = {};
+    ExrResult result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    uint32_t part_count = 0;
+    result = exr_image_get_part_count(image, &part_count);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+    REQUIRE(part_count >= 1);
+
+    printf("[%u parts] ", part_count);
+
+    /* Verify we can query each part */
+    for (uint32_t p = 0; p < part_count; p++) {
+        ExrPart part = nullptr;
+        result = exr_image_get_part(image, p, &part);
+        REQUIRE_EQ(result, EXR_SUCCESS);
+
+        ExrPartInfo part_info = {};
+        result = exr_part_get_info(part, &part_info);
+        REQUIRE_EQ(result, EXR_SUCCESS);
+        REQUIRE(part_info.width > 0);
+        REQUIRE(part_info.height > 0);
+
+        exr_part_destroy(part);
+    }
+
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
+/* ---- Corrupt data stress tests ---- */
+
+TEST(corrupt_chunk_data) {
+    /* Load a real file, corrupt the compressed data, verify error not crash */
+    std::vector<uint8_t> fileData = read_file("../../asakusa.exr");
+    if (fileData.empty()) {
+        printf("[SKIPPED] ");
+        return;
+    }
+
+    /* Corrupt bytes in the middle of the file (in chunk data area) */
+    size_t corrupt_offset = fileData.size() / 2;
+    for (size_t i = 0; i < 64 && corrupt_offset + i < fileData.size(); i++) {
+        fileData[corrupt_offset + i] ^= 0xFF;
+    }
+
+    ExrContext ctx = create_test_context();
+
+    ExrDataSource source = {};
+    ExrResult result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    /* Header might still parse OK since corruption is in chunk data */
+
+    if (result == EXR_SUCCESS) {
+        ExrPart part = nullptr;
+        result = exr_image_get_part(image, 0, &part);
+        if (result == EXR_SUCCESS) {
+            ExrPartInfo pinfo = {};
+            exr_part_get_info(part, &pinfo);
+
+            ExrChannelInfo ch = {};
+            exr_part_get_channel(part, 0, &ch);
+            int bpp = (ch.pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+
+            size_t buf_size = (size_t)pinfo.width * pinfo.height *
+                              pinfo.num_channels * bpp;
+            std::vector<uint8_t> buffer(buf_size, 0);
+
+            ExrCommandBufferCreateInfo cmd_info = {};
+            cmd_info.decoder = decoder;
+            ExrCommandBuffer cmd = nullptr;
+            exr_command_buffer_create(ctx, &cmd_info, &cmd);
+
+            exr_command_buffer_begin(cmd);
+
+            ExrFullImageRequest full_req = {};
+            full_req.part = part;
+            full_req.output.data = buffer.data();
+            full_req.output.size = buf_size;
+            full_req.output_pixel_type = ch.pixel_type;
+
+            exr_cmd_request_full_image(cmd, &full_req);
+            exr_command_buffer_end(cmd);
+
+            ExrSubmitInfo submit_info = {};
+            ExrCommandBuffer cmd_buffers[] = { cmd };
+            submit_info.command_buffer_count = 1;
+            submit_info.command_buffers = cmd_buffers;
+
+            /* This should fail gracefully (error, not crash) */
+            result = exr_submit(decoder, &submit_info);
+            /* We don't assert on the result -- it might succeed if corruption
+             * happened to miss the actual compressed chunk being read,
+             * or it might fail. Either is fine as long as we don't crash. */
+
+            exr_command_buffer_destroy(cmd);
+            exr_part_destroy(part);
+        }
+    }
+
+    printf("[handled gracefully] ");
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
+TEST(regression_2by2_exr) {
+    /* Smallest known good file */
+    std::vector<uint8_t> fileData = read_file("../../test/unit/regression/2by2.exr");
+    if (fileData.empty()) {
+        printf("[SKIPPED] ");
+        return;
+    }
+
+    ExrContext ctx = create_test_context();
+
+    ExrDataSource source = {};
+    ExrResult result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPart part = nullptr;
+    result = exr_image_get_part(image, 0, &part);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPartInfo pinfo = {};
+    result = exr_part_get_info(part, &pinfo);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    printf("[%dx%d, %d ch, comp=%d] ", pinfo.width, pinfo.height,
+           pinfo.num_channels, pinfo.compression);
+
+    exr_part_destroy(part);
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
+TEST(regression_issue160_piz) {
+    /* PIZ decompression regression file */
+    std::vector<uint8_t> fileData = read_file("../../test/unit/regression/issue-160-piz-decode.exr");
+    if (fileData.empty()) {
+        printf("[SKIPPED] ");
+        return;
+    }
+
+    ExrContext ctx = create_test_context();
+
+    ExrDataSource source = {};
+    ExrResult result = exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrDecoderCreateInfo dec_info = {};
+    dec_info.source = source;
+    ExrDecoder decoder = nullptr;
+    result = exr_decoder_create(ctx, &dec_info, &decoder);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrImage image = nullptr;
+    result = exr_decoder_parse_header(decoder, &image);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPart part = nullptr;
+    result = exr_image_get_part(image, 0, &part);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    ExrPartInfo pinfo = {};
+    result = exr_part_get_info(part, &pinfo);
+    REQUIRE_EQ(result, EXR_SUCCESS);
+
+    REQUIRE_EQ(pinfo.compression, (uint32_t)EXR_COMPRESSION_PIZ);
+    printf("[PIZ %dx%d] ", pinfo.width, pinfo.height);
+
+    exr_part_destroy(part);
+    exr_decoder_destroy(decoder);
+    exr_context_destroy(ctx);
+}
+
+TEST(regression_fuzzer_pocs) {
+    /* Run through all fuzzer POC files and verify they don't crash */
+    const char* poc_files[] = {
+        "../../test/unit/regression/poc-df76d1f27adb8927a1446a603028272140905c168a336128465a1162ec7af270.mini",
+        "../../test/unit/regression/poc-efe9007bfdcbbe8a1569bf01fa9acadb8261ead49cb83f6e91fcdc4dae2e99a3_min",
+        "../../test/unit/regression/poc-d5c9c893e559277a3320c196523095b94db93985620ac338d037487e0e613047_min",
+        "../../test/unit/regression/poc-5b66774a7498c635334ad386be0c3b359951738ac47f14878a3346d1c6ea0fe5_min",
+        "../../test/unit/regression/poc-24322747c47e87a10e4407528b779a1a763a48135384909b3d1010bbba1d4c28_min",
+    };
+    int tested = 0;
+
+    for (size_t i = 0; i < sizeof(poc_files) / sizeof(poc_files[0]); i++) {
+        std::vector<uint8_t> fileData = read_file(poc_files[i]);
+        if (fileData.empty()) continue;
+
+        ExrContext ctx = create_test_context();
+        ExrDataSource source = {};
+        exr_data_source_from_memory(fileData.data(), fileData.size(), &source);
+
+        ExrDecoderCreateInfo dec_info = {};
+        dec_info.source = source;
+        ExrDecoder decoder = nullptr;
+        ExrResult result = exr_decoder_create(ctx, &dec_info, &decoder);
+        if (result != EXR_SUCCESS) {
+            exr_context_destroy(ctx);
+            tested++;
+            continue;
+        }
+
+        ExrImage image = nullptr;
+        result = exr_decoder_parse_header(decoder, &image);
+        /* We don't care about the result -- just that it doesn't crash */
+
+        exr_decoder_destroy(decoder);
+        exr_context_destroy(ctx);
+        tested++;
+    }
+
+    printf("[%d POCs tested] ", tested);
+    REQUIRE(tested > 0);
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -1709,6 +2725,37 @@ int main() {
     run_test_c_api_verify_pxr24_vs_v1();
     run_test_c_api_verify_b44_vs_v1();
     run_test_c_api_verify_tiled();
+
+    printf("\n[Compression Unit Tests]\n");
+    run_test_none_passthrough();
+    run_test_none_buffer_too_small();
+    run_test_rle_round_trip_basic();
+    run_test_rle_all_repeat();
+    run_test_rle_uncompressed_passthrough();
+    run_test_rle_truncated_input();
+    run_test_rle_round_trip_large();
+    run_test_zip_uncompressed_passthrough();
+    run_test_zip_zips_uncompressed_passthrough();
+    run_test_zip_corrupt_data();
+    run_test_zip_round_trip_real_file();
+    run_test_zip_round_trip_large();
+
+    printf("\n[Predictor/Reorder Tests]\n");
+    run_test_zip_predictor_reorder_ramp();
+    run_test_zip_predictor_reorder_constant();
+    run_test_zip_predictor_reorder_single_byte();
+
+    printf("\n[Error Path Tests]\n");
+    run_test_decompress_null_args();
+    run_test_decompress_invalid_handle();
+    run_test_corrupt_chunk_data();
+
+    printf("\n[Regression Tests]\n");
+    run_test_regression_2by2_exr();
+    run_test_regression_issue160_piz();
+    run_test_regression_fuzzer_pocs();
+    run_test_b44_real_file();
+    run_test_multipart_parse();
 
     printf("\n[C++ Wrapper Tests]\n");
     run_test_cpp_version_string();

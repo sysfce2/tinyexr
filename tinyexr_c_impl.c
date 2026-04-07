@@ -1791,6 +1791,32 @@ static uint32_t read_le_u32(const uint8_t* p);
 static uint64_t read_le_u64(const uint8_t* p);
 static ExrResult sync_fetch(ExrDecoder decoder, uint64_t offset, uint64_t size, void* dst);
 
+/* Apply EXR delta predictor decode in-place.
+ * Each byte stores delta+128 relative to the previous byte. */
+static void exr_apply_predictor(uint8_t* data, size_t len) {
+    if (len <= 1) return;
+    uint8_t* t = data + 1;
+    uint8_t* stop = data + len;
+    while (t < stop) {
+        int d = (int)t[-1] + (int)t[0] - 128;
+        t[0] = (uint8_t)d;
+        ++t;
+    }
+}
+
+/* Reorder pixel data: interleave the two halves of src into dst.
+ * EXR splits even/odd bytes for better compression; this reverses it. */
+static void exr_reorder_pixels(const uint8_t* src, uint8_t* dst, size_t len) {
+    const uint8_t* t1 = src;
+    const uint8_t* t2 = src + (len + 1) / 2;
+    uint8_t* s = dst;
+    uint8_t* stop = dst + len;
+    while (s < stop) {
+        if (s < stop) *s++ = *t1++;
+        if (s < stop) *s++ = *t2++;
+    }
+}
+
 /* ZIP decompression with EXR-specific post-processing */
 static ExrResult decompress_zip(const uint8_t* src, size_t src_size,
                                  uint8_t* dst, size_t dst_size,
@@ -1830,29 +1856,8 @@ static ExrResult decompress_zip(const uint8_t* src, size_t src_size,
     }
 #endif
 
-    /* Apply EXR predictor (delta decoding) */
-    {
-        uint8_t* t = tmpBuf + 1;
-        uint8_t* stop = tmpBuf + uncomp_size;
-        while (t < stop) {
-            int d = (int)t[-1] + (int)t[0] - 128;
-            t[0] = (uint8_t)d;
-            ++t;
-        }
-    }
-
-    /* Reorder pixel data (interleave two halves) */
-    {
-        const uint8_t* t1 = tmpBuf;
-        const uint8_t* t2 = tmpBuf + (uncomp_size + 1) / 2;
-        uint8_t* s = dst;
-        uint8_t* stop = dst + uncomp_size;
-
-        while (s < stop) {
-            if (s < stop) *s++ = *t1++;
-            if (s < stop) *s++ = *t2++;
-        }
-    }
+    exr_apply_predictor(tmpBuf, uncomp_size);
+    exr_reorder_pixels(tmpBuf, dst, uncomp_size);
 
     ctx->allocator.free(ctx->allocator.userdata, tmpBuf, dst_size);
     *out_size = uncomp_size;
@@ -2057,144 +2062,313 @@ typedef struct {
     int len;
 } HufCode;
 
-/* Huffman decoder table for fast path */
-#define HUF_DECBITS 10
+/* PIZ Huffman decoder constants */
+#define HUF_DECBITS 14
 #define HUF_DECSIZE (1 << HUF_DECBITS)
 #define HUF_DECMASK (HUF_DECSIZE - 1)
+#define PIZ_SHORT_ZEROCODE_RUN 59
+#define PIZ_LONG_ZEROCODE_RUN  63
+#define PIZ_SHORTEST_LONG_RUN  (2 + PIZ_LONG_ZEROCODE_RUN - PIZ_SHORT_ZEROCODE_RUN)
 
-/* Huffman decompression (V1-compatible format) */
+/* Decoding table entry for long codes */
+typedef struct {
+    uint32_t* p;    /* Array of symbol indices */
+    uint32_t lit;   /* Count of symbols (long) or symbol value (short) */
+    uint32_t len;   /* Code length (0 = long code entry) */
+} PizHufDec;
+
+/* MSB-first bit reader for PIZ Huffman bitstream */
+static inline void piz_getChar(int64_t* c, int* lc, const uint8_t** in) {
+    *c = (*c << 8) | (int64_t)(**in);
+    (*in)++;
+    *lc += 8;
+}
+
+/* Bulk refill: load up to 6 bytes at once into MSB-first bit buffer */
+static inline void piz_refill(int64_t* c, int* lc, const uint8_t** in,
+                               const uint8_t* end) {
+    /* Only refill when we have room for at least one byte */
+    while (*lc <= 48 && *in < end) {
+        *c = (*c << 8) | (int64_t)(**in);
+        (*in)++;
+        *lc += 8;
+    }
+}
+
+static inline int64_t piz_getBits(int nBits, int64_t* c, int* lc,
+                                   const uint8_t** in) {
+    while (*lc < nBits) {
+        *c = (*c << 8) | (int64_t)(**in);
+        (*in)++;
+        *lc += 8;
+    }
+    *lc -= nBits;
+    return (*c >> *lc) & ((1LL << nBits) - 1);
+}
+
+/* Build canonical Huffman code table from code lengths.
+ * hcode[i] stores code length on input, packed (code << 6 | length) on output. */
+static void piz_huf_canonical_code_table(int64_t* hcode, int encsize) {
+    int64_t n[59];
+    for (int i = 0; i <= 58; i++) n[i] = 0;
+    for (int i = 0; i < encsize; i++) n[hcode[i]]++;
+
+    int64_t c = 0;
+    for (int i = 58; i > 0; i--) {
+        int64_t nc = ((c + n[i]) >> 1);
+        n[i] = c;
+        c = nc;
+    }
+
+    for (int i = 0; i < encsize; i++) {
+        int l = (int)hcode[i];
+        if (l > 0) hcode[i] = l | (n[l]++ << 6);
+    }
+}
+
+/* Unpack encoding table from bitstream */
+static bool piz_huf_unpack_enc_table(const uint8_t** pcode, int ni,
+                                      int im, int iM, int64_t* hcode) {
+    exr_memset(hcode, 0, sizeof(int64_t) * PIZ_HUF_ENCSIZE);
+
+    const uint8_t* p = *pcode;
+    int64_t c = 0;
+    int lc = 0;
+
+    for (; im <= iM; im++) {
+        if (p - *pcode >= ni) return false;
+
+        int64_t l = piz_getBits(6, &c, &lc, &p);
+        hcode[im] = l;
+
+        if (l == (int64_t)PIZ_LONG_ZEROCODE_RUN) {
+            if (p - *pcode > ni) return false;
+            int zerun = (int)piz_getBits(8, &c, &lc, &p) + PIZ_SHORTEST_LONG_RUN;
+            if (im + zerun > iM + 1) return false;
+            while (zerun--) hcode[im++] = 0;
+            im--;
+        } else if (l >= (int64_t)PIZ_SHORT_ZEROCODE_RUN) {
+            int zerun = (int)(l - PIZ_SHORT_ZEROCODE_RUN + 2);
+            if (im + zerun > iM + 1) return false;
+            while (zerun--) hcode[im++] = 0;
+            im--;
+        }
+    }
+
+    *pcode = p;
+    piz_huf_canonical_code_table(hcode, PIZ_HUF_ENCSIZE);
+    return true;
+}
+
+/* Build decoding table from encoding table */
+static bool piz_huf_build_dec_table(const int64_t* hcode, int im, int iM,
+                                     PizHufDec* hdecod) {
+    for (int i = 0; i < HUF_DECSIZE; i++) {
+        hdecod[i].len = 0;
+        hdecod[i].lit = 0;
+        hdecod[i].p = NULL;
+    }
+
+    for (; im <= iM; im++) {
+        int64_t code_val = hcode[im] >> 6;
+        int l = (int)(hcode[im] & 63);
+
+        if (l == 0) continue;
+        if (code_val >> l) return false;  /* Invalid code */
+
+        if (l > HUF_DECBITS) {
+            /* Long code: add to secondary list indexed by top HUF_DECBITS */
+            PizHufDec* pl = &hdecod[code_val >> (l - HUF_DECBITS)];
+            if (pl->len) return false;  /* Collision with short code */
+
+            pl->lit++;
+            uint32_t* new_p = (uint32_t*)EXR_CRT_MALLOC(pl->lit * sizeof(uint32_t));
+            if (!new_p) return false;
+            if (pl->p) {
+                exr_memcpy(new_p, pl->p, (pl->lit - 1) * sizeof(uint32_t));
+                EXR_CRT_FREE(pl->p);
+            }
+            pl->p = new_p;
+            pl->p[pl->lit - 1] = (uint32_t)im;
+        } else {
+            /* Short code: fill all matching entries */
+            PizHufDec* pl = &hdecod[code_val << (HUF_DECBITS - l)];
+            int64_t fill = 1LL << (HUF_DECBITS - l);
+            for (int64_t i = 0; i < fill; i++, pl++) {
+                if (pl->len || pl->p) return false;  /* Collision */
+                pl->len = (uint32_t)l;
+                pl->lit = (uint32_t)im;
+            }
+        }
+    }
+    return true;
+}
+
+static void piz_huf_free_dec_table(PizHufDec* hdecod) {
+    for (int i = 0; i < HUF_DECSIZE; i++) {
+        if (hdecod[i].p) {
+            EXR_CRT_FREE(hdecod[i].p);
+            hdecod[i].p = NULL;
+        }
+    }
+}
+
+/* Decode and handle RLE symbol */
+static bool piz_huf_get_code(int po, int rlc, int64_t* c, int* lc,
+                              const uint8_t** in, const uint8_t* in_end,
+                              uint16_t** out, const uint16_t* ob,
+                              const uint16_t* oe) {
+    if (po == rlc) {
+        if (*lc < 8) {
+            if (*in >= in_end) return false;
+            piz_getChar(c, lc, in);
+        }
+        *lc -= 8;
+        uint8_t cs = (uint8_t)(*c >> *lc);
+        if (*out + cs > oe) return false;
+        if ((*out - 1) < ob) return false;
+        uint16_t s = (*out)[-1];
+        while (cs-- > 0) *(*out)++ = s;
+    } else if (*out < oe) {
+        *(*out)++ = (uint16_t)po;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/* PIZ Huffman decompression (MSB-first, canonical codes, RLE support) */
 static bool piz_huf_uncompress(const uint8_t* in, size_t in_len,
                                 uint16_t* out, size_t out_len) {
     if (in_len < 20) return false;
+    if (out_len == 0) return in_len == 0;
 
-    /* Read header */
+    /* Read header: im, iM, tableLength, nBits */
     uint32_t im_val, iM_val, nBits_val;
     exr_memcpy(&im_val, in, 4);
     exr_memcpy(&iM_val, in + 4, 4);
-    exr_memcpy(&nBits_val, in + 12, 4);  /* nBits at offset 12 */
+    /* in[8..11] = tableLength (unused, skip) */
+    exr_memcpy(&nBits_val, in + 12, 4);
 
-    if (im_val >= PIZ_HUF_ENCSIZE || iM_val >= PIZ_HUF_ENCSIZE || im_val > iM_val) {
+    int im = (int)im_val;
+    int iM = (int)iM_val;
+    int nBits = (int)nBits_val;
+
+    if (im < 0 || im >= PIZ_HUF_ENCSIZE || iM < 0 || iM >= PIZ_HUF_ENCSIZE) {
         return false;
     }
 
-    const uint8_t* ptr = in + 20;  /* Skip header */
-    size_t remaining = in_len - 20;
+    const uint8_t* ptr = in + 20;
+    int ni = (int)(in_len - 20);
 
-    /* Read Huffman table: for each symbol from im to iM, read code length and code */
-    uint64_t codes[PIZ_HUF_ENCSIZE] = {0};
-    uint8_t lengths[PIZ_HUF_ENCSIZE] = {0};
+    /* Unpack encoding table from bitstream */
+    int64_t hcode[PIZ_HUF_ENCSIZE];
+    if (!piz_huf_unpack_enc_table(&ptr, ni, im, iM, hcode)) {
+        return false;
+    }
 
-    for (uint32_t i = im_val; i <= iM_val; /* incremented in loop */) {
-        if (remaining < 1) return false;
+    ni = (int)(in_len - (size_t)(ptr - in));
+    if (nBits > 8 * ni) return false;
 
-        uint8_t l = *ptr++;
-        remaining--;
+    /* Build decoding table */
+    PizHufDec hdecod[HUF_DECSIZE];
+    if (!piz_huf_build_dec_table(hcode, im, iM, hdecod)) {
+        piz_huf_free_dec_table(hdecod);
+        return false;
+    }
 
-        if (l >= 59) {
-            /* Run of zero-length codes */
-            uint32_t n = l - 59 + 2;
-            i += n;
-        } else if (l >= 0x3F) {
-            /* Long code: 6 bits length + code */
-            if (remaining < 4) return false;
-            uint32_t packed;
-            exr_memcpy(&packed, ptr, 4);
-            ptr += 4;
-            remaining -= 4;
-            lengths[i] = (uint8_t)(packed & 0x3F);
-            codes[i] = packed >> 6;
-            i++;
-        } else {
-            lengths[i] = l;
-            /* Code follows based on length */
-            if (l > 0) {
-                int code_bytes = (l + 7) / 8;
-                if ((size_t)code_bytes > remaining) return false;
-                uint64_t code = 0;
-                for (int b = 0; b < code_bytes; b++) {
-                    code |= ((uint64_t)ptr[b]) << (b * 8);
+    /* Decode */
+    int rlc = iM;  /* RLE symbol is the max symbol */
+    int64_t c = 0;
+    int lc = 0;
+    uint16_t* outb = out;
+    uint16_t* outp = out;
+    uint16_t* oe = out + out_len;
+    const uint8_t* ie = ptr + (nBits + 7) / 8;
+
+    /* Pre-fill the bit buffer for faster startup */
+    piz_refill(&c, &lc, &ptr, ie);
+
+    /* Main decode loop with bulk refill */
+    while (ptr < ie || lc >= HUF_DECBITS) {
+        /* Bulk refill when buffer is getting low */
+        if (lc < HUF_DECBITS && ptr < ie) {
+            piz_refill(&c, &lc, &ptr, ie);
+        }
+
+        while (lc >= HUF_DECBITS) {
+            const PizHufDec* pl = &hdecod[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
+
+            if (pl->len) {
+                /* Short code - fast path */
+                lc -= (int)pl->len;
+                if (!piz_huf_get_code((int)pl->lit, rlc, &c, &lc,
+                                       &ptr, ie, &outp, outb, oe)) {
+                    piz_huf_free_dec_table(hdecod);
+                    return false;
                 }
-                ptr += code_bytes;
-                remaining -= code_bytes;
-                codes[i] = code;
-            }
-            i++;
-        }
-    }
-
-    /* Build decoding table for fast lookup */
-    uint16_t dec_table[HUF_DECSIZE] = {0};
-    for (uint32_t sym = im_val; sym <= iM_val; sym++) {
-        int len = lengths[sym];
-        if (len > 0 && len <= HUF_DECBITS) {
-            uint64_t code = codes[sym];
-            int fill_count = 1 << (HUF_DECBITS - len);
-            for (int f = 0; f < fill_count; f++) {
-                int idx = (int)(code | (f << len));
-                if (idx < HUF_DECSIZE) {
-                    dec_table[idx] = (uint16_t)((sym << 6) | len);
+            } else {
+                if (!pl->p) {
+                    piz_huf_free_dec_table(hdecod);
+                    return false;
                 }
-            }
-        }
-    }
 
-    /* Decode symbols */
-    uint64_t buffer = 0;
-    int bits_in_buffer = 0;
-    size_t bit_pos = 0;
-    const uint8_t* bit_data = ptr;
-    size_t bit_data_len = remaining;
+                /* Search long code */
+                uint32_t j;
+                for (j = 0; j < pl->lit; j++) {
+                    int l = (int)(hcode[pl->p[j]] & 63);
+                    while (lc < l && ptr < ie)
+                        piz_getChar(&c, &lc, &ptr);
 
-    /* Initialize buffer */
-    while (bits_in_buffer < 64 && bit_pos < bit_data_len * 8) {
-        size_t byte_idx = bit_pos / 8;
-        if (byte_idx < bit_data_len) {
-            buffer |= ((uint64_t)bit_data[byte_idx]) << bits_in_buffer;
-            bits_in_buffer += 8;
-            bit_pos += 8;
-        }
-    }
-
-    for (size_t i = 0; i < out_len; i++) {
-        /* Refill buffer */
-        while (bits_in_buffer < 32) {
-            size_t byte_idx = bit_pos / 8;
-            if (byte_idx >= bit_data_len) break;
-            buffer |= ((uint64_t)bit_data[byte_idx]) << bits_in_buffer;
-            bits_in_buffer += 8;
-            bit_pos += 8;
-        }
-
-        /* Fast decode using table */
-        int idx = buffer & HUF_DECMASK;
-        uint16_t entry = dec_table[idx];
-        int len = entry & 0x3F;
-        if (len > 0 && len <= HUF_DECBITS) {
-            out[i] = (uint16_t)(entry >> 6);
-            buffer >>= len;
-            bits_in_buffer -= len;
-        } else {
-            /* Slow path: search for longer codes */
-            bool found = false;
-            for (int test_len = HUF_DECBITS + 1; test_len <= 58 && !found; test_len++) {
-                uint64_t mask = (1ULL << test_len) - 1;
-                uint64_t test_code = buffer & mask;
-                for (uint32_t sym = im_val; sym <= iM_val; sym++) {
-                    if (lengths[sym] == test_len && codes[sym] == test_code) {
-                        out[i] = (uint16_t)sym;
-                        buffer >>= test_len;
-                        bits_in_buffer -= test_len;
-                        found = true;
-                        break;
+                    if (lc >= l) {
+                        int64_t code_val = hcode[pl->p[j]] >> 6;
+                        if (code_val == ((c >> (lc - l)) & ((1LL << l) - 1))) {
+                            lc -= l;
+                            if (!piz_huf_get_code((int)pl->p[j], rlc, &c, &lc,
+                                                   &ptr, ie, &outp, outb, oe)) {
+                                piz_huf_free_dec_table(hdecod);
+                                return false;
+                            }
+                            break;
+                        }
                     }
                 }
+                if (j == pl->lit) {
+                    piz_huf_free_dec_table(hdecod);
+                    return false;
+                }
             }
-            if (!found) {
-                return false;  /* Decode error */
+
+            /* Inline refill to reduce function call overhead */
+            if (lc < HUF_DECBITS && ptr < ie) {
+                piz_refill(&c, &lc, &ptr, ie);
             }
         }
     }
 
+    /* Get remaining short codes */
+    {
+        int i = (8 - nBits) & 7;
+        c >>= i;
+        lc -= i;
+
+        while (lc > 0) {
+            const PizHufDec* pl = &hdecod[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
+            if (pl->len) {
+                lc -= (int)pl->len;
+                if (!piz_huf_get_code((int)pl->lit, rlc, &c, &lc,
+                                       &ptr, ie, &outp, outb, oe)) {
+                    piz_huf_free_dec_table(hdecod);
+                    return false;
+                }
+            } else {
+                piz_huf_free_dec_table(hdecod);
+                return false;
+            }
+        }
+    }
+
+    piz_huf_free_dec_table(hdecod);
     return true;
 }
 
@@ -2220,8 +2394,6 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
      * 5. Wavelet decode per channel
      * 6. Reorder into output layout
      */
-    (void)ctx;
-
     if (src_size < 8) return EXR_ERROR_INVALID_DATA;
 
     const uint8_t* ptr = src;
@@ -2236,14 +2408,19 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
     uint8_t bitmap[PIZ_BITMAP_SIZE];
     exr_memset(bitmap, 0, sizeof(bitmap));
 
-    if (maxNonZero >= minNonZero) {
-        size_t bitmap_len = (size_t)(maxNonZero - minNonZero + 1 + 7) / 8;
-        if (ptr + bitmap_len > ptr_end) return EXR_ERROR_INVALID_DATA;
+    if (maxNonZero >= PIZ_BITMAP_SIZE) return EXR_ERROR_INVALID_DATA;
 
-        size_t start_byte = minNonZero / 8;
-        if (start_byte + bitmap_len > PIZ_BITMAP_SIZE) return EXR_ERROR_INVALID_DATA;
-        exr_memcpy(bitmap + start_byte, ptr, bitmap_len);
+    if (minNonZero <= maxNonZero) {
+        size_t bitmap_len = (size_t)(maxNonZero - minNonZero + 1);
+        if (ptr + bitmap_len > ptr_end) return EXR_ERROR_INVALID_DATA;
+        if ((size_t)minNonZero + bitmap_len > PIZ_BITMAP_SIZE) return EXR_ERROR_INVALID_DATA;
+        exr_memcpy(bitmap + minNonZero, ptr, bitmap_len);
         ptr += bitmap_len;
+    } else {
+        /* minNonZero > maxNonZero: all pixels are zero (Issue 194) */
+        if (!(minNonZero == (PIZ_BITMAP_SIZE - 1) && maxNonZero == 0)) {
+            return EXR_ERROR_INVALID_DATA;
+        }
     }
 
     /* Build forward LUT from bitmap */
@@ -2287,13 +2464,28 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
     if (total_samples > SIZE_MAX / sizeof(uint16_t)) return EXR_ERROR_OUT_OF_MEMORY;
 
     /* Allocate tmp buffer for decompressed uint16 data */
-    uint16_t* tmp = (uint16_t*)EXR_CRT_MALLOC(total_samples * sizeof(uint16_t));
+    size_t tmp_alloc_size = total_samples * sizeof(uint16_t);
+    uint16_t* tmp = (uint16_t*)ctx->allocator.alloc(
+        ctx->allocator.userdata, tmp_alloc_size, EXR_DEFAULT_ALIGNMENT);
     if (!tmp) return EXR_ERROR_OUT_OF_MEMORY;
 
+    /* Read Huffman data length (4-byte LE int preceding the compressed data) */
+    if (ptr + 4 > ptr_end) {
+        ctx->allocator.free(ctx->allocator.userdata, tmp, tmp_alloc_size);
+        return EXR_ERROR_INVALID_DATA;
+    }
+    uint32_t huf_length;
+    exr_memcpy(&huf_length, ptr, 4);
+    ptr += 4;
+
+    if ((size_t)(ptr_end - ptr) < (size_t)huf_length) {
+        ctx->allocator.free(ctx->allocator.userdata, tmp, tmp_alloc_size);
+        return EXR_ERROR_INVALID_DATA;
+    }
+
     /* Huffman decompress */
-    size_t huf_data_size = (size_t)(ptr_end - ptr);
-    if (!piz_huf_uncompress(ptr, huf_data_size, tmp, total_samples)) {
-        EXR_CRT_FREE(tmp);
+    if (!piz_huf_uncompress(ptr, (size_t)huf_length, tmp, total_samples)) {
+        ctx->allocator.free(ctx->allocator.userdata, tmp, tmp_alloc_size);
         return EXR_ERROR_DECOMPRESSION_FAILED;
     }
 
@@ -2302,7 +2494,7 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
 
     /* Build per-channel metadata and wavelet decode */
     PizChannelData cd[128];
-    if (num_channels > 128) { EXR_CRT_FREE(tmp); return EXR_ERROR_INVALID_DATA; }
+    if (num_channels > 128) { ctx->allocator.free(ctx->allocator.userdata, tmp, tmp_alloc_size); return EXR_ERROR_INVALID_DATA; }
 
     uint16_t* chan_ptr = tmp;
     size_t bytes_per_scanline = 0;
@@ -2356,7 +2548,7 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
         }
     }
 
-    EXR_CRT_FREE(tmp);
+    ctx->allocator.free(ctx->allocator.userdata, tmp, tmp_alloc_size);
     *out_size = dst_size;
     return EXR_SUCCESS;
 }
@@ -2368,7 +2560,7 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
    After RLE decode, applies predictor and reorder like ZIP compression */
 static ExrResult decompress_rle(const uint8_t* src, size_t src_size,
                                  uint8_t* dst, size_t dst_size,
-                                 size_t* out_size) {
+                                 size_t* out_size, ExrContext ctx) {
     /* Handle uncompressed data (size matches expected) */
     if (src_size == dst_size) {
         exr_memcpy(dst, src, src_size);
@@ -2377,7 +2569,8 @@ static ExrResult decompress_rle(const uint8_t* src, size_t src_size,
     }
 
     /* Allocate temp buffer for RLE-decoded data (before predictor/reorder) */
-    uint8_t* tmpBuf = (uint8_t*)EXR_CRT_MALLOC(dst_size);
+    uint8_t* tmpBuf = (uint8_t*)ctx->allocator.alloc(
+        ctx->allocator.userdata, dst_size, EXR_DEFAULT_ALIGNMENT);
     if (!tmpBuf) {
         return EXR_ERROR_OUT_OF_MEMORY;
     }
@@ -2395,7 +2588,7 @@ static ExrResult decompress_rle(const uint8_t* src, size_t src_size,
             /* Literal run: -count bytes follow */
             size_t len = (size_t)(-count);
             if (in + len > in_end || out + len > out_end) {
-                EXR_CRT_FREE(tmpBuf);
+                ctx->allocator.free(ctx->allocator.userdata, tmpBuf, dst_size);
                 return EXR_ERROR_INVALID_DATA;
             }
             exr_memcpy(out, in, len);
@@ -2405,7 +2598,7 @@ static ExrResult decompress_rle(const uint8_t* src, size_t src_size,
             /* RLE run: repeat next byte (count + 1) times */
             size_t len = (size_t)count + 1;
             if (in >= in_end || out + len > out_end) {
-                EXR_CRT_FREE(tmpBuf);
+                ctx->allocator.free(ctx->allocator.userdata, tmpBuf, dst_size);
                 return EXR_ERROR_INVALID_DATA;
             }
             uint8_t val = (uint8_t)*in++;
@@ -2416,31 +2609,10 @@ static ExrResult decompress_rle(const uint8_t* src, size_t src_size,
 
     size_t uncomp_size = (size_t)(out - tmpBuf);
 
-    /* Apply EXR predictor (delta decoding) */
-    {
-        uint8_t* t = tmpBuf + 1;
-        uint8_t* stop = tmpBuf + uncomp_size;
-        while (t < stop) {
-            int d = (int)t[-1] + (int)t[0] - 128;
-            t[0] = (uint8_t)d;
-            ++t;
-        }
-    }
+    exr_apply_predictor(tmpBuf, uncomp_size);
+    exr_reorder_pixels(tmpBuf, dst, uncomp_size);
 
-    /* Reorder pixel data (interleave two halves) */
-    {
-        const uint8_t* t1 = tmpBuf;
-        const uint8_t* t2 = tmpBuf + (uncomp_size + 1) / 2;
-        uint8_t* s = dst;
-        uint8_t* stop = dst + uncomp_size;
-
-        while (s < stop) {
-            if (s < stop) *s++ = *t1++;
-            if (s < stop) *s++ = *t2++;
-        }
-    }
-
-    EXR_CRT_FREE(tmpBuf);
+    ctx->allocator.free(ctx->allocator.userdata, tmpBuf, dst_size);
     *out_size = uncomp_size;
     return EXR_SUCCESS;
 }
@@ -2582,7 +2754,7 @@ static ExrResult decompress_chunk_data(ExrContext ctx, ExrPartData* part,
 
         case EXR_COMPRESSION_RLE:
             result = decompress_rle(compressed, data_size, decompressed,
-                                     expected_size, &decompressed_size);
+                                     expected_size, &decompressed_size, ctx);
             if (EXR_FAILED(result)) return result;
             break;
 
@@ -7732,7 +7904,7 @@ ExrResult exr_decompress_chunk(ExrContext ctx, const ExrDecompressInfo* info) {
         case EXR_COMPRESSION_RLE:
             result = decompress_rle((const uint8_t*)info->src, info->src_size,
                                      (uint8_t*)info->dst, info->dst_capacity,
-                                     &out_size);
+                                     &out_size, ctx);
             break;
 
         case EXR_COMPRESSION_ZIPS:
