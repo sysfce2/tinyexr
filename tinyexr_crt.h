@@ -163,9 +163,8 @@ static int exr_strncpy_s(char* dst, size_t dst_size, const char* src, size_t cou
     }
     dst[i] = '\0';
 
-    /* Return non-zero if source was longer than available space */
-    if (src[i] != '\0' && i == max_copy && count >= dst_size) return 1;
-    return 0;
+    /* Non-zero if source was truncated */
+    return (src[i] != '\0') ? 1 : 0;
 }
 
 /*
@@ -254,7 +253,7 @@ static int exr_utoa_hex(char* buf, size_t buf_size, uint64_t val) {
 #include <stdarg.h>
 
 static int exr_vsnprintf_va(char* buf, size_t buf_size, const char* fmt, va_list args) {
-    if (!buf || buf_size == 0) return 0;
+    if (!buf || buf_size == 0 || !fmt) return 0;
 
     char* out = buf;
     char* end = buf + buf_size - 1; /* reserve space for NUL */

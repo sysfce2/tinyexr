@@ -2062,36 +2062,7 @@ typedef struct {
 #define HUF_DECSIZE (1 << HUF_DECBITS)
 #define HUF_DECMASK (HUF_DECSIZE - 1)
 
-/* Decode Huffman symbol using table lookup */
-static int piz_huf_decode_symbol(const uint64_t* hdec, const uint16_t* hdec_short,
-                                  const uint8_t* data, size_t data_len,
-                                  size_t* bit_pos, uint64_t* buffer, int* bits_in_buffer) {
-    /* Refill buffer if needed */
-    while (*bits_in_buffer < 32 && (*bit_pos / 8) < data_len) {
-        size_t byte_pos = *bit_pos / 8;
-        int bit_offset = *bit_pos % 8;
-        *buffer |= ((uint64_t)data[byte_pos] >> bit_offset) << *bits_in_buffer;
-        int bits_taken = 8 - bit_offset;
-        *bits_in_buffer += bits_taken;
-        *bit_pos += bits_taken;
-    }
-
-    /* Fast path: table lookup for short codes */
-    int idx = *buffer & HUF_DECMASK;
-    int len = hdec_short[idx] & 0x3F;
-    if (len > 0 && len <= HUF_DECBITS) {
-        int sym = hdec_short[idx] >> 6;
-        *buffer >>= len;
-        *bits_in_buffer -= len;
-        return sym;
-    }
-
-    /* Slow path: linear search through longer codes */
-    /* This is a simplified fallback - real implementation would use canonical codes */
-    return -1;  /* Error: symbol not found */
-}
-
-/* Simplified Huffman decompression (V1-compatible format) */
+/* Huffman decompression (V1-compatible format) */
 static bool piz_huf_uncompress(const uint8_t* in, size_t in_len,
                                 uint16_t* out, size_t out_len) {
     if (in_len < 20) return false;
@@ -2609,6 +2580,93 @@ static ExrResult decompress_pxr24(const uint8_t* src, size_t src_size,
     return EXR_SUCCESS;
 }
 
+/* Shared decompression dispatch for both scanline and tiled reading.
+ * Decompresses `compressed` into `decompressed` according to `compression` type.
+ * `data_width` and `data_height` are the pixel dimensions of the data block
+ * (image width + num_lines for scanlines, tile_width + tile_height for tiles). */
+static ExrResult decompress_chunk_data(ExrContext ctx, ExrPartData* part,
+                                        const uint8_t* compressed, size_t data_size,
+                                        uint8_t* decompressed, size_t expected_size,
+                                        size_t* out_decompressed_size,
+                                        int data_width, int data_height,
+                                        uint64_t offset) {
+    ExrResult result;
+    size_t decompressed_size = 0;
+
+    switch (part->compression) {
+        case EXR_COMPRESSION_NONE:
+            if (data_size != expected_size) return EXR_ERROR_INVALID_DATA;
+            exr_memcpy(decompressed, compressed, data_size);
+            decompressed_size = data_size;
+            break;
+
+        case EXR_COMPRESSION_RLE:
+            result = decompress_rle(compressed, data_size, decompressed,
+                                     expected_size, &decompressed_size);
+            if (EXR_FAILED(result)) return result;
+            break;
+
+        case EXR_COMPRESSION_ZIP:
+        case EXR_COMPRESSION_ZIPS:
+            result = decompress_zip(compressed, data_size, decompressed,
+                                     expected_size, &decompressed_size, ctx);
+            if (EXR_FAILED(result)) return result;
+            break;
+
+        case EXR_COMPRESSION_PIZ: {
+            ExrChannelData* piz_channels = (ExrChannelData*)ctx->allocator.alloc(
+                ctx->allocator.userdata, part->num_channels * sizeof(ExrChannelData),
+                EXR_DEFAULT_ALIGNMENT);
+            if (!piz_channels) return EXR_ERROR_OUT_OF_MEMORY;
+
+            for (uint32_t c = 0; c < part->num_channels; c++) {
+                piz_channels[c].pixel_type = part->channels[c].pixel_type;
+                piz_channels[c].x_sampling = part->channels[c].x_sampling;
+                piz_channels[c].y_sampling = part->channels[c].y_sampling;
+            }
+
+            result = decompress_piz(compressed, data_size, decompressed,
+                                     expected_size, &decompressed_size,
+                                     part->num_channels, piz_channels,
+                                     data_width, data_height, ctx);
+
+            ctx->allocator.free(ctx->allocator.userdata, piz_channels,
+                               part->num_channels * sizeof(ExrChannelData));
+            if (EXR_FAILED(result)) return result;
+            break;
+        }
+
+        case EXR_COMPRESSION_PXR24: {
+            result = decompress_pxr24(compressed, data_size, decompressed,
+                                       expected_size, &decompressed_size,
+                                       part->num_channels, part->channels,
+                                       data_width, data_height, ctx);
+            if (EXR_FAILED(result)) return result;
+            break;
+        }
+
+        case EXR_COMPRESSION_B44:
+        case EXR_COMPRESSION_B44A: {
+            bool b44_ok = tinyexr_decompress_b44(
+                decompressed, expected_size,
+                compressed, data_size,
+                data_width, data_height,
+                (int)part->num_channels,
+                (const TinyExrB44Channel*)part->channels);
+            if (!b44_ok) return EXR_ERROR_DECOMPRESSION_FAILED;
+            decompressed_size = expected_size;
+            break;
+        }
+
+        default:
+            return EXR_ERROR_UNSUPPORTED_FORMAT;
+    }
+
+    (void)offset;
+    *out_decompressed_size = decompressed_size;
+    return EXR_SUCCESS;
+}
+
 /* Read and decompress a single chunk */
 static ExrResult read_chunk(ExrDecoder decoder, ExrPartData* part, uint32_t chunk_index,
                             uint8_t** out_data, size_t* out_size,
@@ -2648,9 +2706,16 @@ static ExrResult read_chunk(ExrDecoder decoder, ExrPartData* part, uint32_t chun
 
     size_t bytes_per_line = 0;
     for (uint32_t c = 0; c < part->num_channels; c++) {
-        bytes_per_line += (size_t)part->width * get_bytes_per_pixel(part->channels[c].pixel_type);
+        size_t ch_bytes = (size_t)part->width * get_bytes_per_pixel(part->channels[c].pixel_type);
+        if (part->width > 0 && ch_bytes / (size_t)part->width != (size_t)get_bytes_per_pixel(part->channels[c].pixel_type)) {
+            return EXR_ERROR_OUT_OF_MEMORY; /* overflow */
+        }
+        bytes_per_line += ch_bytes;
     }
-    size_t expected_size = bytes_per_line * num_lines;
+    size_t expected_size = bytes_per_line * (size_t)num_lines;
+    if (num_lines > 0 && expected_size / (size_t)num_lines != bytes_per_line) {
+        return EXR_ERROR_OUT_OF_MEMORY; /* overflow */
+    }
 
     /* Allocate compressed data buffer */
     uint8_t* compressed = (uint8_t*)ctx->allocator.alloc(
@@ -2676,114 +2741,14 @@ static ExrResult read_chunk(ExrDecoder decoder, ExrPartData* part, uint32_t chun
 
     /* Decompress based on compression type */
     size_t decompressed_size = 0;
-    switch (part->compression) {
-        case EXR_COMPRESSION_NONE:
-            if (data_size != expected_size) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_INVALID_DATA;
-            }
-            exr_memcpy(decompressed, compressed, data_size);
-            decompressed_size = data_size;
-            break;
-
-        case EXR_COMPRESSION_RLE:
-            result = decompress_rle(compressed, data_size, decompressed,
-                                     expected_size, &decompressed_size);
-            if (EXR_FAILED(result)) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-
-        case EXR_COMPRESSION_ZIP:
-        case EXR_COMPRESSION_ZIPS:
-            result = decompress_zip(compressed, data_size, decompressed,
-                                     expected_size, &decompressed_size, ctx);
-            if (EXR_FAILED(result)) {
-                exr_context_add_error(ctx, result,
-                                      "ZIP decompression failed", "chunk", offset);
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-
-        case EXR_COMPRESSION_PIZ: {
-            /* Set up channel data for PIZ decompression */
-            ExrChannelData* piz_channels = (ExrChannelData*)ctx->allocator.alloc(
-                ctx->allocator.userdata, part->num_channels * sizeof(ExrChannelData),
-                EXR_DEFAULT_ALIGNMENT);
-            if (!piz_channels) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_OUT_OF_MEMORY;
-            }
-
-            for (uint32_t c = 0; c < part->num_channels; c++) {
-                piz_channels[c].pixel_type = part->channels[c].pixel_type;
-                piz_channels[c].x_sampling = part->channels[c].x_sampling;
-                piz_channels[c].y_sampling = part->channels[c].y_sampling;
-            }
-
-            result = decompress_piz(compressed, data_size, decompressed,
-                                     expected_size, &decompressed_size,
-                                     part->num_channels, piz_channels,
-                                     part->width, num_lines, ctx);
-
-            ctx->allocator.free(ctx->allocator.userdata, piz_channels,
-                               part->num_channels * sizeof(ExrChannelData));
-
-            if (EXR_FAILED(result)) {
-                exr_context_add_error(ctx, result,
-                                      "PIZ decompression failed", "chunk", offset);
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-        }
-
-        case EXR_COMPRESSION_PXR24: {
-            result = decompress_pxr24(compressed, data_size, decompressed,
-                                       expected_size, &decompressed_size,
-                                       part->num_channels, part->channels,
-                                       part->width, num_lines, ctx);
-            if (EXR_FAILED(result)) {
-                exr_context_add_error(ctx, result,
-                                      "PXR24 decompression failed", "chunk", offset);
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-        }
-
-        case EXR_COMPRESSION_B44:
-        case EXR_COMPRESSION_B44A: {
-            bool b44_ok = tinyexr_decompress_b44(
-                decompressed, expected_size,
-                compressed, data_size,
-                part->width, num_lines,
-                (int)part->num_channels,
-                (const TinyExrB44Channel*)part->channels);
-
-            if (!b44_ok) {
-                exr_context_add_error(ctx, EXR_ERROR_DECOMPRESSION_FAILED,
-                                      "B44 decompression failed", "chunk", offset);
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_DECOMPRESSION_FAILED;
-            }
-            decompressed_size = expected_size;
-            break;
-        }
-
-        default:
-            ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-            ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-            return EXR_ERROR_UNSUPPORTED_FORMAT;
+    result = decompress_chunk_data(ctx, part, compressed, data_size,
+                                    decompressed, expected_size,
+                                    &decompressed_size,
+                                    part->width, num_lines, offset);
+    if (EXR_FAILED(result)) {
+        ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
+        ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
+        return result;
     }
 
     ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
@@ -2996,106 +2961,14 @@ static ExrResult read_tile(ExrDecoder decoder, ExrPartData* part,
 
     /* Decompress based on compression type */
     size_t decompressed_size = 0;
-    switch (part->compression) {
-        case EXR_COMPRESSION_NONE:
-            if (data_size != expected_size) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_INVALID_DATA;
-            }
-            exr_memcpy(decompressed, compressed, data_size);
-            decompressed_size = data_size;
-            break;
-
-        case EXR_COMPRESSION_RLE:
-            result = decompress_rle(compressed, data_size, decompressed,
-                                     expected_size, &decompressed_size);
-            if (EXR_FAILED(result)) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-
-        case EXR_COMPRESSION_ZIP:
-        case EXR_COMPRESSION_ZIPS:
-            result = decompress_zip(compressed, data_size, decompressed,
-                                     expected_size, &decompressed_size, ctx);
-            if (EXR_FAILED(result)) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-
-        case EXR_COMPRESSION_PIZ: {
-            ExrChannelData* piz_channels = (ExrChannelData*)ctx->allocator.alloc(
-                ctx->allocator.userdata, part->num_channels * sizeof(ExrChannelData),
-                EXR_DEFAULT_ALIGNMENT);
-            if (!piz_channels) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_OUT_OF_MEMORY;
-            }
-
-            for (uint32_t c = 0; c < part->num_channels; c++) {
-                piz_channels[c].pixel_type = part->channels[c].pixel_type;
-                piz_channels[c].x_sampling = part->channels[c].x_sampling;
-                piz_channels[c].y_sampling = part->channels[c].y_sampling;
-            }
-
-            result = decompress_piz(compressed, data_size, decompressed,
-                                     expected_size, &decompressed_size,
-                                     part->num_channels, piz_channels,
-                                     tile_width, tile_height, ctx);
-
-            ctx->allocator.free(ctx->allocator.userdata, piz_channels,
-                               part->num_channels * sizeof(ExrChannelData));
-
-            if (EXR_FAILED(result)) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-        }
-
-        case EXR_COMPRESSION_PXR24: {
-            result = decompress_pxr24(compressed, data_size, decompressed,
-                                       expected_size, &decompressed_size,
-                                       part->num_channels, part->channels,
-                                       tile_width, tile_height, ctx);
-            if (EXR_FAILED(result)) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return result;
-            }
-            break;
-        }
-
-        case EXR_COMPRESSION_B44:
-        case EXR_COMPRESSION_B44A: {
-            bool b44_ok = tinyexr_decompress_b44(
-                decompressed, expected_size,
-                compressed, data_size,
-                tile_width, tile_height,
-                (int)part->num_channels,
-                (const TinyExrB44Channel*)part->channels);
-
-            if (!b44_ok) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_DECOMPRESSION_FAILED;
-            }
-            decompressed_size = expected_size;
-            break;
-        }
-
-        default:
-            /* DWAA/DWAB and other compression types not supported */
-            ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-            ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-            return EXR_ERROR_UNSUPPORTED_FORMAT;
+    result = decompress_chunk_data(ctx, part, compressed, data_size,
+                                    decompressed, expected_size,
+                                    &decompressed_size,
+                                    tile_width, tile_height, offset);
+    if (EXR_FAILED(result)) {
+        ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
+        ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
+        return result;
     }
 
     ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);

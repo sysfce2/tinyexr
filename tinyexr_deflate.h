@@ -232,13 +232,6 @@ static bool tinyexr_dfl_ht_build(TinyExrDflHuffTable* table,
         next_code[bits] = code;
     }
 
-    /* Reset for assignment pass */
-    code = 0;
-    for (int bits = 1; bits <= max_len; bits++) {
-        code = (code + bl_count[bits - 1]) << 1;
-        next_code[bits] = code;
-    }
-
     /* Fill fast table for codes <= 10 bits */
     for (int sym = 0; sym < count; sym++) {
         int len = lens[sym];
@@ -265,13 +258,6 @@ static bool tinyexr_dfl_ht_build(TinyExrDflHuffTable* table,
     /* Build slow table for codes > 10 bits */
     uint16_t* slow_ptr = table->slow_table;
     const size_t slow_cap = sizeof(table->slow_table) / sizeof(table->slow_table[0]);
-
-    /* Reset next_code for slow table pass */
-    code = 0;
-    for (int bits = 1; bits <= max_len; bits++) {
-        code = (code + bl_count[bits - 1]) << 1;
-        next_code[bits] = code;
-    }
 
     for (int target_bits = 11; target_bits <= 15; target_bits++) {
         if ((size_t)(slow_ptr - table->slow_table) >= slow_cap - 1) break;
@@ -392,7 +378,6 @@ static void tinyexr_dfl_copy_match(uint8_t* dst, const uint8_t* src,
             dst += 2;
             length -= 2;
         }
-        src = dst - distance;
     } else if (distance == 4 && length >= 8) {
         uint32_t pattern;
         exr_memcpy(&pattern, src, 4);
@@ -409,9 +394,10 @@ static void tinyexr_dfl_copy_match(uint8_t* dst, const uint8_t* src,
             dst += 4;
             length -= 4;
         }
-        src = dst - distance;
     }
 
+    /* Byte-by-byte copy for trailing bytes or non-pattern distances */
+    src = dst - distance;
     while (length-- > 0) {
         *dst++ = *src++;
     }
@@ -557,9 +543,20 @@ static bool tinyexr_inflate(const uint8_t* src, size_t src_len,
             if ((len ^ nlen) != 0xFFFF) return false;
             if (out + len > out_end) return false;
 
-            for (int i = 0; i < len; i++) {
-                if (reader.count < 8) tinyexr_dfl_br_refill(&reader);
-                *out++ = (uint8_t)tinyexr_dfl_br_read(&reader, 8);
+            /* Flush remaining bits and copy directly from input */
+            {
+                /* Skip any bits remaining in the bit buffer (already aligned) */
+                size_t bytes_avail = (size_t)(reader.end - reader.ptr);
+                /* Account for unread bytes still in the bit buffer */
+                size_t buffered_bytes = (reader.count > 0) ? (size_t)(reader.count / 8) : 0;
+                if ((size_t)len > bytes_avail + buffered_bytes) return false;
+
+                /* Read through bit reader for correctness */
+                for (int i = 0; i < len; i++) {
+                    if (reader.count < 8) tinyexr_dfl_br_refill(&reader);
+                    if (reader.count < 8) return false; /* truncated input */
+                    *out++ = (uint8_t)tinyexr_dfl_br_read(&reader, 8);
+                }
             }
         } else if (block_type == 1) {
             /* Fixed Huffman */
