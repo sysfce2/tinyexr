@@ -17,8 +17,9 @@ INCLUDES = -I./deps/miniz
 INCLUDES_V3 = -I. -I./deps/miniz
 DEFINES =
 
-# V3 specific defines for compression support
-DEFINES_V3 = -DTINYEXR_V3_ENABLE_PIZ=1 -DTINYEXR_V3_ENABLE_PXR24=1 -DTINYEXR_V3_ENABLE_B44=1
+# V3 specific defines (compression now built-in via C11 headers)
+DEFINES_V3 =
+CFLAGS_V3 ?= -O2 -std=c11
 
 # Optional: Address sanitizer (debug builds)
 # CFLAGS += -fsanitize=address -g -O0
@@ -72,9 +73,9 @@ miniz.o: $(MINIZ_SRC)
 miniz-v3.o: $(MINIZ_SRC)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
-# Build C implementation as C++ for v3 (required for V2 compression support)
+# Build C implementation as pure C11 for v3
 tinyexr_c_impl.o: $(C_IMPL_SRC)
-	$(CXX) $(CXXFLAGS_V3) -x c++ $(INCLUDES_V3) $(DEFINES_V3) -c -o $@ $<
+	$(CC) $(CFLAGS_V3) $(INCLUDES_V3) $(DEFINES_V3) -c -o $@ $<
 
 # Run tests
 test: $(TARGET)

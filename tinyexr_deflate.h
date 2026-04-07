@@ -1,0 +1,626 @@
+/*
+ * TinyEXR V3 - Pure C11 Deflate/Inflate Implementation
+ *
+ * Ported from tinyexr_huffman.hh (C++ FastDeflateDecoder).
+ * Provides zlib/deflate decompression for ZIP/ZIPS EXR compression.
+ *
+ * This is a header-only C11 implementation. Include in exactly one .c file
+ * with TINYEXR_DEFLATE_IMPLEMENTATION defined, or include as-is (all static).
+ *
+ * Copyright (c) 2024-2026 TinyEXR authors
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#ifndef TINYEXR_DEFLATE_H_
+#define TINYEXR_DEFLATE_H_
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* Use tinyexr_crt.h for exr_memcpy/exr_memset when available, fall back to string.h */
+#ifdef TINYEXR_CRT_H_
+/* Already included — exr_exr_memcpy, exr_exr_memset available */
+#else
+#include "tinyexr_crt.h"
+#endif
+
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ============================================================================
+ * Compiler Hints
+ * ============================================================================ */
+
+#ifndef TINYEXR_LIKELY
+#if defined(__GNUC__) || defined(__clang__)
+#define TINYEXR_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define TINYEXR_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define TINYEXR_DFL_INLINE  __attribute__((always_inline)) static inline
+#elif defined(_MSC_VER)
+#define TINYEXR_LIKELY(x)   (x)
+#define TINYEXR_UNLIKELY(x) (x)
+#define TINYEXR_DFL_INLINE  __forceinline static
+#else
+#define TINYEXR_LIKELY(x)   (x)
+#define TINYEXR_UNLIKELY(x) (x)
+#define TINYEXR_DFL_INLINE  static inline
+#endif
+#endif
+
+#ifndef TINYEXR_DFL_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define TINYEXR_DFL_INLINE __attribute__((always_inline)) static inline
+#elif defined(_MSC_VER)
+#define TINYEXR_DFL_INLINE __forceinline static
+#else
+#define TINYEXR_DFL_INLINE static inline
+#endif
+#endif
+
+/* ============================================================================
+ * Deflate Constants
+ * ============================================================================ */
+
+#define TINYEXR_DFL_MAX_BITS       15
+#define TINYEXR_DFL_LITLEN_CODES   288
+#define TINYEXR_DFL_DIST_CODES     32
+#define TINYEXR_DFL_CODELEN_CODES  19
+
+static const uint8_t tinyexr_dfl_codelen_order[TINYEXR_DFL_CODELEN_CODES] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+};
+
+static const uint16_t tinyexr_dfl_length_base[29] = {
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+};
+static const uint8_t tinyexr_dfl_length_extra[29] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+};
+
+static const uint16_t tinyexr_dfl_dist_base[30] = {
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577
+};
+static const uint8_t tinyexr_dfl_dist_extra[30] = {
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+};
+
+/* ============================================================================
+ * Bit Reader (LSB first, for deflate)
+ * ============================================================================ */
+
+typedef struct {
+    uint64_t bits;
+    int count;
+    const uint8_t* ptr;
+    const uint8_t* end;
+} TinyExrDflBitReader;
+
+TINYEXR_DFL_INLINE void tinyexr_dfl_br_init(TinyExrDflBitReader* br,
+                                              const uint8_t* data, size_t size) {
+    br->bits = 0;
+    br->count = 0;
+    br->ptr = data;
+    br->end = data + size;
+}
+
+TINYEXR_DFL_INLINE void tinyexr_dfl_br_refill(TinyExrDflBitReader* br) {
+    while (br->count <= 56 && br->ptr < br->end) {
+        br->bits |= (uint64_t)(*br->ptr++) << br->count;
+        br->count += 8;
+    }
+}
+
+TINYEXR_DFL_INLINE void tinyexr_dfl_br_refill_fast(TinyExrDflBitReader* br) {
+    if (TINYEXR_LIKELY(br->ptr + 8 <= br->end)) {
+        uint64_t new_bits;
+        exr_memcpy(&new_bits, br->ptr, 8);
+        br->bits |= new_bits << br->count;
+        int bytes_to_advance = (64 - br->count) / 8;
+        br->ptr += bytes_to_advance;
+        br->count += bytes_to_advance * 8;
+    } else {
+        tinyexr_dfl_br_refill(br);
+    }
+}
+
+TINYEXR_DFL_INLINE uint32_t tinyexr_dfl_br_peek(const TinyExrDflBitReader* br, int n) {
+    return (uint32_t)(br->bits & ((1ULL << n) - 1));
+}
+
+TINYEXR_DFL_INLINE void tinyexr_dfl_br_consume(TinyExrDflBitReader* br, int n) {
+    br->bits >>= n;
+    br->count -= n;
+}
+
+TINYEXR_DFL_INLINE uint32_t tinyexr_dfl_br_read(TinyExrDflBitReader* br, int n) {
+    uint32_t result = tinyexr_dfl_br_peek(br, n);
+    tinyexr_dfl_br_consume(br, n);
+    return result;
+}
+
+TINYEXR_DFL_INLINE void tinyexr_dfl_br_align(TinyExrDflBitReader* br) {
+    int skip = br->count & 7;
+    tinyexr_dfl_br_consume(br, skip);
+}
+
+/* ============================================================================
+ * Huffman Table
+ * ============================================================================ */
+
+typedef struct {
+    /* Fast lookup: 10-bit index -> (symbol << 4) | length | 0x8000 */
+    uint16_t fast_table[1024];
+    /* Slow table for codes > 10 bits */
+    uint16_t slow_table[640];
+    int slow_count;
+    int max_bits;
+} TinyExrDflHuffTable;
+
+static void tinyexr_dfl_ht_build_fixed_litlen(TinyExrDflHuffTable* t) {
+    t->max_bits = 9;
+    t->slow_count = 0;
+    exr_memset(t->fast_table, 0, sizeof(t->fast_table));
+    exr_memset(t->slow_table, 0, sizeof(t->slow_table));
+
+    for (int sym = 0; sym <= 287; sym++) {
+        int len, code;
+        if (sym <= 143) {
+            len = 8; code = 0x30 + sym;
+        } else if (sym <= 255) {
+            len = 9; code = 0x190 + (sym - 144);
+        } else if (sym <= 279) {
+            len = 7; code = sym - 256;
+        } else {
+            len = 8; code = 0xC0 + (sym - 280);
+        }
+
+        int rev_code = 0;
+        for (int i = 0; i < len; i++) {
+            rev_code = (rev_code << 1) | ((code >> i) & 1);
+        }
+
+        int fill = 1 << (10 - len);
+        for (int i = 0; i < fill; i++) {
+            int idx = rev_code | (i << len);
+            if (idx < 1024) {
+                t->fast_table[idx] = (uint16_t)((sym << 4) | len | 0x8000);
+            }
+        }
+    }
+}
+
+static void tinyexr_dfl_ht_build_fixed_dist(TinyExrDflHuffTable* t) {
+    t->max_bits = 5;
+    t->slow_count = 0;
+    exr_memset(t->fast_table, 0, sizeof(t->fast_table));
+    exr_memset(t->slow_table, 0, sizeof(t->slow_table));
+
+    for (int sym = 0; sym < 32; sym++) {
+        int rev_code = 0;
+        for (int i = 0; i < 5; i++) {
+            rev_code = (rev_code << 1) | ((sym >> i) & 1);
+        }
+
+        int fill = 1 << (10 - 5);
+        for (int i = 0; i < fill; i++) {
+            int idx = rev_code | (i << 5);
+            if (idx < 1024) {
+                t->fast_table[idx] = (uint16_t)((sym << 4) | 5 | 0x8000);
+            }
+        }
+    }
+}
+
+static bool tinyexr_dfl_ht_build(TinyExrDflHuffTable* table,
+                                  const uint8_t* lens, int count) {
+    int bl_count[TINYEXR_DFL_MAX_BITS + 1] = {0};
+    int max_len = 0;
+    for (int i = 0; i < count; i++) {
+        if (lens[i] > 0) {
+            bl_count[lens[i]]++;
+            if (lens[i] > max_len) max_len = lens[i];
+        }
+    }
+
+    table->max_bits = max_len;
+    table->slow_count = 0;
+    exr_memset(table->fast_table, 0, sizeof(table->fast_table));
+    exr_memset(table->slow_table, 0, sizeof(table->slow_table));
+
+    /* Compute first code for each length */
+    int next_code[TINYEXR_DFL_MAX_BITS + 1] = {0};
+    int code = 0;
+    for (int bits = 1; bits <= max_len; bits++) {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+
+    /* Reset for assignment pass */
+    code = 0;
+    for (int bits = 1; bits <= max_len; bits++) {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+
+    /* Fill fast table for codes <= 10 bits */
+    for (int sym = 0; sym < count; sym++) {
+        int len = lens[sym];
+        if (len == 0) continue;
+
+        int code_val = next_code[len]++;
+
+        int rev_code = 0;
+        for (int i = 0; i < len; i++) {
+            rev_code = (rev_code << 1) | ((code_val >> i) & 1);
+        }
+
+        if (len <= 10) {
+            int fill = 1 << (10 - len);
+            for (int i = 0; i < fill; i++) {
+                int idx = rev_code | (i << len);
+                if (idx < 1024) {
+                    table->fast_table[idx] = (uint16_t)((sym << 4) | len | 0x8000);
+                }
+            }
+        }
+    }
+
+    /* Build slow table for codes > 10 bits */
+    uint16_t* slow_ptr = table->slow_table;
+    const size_t slow_cap = sizeof(table->slow_table) / sizeof(table->slow_table[0]);
+
+    /* Reset next_code for slow table pass */
+    code = 0;
+    for (int bits = 1; bits <= max_len; bits++) {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+
+    for (int target_bits = 11; target_bits <= 15; target_bits++) {
+        if ((size_t)(slow_ptr - table->slow_table) >= slow_cap - 1) break;
+
+        uint16_t* count_ptr = slow_ptr++;
+        uint16_t bit_count = 0;
+
+        /* Reset next_code for this scan */
+        int nc[TINYEXR_DFL_MAX_BITS + 1];
+        code = 0;
+        for (int bits = 1; bits <= max_len; bits++) {
+            code = (code + bl_count[bits - 1]) << 1;
+            nc[bits] = code;
+        }
+
+        for (int sym = 0; sym < count; sym++) {
+            int len = lens[sym];
+            if (len != target_bits) {
+                if (len > 0) nc[len]++;
+                continue;
+            }
+
+            if ((size_t)(slow_ptr - table->slow_table) >= slow_cap - 2) break;
+
+            int code_val = nc[len]++;
+
+            int rev_code = 0;
+            for (int i = 0; i < len; i++) {
+                rev_code = (rev_code << 1) | ((code_val >> i) & 1);
+            }
+
+            *slow_ptr++ = (uint16_t)rev_code;
+            *slow_ptr++ = (uint16_t)sym;
+            bit_count++;
+            table->slow_count++;
+        }
+
+        *count_ptr = bit_count;
+    }
+
+    return true;
+}
+
+/* ============================================================================
+ * Deflate Decoder
+ * ============================================================================ */
+
+static int tinyexr_dfl_decode_symbol_slow(TinyExrDflBitReader* reader,
+                                           const TinyExrDflHuffTable* table) {
+    if (reader->count < 15) {
+        tinyexr_dfl_br_refill(reader);
+    }
+
+    const uint16_t* ptr = table->slow_table;
+
+    for (int bits = 11; bits <= table->max_bits && bits <= 15; bits++) {
+        uint16_t cnt = *ptr++;
+        uint32_t code_mask = (1u << bits) - 1;
+        uint32_t peeked = tinyexr_dfl_br_peek(reader, bits) & code_mask;
+
+        for (uint16_t i = 0; i < cnt; i++) {
+            uint16_t stored_code = ptr[i * 2];
+            uint16_t symbol = ptr[i * 2 + 1];
+
+            if (peeked == stored_code) {
+                tinyexr_dfl_br_consume(reader, bits);
+                return (int)symbol;
+            }
+        }
+        ptr += cnt * 2;
+    }
+
+    return -1;
+}
+
+TINYEXR_DFL_INLINE int tinyexr_dfl_decode_symbol(TinyExrDflBitReader* reader,
+                                                   const TinyExrDflHuffTable* table) {
+    if (reader->count < 15) {
+        tinyexr_dfl_br_refill(reader);
+    }
+
+    uint32_t idx = tinyexr_dfl_br_peek(reader, 10);
+    uint16_t entry = table->fast_table[idx];
+
+    if (TINYEXR_LIKELY(entry & 0x8000)) {
+        int len = entry & 0xF;
+        int sym = (entry >> 4) & 0x7FF;
+        tinyexr_dfl_br_consume(reader, len);
+        return sym;
+    }
+
+    return tinyexr_dfl_decode_symbol_slow(reader, table);
+}
+
+static void tinyexr_dfl_copy_match(uint8_t* dst, const uint8_t* src,
+                                    int length, int distance) {
+    if (TINYEXR_UNLIKELY(length <= 0)) return;
+
+    if (distance == 1) {
+        /* RLE: single byte repeat */
+        exr_memset(dst, *src, (size_t)length);
+        return;
+    }
+
+    if (distance == 2 && length >= 4) {
+        uint16_t pattern;
+        exr_memcpy(&pattern, src, 2);
+        while (length >= 8) {
+            exr_memcpy(dst + 0, &pattern, 2);
+            exr_memcpy(dst + 2, &pattern, 2);
+            exr_memcpy(dst + 4, &pattern, 2);
+            exr_memcpy(dst + 6, &pattern, 2);
+            dst += 8;
+            length -= 8;
+        }
+        while (length >= 2) {
+            exr_memcpy(dst, &pattern, 2);
+            dst += 2;
+            length -= 2;
+        }
+        src = dst - distance;
+    } else if (distance == 4 && length >= 8) {
+        uint32_t pattern;
+        exr_memcpy(&pattern, src, 4);
+        while (length >= 16) {
+            exr_memcpy(dst + 0, &pattern, 4);
+            exr_memcpy(dst + 4, &pattern, 4);
+            exr_memcpy(dst + 8, &pattern, 4);
+            exr_memcpy(dst + 12, &pattern, 4);
+            dst += 16;
+            length -= 16;
+        }
+        while (length >= 4) {
+            exr_memcpy(dst, &pattern, 4);
+            dst += 4;
+            length -= 4;
+        }
+        src = dst - distance;
+    }
+
+    while (length-- > 0) {
+        *dst++ = *src++;
+    }
+}
+
+static bool tinyexr_dfl_decode_dynamic_tables(TinyExrDflBitReader* reader,
+                                               TinyExrDflHuffTable* litlen,
+                                               TinyExrDflHuffTable* dist) {
+    tinyexr_dfl_br_refill(reader);
+
+    int hlit = tinyexr_dfl_br_read(reader, 5) + 257;
+    int hdist = tinyexr_dfl_br_read(reader, 5) + 1;
+    int hclen = tinyexr_dfl_br_read(reader, 4) + 4;
+
+    uint8_t codelen_lens[TINYEXR_DFL_CODELEN_CODES] = {0};
+    for (int i = 0; i < hclen; i++) {
+        if (reader->count < 3) tinyexr_dfl_br_refill(reader);
+        codelen_lens[tinyexr_dfl_codelen_order[i]] = (uint8_t)tinyexr_dfl_br_read(reader, 3);
+    }
+
+    TinyExrDflHuffTable codelen_table;
+    if (!tinyexr_dfl_ht_build(&codelen_table, codelen_lens, TINYEXR_DFL_CODELEN_CODES)) {
+        return false;
+    }
+
+    uint8_t all_lens[TINYEXR_DFL_LITLEN_CODES + TINYEXR_DFL_DIST_CODES] = {0};
+    int total = hlit + hdist;
+    int i = 0;
+
+    while (i < total) {
+        tinyexr_dfl_br_refill(reader);
+        int sym = tinyexr_dfl_decode_symbol(reader, &codelen_table);
+
+        if (sym < 0) return false;
+
+        if (sym < 16) {
+            all_lens[i++] = (uint8_t)sym;
+        } else if (sym == 16) {
+            if (i == 0) return false;
+            int repeat = tinyexr_dfl_br_read(reader, 2) + 3;
+            uint8_t prev = all_lens[i - 1];
+            while (repeat-- > 0 && i < total) {
+                all_lens[i++] = prev;
+            }
+        } else if (sym == 17) {
+            int repeat = tinyexr_dfl_br_read(reader, 3) + 3;
+            while (repeat-- > 0 && i < total) {
+                all_lens[i++] = 0;
+            }
+        } else if (sym == 18) {
+            int repeat = tinyexr_dfl_br_read(reader, 7) + 11;
+            while (repeat-- > 0 && i < total) {
+                all_lens[i++] = 0;
+            }
+        }
+    }
+
+    if (!tinyexr_dfl_ht_build(litlen, all_lens, hlit)) return false;
+    if (!tinyexr_dfl_ht_build(dist, all_lens + hlit, hdist)) return false;
+
+    return true;
+}
+
+static bool tinyexr_dfl_decode_block(TinyExrDflBitReader* reader,
+                                      const TinyExrDflHuffTable* litlen_t,
+                                      const TinyExrDflHuffTable* dist_t,
+                                      uint8_t** out,
+                                      uint8_t* out_start,
+                                      uint8_t* out_end) {
+    for (;;) {
+        int sym = tinyexr_dfl_decode_symbol(reader, litlen_t);
+        if (sym < 0) return false;
+
+        if (sym < 256) {
+            if (TINYEXR_UNLIKELY(*out >= out_end)) return false;
+            *(*out)++ = (uint8_t)sym;
+        } else if (sym == 256) {
+            return true;
+        } else {
+            int length_sym = sym - 257;
+            if (length_sym >= 29) return false;
+
+            int length = tinyexr_dfl_length_base[length_sym];
+            int extra_bits = tinyexr_dfl_length_extra[length_sym];
+            if (extra_bits > 0) {
+                if (reader->count < extra_bits) tinyexr_dfl_br_refill(reader);
+                length += tinyexr_dfl_br_read(reader, extra_bits);
+            }
+
+            int dist_sym = tinyexr_dfl_decode_symbol(reader, dist_t);
+            if (dist_sym < 0 || dist_sym >= 30) return false;
+
+            int distance = tinyexr_dfl_dist_base[dist_sym];
+            extra_bits = tinyexr_dfl_dist_extra[dist_sym];
+            if (extra_bits > 0) {
+                if (reader->count < extra_bits) tinyexr_dfl_br_refill(reader);
+                distance += tinyexr_dfl_br_read(reader, extra_bits);
+            }
+
+            if (TINYEXR_UNLIKELY(*out + length > out_end)) return false;
+            if (TINYEXR_UNLIKELY(*out - out_start < distance)) return false;
+
+            const uint8_t* match = *out - distance;
+            tinyexr_dfl_copy_match(*out, match, length, distance);
+            *out += length;
+        }
+    }
+}
+
+/* ============================================================================
+ * Public API
+ * ============================================================================ */
+
+/* Decompress raw deflate stream (no zlib header) */
+static bool tinyexr_inflate(const uint8_t* src, size_t src_len,
+                             uint8_t* dst, size_t* dst_len) {
+    TinyExrDflBitReader reader;
+    tinyexr_dfl_br_init(&reader, src, src_len);
+
+    /* Build fixed Huffman tables */
+    TinyExrDflHuffTable fixed_litlen, fixed_dist;
+    tinyexr_dfl_ht_build_fixed_litlen(&fixed_litlen);
+    tinyexr_dfl_ht_build_fixed_dist(&fixed_dist);
+
+    uint8_t* out = dst;
+    uint8_t* out_end = dst + *dst_len;
+    bool final_block = false;
+
+    while (!final_block) {
+        tinyexr_dfl_br_refill(&reader);
+
+        final_block = tinyexr_dfl_br_read(&reader, 1) != 0;
+        int block_type = tinyexr_dfl_br_read(&reader, 2);
+
+        if (block_type == 0) {
+            /* Stored block */
+            tinyexr_dfl_br_align(&reader);
+            if (reader.count < 32) tinyexr_dfl_br_refill(&reader);
+
+            uint16_t len = (uint16_t)tinyexr_dfl_br_read(&reader, 16);
+            uint16_t nlen = (uint16_t)tinyexr_dfl_br_read(&reader, 16);
+
+            if ((len ^ nlen) != 0xFFFF) return false;
+            if (out + len > out_end) return false;
+
+            for (int i = 0; i < len; i++) {
+                if (reader.count < 8) tinyexr_dfl_br_refill(&reader);
+                *out++ = (uint8_t)tinyexr_dfl_br_read(&reader, 8);
+            }
+        } else if (block_type == 1) {
+            /* Fixed Huffman */
+            if (!tinyexr_dfl_decode_block(&reader, &fixed_litlen, &fixed_dist,
+                                           &out, dst, out_end)) {
+                return false;
+            }
+        } else if (block_type == 2) {
+            /* Dynamic Huffman */
+            TinyExrDflHuffTable dyn_litlen, dyn_dist;
+            if (!tinyexr_dfl_decode_dynamic_tables(&reader, &dyn_litlen, &dyn_dist)) {
+                return false;
+            }
+            if (!tinyexr_dfl_decode_block(&reader, &dyn_litlen, &dyn_dist,
+                                           &out, dst, out_end)) {
+                return false;
+            }
+        } else {
+            return false; /* Invalid block type */
+        }
+    }
+
+    *dst_len = (size_t)(out - dst);
+    return true;
+}
+
+/* Decompress zlib data (with 2-byte header + 4-byte Adler-32 trailer) */
+static bool tinyexr_inflate_zlib(const uint8_t* src, size_t src_len,
+                                  uint8_t* dst, size_t* dst_len) {
+    if (src_len < 2) return false;
+
+    uint8_t cmf = src[0];
+    uint8_t flg = src[1];
+
+    if ((cmf & 0x0F) != 8) return false;           /* Must be deflate */
+    if (((cmf << 8) | flg) % 31 != 0) return false; /* Header checksum */
+
+    size_t offset = 2;
+    if (flg & 0x20) {
+        /* Dictionary present - skip 4 bytes */
+        if (src_len < 6) return false;
+        offset += 4;
+    }
+
+    /* Skip trailing 4-byte Adler-32 checksum */
+    if (src_len - offset < 4) return false;
+    return tinyexr_inflate(src + offset, src_len - offset - 4, dst, dst_len);
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TINYEXR_DEFLATE_H_ */
