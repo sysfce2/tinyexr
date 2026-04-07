@@ -2329,81 +2329,59 @@ static ExrResult decompress_piz(const uint8_t* src, size_t src_size,
     /* Apply forward LUT (compress range) */
     piz_apply_lut(fwd_lut, tmp, (int)total_samples);
 
-    /* Wavelet decode per channel */
-    {
-        PizChannelData cd[128]; /* max channels */
-        if (num_channels > 128) { EXR_CRT_FREE(tmp); return EXR_ERROR_INVALID_DATA; }
+    /* Build per-channel metadata and wavelet decode */
+    PizChannelData cd[128];
+    if (num_channels > 128) { EXR_CRT_FREE(tmp); return EXR_ERROR_INVALID_DATA; }
 
-        uint16_t* chan_ptr = tmp;
-        for (int c = 0; c < num_channels; c++) {
-            int ch_width = data_width / channels[c].x_sampling;
-            int ch_height = num_lines / channels[c].y_sampling;
-            int bpp = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
-            size_t ch_samples = (size_t)ch_width * ch_height * bpp;
+    uint16_t* chan_ptr = tmp;
+    size_t bytes_per_scanline = 0;
+    for (int c = 0; c < num_channels; c++) {
+        int ch_width = data_width / channels[c].x_sampling;
+        int ch_height = num_lines / channels[c].y_sampling;
+        int bpp = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
+        size_t ch_samples = (size_t)ch_width * (size_t)ch_height * (size_t)bpp;
+        int pixel_bytes = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
 
-            cd[c].start = chan_ptr;
-            cd[c].end = chan_ptr + ch_samples;
-            cd[c].nx = ch_width * bpp;
-            cd[c].ny = ch_height;
-            cd[c].size = bpp;
+        cd[c].start = chan_ptr;
+        cd[c].end = chan_ptr + ch_samples;
+        cd[c].nx = ch_width * bpp;
+        cd[c].ny = ch_height;
+        cd[c].size = bpp;
 
-            chan_ptr += ch_samples;
-        }
+        chan_ptr += ch_samples;
+        bytes_per_scanline += (size_t)ch_width * (size_t)pixel_bytes;
+    }
 
-        for (int c = 0; c < num_channels; c++) {
-            piz_wav2_decode(cd[c].start, cd[c].nx, 1, cd[c].ny, cd[c].nx, maxValue);
-        }
+    for (int c = 0; c < num_channels; c++) {
+        piz_wav2_decode(cd[c].start, cd[c].nx, 1, cd[c].ny, cd[c].nx, maxValue);
     }
 
     /* Apply reverse LUT (expand range) */
     piz_apply_lut(rev_lut, tmp, (int)total_samples);
 
     /* Copy to output in per-scanline interleaved layout */
-    {
-        size_t bytes_per_scanline = 0;
+    for (int line = 0; line < num_lines; line++) {
+        size_t ch_byte_offset = 0;
         for (int c = 0; c < num_channels; c++) {
             int ch_width = data_width / channels[c].x_sampling;
             int pixel_bytes = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
-            bytes_per_scanline += (size_t)ch_width * pixel_bytes;
-        }
 
-        for (int line = 0; line < num_lines; line++) {
-            size_t ch_byte_offset = 0;
-            for (int c = 0; c < num_channels; c++) {
-                int ch_width = data_width / channels[c].x_sampling;
-                if ((line % channels[c].y_sampling) != 0) {
-                    int pixel_bytes = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
-                    ch_byte_offset += (size_t)ch_width * pixel_bytes;
-                    continue;
-                }
-
-                int bpp = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
-                int ch_line = line / channels[c].y_sampling;
-                int nx = ch_width * bpp;
-
-                /* Source: channel c's wavelet-decoded data, line ch_line */
-                /* Find channel start in tmp */
-                uint16_t* ch_start = tmp;
-                for (int i = 0; i < c; i++) {
-                    int w = data_width / channels[i].x_sampling;
-                    int h = num_lines / channels[i].y_sampling;
-                    int b = (channels[i].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
-                    ch_start += (size_t)w * h * b;
-                }
-
-                uint16_t* line_data = ch_start + (size_t)ch_line * nx;
-                uint8_t* dst_line = dst + (size_t)line * bytes_per_scanline + ch_byte_offset;
-
-                /* Copy uint16 samples to output bytes (little-endian) */
-                for (int x = 0; x < nx; x++) {
-                    uint16_t val = line_data[x];
-                    dst_line[x * 2] = (uint8_t)(val & 0xFF);
-                    dst_line[x * 2 + 1] = (uint8_t)(val >> 8);
-                }
-
-                int pixel_bytes = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
-                ch_byte_offset += (size_t)ch_width * pixel_bytes;
+            if ((line % channels[c].y_sampling) != 0) {
+                ch_byte_offset += (size_t)ch_width * (size_t)pixel_bytes;
+                continue;
             }
+
+            int ch_line = line / channels[c].y_sampling;
+            uint16_t* line_data = cd[c].start + (size_t)ch_line * cd[c].nx;
+            uint8_t* dst_line = dst + (size_t)line * bytes_per_scanline + ch_byte_offset;
+
+            for (int x = 0; x < cd[c].nx; x++) {
+                uint16_t val = line_data[x];
+                dst_line[x * 2] = (uint8_t)(val & 0xFF);
+                dst_line[x * 2 + 1] = (uint8_t)(val >> 8);
+            }
+
+            ch_byte_offset += (size_t)ch_width * (size_t)pixel_bytes;
         }
     }
 
@@ -2514,6 +2492,121 @@ static void deinterleave_channels(const uint8_t* src, uint8_t* dst,
             }
         }
     }
+}
+
+/* PXR24 decompression: zlib inflate + byte-plane delta decode.
+ * Shared by both scanline and tiled reading paths. */
+static ExrResult decompress_pxr24(const uint8_t* src, size_t src_size,
+                                   uint8_t* dst, size_t dst_size,
+                                   size_t* out_size,
+                                   uint32_t num_channels, const ExrChannelData* channels,
+                                   int data_width, int num_lines,
+                                   ExrContext ctx) {
+    /* Calculate PXR24 intermediate buffer size (with overflow checks) */
+    size_t pxr24_size = 0;
+    for (uint32_t c = 0; c < num_channels; c++) {
+        size_t ch_w = (size_t)(data_width / channels[c].x_sampling);
+        size_t ch_h = (size_t)(num_lines / channels[c].y_sampling);
+        size_t bpc;
+        switch (channels[c].pixel_type) {
+            case EXR_PIXEL_UINT:  bpc = 4; break;
+            case EXR_PIXEL_HALF:  bpc = 2; break;
+            case EXR_PIXEL_FLOAT: bpc = 3; break;
+            default: bpc = 2; break;
+        }
+        size_t ch_size = ch_w * ch_h * bpc;
+        if (ch_w > 0 && ch_size / ch_w / bpc != ch_h) {
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+        pxr24_size += ch_size;
+    }
+
+    uint8_t* pxr24_buf = (uint8_t*)ctx->allocator.alloc(
+        ctx->allocator.userdata, pxr24_size, EXR_DEFAULT_ALIGNMENT);
+    if (!pxr24_buf) return EXR_ERROR_OUT_OF_MEMORY;
+
+    /* Decompress zlib */
+    bool pxr24_ok = false;
+    if (pxr24_size == src_size) {
+        exr_memcpy(pxr24_buf, src, src_size);
+        pxr24_ok = true;
+    } else {
+        size_t uncomp_size = pxr24_size;
+#if defined(TINYEXR_V3_USE_MINIZ)
+        {
+            mz_ulong mz_uncomp = (mz_ulong)pxr24_size;
+            pxr24_ok = (mz_uncompress(pxr24_buf, &mz_uncomp, src, (mz_ulong)src_size) == MZ_OK);
+            if (pxr24_ok && (size_t)mz_uncomp != pxr24_size) pxr24_ok = false;
+        }
+#else
+        pxr24_ok = tinyexr_inflate_zlib(src, src_size, pxr24_buf, &uncomp_size);
+        if (pxr24_ok && uncomp_size != pxr24_size) pxr24_ok = false;
+#endif
+    }
+
+    if (pxr24_ok) {
+        /* Convert PXR24 byte-plane delta encoding to standard pixel format */
+        const uint8_t* in_ptr = pxr24_buf;
+        uint8_t* out_ptr = dst;
+
+        for (int line = 0; line < num_lines; line++) {
+            for (uint32_t c = 0; c < num_channels; c++) {
+                int w = data_width / channels[c].x_sampling;
+                if ((line % channels[c].y_sampling) != 0) continue;
+
+                switch (channels[c].pixel_type) {
+                    case EXR_PIXEL_UINT: {
+                        const uint8_t* p0 = in_ptr;
+                        const uint8_t* p1 = in_ptr + w;
+                        const uint8_t* p2 = in_ptr + w * 2;
+                        const uint8_t* p3 = in_ptr + w * 3;
+                        in_ptr += w * 4;
+                        uint32_t pixel = 0;
+                        for (int x = 0; x < w; x++) {
+                            pixel += ((uint32_t)p0[x] << 24) | ((uint32_t)p1[x] << 16) |
+                                     ((uint32_t)p2[x] << 8) | ((uint32_t)p3[x]);
+                            exr_memcpy(out_ptr, &pixel, 4);
+                            out_ptr += 4;
+                        }
+                        break;
+                    }
+                    case EXR_PIXEL_HALF: {
+                        const uint8_t* p0 = in_ptr;
+                        const uint8_t* p1 = in_ptr + w;
+                        in_ptr += w * 2;
+                        uint32_t pixel = 0;
+                        for (int x = 0; x < w; x++) {
+                            pixel += ((uint32_t)p0[x] << 8) | ((uint32_t)p1[x]);
+                            uint16_t h = (uint16_t)pixel;
+                            exr_memcpy(out_ptr, &h, 2);
+                            out_ptr += 2;
+                        }
+                        break;
+                    }
+                    case EXR_PIXEL_FLOAT: {
+                        const uint8_t* p0 = in_ptr;
+                        const uint8_t* p1 = in_ptr + w;
+                        const uint8_t* p2 = in_ptr + w * 2;
+                        in_ptr += w * 3;
+                        uint32_t pixel = 0;
+                        for (int x = 0; x < w; x++) {
+                            pixel += ((uint32_t)p0[x] << 24) | ((uint32_t)p1[x] << 16) |
+                                     ((uint32_t)p2[x] << 8);
+                            exr_memcpy(out_ptr, &pixel, 4);
+                            out_ptr += 4;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    ctx->allocator.free(ctx->allocator.userdata, pxr24_buf, pxr24_size);
+
+    if (!pxr24_ok) return EXR_ERROR_DECOMPRESSION_FAILED;
+    *out_size = dst_size;
+    return EXR_SUCCESS;
 }
 
 /* Read and decompress a single chunk */
@@ -2653,143 +2746,28 @@ static ExrResult read_chunk(ExrDecoder decoder, ExrPartData* part, uint32_t chun
         }
 
         case EXR_COMPRESSION_PXR24: {
-            /* Calculate expected PXR24 intermediate size (with overflow checks) */
-            size_t pxr24_size = 0;
-            for (uint32_t c = 0; c < part->num_channels; c++) {
-                size_t ch_width = (size_t)(part->width / part->channels[c].x_sampling);
-                size_t ch_height = (size_t)(num_lines / part->channels[c].y_sampling);
-                size_t bpc; /* bytes per component in PXR24 format */
-                switch (part->channels[c].pixel_type) {
-                    case EXR_PIXEL_UINT:  bpc = 4; break;
-                    case EXR_PIXEL_HALF:  bpc = 2; break;
-                    case EXR_PIXEL_FLOAT: bpc = 3; break;
-                    default: bpc = 2; break;
-                }
-                size_t ch_size = ch_width * ch_height * bpc;
-                if (ch_width > 0 && ch_size / ch_width / bpc != ch_height) {
-                    ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                    ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                    return EXR_ERROR_OUT_OF_MEMORY;
-                }
-                pxr24_size += ch_size;
-            }
-
-            uint8_t* pxr24_buf = (uint8_t*)ctx->allocator.alloc(
-                ctx->allocator.userdata, pxr24_size, EXR_DEFAULT_ALIGNMENT);
-            if (!pxr24_buf) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_OUT_OF_MEMORY;
-            }
-
-            bool pxr24_ok = false;
-            if (pxr24_size == data_size) {
-                exr_memcpy(pxr24_buf, compressed, data_size);
-                pxr24_ok = true;
-            } else {
-                size_t uncomp_size = pxr24_size;
-#if defined(TINYEXR_V3_USE_MINIZ)
-                {
-                    mz_ulong mz_uncomp = (mz_ulong)pxr24_size;
-                    pxr24_ok = (mz_uncompress(pxr24_buf, &mz_uncomp, compressed, (mz_ulong)data_size) == MZ_OK);
-                    if (pxr24_ok && (size_t)mz_uncomp != pxr24_size) pxr24_ok = false;
-                }
-#else
-                pxr24_ok = tinyexr_inflate_zlib(compressed, data_size, pxr24_buf, &uncomp_size);
-                if (pxr24_ok && uncomp_size != pxr24_size) pxr24_ok = false;
-#endif
-            }
-
-            if (pxr24_ok) {
-                const uint8_t* in_ptr = pxr24_buf;
-                uint8_t* out_ptr = decompressed;
-
-                for (int line = 0; line < num_lines; line++) {
-                    for (uint32_t c = 0; c < part->num_channels; c++) {
-                        int w = part->width / part->channels[c].x_sampling;
-                        if ((line % part->channels[c].y_sampling) != 0) continue;
-
-                        switch (part->channels[c].pixel_type) {
-                            case 0: { /* UINT - 4 byte planes with delta encoding */
-                                const uint8_t* ptr0 = in_ptr;
-                                const uint8_t* ptr1 = in_ptr + w;
-                                const uint8_t* ptr2 = in_ptr + w * 2;
-                                const uint8_t* ptr3 = in_ptr + w * 3;
-                                in_ptr += w * 4;
-
-                                uint32_t pixel = 0;
-                                for (int x = 0; x < w; x++) {
-                                    uint32_t diff = ((uint32_t)ptr0[x] << 24) |
-                                                    ((uint32_t)ptr1[x] << 16) |
-                                                    ((uint32_t)ptr2[x] << 8) |
-                                                    ((uint32_t)ptr3[x]);
-                                    pixel += diff;
-                                    exr_memcpy(out_ptr, &pixel, 4);
-                                    out_ptr += 4;
-                                }
-                                break;
-                            }
-                            case 1: { /* HALF - 2 byte planes with delta encoding */
-                                const uint8_t* ptr0 = in_ptr;
-                                const uint8_t* ptr1 = in_ptr + w;
-                                in_ptr += w * 2;
-
-                                uint32_t pixel = 0;
-                                for (int x = 0; x < w; x++) {
-                                    uint32_t diff = ((uint32_t)ptr0[x] << 8) |
-                                                    ((uint32_t)ptr1[x]);
-                                    pixel += diff;
-                                    uint16_t h = (uint16_t)pixel;
-                                    exr_memcpy(out_ptr, &h, 2);
-                                    out_ptr += 2;
-                                }
-                                break;
-                            }
-                            case 2: { /* FLOAT - 3 byte planes with delta encoding */
-                                const uint8_t* ptr0 = in_ptr;
-                                const uint8_t* ptr1 = in_ptr + w;
-                                const uint8_t* ptr2 = in_ptr + w * 2;
-                                in_ptr += w * 3;
-
-                                uint32_t pixel = 0;
-                                for (int x = 0; x < w; x++) {
-                                    uint32_t diff = ((uint32_t)ptr0[x] << 24) |
-                                                    ((uint32_t)ptr1[x] << 16) |
-                                                    ((uint32_t)ptr2[x] << 8);
-                                    pixel += diff;
-                                    exr_memcpy(out_ptr, &pixel, 4);
-                                    out_ptr += 4;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            ctx->allocator.free(ctx->allocator.userdata, pxr24_buf, pxr24_size);
-
-            if (!pxr24_ok) {
-                exr_context_add_error(ctx, EXR_ERROR_DECOMPRESSION_FAILED,
+            result = decompress_pxr24(compressed, data_size, decompressed,
+                                       expected_size, &decompressed_size,
+                                       part->num_channels, part->channels,
+                                       part->width, num_lines, ctx);
+            if (EXR_FAILED(result)) {
+                exr_context_add_error(ctx, result,
                                       "PXR24 decompression failed", "chunk", offset);
                 ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
                 ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_DECOMPRESSION_FAILED;
+                return result;
             }
-            decompressed_size = expected_size;
             break;
         }
 
         case EXR_COMPRESSION_B44:
         case EXR_COMPRESSION_B44A: {
-            bool is_b44a = (part->compression == EXR_COMPRESSION_B44A);
-
             bool b44_ok = tinyexr_decompress_b44(
                 decompressed, expected_size,
                 compressed, data_size,
                 part->width, num_lines,
                 (int)part->num_channels,
-                (const TinyExrB44Channel*)part->channels, is_b44a);
+                (const TinyExrB44Channel*)part->channels);
 
             if (!b44_ok) {
                 exr_context_add_error(ctx, EXR_ERROR_DECOMPRESSION_FAILED,
@@ -3083,138 +3061,26 @@ static ExrResult read_tile(ExrDecoder decoder, ExrPartData* part,
         }
 
         case EXR_COMPRESSION_PXR24: {
-            /* Calculate expected PXR24 intermediate size for tile (with overflow checks) */
-            size_t pxr24_size = 0;
-            for (uint32_t c = 0; c < part->num_channels; c++) {
-                size_t ch_width = (size_t)(tile_width / part->channels[c].x_sampling);
-                size_t ch_height = (size_t)(tile_height / part->channels[c].y_sampling);
-                size_t bpc;
-                switch (part->channels[c].pixel_type) {
-                    case EXR_PIXEL_UINT:  bpc = 4; break;
-                    case EXR_PIXEL_HALF:  bpc = 2; break;
-                    case EXR_PIXEL_FLOAT: bpc = 3; break;
-                    default: bpc = 2; break;
-                }
-                size_t ch_size = ch_width * ch_height * bpc;
-                if (ch_width > 0 && ch_size / ch_width / bpc != ch_height) {
-                    ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                    ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                    return EXR_ERROR_OUT_OF_MEMORY;
-                }
-                pxr24_size += ch_size;
-            }
-
-            uint8_t* pxr24_buf = (uint8_t*)ctx->allocator.alloc(
-                ctx->allocator.userdata, pxr24_size, EXR_DEFAULT_ALIGNMENT);
-            if (!pxr24_buf) {
+            result = decompress_pxr24(compressed, data_size, decompressed,
+                                       expected_size, &decompressed_size,
+                                       part->num_channels, part->channels,
+                                       tile_width, tile_height, ctx);
+            if (EXR_FAILED(result)) {
                 ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
                 ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_OUT_OF_MEMORY;
+                return result;
             }
-
-            bool pxr24_ok = false;
-            if (pxr24_size == data_size) {
-                exr_memcpy(pxr24_buf, compressed, data_size);
-                pxr24_ok = true;
-            } else {
-                size_t uncomp_size = pxr24_size;
-#if defined(TINYEXR_V3_USE_MINIZ)
-                {
-                    mz_ulong mz_uncomp = (mz_ulong)pxr24_size;
-                    pxr24_ok = (mz_uncompress(pxr24_buf, &mz_uncomp, compressed, (mz_ulong)data_size) == MZ_OK);
-                    if (pxr24_ok && (size_t)mz_uncomp != pxr24_size) pxr24_ok = false;
-                }
-#else
-                pxr24_ok = tinyexr_inflate_zlib(compressed, data_size, pxr24_buf, &uncomp_size);
-                if (pxr24_ok && uncomp_size != pxr24_size) pxr24_ok = false;
-#endif
-            }
-
-            if (pxr24_ok) {
-                const uint8_t* in_ptr = pxr24_buf;
-                uint8_t* out_ptr = decompressed;
-
-                for (int line = 0; line < tile_height; line++) {
-                    for (uint32_t c = 0; c < part->num_channels; c++) {
-                        int w = tile_width / part->channels[c].x_sampling;
-                        if ((line % part->channels[c].y_sampling) != 0) continue;
-
-                        switch (part->channels[c].pixel_type) {
-                            case EXR_PIXEL_UINT: {
-                                const uint8_t* ptr0 = in_ptr;
-                                const uint8_t* ptr1 = in_ptr + w;
-                                const uint8_t* ptr2 = in_ptr + w * 2;
-                                const uint8_t* ptr3 = in_ptr + w * 3;
-                                in_ptr += w * 4;
-                                uint32_t pixel = 0;
-                                for (int x = 0; x < w; x++) {
-                                    uint32_t diff = ((uint32_t)ptr0[x] << 24) |
-                                                    ((uint32_t)ptr1[x] << 16) |
-                                                    ((uint32_t)ptr2[x] << 8) |
-                                                    ((uint32_t)ptr3[x]);
-                                    pixel += diff;
-                                    exr_memcpy(out_ptr, &pixel, 4);
-                                    out_ptr += 4;
-                                }
-                                break;
-                            }
-                            case EXR_PIXEL_HALF: {
-                                const uint8_t* ptr0 = in_ptr;
-                                const uint8_t* ptr1 = in_ptr + w;
-                                in_ptr += w * 2;
-                                uint32_t pixel = 0;
-                                for (int x = 0; x < w; x++) {
-                                    uint32_t diff = ((uint32_t)ptr0[x] << 8) |
-                                                    ((uint32_t)ptr1[x]);
-                                    pixel += diff;
-                                    uint16_t h = (uint16_t)pixel;
-                                    exr_memcpy(out_ptr, &h, 2);
-                                    out_ptr += 2;
-                                }
-                                break;
-                            }
-                            case EXR_PIXEL_FLOAT: {
-                                const uint8_t* ptr0 = in_ptr;
-                                const uint8_t* ptr1 = in_ptr + w;
-                                const uint8_t* ptr2 = in_ptr + w * 2;
-                                in_ptr += w * 3;
-                                uint32_t pixel = 0;
-                                for (int x = 0; x < w; x++) {
-                                    uint32_t diff = ((uint32_t)ptr0[x] << 24) |
-                                                    ((uint32_t)ptr1[x] << 16) |
-                                                    ((uint32_t)ptr2[x] << 8);
-                                    pixel += diff;
-                                    exr_memcpy(out_ptr, &pixel, 4);
-                                    out_ptr += 4;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            ctx->allocator.free(ctx->allocator.userdata, pxr24_buf, pxr24_size);
-
-            if (!pxr24_ok) {
-                ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);
-                ctx->allocator.free(ctx->allocator.userdata, decompressed, expected_size);
-                return EXR_ERROR_DECOMPRESSION_FAILED;
-            }
-            decompressed_size = expected_size;
             break;
         }
 
         case EXR_COMPRESSION_B44:
         case EXR_COMPRESSION_B44A: {
-            bool is_b44a = (part->compression == EXR_COMPRESSION_B44A);
-
             bool b44_ok = tinyexr_decompress_b44(
                 decompressed, expected_size,
                 compressed, data_size,
                 tile_width, tile_height,
                 (int)part->num_channels,
-                (const TinyExrB44Channel*)part->channels, is_b44a);
+                (const TinyExrB44Channel*)part->channels);
 
             if (!b44_ok) {
                 ctx->allocator.free(ctx->allocator.userdata, compressed, data_size);

@@ -192,24 +192,20 @@ static void tinyexr_b44_unpack_flat_block(uint16_t dst[16], const uint8_t src[3]
     }
 }
 
-/* ============================================================================
- * B44 Channel Info (matches ExrChannelData layout)
- * ============================================================================ */
+/*
+ * Channel info for B44 decompression.
+ * Layout must match ExrChannelData in tinyexr_c_impl.c exactly.
+ * Uses EXR_PIXEL_* constants from tinyexr_c.h.
+ */
+#include "tinyexr_c.h"
 
-/* We accept a generic channel struct with these fields.
- * The caller passes ExrChannelData* which has compatible layout. */
 typedef struct {
     char name[64];
-    uint32_t pixel_type;   /* 0=UINT, 1=HALF, 2=FLOAT */
+    uint32_t pixel_type;   /* EXR_PIXEL_UINT/HALF/FLOAT */
     int32_t x_sampling;
     int32_t y_sampling;
     uint8_t p_linear;
 } TinyExrB44Channel;
-
-/* Pixel type constants (must match EXR_PIXEL_*) */
-#define TINYEXR_B44_PIXEL_UINT   0
-#define TINYEXR_B44_PIXEL_HALF   1
-#define TINYEXR_B44_PIXEL_FLOAT  2
 
 /* ============================================================================
  * B44/B44A Decompression
@@ -219,9 +215,13 @@ static bool tinyexr_decompress_b44(uint8_t* dst, size_t expected_size,
                                     const uint8_t* src, size_t src_size,
                                     int width, int num_lines,
                                     int num_channels,
-                                    const TinyExrB44Channel* channels,
-                                    bool is_b44a) {
-    (void)is_b44a; /* B44A flat detection is done per-block via shift value */
+                                    const TinyExrB44Channel* channels) {
+    /* B44A flat-block detection is done per-block via shift value (>= 13<<2) */
+
+    /* Eagerly init log tables if any channel uses p_linear */
+    for (int c = 0; c < num_channels; c++) {
+        if (channels[c].p_linear) { tinyexr_b44_init_tables(); break; }
+    }
 
     const uint8_t* in_ptr = src;
     const uint8_t* in_end = src + src_size;
@@ -230,7 +230,7 @@ static bool tinyexr_decompress_b44(uint8_t* dst, size_t expected_size,
     size_t bytes_per_scanline = 0;
     for (int c = 0; c < num_channels; c++) {
         int ch_width = width / channels[c].x_sampling;
-        size_t pixel_size = (channels[c].pixel_type == TINYEXR_B44_PIXEL_HALF) ? 2 : 4;
+        size_t pixel_size = (channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
         bytes_per_scanline += (size_t)ch_width * pixel_size;
     }
 
@@ -247,11 +247,11 @@ static bool tinyexr_decompress_b44(uint8_t* dst, size_t expected_size,
         size_t ch_offset = 0;
         for (int i = 0; i < c; i++) {
             int ch_w = width / channels[i].x_sampling;
-            size_t ps = (channels[i].pixel_type == TINYEXR_B44_PIXEL_HALF) ? 2 : 4;
+            size_t ps = (channels[i].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
             ch_offset += (size_t)ch_w * ps;
         }
 
-        if (channels[c].pixel_type != TINYEXR_B44_PIXEL_HALF) {
+        if (channels[c].pixel_type != EXR_PIXEL_HALF) {
             /* Non-HALF channels are stored uncompressed */
             size_t pixel_size = 4; /* UINT and FLOAT are both 4 bytes */
             for (int line = 0; line < num_lines; line++) {
@@ -309,7 +309,6 @@ static bool tinyexr_decompress_b44(uint8_t* dst, size_t expected_size,
 
                 /* Apply p_linear conversion (log table) if needed */
                 if (channels[c].p_linear) {
-                    tinyexr_b44_init_tables();
                     for (int i = 0; i < 16; i++) {
                         block[i] = g_tinyexr_b44_log_table[block[i]];
                     }

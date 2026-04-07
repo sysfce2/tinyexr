@@ -50,16 +50,6 @@ extern "C" {
 #endif
 #endif
 
-#ifndef TINYEXR_DFL_INLINE
-#if defined(__GNUC__) || defined(__clang__)
-#define TINYEXR_DFL_INLINE __attribute__((always_inline)) static inline
-#elif defined(_MSC_VER)
-#define TINYEXR_DFL_INLINE __forceinline static
-#else
-#define TINYEXR_DFL_INLINE static inline
-#endif
-#endif
-
 /* ============================================================================
  * Deflate Constants
  * ============================================================================ */

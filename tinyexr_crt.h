@@ -64,80 +64,63 @@ extern "C" {
  * Memory Functions
  * ============================================================================ */
 
+/*
+ * Use compiler builtins for memcpy/memset/memmove when available.
+ * These generate optimal code (single instructions for small sizes)
+ * and are freestanding-safe on GCC/Clang — no libc link required.
+ * Fall back to byte loops only on unknown compilers.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+#define exr_memcpy(d,s,n)  __builtin_memcpy((d),(s),(n))
+#define exr_memset(d,c,n)  __builtin_memset((d),(c),(n))
+#define exr_memmove(d,s,n) __builtin_memmove((d),(s),(n))
+#define exr_memcmp(a,b,n)  __builtin_memcmp((a),(b),(n))
+#define EXR_CRT_HAS_BUILTIN_MEM 1
+#elif defined(_MSC_VER)
+  void* __cdecl memcpy(void*, const void*, size_t);
+  void* __cdecl memset(void*, int, size_t);
+  void* __cdecl memmove(void*, const void*, size_t);
+  int   __cdecl memcmp(const void*, const void*, size_t);
+#define exr_memcpy(d,s,n)  memcpy((d),(s),(n))
+#define exr_memset(d,c,n)  memset((d),(c),(n))
+#define exr_memmove(d,s,n) memmove((d),(s),(n))
+#define exr_memcmp(a,b,n)  memcmp((a),(b),(n))
+#define EXR_CRT_HAS_BUILTIN_MEM 1
+#else
+/* Fallback: portable byte-at-a-time implementations */
 static void* exr_memcpy(void* dst, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
-    /* Word-sized copy for aligned, large transfers */
-    if (n >= sizeof(size_t) &&
-        ((uintptr_t)d % sizeof(size_t) == 0) &&
-        ((uintptr_t)s % sizeof(size_t) == 0)) {
-        size_t* dw = (size_t*)d;
-        const size_t* sw = (const size_t*)s;
-        size_t words = n / sizeof(size_t);
-        size_t i;
-        for (i = 0; i < words; i++) {
-            dw[i] = sw[i];
-        }
-        size_t done = words * sizeof(size_t);
-        d += done;
-        s += done;
-        n -= done;
-    }
-    while (n--) {
-        *d++ = *s++;
-    }
+    while (n--) *d++ = *s++;
     return dst;
 }
-
 static void* exr_memset(void* dst, int c, size_t n) {
     uint8_t* d = (uint8_t*)dst;
-    uint8_t val = (uint8_t)c;
-    /* Word fill for large clears */
-    if (n >= sizeof(size_t) && val == 0 &&
-        ((uintptr_t)d % sizeof(size_t) == 0)) {
-        size_t* dw = (size_t*)d;
-        size_t words = n / sizeof(size_t);
-        size_t i;
-        for (i = 0; i < words; i++) {
-            dw[i] = 0;
-        }
-        size_t done = words * sizeof(size_t);
-        d += done;
-        n -= done;
-    }
-    while (n--) {
-        *d++ = val;
-    }
+    while (n--) *d++ = (uint8_t)c;
     return dst;
 }
-
 static void* exr_memmove(void* dst, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
     if (d == s || n == 0) return dst;
     if (d < s || d >= s + n) {
-        /* No overlap or forward-safe: copy forward */
         return exr_memcpy(dst, src, n);
     }
-    /* Overlap, copy backward */
     d += n;
     s += n;
-    while (n--) {
-        *--d = *--s;
-    }
+    while (n--) { *--d = *--s; }
     return dst;
 }
-
 static int exr_memcmp(const void* a, const void* b, size_t n) {
     const uint8_t* pa = (const uint8_t*)a;
     const uint8_t* pb = (const uint8_t*)b;
     while (n--) {
         if (*pa != *pb) return (int)*pa - (int)*pb;
-        pa++;
-        pb++;
+        pa++; pb++;
     }
     return 0;
 }
+#endif /* fallback mem functions */
 
 /* ============================================================================
  * String Functions
@@ -267,14 +250,7 @@ static int exr_utoa_hex(char* buf, size_t buf_size, uint64_t val) {
  * Always NUL-terminates. Returns chars that would have been written.
  * ============================================================================ */
 
-static int exr_vsnprintf(char* buf, size_t buf_size, const char* fmt, ...) {
-    /* We implement this with a manual va_list-free format walker.
-     * For the actual variadic version, we need stdarg.h which is freestanding. */
-    (void)buf; (void)buf_size; (void)fmt;
-    return 0; /* placeholder — real impl below with va_list */
-}
-
-/* We need stdarg.h for va_list — this IS a freestanding header per C standard */
+/* stdarg.h is a freestanding header per the C standard */
 #include <stdarg.h>
 
 static int exr_vsnprintf_va(char* buf, size_t buf_size, const char* fmt, va_list args) {
