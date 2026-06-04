@@ -123,6 +123,46 @@ static void roundtrip(const char *path, exr_compression comp, const char *name) 
     exr_image_free(&back);
 }
 
+/* Build a tiled image from a scanline source in-memory, save tiled, reload. */
+static void tiled_roundtrip(const char *path) {
+    exr_image src, back;
+    void *buf = NULL;
+    size_t sz = 0;
+    exr_result rc;
+    memset(&src, 0, sizeof(src));
+    memset(&back, 0, sizeof(back));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src))) {
+        g_fail++;
+        printf("  FAIL: %s load (tiled rt)\n", path);
+        return;
+    }
+    src.parts[0].header.tiled = 1;
+    src.parts[0].header.part_type = EXR_PART_TILED;
+    src.parts[0].header.tile_x_size = 64;
+    src.parts[0].header.tile_y_size = 64;
+    src.parts[0].header.level_mode = EXR_TILE_ONE_LEVEL;
+    src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    rc = exr_save_to_memory(&buf, &sz, NULL, &src, EXR_COMPRESSION_ZIP);
+    if (!EXR_OK(rc)) {
+        g_fail++;
+        printf("  FAIL: tiled save: %s\n", exr_result_string(rc));
+        exr_image_free(&src);
+        return;
+    }
+    rc = exr_load_from_memory(buf, sz, NULL, &back);
+    if (!EXR_OK(rc)) {
+        g_fail++;
+        printf("  FAIL: tiled reload: %s\n", exr_result_string(rc));
+    } else {
+        CHECK(back.parts[0].header.tiled, "tiled flag preserved");
+        CHECK(images_equal(&src, &back), "tiled roundtrip pixels");
+        printf("  ok: tiled roundtrip (%s, ZIP, %zu bytes)\n", path, sz);
+    }
+    free(buf);
+    exr_image_free(&src);
+    exr_image_free(&back);
+}
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -154,6 +194,7 @@ int main(void) {
     roundtrip("asakusa.exr", EXR_COMPRESSION_ZIPS, "ZIPS");
     roundtrip("asakusa.exr", EXR_COMPRESSION_ZIP, "ZIP");
     roundtrip("test/unit/regression/flaga.exr", EXR_COMPRESSION_ZIP, "ZIP-8ch");
+    tiled_roundtrip("asakusa.exr");
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

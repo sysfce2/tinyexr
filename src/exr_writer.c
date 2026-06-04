@@ -213,6 +213,34 @@ static void gather_scanline_block(const exr_header *h, const int *order,
     }
 }
 
+static void gather_tile_block(const exr_header *h, const int *order,
+                              void *const *images, int abs_x0, int abs_y0,
+                              int tile_w, int tile_h, uint8_t *block) {
+    int xmin = h->data_window.min_x, xmax = h->data_window.max_x;
+    int ymin = h->data_window.min_y;
+    size_t off = 0;
+    int row, oi;
+    for (row = 0; row < tile_h; ++row) {
+        int yy = abs_y0 + row;
+        for (oi = 0; oi < h->num_channels; ++oi) {
+            int c = order[oi];
+            int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+            size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+            int tnx, cw, ch_row, ch_col;
+            if ((yy % ys) != 0) continue;
+            tnx = exr_num_samples(abs_x0, abs_x0 + tile_w - 1, xs);
+            if (tnx <= 0) continue;
+            cw = exr_num_samples(xmin, xmax, xs);
+            ch_row = exr_num_samples(ymin, yy, ys) - 1;
+            ch_col = exr_num_samples(xmin, abs_x0 - 1, xs);
+            memcpy(block + off,
+                   (const uint8_t *)images[c] + ((size_t)ch_row * cw + ch_col) * ps,
+                   (size_t)tnx * ps);
+            off += (size_t)tnx * ps;
+        }
+    }
+}
+
 /* Compress one canonical block per the codec; allocates *out (caller frees). */
 static exr_result compress_block(const exr_allocator *a, exr_compression comp,
                                  const uint8_t *block, size_t n, uint8_t **out,
@@ -256,11 +284,17 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
     b.a = a;
 
     for (p = 0; p < num_parts; ++p) {
-        if (parts[p].header.tiled) any_tiled = 1;
+        if (parts[p].header.tiled) {
+            any_tiled = 1;
+            /* mip/ripmap writing would require generating downsampled levels */
+            if (parts[p].header.level_mode != EXR_TILE_ONE_LEVEL)
+                return EXR_ERROR_UNSUPPORTED;
+            if (parts[p].header.tile_x_size == 0 || parts[p].header.tile_y_size == 0)
+                return EXR_ERROR_INVALID_ARGUMENT;
+        }
         if (parts[p].is_deep) any_deep = 1;
     }
-    if (any_tiled || any_deep)
-        return EXR_ERROR_UNSUPPORTED; /* writer: scanline only for now */
+    if (any_deep) return EXR_ERROR_UNSUPPORTED;
 
     orders = (int **)exr_calloc(a, (size_t)num_parts, sizeof(int *));
     chunk_counts = (uint32_t *)exr_calloc(a, (size_t)num_parts, sizeof(uint32_t));
@@ -279,9 +313,16 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
         orders[p] = (int *)exr_calloc(a, nch ? (size_t)nch : 1, sizeof(int));
         if (!orders[p]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
         sort_channels(&pt->header, orders[p]);
-        lpb = exr_lines_per_block(comp);
-        chunk_counts[p] =
-            (uint32_t)(((int64_t)pt->height + lpb - 1) / lpb);
+        if (pt->header.tiled) {
+            int tx = (int)pt->header.tile_x_size, ty = (int)pt->header.tile_y_size;
+            uint32_t nx = (uint32_t)((pt->width + tx - 1) / tx);
+            uint32_t ny = (uint32_t)((pt->height + ty - 1) / ty);
+            chunk_counts[p] = nx * ny;
+        } else {
+            lpb = exr_lines_per_block(comp);
+            chunk_counts[p] = (uint32_t)(((int64_t)pt->height + lpb - 1) / lpb);
+        }
+        (void)lpb;
     }
 
     /* magic + version */
@@ -320,35 +361,79 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
         const exr_header *h = &pt->header;
         exr_compression comp =
             comp_override >= 0 ? (exr_compression)comp_override : h->compression;
-        int lpb = exr_lines_per_block(comp);
-        int ymin = h->data_window.min_y, ymax = h->data_window.max_y;
-        uint32_t ci;
-        for (ci = 0; ci < chunk_counts[p]; ++ci) {
-            int y0 = ymin + (int)ci * lpb;
-            int nlines = (y0 + lpb - 1 > ymax) ? (ymax - y0 + 1) : lpb;
-            size_t blk_size;
-            uint8_t *block, *payload = NULL;
-            size_t payload_size = 0;
+        int xmin = h->data_window.min_x, ymin = h->data_window.min_y;
+        int ymax = h->data_window.max_y;
 
-            rc = exr_block_uncompressed_size(h->channels, h->num_channels,
-                                             h->data_window.min_x, y0, pt->width,
-                                             nlines, &blk_size);
-            if (!EXR_OK(rc)) goto done;
-            block = (uint8_t *)exr_malloc(a, blk_size ? blk_size : 1);
-            if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
-            gather_scanline_block(h, orders[p], (void *const *)pt->images, y0,
-                                  nlines, block);
-            rc = compress_block(a, comp, block, blk_size, &payload, &payload_size);
-            exr_free(a, block);
-            if (!EXR_OK(rc)) goto done;
+        if (h->tiled) {
+            int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
+            int nxt = (pt->width + tx - 1) / tx;
+            int nyt = (pt->height + ty - 1) / ty;
+            int txi, tyi;
+            for (tyi = 0; tyi < nyt; ++tyi) {
+                for (txi = 0; txi < nxt; ++txi) {
+                    uint32_t ci = (uint32_t)tyi * (uint32_t)nxt + (uint32_t)txi;
+                    int x0 = txi * tx, y0 = tyi * ty;
+                    int tile_w = (tx < pt->width - x0) ? tx : (pt->width - x0);
+                    int tile_h = (ty < pt->height - y0) ? ty : (pt->height - y0);
+                    int abs_x0 = xmin + x0, abs_y0 = ymin + y0;
+                    size_t blk_size, payload_size = 0;
+                    uint8_t *block, *payload = NULL;
 
-            offset_tables[p][ci] = (uint64_t)b.len;
-            if (multipart) ob_i32(&b, p);
-            ob_i32(&b, y0);
-            ob_i32(&b, (int32_t)payload_size);
-            ob_bytes(&b, payload, payload_size);
-            exr_free(a, payload);
-            if (b.err) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+                    rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                                     abs_x0, abs_y0, tile_w,
+                                                     tile_h, &blk_size);
+                    if (!EXR_OK(rc)) goto done;
+                    block = (uint8_t *)exr_malloc(a, blk_size ? blk_size : 1);
+                    if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+                    gather_tile_block(h, orders[p], (void *const *)pt->images,
+                                      abs_x0, abs_y0, tile_w, tile_h, block);
+                    rc = compress_block(a, comp, block, blk_size, &payload,
+                                        &payload_size);
+                    exr_free(a, block);
+                    if (!EXR_OK(rc)) goto done;
+
+                    offset_tables[p][ci] = (uint64_t)b.len;
+                    if (multipart) ob_i32(&b, p);
+                    ob_i32(&b, txi);
+                    ob_i32(&b, tyi);
+                    ob_i32(&b, 0); /* level x */
+                    ob_i32(&b, 0); /* level y */
+                    ob_i32(&b, (int32_t)payload_size);
+                    ob_bytes(&b, payload, payload_size);
+                    exr_free(a, payload);
+                    if (b.err) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+                }
+            }
+        } else {
+            int lpb = exr_lines_per_block(comp);
+            uint32_t ci;
+            for (ci = 0; ci < chunk_counts[p]; ++ci) {
+                int y0 = ymin + (int)ci * lpb;
+                int nlines = (y0 + lpb - 1 > ymax) ? (ymax - y0 + 1) : lpb;
+                size_t blk_size, payload_size = 0;
+                uint8_t *block, *payload = NULL;
+
+                rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                                 xmin, y0, pt->width, nlines,
+                                                 &blk_size);
+                if (!EXR_OK(rc)) goto done;
+                block = (uint8_t *)exr_malloc(a, blk_size ? blk_size : 1);
+                if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+                gather_scanline_block(h, orders[p], (void *const *)pt->images, y0,
+                                      nlines, block);
+                rc = compress_block(a, comp, block, blk_size, &payload,
+                                    &payload_size);
+                exr_free(a, block);
+                if (!EXR_OK(rc)) goto done;
+
+                offset_tables[p][ci] = (uint64_t)b.len;
+                if (multipart) ob_i32(&b, p);
+                ob_i32(&b, y0);
+                ob_i32(&b, (int32_t)payload_size);
+                ob_bytes(&b, payload, payload_size);
+                exr_free(a, payload);
+                if (b.err) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+            }
         }
     }
 
