@@ -39,6 +39,27 @@ void exr_interleave_sse2(const uint8_t *src, uint8_t *dst, size_t n) {
     if (n & 1) dst[n - 1] = t1[n2];
 }
 
+EXR_TARGET("avx2")
+void exr_interleave_avx2(const uint8_t *src, uint8_t *dst, size_t n) {
+    size_t half = (n + 1) / 2, n2 = n / 2, i = 0;
+    const uint8_t *t1 = src, *t2 = src + half;
+    for (; i + 32 <= n2; i += 32) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(t1 + i));
+        __m256i b = _mm256_loadu_si256((const __m256i *)(t2 + i));
+        __m256i lo = _mm256_unpacklo_epi8(a, b);
+        __m256i hi = _mm256_unpackhi_epi8(a, b);
+        _mm256_storeu_si256((__m256i *)(dst + 2 * i),
+                            _mm256_permute2x128_si256(lo, hi, 0x20));
+        _mm256_storeu_si256((__m256i *)(dst + 2 * i + 32),
+                            _mm256_permute2x128_si256(lo, hi, 0x31));
+    }
+    for (; i < n2; ++i) {
+        dst[2 * i] = t1[i];
+        dst[2 * i + 1] = t2[i];
+    }
+    if (n & 1) dst[n - 1] = t1[n2];
+}
+
 EXR_TARGET("avx2,f16c")
 void exr_half_to_float_f16c(const uint16_t *src, float *dst, size_t count) {
     size_t i = 0;

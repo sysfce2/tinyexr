@@ -61,6 +61,11 @@ test-c: $(V3_SRC) test/unit/test_exr_v3.c | build
 	  test/unit/test_exr_v3.c $(V3_SRC) -lm -o build/test_exr_v3
 	./build/test_exr_v3
 
+bench: $(V3_SRC) benchmark/bench.c | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O3 \
+	  benchmark/bench.c $(V3_SRC) -lm -o build/bench
+	./build/bench
+
 clean:
 	rm -rf $(TARGET) miniz.o build
 

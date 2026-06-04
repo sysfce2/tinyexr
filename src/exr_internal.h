@@ -129,6 +129,8 @@ typedef struct {
 
 extern exr_simd_vtbl exr_simd;
 void exr_simd_init(void);
+/* Force a kernel tier for benchmarking: 0=scalar, 1=sse2/neon, 2=avx2/f16c. */
+void exr_simd_force(int level);
 
 /* Scalar kernels (always built). */
 void exr_half_to_float_scalar(const uint16_t *src, float *dst, size_t count);
@@ -138,6 +140,7 @@ void exr_interleave_scalar(const uint8_t *src, uint8_t *dst, size_t n);
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define EXR_X86 1
 void exr_interleave_sse2(const uint8_t *src, uint8_t *dst, size_t n);
+void exr_interleave_avx2(const uint8_t *src, uint8_t *dst, size_t n);
 void exr_half_to_float_f16c(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half_f16c(const float *src, uint16_t *dst, size_t count);
 #endif

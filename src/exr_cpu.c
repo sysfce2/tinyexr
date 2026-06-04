@@ -98,6 +98,7 @@ void exr_simd_init(void) {
 
 #if defined(EXR_X86)
     if (caps & EXR_SIMD_SSE2) exr_simd.interleave = exr_interleave_sse2;
+    if (caps & EXR_SIMD_AVX2) exr_simd.interleave = exr_interleave_avx2;
     if (caps & CAP_F16C) {
         exr_simd.half_to_float = exr_half_to_float_f16c;
         exr_simd.float_to_half = exr_float_to_half_f16c;
@@ -107,6 +108,29 @@ void exr_simd_init(void) {
     exr_simd.interleave = exr_interleave_neon;
 #endif
     done = 1;
+}
+
+void exr_simd_force(int level) {
+    exr_simd.half_to_float = exr_half_to_float_scalar;
+    exr_simd.float_to_half = exr_float_to_half_scalar;
+    exr_simd.interleave = exr_interleave_scalar;
+#if defined(EXR_X86)
+    {
+        uint32_t caps = cpu_caps_cached();
+        if (level >= 1 && (caps & EXR_SIMD_SSE2))
+            exr_simd.interleave = exr_interleave_sse2;
+        if (level >= 2 && (caps & EXR_SIMD_AVX2))
+            exr_simd.interleave = exr_interleave_avx2;
+        if (level >= 2 && (caps & CAP_F16C)) {
+            exr_simd.half_to_float = exr_half_to_float_f16c;
+            exr_simd.float_to_half = exr_float_to_half_f16c;
+        }
+    }
+#elif defined(EXR_NEON)
+    if (level >= 1) exr_simd.interleave = exr_interleave_neon;
+#else
+    (void)level;
+#endif
 }
 
 uint32_t exr_simd_capabilities(void) {
