@@ -141,8 +141,8 @@ static void compute_canonical(const uint8_t *nbits, uint16_t *bits) {
     for (i = 0; i < 286; i++) bits[i] = bit_reverse(nbits[i], next[nbits[i]]++);
 }
 
-static int build_table(const exr_allocator *a, const uint64_t *collected,
-                       exr_fpnge_table *t) {
+int exr_fpnge_build_table(const exr_allocator *a, const uint64_t *collected,
+                          exr_fpnge_table *t) {
     uint16_t bits[286];
     size_t i;
     if (!compute_nbits(a, collected, t->nbits)) return 0;
@@ -249,7 +249,7 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
     memset(collected, 0, sizeof(collected));
     for (i = 0; i < n; i++) collected[src[i]]++;
 
-    if (!build_table(a, collected, &t)) return EXR_ERROR_OUT_OF_MEMORY;
+    if (!exr_fpnge_build_table(a, collected, &t)) return EXR_ERROR_OUT_OF_MEMORY;
 
     cap = 2 + 286 + 64 + n * 2 + 16; /* header + worst-case literals + framing */
     out = (uint8_t *)exr_malloc(a, cap);
@@ -273,9 +273,13 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
     fbw_put(&w, 2, 2); /* BTYPE = dynamic */
     write_huffman_header(&w, &t);
 
-    simd = 0;
+    simd = 0; /* 0 scalar, 1 sse4.1, 2 avx2 */
 #if defined(EXR_X86)
-    if (use_simd && (exr_cpu_caps() & EXR_SIMD_SSE41)) simd = 1;
+    if (use_simd) {
+        uint32_t caps = exr_cpu_caps();
+        if (caps & EXR_SIMD_AVX2) simd = 2;
+        else if (caps & EXR_SIMD_SSE41) simd = 1;
+    }
 #else
     (void)use_simd;
 #endif
@@ -284,7 +288,8 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
         size_t c = (n - off < CH) ? (n - off) : CH;
         size_t j;
 #if defined(EXR_X86)
-        if (simd) exr_fpnge_lookup_sse41(&t, src + off, c, nb, blo, bhi);
+        if (simd == 2) exr_fpnge_lookup_avx2(&t, src + off, c, nb, blo, bhi);
+        else if (simd == 1) exr_fpnge_lookup_sse41(&t, src + off, c, nb, blo, bhi);
         else exr_fpnge_lookup_scalar(&t, src + off, c, nb, blo, bhi);
 #else
         exr_fpnge_lookup_scalar(&t, src + off, c, nb, blo, bhi);

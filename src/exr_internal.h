@@ -351,13 +351,19 @@ typedef struct {
     uint8_t mid_nbits;
 } exr_fpnge_table;
 
+/* Build the PSHUFB-friendly table from per-symbol frequencies[286]. */
+int exr_fpnge_build_table(const exr_allocator *a, const uint64_t *collected,
+                          exr_fpnge_table *t);
+
 /* Per-byte Huffman lookup: fills nb[count] and the 16-bit code as blo|bhi<<8.
- * Scalar reference plus an SSE4.1 PSHUFB kernel (selected by exr_fpnge_deflate). */
+ * Scalar reference plus SSE4.1/AVX2 PSHUFB kernels (selected by exr_fpnge_deflate). */
 void exr_fpnge_lookup_scalar(const exr_fpnge_table *t, const uint8_t *src,
                              size_t count, uint8_t *nb, uint8_t *blo, uint8_t *bhi);
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 void exr_fpnge_lookup_sse41(const exr_fpnge_table *t, const uint8_t *src,
                             size_t count, uint8_t *nb, uint8_t *blo, uint8_t *bhi);
+void exr_fpnge_lookup_avx2(const exr_fpnge_table *t, const uint8_t *src,
+                           size_t count, uint8_t *nb, uint8_t *blo, uint8_t *bhi);
 #endif
 
 /* Literal-only zlib stream over src[0..n). use_simd selects the PSHUFB lookup

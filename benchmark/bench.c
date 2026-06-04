@@ -201,6 +201,47 @@ static void bench_kernels(void) {
             free(f);
         }
     }
+
+#if defined(EXR_X86)
+    printf("  fpnge Huffman lookup (PSHUFB):\n");
+    {
+        const exr_allocator *al = exr_default_allocator();
+        uint64_t freqs[286];
+        exr_fpnge_table tbl;
+        uint8_t *nbo = (uint8_t *)malloc(N), *blo = (uint8_t *)malloc(N),
+                *bho = (uint8_t *)malloc(N);
+        size_t k;
+        double base = 0;
+        struct {
+            const char *n;
+            void (*f)(const exr_fpnge_table *, const uint8_t *, size_t, uint8_t *,
+                      uint8_t *, uint8_t *);
+            int ok;
+        } v[] = {
+            {"scalar", exr_fpnge_lookup_scalar, 1},
+            {"sse4.1", exr_fpnge_lookup_sse41, (caps & EXR_SIMD_SSE41) != 0},
+            {"avx2", exr_fpnge_lookup_avx2, (caps & EXR_SIMD_AVX2) != 0},
+        };
+        memset(freqs, 0, sizeof(freqs));
+        for (i = 0; i < N; ++i) freqs[src[i]]++;
+        if (nbo && blo && bho && exr_fpnge_build_table(al, freqs, &tbl)) {
+            for (k = 0; k < 3; ++k) {
+                double t0, gbs;
+                long n2 = 0;
+                if (!v[k].ok) { printf("    %-7s   (unavailable)\n", v[k].n); continue; }
+                t0 = now_sec();
+                do { v[k].f(&tbl, src, N, nbo, blo, bho); ++n2; } while (now_sec() - t0 < 0.3);
+                gbs = (double)N * n2 / (now_sec() - t0) / 1e9;
+                if (k == 0) base = gbs;
+                printf("    %-7s %8.2f GB/s  (%.2fx)\n", v[k].n, gbs,
+                       base > 0 ? gbs / base : 1.0);
+            }
+        }
+        free(nbo);
+        free(blo);
+        free(bho);
+    }
+#endif
     free(src);
     free(dst);
 }

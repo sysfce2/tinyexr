@@ -197,6 +197,43 @@ static void fpnge_check(void) {
         free(dec);
     }
     printf("  ok: fpnge PSHUFB encoder (scalar==simd, round-trip)\n");
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /* SSE4.1 and AVX2 lookup kernels must match the scalar reference exactly. */
+    {
+        size_t n = 100000, i;
+        uint8_t *buf = (uint8_t *)malloc(n);
+        uint8_t *ns = (uint8_t *)malloc(n), *ls = (uint8_t *)malloc(n),
+                *hs = (uint8_t *)malloc(n);
+        uint8_t *nx = (uint8_t *)malloc(n), *lx = (uint8_t *)malloc(n),
+                *hx = (uint8_t *)malloc(n);
+        uint64_t freqs[286];
+        exr_fpnge_table tbl;
+        unsigned rng = 42;
+        uint32_t caps = exr_simd_capabilities();
+        memset(freqs, 0, sizeof(freqs));
+        for (i = 0; i < n; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            buf[i] = (uint8_t)(rng >> 8);
+            freqs[buf[i]]++;
+        }
+        if (exr_fpnge_build_table(exr_default_allocator(), freqs, &tbl)) {
+            exr_fpnge_lookup_scalar(&tbl, buf, n, ns, ls, hs);
+            if (caps & EXR_SIMD_SSE41) {
+                exr_fpnge_lookup_sse41(&tbl, buf, n, nx, lx, hx);
+                CHECK(!memcmp(ns, nx, n) && !memcmp(ls, lx, n) && !memcmp(hs, hx, n),
+                      "fpnge sse4.1 lookup == scalar");
+            }
+            if (caps & EXR_SIMD_AVX2) {
+                exr_fpnge_lookup_avx2(&tbl, buf, n, nx, lx, hx);
+                CHECK(!memcmp(ns, nx, n) && !memcmp(ls, lx, n) && !memcmp(hs, hx, n),
+                      "fpnge avx2 lookup == scalar");
+            }
+            printf("  ok: fpnge lookup kernels match scalar\n");
+        }
+        free(buf); free(ns); free(ls); free(hs); free(nx); free(lx); free(hx);
+    }
+#endif
 }
 
 int main(void) {
