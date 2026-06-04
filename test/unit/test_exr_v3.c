@@ -194,6 +194,8 @@ int main(void) {
     roundtrip("asakusa.exr", EXR_COMPRESSION_ZIPS, "ZIPS");
     roundtrip("asakusa.exr", EXR_COMPRESSION_ZIP, "ZIP");
     roundtrip("test/unit/regression/flaga.exr", EXR_COMPRESSION_ZIP, "ZIP-8ch");
+    roundtrip("asakusa.exr", EXR_COMPRESSION_PIZ, "PIZ");
+    roundtrip("test/unit/regression/000-issue194.exr", EXR_COMPRESSION_PIZ, "PIZ-3ch");
     tiled_roundtrip("asakusa.exr");
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

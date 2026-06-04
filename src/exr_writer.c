@@ -241,28 +241,6 @@ static void gather_tile_block(const exr_header *h, const int *order,
     }
 }
 
-/* Compress one canonical block per the codec; allocates *out (caller frees). */
-static exr_result compress_block(const exr_allocator *a, exr_compression comp,
-                                 const uint8_t *block, size_t n, uint8_t **out,
-                                 size_t *out_size) {
-    switch (comp) {
-    case EXR_COMPRESSION_NONE: {
-        *out = (uint8_t *)exr_malloc(a, n ? n : 1);
-        if (!*out) return EXR_ERROR_OUT_OF_MEMORY;
-        memcpy(*out, block, n);
-        *out_size = n;
-        return EXR_SUCCESS;
-    }
-    case EXR_COMPRESSION_RLE:
-        return exr_rle_compress(a, block, n, out, out_size);
-    case EXR_COMPRESSION_ZIP:
-    case EXR_COMPRESSION_ZIPS:
-        return exr_zip_compress(a, block, n, out, out_size);
-    default:
-        return EXR_ERROR_UNSUPPORTED;
-    }
-}
-
 /* ---- serialize a set of parts -------------------------------------------- */
 
 static exr_result serialize(const exr_allocator *a, const exr_part *parts,
@@ -276,6 +254,7 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
     size_t *offset_positions = NULL;
     uint32_t *chunk_counts = NULL;
     int **orders = NULL;
+    exr_channel **sorted_chans = NULL;
     exr_result rc = EXR_SUCCESS;
 
     if (num_parts <= 0) return EXR_ERROR_INVALID_ARGUMENT;
@@ -297,22 +276,28 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
     if (any_deep) return EXR_ERROR_UNSUPPORTED;
 
     orders = (int **)exr_calloc(a, (size_t)num_parts, sizeof(int *));
+    sorted_chans = (exr_channel **)exr_calloc(a, (size_t)num_parts, sizeof(exr_channel *));
     chunk_counts = (uint32_t *)exr_calloc(a, (size_t)num_parts, sizeof(uint32_t));
     offset_tables = (uint64_t **)exr_calloc(a, (size_t)num_parts, sizeof(uint64_t *));
     offset_positions = (size_t *)exr_calloc(a, (size_t)num_parts, sizeof(size_t));
-    if (!orders || !chunk_counts || !offset_tables || !offset_positions) {
+    if (!orders || !sorted_chans || !chunk_counts || !offset_tables ||
+        !offset_positions) {
         rc = EXR_ERROR_OUT_OF_MEMORY;
         goto done;
     }
     for (p = 0; p < num_parts; ++p) {
         const exr_part *pt = &parts[p];
         int nch = pt->header.num_channels;
-        int lpb;
+        int lpb, ci2;
         exr_compression comp =
             comp_override >= 0 ? (exr_compression)comp_override : pt->header.compression;
         orders[p] = (int *)exr_calloc(a, nch ? (size_t)nch : 1, sizeof(int));
-        if (!orders[p]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        sorted_chans[p] =
+            (exr_channel *)exr_calloc(a, nch ? (size_t)nch : 1, sizeof(exr_channel));
+        if (!orders[p] || !sorted_chans[p]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
         sort_channels(&pt->header, orders[p]);
+        for (ci2 = 0; ci2 < nch; ++ci2)
+            sorted_chans[p][ci2] = pt->header.channels[orders[p][ci2]];
         if (pt->header.tiled) {
             int tx = (int)pt->header.tile_x_size, ty = (int)pt->header.tile_y_size;
             uint32_t nx = (uint32_t)((pt->width + tx - 1) / tx);
@@ -387,8 +372,19 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
                     if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
                     gather_tile_block(h, orders[p], (void *const *)pt->images,
                                       abs_x0, abs_y0, tile_w, tile_h, block);
-                    rc = compress_block(a, comp, block, blk_size, &payload,
-                                        &payload_size);
+                    {
+                        exr_codec_ctx cx;
+                        cx.alloc = a;
+                        cx.compression = comp;
+                        cx.channels = sorted_chans[p];
+                        cx.num_channels = h->num_channels;
+                        cx.x = abs_x0;
+                        cx.y = abs_y0;
+                        cx.width = tile_w;
+                        cx.num_lines = tile_h;
+                        rc = exr_compress_block(&cx, block, blk_size, &payload,
+                                                &payload_size);
+                    }
                     exr_free(a, block);
                     if (!EXR_OK(rc)) goto done;
 
@@ -421,8 +417,19 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
                 if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
                 gather_scanline_block(h, orders[p], (void *const *)pt->images, y0,
                                       nlines, block);
-                rc = compress_block(a, comp, block, blk_size, &payload,
-                                    &payload_size);
+                {
+                    exr_codec_ctx cx;
+                    cx.alloc = a;
+                    cx.compression = comp;
+                    cx.channels = sorted_chans[p];
+                    cx.num_channels = h->num_channels;
+                    cx.x = xmin;
+                    cx.y = y0;
+                    cx.width = pt->width;
+                    cx.num_lines = nlines;
+                    rc = exr_compress_block(&cx, block, blk_size, &payload,
+                                            &payload_size);
+                }
                 exr_free(a, block);
                 if (!EXR_OK(rc)) goto done;
 
@@ -453,6 +460,10 @@ done:
     if (orders) {
         for (p = 0; p < num_parts; ++p) exr_free(a, orders[p]);
         exr_free(a, orders);
+    }
+    if (sorted_chans) {
+        for (p = 0; p < num_parts; ++p) exr_free(a, sorted_chans[p]);
+        exr_free(a, sorted_chans);
     }
     if (offset_tables) {
         for (p = 0; p < num_parts; ++p) exr_free(a, offset_tables[p]);

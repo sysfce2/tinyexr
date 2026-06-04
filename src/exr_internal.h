@@ -342,5 +342,11 @@ exr_result exr_rle_compress(const exr_allocator *a, const uint8_t *src,
                             size_t n, uint8_t **out_data, size_t *out_size);
 exr_result exr_zip_compress(const exr_allocator *a, const uint8_t *src,
                             size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_piz_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                            size_t n, uint8_t **out_data, size_t *out_size);
+
+/* Encode dispatch: compress one canonical block per ctx->compression. */
+exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
+                              size_t n, uint8_t **out_data, size_t *out_size);
 
 #endif /* TINYEXR_INTERNAL_H_ */

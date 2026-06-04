@@ -47,6 +47,30 @@ exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
     return EXR_ERROR_UNSUPPORTED;
 }
 
+/* Encode dispatch: compress one canonical block per ctx->compression.
+ * Allocates *out_data (caller frees); NONE/store-raw yields *out_size == n. */
+exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
+                              size_t n, uint8_t **out_data, size_t *out_size) {
+    switch (ctx->compression) {
+    case EXR_COMPRESSION_NONE: {
+        *out_data = (uint8_t *)exr_malloc(ctx->alloc, n ? n : 1);
+        if (!*out_data) return EXR_ERROR_OUT_OF_MEMORY;
+        memcpy(*out_data, block, n);
+        *out_size = n;
+        return EXR_SUCCESS;
+    }
+    case EXR_COMPRESSION_RLE:
+        return exr_rle_compress(ctx->alloc, block, n, out_data, out_size);
+    case EXR_COMPRESSION_ZIP:
+    case EXR_COMPRESSION_ZIPS:
+        return exr_zip_compress(ctx->alloc, block, n, out_data, out_size);
+    case EXR_COMPRESSION_PIZ:
+        return exr_piz_compress(ctx, block, n, out_data, out_size);
+    default:
+        return EXR_ERROR_UNSUPPORTED;
+    }
+}
+
 /* ----------------------------------------------------------------------------
  * EXR post-DEFLATE reconstruction passes (shared by ZIP/ZIPS/RLE).
  * These match OpenEXR's ImfZipCompressor reconstruction exactly:
