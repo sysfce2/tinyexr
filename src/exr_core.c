@@ -87,7 +87,8 @@ int exr_lines_per_block(exr_compression c) {
     case EXR_COMPRESSION_PXR24: return 16;
     case EXR_COMPRESSION_PIZ:
     case EXR_COMPRESSION_B44:
-    case EXR_COMPRESSION_B44A: return 32;
+    case EXR_COMPRESSION_B44A:
+    case EXR_COMPRESSION_ZSTD: return 32;
     case EXR_COMPRESSION_DWAA: return 32;
     case EXR_COMPRESSION_DWAB: return 256;
     }

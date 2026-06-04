@@ -82,7 +82,8 @@ typedef enum exr_compression {
     EXR_COMPRESSION_B44 = 6,   /* lossy 4x4, 32 scanlines/block */
     EXR_COMPRESSION_B44A = 7,  /* B44 with flat-block packing, 32/block */
     EXR_COMPRESSION_DWAA = 8,  /* not yet supported */
-    EXR_COMPRESSION_DWAB = 9   /* not yet supported */
+    EXR_COMPRESSION_DWAB = 9,  /* not yet supported */
+    EXR_COMPRESSION_ZSTD = 12  /* zstd, 32 scanlines/block */
 } exr_compression;
 
 typedef enum exr_line_order {

@@ -91,6 +91,56 @@ static int images_equal(const exr_image *a, const exr_image *b) {
     return 1;
 }
 
+static unsigned rd_u32le(const unsigned char *p) {
+    return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) |
+           ((unsigned)p[3] << 24);
+}
+
+static unsigned long long rd_u64le(const unsigned char *p) {
+    return (unsigned long long)rd_u32le(p) |
+           ((unsigned long long)rd_u32le(p + 4) << 32);
+}
+
+static int first_scanline_payload(void *buf, size_t sz, size_t *payload,
+                                  unsigned *payload_size) {
+    unsigned char *p = (unsigned char *)buf;
+    size_t pos = 8;
+    unsigned long long chunk_off;
+
+    while (pos < sz && p[pos] != 0) {
+        int32_t attr_size;
+        while (pos < sz && p[pos] != 0) pos++;
+        if (pos >= sz) return 0;
+        pos++;
+        while (pos < sz && p[pos] != 0) pos++;
+        if (pos >= sz || pos + 5 > sz) return 0;
+        pos++;
+        attr_size = (int32_t)rd_u32le(p + pos);
+        pos += 4;
+        if (attr_size < 0 || pos + (size_t)attr_size > sz) return 0;
+        pos += (size_t)attr_size;
+    }
+    if (pos >= sz || pos + 9 > sz) return 0;
+    pos++;
+    chunk_off = rd_u64le(p + pos);
+    if (chunk_off > sz || (size_t)chunk_off + 8 > sz) return 0;
+    *payload_size = rd_u32le(p + (size_t)chunk_off + 4);
+    *payload = (size_t)chunk_off + 8;
+    return *payload + *payload_size <= sz;
+}
+
+static void zero_image(exr_image *img) {
+    int p, c;
+    for (p = 0; p < img->num_parts; ++p) {
+        exr_part *part = &img->parts[p];
+        for (c = 0; c < part->header.num_channels; ++c) {
+            size_t ps =
+                part->header.channels[c].pixel_type == EXR_PIXEL_HALF ? 2 : 4;
+            memset(part->images[c], 0, (size_t)part->width * part->height * ps);
+        }
+    }
+}
+
 /* Load -> save (codec) -> reload -> must equal the original. */
 static void roundtrip(const char *path, exr_compression comp, const char *name) {
     exr_image src, back;
@@ -116,6 +166,7 @@ static void roundtrip(const char *path, exr_compression comp, const char *name) 
         g_fail++;
         printf("  FAIL: reload %s: %s\n", name, exr_result_string(rc));
     } else {
+        CHECK(back.parts[0].header.compression == comp, name);
         CHECK(images_equal(&src, &back), name);
         printf("  ok: roundtrip %s (%s, %zu bytes)\n", name, path, sz);
     }
@@ -125,7 +176,8 @@ static void roundtrip(const char *path, exr_compression comp, const char *name) 
 }
 
 /* Build a tiled image from a scanline source in-memory, save tiled, reload. */
-static void tiled_roundtrip(const char *path) {
+static void tiled_roundtrip(const char *path, exr_compression comp,
+                            const char *name) {
     exr_image src, back;
     void *buf = NULL;
     size_t sz = 0;
@@ -143,7 +195,7 @@ static void tiled_roundtrip(const char *path) {
     src.parts[0].header.tile_y_size = 64;
     src.parts[0].header.level_mode = EXR_TILE_ONE_LEVEL;
     src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
-    rc = exr_save_to_memory(&buf, &sz, NULL, &src, EXR_COMPRESSION_ZIP);
+    rc = exr_save_to_memory(&buf, &sz, NULL, &src, comp);
     if (!EXR_OK(rc)) {
         g_fail++;
         printf("  FAIL: tiled save: %s\n", exr_result_string(rc));
@@ -156,12 +208,53 @@ static void tiled_roundtrip(const char *path) {
         printf("  FAIL: tiled reload: %s\n", exr_result_string(rc));
     } else {
         CHECK(back.parts[0].header.tiled, "tiled flag preserved");
+        CHECK(back.parts[0].header.compression == comp, name);
         CHECK(images_equal(&src, &back), "tiled roundtrip pixels");
-        printf("  ok: tiled roundtrip (%s, ZIP, %zu bytes)\n", path, sz);
+        printf("  ok: tiled roundtrip (%s, %s, %zu bytes)\n", path, name, sz);
     }
     free(buf);
     exr_image_free(&src);
     exr_image_free(&back);
+}
+
+static void zstd_corruption_rejects(const char *path) {
+    exr_image src, back;
+    void *buf = NULL;
+    size_t sz = 0, payload = 0;
+    unsigned payload_size = 0;
+    exr_result rc;
+    memset(&src, 0, sizeof(src));
+    memset(&back, 0, sizeof(back));
+
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src))) {
+        g_fail++;
+        printf("  FAIL: %s load (zstd corrupt test)\n", path);
+        return;
+    }
+    zero_image(&src);
+    rc = exr_save_to_memory(&buf, &sz, NULL, &src, EXR_COMPRESSION_ZSTD);
+    if (!EXR_OK(rc)) {
+        g_fail++;
+        printf("  FAIL: zstd save for corruption test: %s\n",
+               exr_result_string(rc));
+        exr_image_free(&src);
+        return;
+    }
+    if (!first_scanline_payload(buf, sz, &payload, &payload_size) ||
+        payload_size == 0) {
+        g_fail++;
+        printf("  FAIL: could not locate zstd payload\n");
+        free(buf);
+        exr_image_free(&src);
+        return;
+    }
+    ((unsigned char *)buf)[payload] ^= 0xffu;
+    rc = exr_load_from_memory(buf, sz, NULL, &back);
+    CHECK(!EXR_OK(rc), "corrupted zstd payload rejected");
+    if (EXR_OK(rc)) exr_image_free(&back);
+    printf("  ok: corrupted zstd payload rejected\n");
+    free(buf);
+    exr_image_free(&src);
 }
 
 /* fpnge PSHUFB literal encoder: SIMD output must equal scalar, and both must
@@ -269,7 +362,11 @@ int main(void) {
     roundtrip("test/unit/regression/flaga.exr", EXR_COMPRESSION_ZIP, "ZIP-8ch");
     roundtrip("asakusa.exr", EXR_COMPRESSION_PIZ, "PIZ");
     roundtrip("test/unit/regression/000-issue194.exr", EXR_COMPRESSION_PIZ, "PIZ-3ch");
-    tiled_roundtrip("asakusa.exr");
+    roundtrip("asakusa.exr", EXR_COMPRESSION_ZSTD, "ZSTD");
+    roundtrip("test/unit/regression/flaga.exr", EXR_COMPRESSION_ZSTD, "ZSTD-8ch");
+    tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZIP, "ZIP");
+    tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZSTD, "ZSTD");
+    zstd_corruption_rejects("asakusa.exr");
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();

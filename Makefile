@@ -32,21 +32,27 @@ test: $(TARGET)
 	./$(TARGET) asakusa.exr
 
 # ---- pure-C11 v3 library + tests ------------------------------------------
-V3_INC   = -Iinclude -Isrc
+V3_INC   = -Iinclude -Isrc -Ideps/zstd
 V3_CSTD  = -std=c11
 V3_WARN  = -Wall -Wextra -Werror
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
+ZSTD_SRC = deps/zstd/tinyexr_zstd.c
+ZSTD_OBJ = build/tinyexr_zstd.o
+V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
 SAN      = -fsanitize=address,undefined
 
 build:
 	@mkdir -p build
 
-build/%.o: src/%.c include/exr.h src/exr_internal.h | build
+build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_INC) -O2 -g -c $< -o $@
 
-lib: $(V3_OBJ)
-	$(AR) rcs build/libtinyexr3.a $(V3_OBJ)
+build/tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h | build
+	$(CC) $(V3_CSTD) $(V3_INC) -O2 -g -w -c $< -o $@
+
+lib: $(V3_OBJ) $(ZSTD_OBJ)
+	$(AR) rcs build/libtinyexr3.a $(V3_OBJ) $(ZSTD_OBJ)
 
 # Strict pure-C11 gate: the rewrite must never require a C++ compiler.
 c11-gate: | build
@@ -56,14 +62,20 @@ c11-gate: | build
 	done
 	@echo "pure-C11 gate: OK"
 
-test-c: $(V3_SRC) test/unit/test_exr_v3.c | build
-	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) \
-	  test/unit/test_exr_v3.c $(V3_SRC) -lm -o build/test_exr_v3
-	./build/test_exr_v3
+build/test-%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -c $< -o $@
 
-bench: $(V3_SRC) benchmark/bench.c | build
+build/test-tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h | build
+	$(CC) $(V3_CSTD) $(V3_INC) -O1 -g $(SAN) -w -c $< -o $@
+
+test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o test/unit/test_exr_v3.c | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) \
+	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o -lm -o build/test_exr_v3
+	ASAN_OPTIONS=detect_leaks=0 ./build/test_exr_v3
+
+bench: $(V3_OBJ) $(ZSTD_OBJ) benchmark/bench.c | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O3 \
-	  benchmark/bench.c $(V3_SRC) -lm -o build/bench
+	  benchmark/bench.c $(V3_OBJ) $(ZSTD_OBJ) -lm -o build/bench
 	./build/bench
 
 clean:

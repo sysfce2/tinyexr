@@ -315,6 +315,8 @@ exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
 exr_result exr_b44_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size,
                               int optimize_flat);
+exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
+                               size_t src_size, uint8_t *dst, size_t dst_size);
 
 /* Raw zlib (DEFLATE) inflate used by ZIP/ZIPS/PXR24. Returns the number of
  * decoded bytes in *out_size; fails on truncation/corruption. */
@@ -380,6 +382,8 @@ exr_result exr_zip_compress(const exr_allocator *a, const uint8_t *src,
                             size_t n, uint8_t **out_data, size_t *out_size);
 exr_result exr_piz_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
+                             size_t n, uint8_t **out_data, size_t *out_size);
 
 /* Encode dispatch: compress one canonical block per ctx->compression. */
 exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
