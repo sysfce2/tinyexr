@@ -6,3 +6,11 @@ test/unit/tester-v2
 test/unit/tester-v3
 test/unit/*.exr
 test/unit/*.o
+
+# pure-C11 v3 build outputs
+/build/
+*.obj
+*.exe
+test_tinyexr_v3
+test/unit/bench-v3
+test/unit/test_exr_v3
