@@ -338,6 +338,33 @@ exr_result exr_deflate_zlib(const exr_allocator *a, const uint8_t *src,
 /* Adler-32 (zlib trailer). */
 uint32_t exr_adler32(const uint8_t *data, size_t n, uint32_t adler);
 
+/* fpnge-derived literal DEFLATE encoder with a PSHUFB Huffman-table lookup.
+ * The PSHUFB-friendly table: symbols 0-15 and 240-255 are looked up by low
+ * nibble, and 16-239 share one code length (so the code is computable from the
+ * byte's nibbles). */
+typedef struct {
+    uint8_t nbits[286];
+    uint16_t end_bits; /* end-of-block (symbol 256) code */
+    uint8_t first16_nbits[16], first16_bits[16];
+    uint8_t last16_nbits[16], last16_bits[16];
+    uint8_t mid_lowbits[16];
+    uint8_t mid_nbits;
+} exr_fpnge_table;
+
+/* Per-byte Huffman lookup: fills nb[count] and the 16-bit code as blo|bhi<<8.
+ * Scalar reference plus an SSE4.1 PSHUFB kernel (selected by exr_fpnge_deflate). */
+void exr_fpnge_lookup_scalar(const exr_fpnge_table *t, const uint8_t *src,
+                             size_t count, uint8_t *nb, uint8_t *blo, uint8_t *bhi);
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+void exr_fpnge_lookup_sse41(const exr_fpnge_table *t, const uint8_t *src,
+                            size_t count, uint8_t *nb, uint8_t *blo, uint8_t *bhi);
+#endif
+
+/* Literal-only zlib stream over src[0..n). use_simd selects the PSHUFB lookup
+ * when SSE4.1 is available. Allocates *out_data (caller frees). */
+exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src, size_t n,
+                             uint8_t **out_data, size_t *out_size, int use_simd);
+
 /* Codec encoders (compress one canonical block). Each allocates *out_data
  * (caller frees) holding the chunk payload; if compression does not shrink the
  * data the codec stores it verbatim and *out_size == src_size. */

@@ -205,6 +205,69 @@ static void bench_kernels(void) {
     free(dst);
 }
 
+/* ---- DEFLATE encoders on real (predictor+split) EXR bytes ----------------- */
+
+static void bench_deflate(const char *path) {
+    exr_image img;
+    exr_part *p;
+    size_t n = 0, c;
+    uint8_t *raw, *tmp, *cur;
+    const exr_allocator *a = exr_default_allocator();
+
+    memset(&img, 0, sizeof(img));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &img))) return;
+    p = &img.parts[0];
+    for (c = 0; c < (size_t)p->header.num_channels; ++c) {
+        size_t ps = p->header.channels[c].pixel_type == EXR_PIXEL_HALF ? 2 : 4;
+        n += (size_t)p->width * p->height * ps;
+    }
+    raw = (uint8_t *)malloc(n);
+    tmp = (uint8_t *)malloc(n);
+    if (!raw || !tmp) { free(raw); free(tmp); exr_image_free(&img); return; }
+    cur = raw;
+    for (c = 0; c < (size_t)p->header.num_channels; ++c) {
+        size_t ps = p->header.channels[c].pixel_type == EXR_PIXEL_HALF ? 2 : 4;
+        size_t cb = (size_t)p->width * p->height * ps;
+        memcpy(cur, p->images[c], cb);
+        cur += cb;
+    }
+    /* EXR ZIP intermediate transform */
+    exr_interleave_encode(raw, tmp, n);
+    exr_predictor_encode(tmp, n);
+
+    printf("\n== DEFLATE encode on EXR bytes: %s (%.2f MB) ==\n", path,
+           n / 1048576.0);
+    printf("  %-18s %10s %12s\n", "encoder", "MB/s", "out (ratio)");
+    {
+        struct { const char *name; int kind; } v[] = {
+            {"fpng LZ77 (scalar)", 0},
+            {"fpnge PSHUFB-huff scalar", 1},
+            {"fpnge PSHUFB-huff sse4.1", 2},
+        };
+        size_t k;
+        for (k = 0; k < 3; ++k) {
+            double t0 = now_sec(), t;
+            long it = 0;
+            uint8_t *out = NULL;
+            size_t os = 0;
+            do {
+                if (out) free(out);
+                out = NULL;
+                if (v[k].kind == 0) exr_deflate_zlib(a, tmp, n, &out, &os);
+                else exr_fpnge_deflate(a, tmp, n, &out, &os, v[k].kind == 2);
+                ++it;
+            } while (now_sec() - t0 < 0.3);
+            t = (now_sec() - t0) / it;
+            printf("  %-18s %10.1f %9zuK (%.2fx)\n", v[k].name,
+                   n / t / 1e6, os / 1024, (double)n / (double)os);
+            free(out);
+        }
+    }
+    free(raw);
+    free(tmp);
+    exr_image_free(&img);
+}
+
 int main(int argc, char **argv) {
     printf("TinyEXR v3 benchmark  |  SIMD: %s (caps=0x%x)\n", exr_simd_info(),
            exr_simd_capabilities());
@@ -216,10 +279,11 @@ int main(int argc, char **argv) {
         bench_codecs("asakusa.exr");
     }
     bench_kernels();
+    bench_deflate(argc > 1 ? argv[1] : "asakusa.exr");
 
-    printf("\nNote: the SSE4.1/AVX2 PSHUFB Huffman-emit kernel (fpnge port) for\n"
-           "the DEFLATE/ZIP encoder is not yet wired in; the ZIP encoder above\n"
-           "uses the scalar fpng Huffman path. Decode de-interleave is\n"
-           "SIMD-dispatched (scalar/SSE2/AVX2 shown).\n");
+    printf("\nNote: 'fpnge PSHUFB-huff' is a literal-only DEFLATE encoder using\n"
+           "the fpnge constrained Huffman table with a PSHUFB per-byte code\n"
+           "lookup (sse4.1 path). It trades ratio for a simpler, vectorizable\n"
+           "emit; the default ZIP codec still uses the fpng LZ77 encoder.\n");
     return 0;
 }

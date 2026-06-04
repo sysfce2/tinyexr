@@ -12,6 +12,7 @@
  */
 
 #include "exr.h"
+#include "exr_internal.h" /* exr_fpnge_deflate / exr_inflate_zlib (internal) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,6 +164,41 @@ static void tiled_roundtrip(const char *path) {
     exr_image_free(&back);
 }
 
+/* fpnge PSHUFB literal encoder: SIMD output must equal scalar, and both must
+ * round-trip through the inflater. */
+static void fpnge_check(void) {
+    const exr_allocator *a = exr_default_allocator();
+    static const size_t sizes[] = {0, 1, 16, 17, 1000, 50000};
+    size_t s;
+    for (s = 0; s < sizeof(sizes) / sizeof(sizes[0]); ++s) {
+        size_t n = sizes[s], i;
+        uint8_t *src = (uint8_t *)malloc(n ? n : 1);
+        uint8_t *c0 = NULL, *c1 = NULL, *dec = NULL;
+        size_t l0 = 0, l1 = 0, got = 0;
+        unsigned rng = 1234567u;
+        for (i = 0; i < n; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            src[i] = (uint8_t)((i % 40 < 6) ? (rng >> 9) : (i / 11));
+        }
+        if (EXR_OK(exr_fpnge_deflate(a, src, n, &c0, &l0, 0)) &&
+            EXR_OK(exr_fpnge_deflate(a, src, n, &c1, &l1, 1))) {
+            CHECK(l0 == l1 && (l0 == 0 || memcmp(c0, c1, l0) == 0),
+                  "fpnge simd==scalar");
+            dec = (uint8_t *)malloc(n ? n : 1);
+            CHECK(EXR_OK(exr_inflate_zlib(c1, l1, dec, n, &got)) && got == n &&
+                      (n == 0 || memcmp(src, dec, n) == 0),
+                  "fpnge round-trip");
+        } else {
+            g_fail++;
+        }
+        free(src);
+        free(c0);
+        free(c1);
+        free(dec);
+    }
+    printf("  ok: fpnge PSHUFB encoder (scalar==simd, round-trip)\n");
+}
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -197,6 +233,9 @@ int main(void) {
     roundtrip("asakusa.exr", EXR_COMPRESSION_PIZ, "PIZ");
     roundtrip("test/unit/regression/000-issue194.exr", EXR_COMPRESSION_PIZ, "PIZ-3ch");
     tiled_roundtrip("asakusa.exr");
+
+    printf("== fpnge PSHUFB Huffman-emit ==\n");
+    fpnge_check();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

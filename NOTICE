@@ -8,11 +8,11 @@ header of the corresponding source file.
 --------------------------------------------------------------------------------
 1. fpnge - https://github.com/veluca93/fpnge
 --------------------------------------------------------------------------------
-Portions of the SIMD DEFLATE Huffman-encoding kernels (the PSHUFB / vpshufb
-nibble-table symbol-emit path) in src/exr_simd_sse41.c and src/exr_simd_avx2.c
-are derived from fpnge and have been modified (ported from C++ intrinsics to
-pure C11, adapted to generic DEFLATE Huffman tables, and integrated into the
-TinyEXR ZIP encoder).
+The fpnge-derived DEFLATE literal encoder in src/exr_fpnge.c (the constrained
+Huffman-table construction and code-length encoding) and its PSHUFB per-byte
+Huffman-table lookup kernel in src/exr_simd_x86.c are derived from fpnge and
+have been modified (ported from C++ intrinsics to pure C11, reduced to a
+generic literal-only DEFLATE encoder, and the bit-packing reimplemented).
 
     Copyright 2021 Google LLC
 

@@ -39,6 +39,57 @@ void exr_interleave_sse2(const uint8_t *src, uint8_t *dst, size_t n) {
     if (n & 1) dst[n - 1] = t1[n2];
 }
 
+/* fpnge-style PSHUFB Huffman-table lookup: for each byte, gather (nbits, code)
+ * where the 16-bit code is split into blo (low 8) + bhi (high). Symbols 0-15
+ * and 240-255 are looked up by low nibble; 16-239 share length 12 (mid_nbits),
+ * so their code is mid_lowbits[hi_nibble] | (revnib[lo_nibble] << 8). */
+EXR_TARGET("sse4.1")
+void exr_fpnge_lookup_sse41(const exr_fpnge_table *t, const uint8_t *src,
+                            size_t count, uint8_t *nb, uint8_t *blo,
+                            uint8_t *bhi) {
+    static const uint8_t kRevNib[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                                        0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+    size_t i = 0;
+    if (t->mid_nbits == 12) { /* always true for this construction */
+        const __m128i f16n = _mm_loadu_si128((const __m128i *)t->first16_nbits);
+        const __m128i f16b = _mm_loadu_si128((const __m128i *)t->first16_bits);
+        const __m128i l16n = _mm_loadu_si128((const __m128i *)t->last16_nbits);
+        const __m128i l16b = _mm_loadu_si128((const __m128i *)t->last16_bits);
+        const __m128i midl = _mm_loadu_si128((const __m128i *)t->mid_lowbits);
+        const __m128i rev = _mm_loadu_si128((const __m128i *)kRevNib);
+        const __m128i nib = _mm_set1_epi8(0x0F);
+        const __m128i midn = _mm_set1_epi8((char)t->mid_nbits);
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i ones = _mm_set1_epi8((char)0xFF);
+        const __m128i c15 = _mm_set1_epi8(15);
+        const __m128i c239 = _mm_set1_epi8((char)239);
+        for (; i + 16 <= count; i += 16) {
+            __m128i b = _mm_loadu_si128((const __m128i *)(src + i));
+            __m128i lo = _mm_and_si128(b, nib);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), nib);
+            __m128i fnb = _mm_shuffle_epi8(f16n, lo);
+            __m128i fb = _mm_shuffle_epi8(f16b, lo);
+            __m128i lnb = _mm_shuffle_epi8(l16n, lo);
+            __m128i lb = _mm_shuffle_epi8(l16b, lo);
+            __m128i mlo = _mm_shuffle_epi8(midl, hi);
+            __m128i mhi = _mm_shuffle_epi8(rev, lo);
+            __m128i is_first = _mm_cmpeq_epi8(_mm_subs_epu8(b, c15), zero);
+            __m128i is_last =
+                _mm_xor_si128(_mm_cmpeq_epi8(_mm_subs_epu8(b, c239), zero), ones);
+            __m128i fl = _mm_or_si128(is_first, is_last);
+            __m128i rnb = _mm_blendv_epi8(midn, fnb, is_first);
+            __m128i rlo = _mm_blendv_epi8(mlo, fb, is_first);
+            rnb = _mm_blendv_epi8(rnb, lnb, is_last);
+            rlo = _mm_blendv_epi8(rlo, lb, is_last);
+            _mm_storeu_si128((__m128i *)(nb + i), rnb);
+            _mm_storeu_si128((__m128i *)(blo + i), rlo);
+            _mm_storeu_si128((__m128i *)(bhi + i), _mm_andnot_si128(fl, mhi));
+        }
+    }
+    if (i < count)
+        exr_fpnge_lookup_scalar(t, src + i, count - i, nb + i, blo + i, bhi + i);
+}
+
 EXR_TARGET("avx2")
 void exr_interleave_avx2(const uint8_t *src, uint8_t *dst, size_t n) {
     size_t half = (n + 1) / 2, n2 = n / 2, i = 0;
