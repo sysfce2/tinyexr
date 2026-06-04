@@ -34,7 +34,9 @@ selected path). Tiers measured:
 | SSE2   | ✅            | —          |
 | AVX2   | ✅            | F16C       |
 
-**PSHUFB note:** the SSE4.1/AVX2 PSHUFB Huffman-emit kernel (ported from
-fpnge) for the DEFLATE/ZIP *encoder* is not yet wired in — the ZIP encoder
-currently uses the scalar fpng Huffman path. When added it will appear as a
-fourth tier on the encode side.
+**PSHUFB Huffman-emit:** the `DEFLATE encode on EXR bytes` section compares
+three encoders on real predictor+split EXR bytes: the default fpng LZ77 encoder,
+and the fpnge-derived literal encoder with its PSHUFB per-byte Huffman-table
+lookup (scalar vs SSE4.1). The PSHUFB lookup is the SSE4.1 (`pshufb`) tier. Note
+that fpnge's literal-only, PNG-tuned table tends to *expand* EXR data, so it is
+an opt-in/benchmark encoder — the default ZIP codec keeps the fpng LZ77 path.
