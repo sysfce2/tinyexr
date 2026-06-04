@@ -114,6 +114,39 @@ void exr_free(const exr_allocator *a, void *ptr);
 char *exr_strdup(const exr_allocator *a, const char *s);
 
 /* ============================================================================
+ * SIMD dispatch
+ * ========================================================================== */
+
+/* Runtime-detected CPU features (bit flags mirror exr_simd_caps). */
+uint32_t exr_cpu_caps(void);
+
+/* Function-pointer table populated once by exr_simd_init() (idempotent). */
+typedef struct {
+    void (*half_to_float)(const uint16_t *src, float *dst, size_t count);
+    void (*float_to_half)(const float *src, uint16_t *dst, size_t count);
+    void (*interleave)(const uint8_t *src, uint8_t *dst, size_t n); /* de-split */
+} exr_simd_vtbl;
+
+extern exr_simd_vtbl exr_simd;
+void exr_simd_init(void);
+
+/* Scalar kernels (always built). */
+void exr_half_to_float_scalar(const uint16_t *src, float *dst, size_t count);
+void exr_float_to_half_scalar(const float *src, uint16_t *dst, size_t count);
+void exr_interleave_scalar(const uint8_t *src, uint8_t *dst, size_t n);
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define EXR_X86 1
+void exr_interleave_sse2(const uint8_t *src, uint8_t *dst, size_t n);
+void exr_half_to_float_f16c(const uint16_t *src, float *dst, size_t count);
+void exr_float_to_half_f16c(const float *src, uint16_t *dst, size_t count);
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define EXR_NEON 1
+void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n);
+#endif
+
+/* ============================================================================
  * Pixel helpers
  * ========================================================================== */
 

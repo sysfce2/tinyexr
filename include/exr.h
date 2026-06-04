@@ -308,6 +308,10 @@ typedef enum exr_simd_caps {
 uint32_t exr_simd_capabilities(void);
 const char *exr_simd_info(void);
 
+/* Pixel-format conversion (runtime SIMD-dispatched). */
+void exr_half_to_float(const uint16_t *src, float *dst, size_t count);
+void exr_float_to_half(const float *src, uint16_t *dst, size_t count);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

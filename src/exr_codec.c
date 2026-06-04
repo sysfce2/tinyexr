@@ -63,14 +63,8 @@ void exr_predictor_decode(uint8_t *p, size_t n) {
 }
 
 void exr_interleave_decode(const uint8_t *src, uint8_t *dst, size_t n) {
-    const uint8_t *t1 = src;
-    const uint8_t *t2 = src + (n + 1) / 2;
-    uint8_t *s = dst;
-    uint8_t *stop = dst + n;
-    while (s < stop) {
-        *s++ = *t1++;
-        if (s < stop) *s++ = *t2++;
-    }
+    exr_simd_init();
+    exr_simd.interleave(src, dst, n);
 }
 
 /* Forward byte split: even-position bytes into the first half, odd into the
