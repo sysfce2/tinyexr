@@ -733,21 +733,23 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         size_t rh = jph_ceil_div_pow2_size(height, level - 1u);
         size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
-        size_t temp_count, temp_bytes, col_bytes;
+        size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
         int32_t *temp = NULL, *col_low = NULL, *col_high = NULL, *col_out = NULL;
         size_t y, x;
         exr_result rc = EXR_SUCCESS;
 
         if (rw == 0 || rh == 0) return EXR_ERROR_CORRUPT;
         if (exr_mul_ovf(rw, rh, &temp_count) ||
-            exr_mul_ovf(temp_count, sizeof(int32_t), &temp_bytes) ||
-            exr_mul_ovf(rh, sizeof(int32_t), &col_bytes))
+            exr_mul_ovf(temp_count, sizeof(int32_t), &temp_bytes))
+            return EXR_ERROR_CORRUPT;
+        scratch_len = rw > rh ? rw : rh;
+        if (exr_mul_ovf(scratch_len, sizeof(int32_t), &scratch_bytes))
             return EXR_ERROR_CORRUPT;
 
         temp = (int32_t *)exr_malloc(a, temp_bytes);
-        col_low = (int32_t *)exr_malloc(a, col_bytes);
-        col_high = (int32_t *)exr_malloc(a, col_bytes);
-        col_out = (int32_t *)exr_malloc(a, col_bytes);
+        col_low = (int32_t *)exr_malloc(a, scratch_bytes);
+        col_high = (int32_t *)exr_malloc(a, scratch_bytes);
+        col_out = (int32_t *)exr_malloc(a, scratch_bytes);
         if (!temp || !col_low || !col_high || !col_out) {
             exr_free(a, temp);
             exr_free(a, col_low);
@@ -3317,20 +3319,22 @@ exr_result exr_jph_forward_53_2d_i32(const exr_allocator *a,
         size_t rh = jph_ceil_div_pow2_size(height, level - 1u);
         size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
-        size_t temp_count, temp_bytes, col_bytes;
+        size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
         int32_t *temp = NULL, *col_low = NULL, *col_high = NULL;
         size_t y, x;
         exr_result rc = EXR_SUCCESS;
 
         if (rw == 0 || rh == 0) return EXR_ERROR_CORRUPT;
         if (exr_mul_ovf(rw, rh, &temp_count) ||
-            exr_mul_ovf(temp_count, sizeof(int32_t), &temp_bytes) ||
-            exr_mul_ovf(rh, sizeof(int32_t), &col_bytes))
+            exr_mul_ovf(temp_count, sizeof(int32_t), &temp_bytes))
+            return EXR_ERROR_CORRUPT;
+        scratch_len = rw > rh ? rw : rh;
+        if (exr_mul_ovf(scratch_len, sizeof(int32_t), &scratch_bytes))
             return EXR_ERROR_CORRUPT;
 
         temp = (int32_t *)exr_malloc(a, temp_bytes);
-        col_low = (int32_t *)exr_malloc(a, col_bytes);
-        col_high = (int32_t *)exr_malloc(a, col_bytes);
+        col_low = (int32_t *)exr_malloc(a, scratch_bytes);
+        col_high = (int32_t *)exr_malloc(a, scratch_bytes);
         if (!temp || !col_low || !col_high) {
             exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
             return EXR_ERROR_OUT_OF_MEMORY;
@@ -3729,6 +3733,111 @@ static uint32_t jph_abs_i32_to_u32(int32_t v) {
     return (uint32_t)v;
 }
 
+static uint32_t jph_encode_block_sample(const int32_t *plane_data,
+                                        uint32_t plane_stride,
+                                        uint32_t cb_x0, uint32_t cb_y0,
+                                        uint32_t x, uint32_t y,
+                                        uint32_t shift) {
+    int32_t sv = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
+    uint32_t sign = sv < 0 ? 0x80000000u : 0u;
+    uint32_t mag = jph_abs_i32_to_u32(sv);
+    return sign | (mag << shift);
+}
+
+static void jph_encode_block_prepare_sample(const int32_t *plane_data,
+                                            uint32_t plane_stride,
+                                            uint32_t cb_x0, uint32_t cb_y0,
+                                            uint32_t x, uint32_t y,
+                                            uint32_t shift, uint32_t p,
+                                            int *rho, int *e_qmax,
+                                            int *e_q, uint32_t *s,
+                                            int bit) {
+    uint32_t t, val;
+    t = jph_encode_block_sample(plane_data, plane_stride, cb_x0, cb_y0,
+                                x, y, shift);
+    val = t + t;
+    val >>= p;
+    val &= ~1u;
+    if (val) {
+        int eq;
+        *rho |= bit;
+        eq = 32 - jph_clz32(--val);
+        *e_q = eq;
+        if (eq > *e_qmax) *e_qmax = eq;
+        *s = --val + (t >> 31);
+    } else {
+        *e_q = 0;
+        *s = 0;
+    }
+}
+
+static exr_result jph_encode_uvlc_pair(JphVlcEnc *vlc, int u_q0,
+                                       int u_q1, int initial_line) {
+    exr_result rc;
+    if (u_q0 < 0 || u_q1 < 0 || u_q0 >= 75 || u_q1 >= 75)
+        return EXR_ERROR_CORRUPT;
+    if (initial_line && u_q0 > 0 && u_q1 > 0) {
+        if (u_q0 > 2 && u_q1 > 2) {
+            if (u_q0 - 2 >= 75 || u_q1 - 2 >= 75) return EXR_ERROR_CORRUPT;
+            rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0 - 2].pre,
+                                    g_uvlc_enc_tbl[u_q0 - 2].pre_len);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q1 - 2].pre,
+                                    g_uvlc_enc_tbl[u_q1 - 2].pre_len);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0 - 2].suf,
+                                    g_uvlc_enc_tbl[u_q0 - 2].suf_len);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q1 - 2].suf,
+                                    g_uvlc_enc_tbl[u_q1 - 2].suf_len);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0 - 2].ext,
+                                    g_uvlc_enc_tbl[u_q0 - 2].ext_len);
+            if (rc != EXR_SUCCESS) return rc;
+            return jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q1 - 2].ext,
+                                      g_uvlc_enc_tbl[u_q1 - 2].ext_len);
+        }
+        if (u_q0 > 2) {
+            rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0].pre,
+                                    g_uvlc_enc_tbl[u_q0].pre_len);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_vlc_enc_encode(vlc, (uint32_t)(u_q1 - 1), 1);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0].suf,
+                                    g_uvlc_enc_tbl[u_q0].suf_len);
+            if (rc != EXR_SUCCESS) return rc;
+            return jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0].ext,
+                                      g_uvlc_enc_tbl[u_q0].ext_len);
+        }
+    }
+    rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0].pre,
+                            g_uvlc_enc_tbl[u_q0].pre_len);
+    if (rc != EXR_SUCCESS) return rc;
+    rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q1].pre,
+                            g_uvlc_enc_tbl[u_q1].pre_len);
+    if (rc != EXR_SUCCESS) return rc;
+    rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0].suf,
+                            g_uvlc_enc_tbl[u_q0].suf_len);
+    if (rc != EXR_SUCCESS) return rc;
+    rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q1].suf,
+                            g_uvlc_enc_tbl[u_q1].suf_len);
+    if (rc != EXR_SUCCESS) return rc;
+    rc = jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q0].ext,
+                            g_uvlc_enc_tbl[u_q0].ext_len);
+    if (rc != EXR_SUCCESS) return rc;
+    return jph_vlc_enc_encode(vlc, g_uvlc_enc_tbl[u_q1].ext,
+                              g_uvlc_enc_tbl[u_q1].ext_len);
+}
+
+static exr_result jph_encode_mag_bits(JphMsEnc *ms, uint32_t s,
+                                      int rho, int bit, int Uq,
+                                      uint16_t tuple) {
+    int m = (rho & bit) ? Uq - ((tuple & bit) ? 1 : 0) : 0;
+    if (m <= 0) return EXR_SUCCESS;
+    if (m >= 32) return EXR_ERROR_CORRUPT;
+    return jph_ms_encode(ms, s & ((1u << m) - 1u), m);
+}
+
 /* Encode one HT codeblock. */
 static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
                                     uint32_t plane_stride,
@@ -3746,7 +3855,7 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
     uint8_t *mel_buf = mel_vlc_buf;
     uint8_t *vlc_buf = mel_vlc_buf + 192;
     uint32_t ms_cap = 4096, mel_cap = 192, vlc_cap = 3072 - 192;
-    uint32_t shift;
+    uint32_t shift, p;
     exr_result rc;
 
     if (cb_w == 0 || cb_h == 0) { *out_size = 0; return EXR_SUCCESS; }
@@ -3774,7 +3883,7 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
     }
     if (max_val >= (1u << kmax)) return EXR_ERROR_CORRUPT;
     *out_missing_msbs = kmax - 1u;
-    uint32_t p = 31u - kmax;
+    p = 31u - kmax;
     shift = 31u - kmax;
 
     /* Initialize encoders */
@@ -3787,138 +3896,291 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
     uint8_t *lep = e_val; lep[0] = 0;
     uint8_t *lcxp = cx_val; lcxp[0] = 0;
 
-    int e_q[8] = {0,0,0,0,0,0,0,0};
-    int rho[2] = {0,0};
-    uint32_t s[8] = {0,0,0,0,0,0,0,0};
     uint32_t width = cb_w, height = cb_h;
-    int c_q0 = 0, c_q1 = 0;
+    int c_q0 = 0;
 
-    for (uint32_t y = 0; y < height; y += 4) {
-        uint8_t e_val_local[513] = {0};
-        uint8_t cx_val_local[513] = {0};
-        lep = e_val_local; lcxp = cx_val_local;
+    {
+        uint32_t x;
+        int e_qmax[2] = {0, 0};
+        int e_q[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int rho[2] = {0, 0};
+        uint32_t s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (x = 0u; x < width; x += 4u) {
+            int Uq0, Uq1 = 1, u_q0, u_q1 = 0, eps0 = 0, eps1 = 0;
+            int c_q1;
+            uint16_t tuple0, tuple1 = 0;
+            memset(e_q, 0, sizeof(e_q));
+            memset(s, 0, sizeof(s));
+            rho[0] = rho[1] = 0;
+            e_qmax[0] = e_qmax[1] = 0;
 
-        for (uint32_t x = 0; x < width; x += 4) {
-            int e_qmax[2] = {0,0};
-            int u_qs[2] = {0,0};
-            int active_quads = (x + 2u < width) ? 2 : 1;
-            rho[0] = 0; rho[1] = 0;
-            uint32_t t;
-            /* First quad: samples at 4 positions */
-            for (int qi = 0; qi < 8; ++qi) {
-                int qx = qi & 1, qy = qi >> 1;
-                if (x + qx * 2u >= width || y + qy * 2u >= height) { s[qi] = 0; continue; }
-                int ri = qi / 4;
-                int si = qi % 4;
-                int sx = (qi & 1) ? (x + 1) : x;
-                int sy = (qi & 2) ? (y + 1) : y;
-                if (sx >= (int)width || sy >= (int)height) { s[qi] = 0; continue; }
-                {
-                    int32_t sv = plane_data[(cb_y0 + sy) * plane_stride +
-                                             (cb_x0 + sx)];
-                    uint32_t sign = sv < 0 ? 0x80000000u : 0u;
-                    uint32_t mag = jph_abs_i32_to_u32(sv);
-                    t = sign | (mag << shift);
-                }
-                uint32_t val = t + t;
-                val >>= p;
-                val &= ~1u;
-                if (val) {
-                    rho[ri] |= (1 << si);
-                    int eq = 32 - jph_clz32(--val);
-                    e_q[qi] = eq;
-                    if (eq > e_qmax[ri]) e_qmax[ri] = eq;
-                    s[qi] = --val + (t >> 31);
-                } else {
-                    e_q[qi] = 0;
-                    s[qi] = 0;
-                }
+            jph_encode_block_prepare_sample(plane_data, plane_stride, cb_x0,
+                                            cb_y0, x, 0u, shift, p, &rho[0],
+                                            &e_qmax[0], &e_q[0], &s[0], 1);
+            if (height > 1u)
+                jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                cb_x0, cb_y0, x, 1u, shift,
+                                                p, &rho[0], &e_qmax[0],
+                                                &e_q[1], &s[1], 2);
+            if (x + 1u < width) {
+                jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                cb_x0, cb_y0, x + 1u, 0u,
+                                                shift, p, &rho[0],
+                                                &e_qmax[0], &e_q[2], &s[2], 4);
+                if (height > 1u)
+                    jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                    cb_x0, cb_y0, x + 1u, 1u,
+                                                    shift, p, &rho[0],
+                                                    &e_qmax[0], &e_q[3],
+                                                    &s[3], 8);
             }
 
-            /* Process quad pair */
-            for (int ri = 0; ri < active_quads; ++ri) {
-                int c_q = (ri == 0) ? c_q0 : c_q1;
-                int Uq = (e_qmax[ri] > 0) ? e_qmax[ri] : 1;
-                int u_q = Uq - 1;
-                int eps = 0;
-                if (u_q > 0) {
-                    for (int bi = 0; bi < 4; ++bi) {
-                        if (e_q[ri * 4 + bi] == (int)e_qmax[ri])
-                            eps |= (1 << bi);
-                    }
+            Uq0 = e_qmax[0] > 1 ? e_qmax[0] : 1;
+            u_q0 = Uq0 - 1;
+            if (u_q0 > 0) {
+                eps0 |= (e_q[0] == e_qmax[0]);
+                eps0 |= (e_q[1] == e_qmax[0]) << 1;
+                eps0 |= (e_q[2] == e_qmax[0]) << 2;
+                eps0 |= (e_q[3] == e_qmax[0]) << 3;
+            }
+            lep[0] = lep[0] > (uint8_t)e_q[1] ? lep[0] : (uint8_t)e_q[1];
+            lep++;
+            lep[0] = (uint8_t)e_q[3];
+            lcxp[0] = (uint8_t)(lcxp[0] | (uint8_t)((rho[0] & 2) >> 1));
+            lcxp++;
+            lcxp[0] = (uint8_t)((rho[0] & 8) >> 3);
+
+            tuple0 = g_vlc_enc_tbl0[(c_q0 << 8) + (rho[0] << 4) + eps0];
+            rc = jph_vlc_enc_encode(&vlc, tuple0 >> 8, (tuple0 >> 4) & 7);
+            if (rc != EXR_SUCCESS) return rc;
+            if (c_q0 == 0) {
+                rc = jph_mel_enc_encode(&mel, rho[0] != 0);
+                if (rc != EXR_SUCCESS) return rc;
+            }
+            rc = jph_encode_mag_bits(&ms, s[0], rho[0], 1, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_encode_mag_bits(&ms, s[1], rho[0], 2, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_encode_mag_bits(&ms, s[2], rho[0], 4, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_encode_mag_bits(&ms, s[3], rho[0], 8, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+
+            if (x + 2u < width) {
+                jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                cb_x0, cb_y0, x + 2u, 0u,
+                                                shift, p, &rho[1],
+                                                &e_qmax[1], &e_q[4], &s[4], 1);
+                if (height > 1u)
+                    jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                    cb_x0, cb_y0, x + 2u, 1u,
+                                                    shift, p, &rho[1],
+                                                    &e_qmax[1], &e_q[5],
+                                                    &s[5], 2);
+                if (x + 3u < width) {
+                    jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                    cb_x0, cb_y0, x + 3u, 0u,
+                                                    shift, p, &rho[1],
+                                                    &e_qmax[1], &e_q[6],
+                                                    &s[6], 4);
+                    if (height > 1u)
+                        jph_encode_block_prepare_sample(plane_data,
+                                                        plane_stride, cb_x0,
+                                                        cb_y0, x + 3u, 1u,
+                                                        shift, p, &rho[1],
+                                                        &e_qmax[1], &e_q[7],
+                                                        &s[7], 8);
                 }
-                int emb = 0;
-                uint16_t tuple = 0;
-                if ((c_q << 8 | (rho[ri] << 4) | emb) < 2048) {
-                    tuple = g_vlc_enc_tbl0[c_q << 8 | (rho[ri] << 4) | emb];
-                    if (tuple == 0 && ri == 1) {
-                        tuple = g_vlc_enc_tbl1[c_q << 8 | (rho[ri] << 4) | emb];
-                    }
+
+                c_q1 = (rho[0] >> 1) | (rho[0] & 1);
+                Uq1 = e_qmax[1] > 1 ? e_qmax[1] : 1;
+                u_q1 = Uq1 - 1;
+                if (u_q1 > 0) {
+                    eps1 |= (e_q[4] == e_qmax[1]);
+                    eps1 |= (e_q[5] == e_qmax[1]) << 1;
+                    eps1 |= (e_q[6] == e_qmax[1]) << 2;
+                    eps1 |= (e_q[7] == e_qmax[1]) << 3;
                 }
-                int cwd = tuple >> 8;
-                int cwd_len = (tuple >> 4) & 7;
-                if (cwd_len > 0) {
-                    jph_vlc_enc_encode(&vlc, cwd, cwd_len);
+                lep[0] = lep[0] > (uint8_t)e_q[5] ? lep[0] : (uint8_t)e_q[5];
+                lep++;
+                lep[0] = (uint8_t)e_q[7];
+                lcxp[0] = (uint8_t)(lcxp[0] |
+                                    (uint8_t)((rho[1] & 2) >> 1));
+                lcxp++;
+                lcxp[0] = (uint8_t)((rho[1] & 8) >> 3);
+
+                tuple1 = g_vlc_enc_tbl0[(c_q1 << 8) + (rho[1] << 4) + eps1];
+                rc = jph_vlc_enc_encode(&vlc, tuple1 >> 8,
+                                        (tuple1 >> 4) & 7);
+                if (rc != EXR_SUCCESS) return rc;
+                if (c_q1 == 0) {
+                    rc = jph_mel_enc_encode(&mel, rho[1] != 0);
+                    if (rc != EXR_SUCCESS) return rc;
                 }
-                if (c_q == 0) {
-                    jph_mel_enc_encode(&mel, rho[ri] != 0);
-                }
-                u_qs[ri] = u_q;
-                for (int bi = 0; bi < 4; ++bi) {
-                    int m = (rho[ri] & (1 << bi)) ? Uq - ((tuple & (1 << bi)) >> bi) : 0;
-                    if (m > 0) {
-                        jph_ms_encode(&ms, s[ri * 4 + bi] & ((1U << m) - 1), m);
-                    }
-                }
+                rc = jph_encode_mag_bits(&ms, s[4], rho[1], 1, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_encode_mag_bits(&ms, s[5], rho[1], 2, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_encode_mag_bits(&ms, s[6], rho[1], 4, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_encode_mag_bits(&ms, s[7], rho[1], 8, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
             }
 
-            if (u_qs[0] > 0 && u_qs[1] > 0) {
-                rc = jph_mel_enc_encode(&mel,
-                                        (u_qs[0] < u_qs[1] ? u_qs[0] : u_qs[1]) > 2);
+            if (u_q0 > 0 && u_q1 > 0) {
+                int min_uq = u_q0 < u_q1 ? u_q0 : u_q1;
+                rc = jph_mel_enc_encode(&mel, min_uq > 2);
                 if (rc != EXR_SUCCESS) return rc;
             }
-            if (u_qs[0] > 2 && u_qs[1] > 2) {
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[0] - 2].pre,
-                                        g_uvlc_enc_tbl[u_qs[0] - 2].pre_len);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[1] - 2].pre,
-                                        g_uvlc_enc_tbl[u_qs[1] - 2].pre_len);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[0] - 2].suf,
-                                        g_uvlc_enc_tbl[u_qs[0] - 2].suf_len);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[1] - 2].suf,
-                                        g_uvlc_enc_tbl[u_qs[1] - 2].suf_len);
-                if (rc != EXR_SUCCESS) return rc;
-            } else if (u_qs[0] > 2 && u_qs[1] > 0) {
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[0]].pre,
-                                        g_uvlc_enc_tbl[u_qs[0]].pre_len);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, (uint32_t)(u_qs[1] - 1), 1);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[0]].suf,
-                                        g_uvlc_enc_tbl[u_qs[0]].suf_len);
-                if (rc != EXR_SUCCESS) return rc;
-            } else {
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[0]].pre,
-                                        g_uvlc_enc_tbl[u_qs[0]].pre_len);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[1]].pre,
-                                        g_uvlc_enc_tbl[u_qs[1]].pre_len);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[0]].suf,
-                                        g_uvlc_enc_tbl[u_qs[0]].suf_len);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_vlc_enc_encode(&vlc, g_uvlc_enc_tbl[u_qs[1]].suf,
-                                        g_uvlc_enc_tbl[u_qs[1]].suf_len);
-                if (rc != EXR_SUCCESS) return rc;
-            }
-
-            /* Update context for next quad pair */
-            c_q0 = (rho[0] >> 1) | (rho[0] & 1);
-            c_q1 = (rho[1] >> 1) | (rho[1] & 1);
+            rc = jph_encode_uvlc_pair(&vlc, u_q0, u_q1, 1);
+            if (rc != EXR_SUCCESS) return rc;
+            c_q0 = (rho[1] >> 1) | (rho[1] & 1);
         }
-        (void)lep; (void)lcxp;
+    }
+
+    lep[1] = 0;
+
+    for (uint32_t y = 2u; y < height; y += 2u) {
+        int max_e;
+        lep = e_val;
+        max_e = (lep[0] > lep[1] ? lep[0] : lep[1]) - 1;
+        lep[0] = 0;
+        lcxp = cx_val;
+        c_q0 = lcxp[0] + (lcxp[1] << 2);
+        lcxp[0] = 0;
+
+        for (uint32_t x = 0u; x < width; x += 4u) {
+            int e_qmax[2] = {0, 0};
+            int e_q[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            int rho[2] = {0, 0};
+            uint32_t s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            int kappa, Uq0, Uq1 = 1, u_q0, u_q1 = 0;
+            int eps0 = 0, eps1 = 0, c_q1;
+            uint16_t tuple0, tuple1 = 0;
+
+            jph_encode_block_prepare_sample(plane_data, plane_stride, cb_x0,
+                                            cb_y0, x, y, shift, p, &rho[0],
+                                            &e_qmax[0], &e_q[0], &s[0], 1);
+            if (y + 1u < height)
+                jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                cb_x0, cb_y0, x, y + 1u,
+                                                shift, p, &rho[0],
+                                                &e_qmax[0], &e_q[1], &s[1], 2);
+            if (x + 1u < width) {
+                jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                cb_x0, cb_y0, x + 1u, y,
+                                                shift, p, &rho[0],
+                                                &e_qmax[0], &e_q[2], &s[2], 4);
+                if (y + 1u < height)
+                    jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                    cb_x0, cb_y0, x + 1u,
+                                                    y + 1u, shift, p,
+                                                    &rho[0], &e_qmax[0],
+                                                    &e_q[3], &s[3], 8);
+            }
+
+            kappa = (rho[0] & (rho[0] - 1)) ? (max_e > 1 ? max_e : 1) : 1;
+            Uq0 = e_qmax[0] > kappa ? e_qmax[0] : kappa;
+            u_q0 = Uq0 - kappa;
+            if (u_q0 > 0) {
+                eps0 |= (e_q[0] == e_qmax[0]);
+                eps0 |= (e_q[1] == e_qmax[0]) << 1;
+                eps0 |= (e_q[2] == e_qmax[0]) << 2;
+                eps0 |= (e_q[3] == e_qmax[0]) << 3;
+            }
+            lep[0] = lep[0] > (uint8_t)e_q[1] ? lep[0] : (uint8_t)e_q[1];
+            lep++;
+            max_e = (lep[0] > lep[1] ? lep[0] : lep[1]) - 1;
+            lep[0] = (uint8_t)e_q[3];
+            lcxp[0] = (uint8_t)(lcxp[0] | (uint8_t)((rho[0] & 2) >> 1));
+            lcxp++;
+            c_q1 = lcxp[0] + (lcxp[1] << 2);
+            lcxp[0] = (uint8_t)((rho[0] & 8) >> 3);
+
+            tuple0 = g_vlc_enc_tbl1[(c_q0 << 8) + (rho[0] << 4) + eps0];
+            rc = jph_vlc_enc_encode(&vlc, tuple0 >> 8, (tuple0 >> 4) & 7);
+            if (rc != EXR_SUCCESS) return rc;
+            if (c_q0 == 0) {
+                rc = jph_mel_enc_encode(&mel, rho[0] != 0);
+                if (rc != EXR_SUCCESS) return rc;
+            }
+            rc = jph_encode_mag_bits(&ms, s[0], rho[0], 1, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_encode_mag_bits(&ms, s[1], rho[0], 2, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_encode_mag_bits(&ms, s[2], rho[0], 4, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_encode_mag_bits(&ms, s[3], rho[0], 8, Uq0, tuple0);
+            if (rc != EXR_SUCCESS) return rc;
+
+            if (x + 2u < width) {
+                jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                cb_x0, cb_y0, x + 2u, y,
+                                                shift, p, &rho[1],
+                                                &e_qmax[1], &e_q[4], &s[4], 1);
+                if (y + 1u < height)
+                    jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                    cb_x0, cb_y0, x + 2u,
+                                                    y + 1u, shift, p,
+                                                    &rho[1], &e_qmax[1],
+                                                    &e_q[5], &s[5], 2);
+                if (x + 3u < width) {
+                    jph_encode_block_prepare_sample(plane_data, plane_stride,
+                                                    cb_x0, cb_y0, x + 3u, y,
+                                                    shift, p, &rho[1],
+                                                    &e_qmax[1], &e_q[6],
+                                                    &s[6], 4);
+                    if (y + 1u < height)
+                        jph_encode_block_prepare_sample(plane_data,
+                                                        plane_stride, cb_x0,
+                                                        cb_y0, x + 3u, y + 1u,
+                                                        shift, p, &rho[1],
+                                                        &e_qmax[1], &e_q[7],
+                                                        &s[7], 8);
+                }
+
+                kappa = (rho[1] & (rho[1] - 1)) ? (max_e > 1 ? max_e : 1) : 1;
+                c_q1 |= ((rho[0] & 4) >> 1) | ((rho[0] & 8) >> 2);
+                Uq1 = e_qmax[1] > kappa ? e_qmax[1] : kappa;
+                u_q1 = Uq1 - kappa;
+                if (u_q1 > 0) {
+                    eps1 |= (e_q[4] == e_qmax[1]);
+                    eps1 |= (e_q[5] == e_qmax[1]) << 1;
+                    eps1 |= (e_q[6] == e_qmax[1]) << 2;
+                    eps1 |= (e_q[7] == e_qmax[1]) << 3;
+                }
+                lep[0] = lep[0] > (uint8_t)e_q[5] ? lep[0] : (uint8_t)e_q[5];
+                lep++;
+                max_e = (lep[0] > lep[1] ? lep[0] : lep[1]) - 1;
+                lep[0] = (uint8_t)e_q[7];
+                lcxp[0] = (uint8_t)(lcxp[0] |
+                                    (uint8_t)((rho[1] & 2) >> 1));
+                lcxp++;
+                c_q0 = lcxp[0] + (lcxp[1] << 2);
+                lcxp[0] = (uint8_t)((rho[1] & 8) >> 3);
+
+                tuple1 = g_vlc_enc_tbl1[(c_q1 << 8) + (rho[1] << 4) + eps1];
+                rc = jph_vlc_enc_encode(&vlc, tuple1 >> 8,
+                                        (tuple1 >> 4) & 7);
+                if (rc != EXR_SUCCESS) return rc;
+                if (c_q1 == 0) {
+                    rc = jph_mel_enc_encode(&mel, rho[1] != 0);
+                    if (rc != EXR_SUCCESS) return rc;
+                }
+                rc = jph_encode_mag_bits(&ms, s[4], rho[1], 1, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_encode_mag_bits(&ms, s[5], rho[1], 2, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_encode_mag_bits(&ms, s[6], rho[1], 4, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_encode_mag_bits(&ms, s[7], rho[1], 8, Uq1, tuple1);
+                if (rc != EXR_SUCCESS) return rc;
+            }
+
+            rc = jph_encode_uvlc_pair(&vlc, u_q0, u_q1, 0);
+            if (rc != EXR_SUCCESS) return rc;
+            c_q0 |= ((rho[1] & 4) >> 1) | ((rho[1] & 8) >> 2);
+        }
     }
 
     /* Terminate encoders and assemble cleanup pass */
@@ -4593,15 +4855,13 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
     size_t buf_cap, buf_pos = 0;
     uint32_t c;
     exr_result rc;
+    int mc_trans = 0;
+    uint32_t kmax = 20u;
 
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
     if (!ctx || !block || !out_data || !out_size)
         return EXR_ERROR_INVALID_ARGUMENT;
-    return EXR_ERROR_UNSUPPORTED;
-
-    int mc_trans = 0;
-    uint32_t kmax = 20u;
 
     for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
         const exr_channel *ch = &ctx->channels[c];

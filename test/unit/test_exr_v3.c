@@ -158,9 +158,9 @@ diff_done:
     exr_image_free(&ht);
 }
 
-static void jph_encode_reports_unsupported(const char *path,
-                                           exr_compression comp,
-                                           const char *name) {
+static void jph_encode_unsupported_sampling(const char *path,
+                                            exr_compression comp,
+                                            const char *name) {
     exr_image src;
     void *buf = NULL;
     size_t sz = 0;
@@ -173,10 +173,12 @@ static void jph_encode_reports_unsupported(const char *path,
                exr_result_string(rc));
         return;
     }
+    if (src.num_parts > 0 && src.parts[0].header.num_channels > 0)
+        src.parts[0].header.channels[0].x_sampling = 2;
     rc = exr_save_to_memory(&buf, &sz, NULL, &src, comp);
     CHECK(rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0, name);
     if (rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0) {
-        printf("  ok: %s encode reports unsupported\n", name);
+        printf("  ok: %s encode rejects unsupported sampling\n", name);
     } else {
         printf("  FAIL: %s encode rc=%s size=%zu\n", name,
                exr_result_string(rc), sz);
@@ -1064,10 +1066,17 @@ int main(void) {
                        "htj2k32_RgbRampsDiagonal");
 
     printf("== HTJ2K/JPH writer ==\n");
-    jph_encode_reports_unsupported("test/unit/regression/2by2.exr",
-                                   EXR_COMPRESSION_HTJ2K32, "HTJ2K32");
-    jph_encode_reports_unsupported("test/unit/regression/2by2.exr",
-                                   EXR_COMPRESSION_HTJ2K256, "HTJ2K256");
+    roundtrip("test/unit/regression/2by2.exr",
+              EXR_COMPRESSION_HTJ2K32, "HTJ2K32");
+    roundtrip("test/unit/regression/2by2.exr",
+              EXR_COMPRESSION_HTJ2K256, "HTJ2K256");
+    roundtrip("openexr-images/TestImages/AllHalfValues.exr",
+              EXR_COMPRESSION_HTJ2K32, "HTJ2K32 AllHalfValues");
+    roundtrip("openexr-images/TestImages/RgbRampsDiagonal.exr",
+              EXR_COMPRESSION_HTJ2K32, "HTJ2K32 RgbRampsDiagonal");
+    jph_encode_unsupported_sampling("test/unit/regression/2by2.exr",
+                                    EXR_COMPRESSION_HTJ2K32,
+                                    "HTJ2K32 unsupported sampling");
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();
