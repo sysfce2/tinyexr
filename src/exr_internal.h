@@ -257,10 +257,16 @@ struct exr_reader {
     exr_int_part *parts;
     int32_t num_parts;
 
-    /* streaming suspend state (callback path). */
+    /* streaming suspend state (callback path). The whole file is buffered into
+     * `mem` incrementally; `filled` bytes are valid so far. */
+    size_t filled;
     int have_pending;
     exr_pending_read pending;
 };
+
+/* Ensure the streaming buffer holds the whole file; may return EXR_WOULD_BLOCK
+ * with r->pending set. No-op for the memory path. */
+exr_result exr_reader_ensure_buffered(exr_reader *r);
 
 /*
  * Random-access read of [offset, offset+size) from the source.
@@ -272,6 +278,74 @@ struct exr_reader {
  */
 exr_result exr_reader_fetch(exr_reader *r, uint64_t offset, size_t size,
                             void *scratch, const uint8_t **out_ptr);
+
+/* Mipmap pyramid generation for tiled writing (exr_mip.c). Channels stay in
+ * the part's original order; img[level][channel] is a contiguous level image.
+ * Only x/y sampling == 1 is supported. */
+typedef struct {
+    int num_levels;
+    int *lw;     /* [num_levels] */
+    int *lh;     /* [num_levels] */
+    void ***img; /* [num_levels][num_channels] */
+    int num_channels;
+    exr_allocator alloc;
+} exr_mip_pyramid;
+
+exr_result exr_mip_generate(const exr_allocator *a, const exr_part *part,
+                            int round_up, exr_mip_pyramid *out);
+void exr_mip_free(exr_mip_pyramid *pyr);
+
+/* Ripmap pyramid: img[lx*num_y_levels + ly][channel] is the level-0 image
+ * downsampled by 2^lx in x and 2^ly in y. Sampling == 1 only. */
+typedef struct {
+    int num_x_levels;
+    int num_y_levels;
+    int *lw; /* [num_x_levels] */
+    int *lh; /* [num_y_levels] */
+    void ***img;
+    int num_channels;
+    exr_allocator alloc;
+} exr_ripmap_pyramid;
+
+exr_result exr_ripmap_generate(const exr_allocator *a, const exr_part *part,
+                               int round_up, exr_ripmap_pyramid *out);
+void exr_ripmap_free(exr_ripmap_pyramid *pyr);
+
+/* Deep read (exr_deep.c). */
+exr_result exr_read_deep_scanline_part(exr_reader *r, exr_int_part *p,
+                                       int32_t part_idx, exr_part *out);
+exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
+                                    int32_t part_idx, exr_part *out);
+
+/* Build a temporary deep part for tile level (lw x lh) by point-subsampling the
+ * source: level pixel (x,y) takes the samples of source pixel
+ * (x*W/lw, y*H/lh). out shares src's header (channels not owned); free the deep
+ * arrays with exr_deep_level_free. src_prefix[pixel] is src's running offset. */
+exr_result exr_deep_build_level(const exr_allocator *a, const exr_part *src,
+                                const uint64_t *src_prefix, int lw, int lh,
+                                exr_part *out);
+void exr_deep_level_free(const exr_allocator *a, exr_part *level);
+
+/* Deep tiled write: encode one tile's offset table + sample data. tile_w/tile_h
+ * are the (clamped) tile pixel dimensions; x0/y0 the tile pixel origin. */
+exr_result exr_deep_encode_tile(const exr_allocator *a, exr_compression comp,
+                                const exr_part *part, const uint64_t *prefix,
+                                int x0, int y0, int tile_w, int tile_h,
+                                uint8_t **packed_off, size_t *packed_off_size,
+                                uint64_t *unpacked_off_size, uint8_t **packed_samp,
+                                size_t *packed_samp_size,
+                                uint64_t *unpacked_samp_size);
+
+/* Deep scanline write: encode one block's offset table + sample data, each
+ * compressed per `comp`. `prefix[pixel]` is the running sample offset of each
+ * pixel within part->deep_images[c]. Allocates *packed_off / *packed_samp. */
+exr_result exr_deep_encode_block(const exr_allocator *a, exr_compression comp,
+                                 const exr_part *part, const uint64_t *prefix,
+                                 int y0, int nlines, uint8_t **packed_off,
+                                 size_t *packed_off_size,
+                                 uint64_t *unpacked_off_size,
+                                 uint8_t **packed_samp, size_t *packed_samp_size,
+                                 uint64_t *unpacked_samp_size);
 
 /* ============================================================================
  * Codec layer (exr_codec.c and friends). Each decodes one chunk's raw
@@ -317,6 +391,102 @@ exr_result exr_b44_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
                               int optimize_flat);
 exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
                                size_t src_size, uint8_t *dst, size_t dst_size);
+exr_result exr_jph_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
+                              size_t src_size, uint8_t *dst, size_t dst_size);
+exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
+                                  const int32_t *high, size_t high_count,
+                                  int32_t *out, size_t out_count);
+exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
+                                     size_t width, size_t height,
+                                     unsigned levels);
+exr_result exr_jph_inverse_rct_i32(int32_t *c0, int32_t *c1, int32_t *c2,
+                                   size_t count);
+exr_result exr_jph_apply_nlt_type3_i32(int32_t *data, size_t count,
+                                       uint32_t bit_depth);
+
+typedef struct exr_jph_bitreader {
+    const uint8_t *p;
+    const uint8_t *end;
+    uint64_t bits;
+    unsigned bit_count;
+    int prev_ff;
+} exr_jph_bitreader;
+
+void exr_jph_bitreader_init(exr_jph_bitreader *br, const uint8_t *data,
+                            size_t size);
+exr_result exr_jph_bitreader_read(exr_jph_bitreader *br, unsigned nbits,
+                                  uint32_t *out);
+void exr_jph_bitreader_align(exr_jph_bitreader *br);
+exr_result exr_jph_packet_read_pass_count(exr_jph_bitreader *br,
+                                          uint32_t *raw_passes,
+                                          uint32_t *active_passes,
+                                          uint32_t *placeholder_groups);
+exr_result exr_jph_packet_read_pass_lengths(exr_jph_bitreader *br,
+                                            uint32_t active_passes,
+                                            uint32_t placeholder_groups,
+                                            uint32_t lengths[2]);
+
+typedef struct exr_jph_ht_forward_reader {
+    const uint8_t *p;
+    const uint8_t *end;
+    uint64_t bits;
+    unsigned bit_count;
+    uint8_t fill_byte;
+    int prev_ff;
+} exr_jph_ht_forward_reader;
+
+typedef struct exr_jph_ht_reverse_reader {
+    const uint8_t *start;
+    const uint8_t *p;
+    uint64_t bits;
+    unsigned bit_count;
+    int unstuff;
+    int zero_fill;
+} exr_jph_ht_reverse_reader;
+
+typedef struct exr_jph_mel_reader {
+    const uint8_t *p;
+    const uint8_t *end;
+    uint64_t bits;
+    unsigned bit_count;
+    int prev_ff;
+    int k;
+} exr_jph_mel_reader;
+
+void exr_jph_ht_forward_init(exr_jph_ht_forward_reader *r,
+                             const uint8_t *data, size_t size,
+                             uint8_t fill_byte);
+exr_result exr_jph_ht_forward_read(exr_jph_ht_forward_reader *r,
+                                   unsigned nbits, uint32_t *out);
+void exr_jph_ht_reverse_init(exr_jph_ht_reverse_reader *r,
+                             const uint8_t *data, size_t size,
+                             int initial_unstuff, int zero_fill);
+exr_result exr_jph_ht_reverse_read(exr_jph_ht_reverse_reader *r,
+                                   unsigned nbits, uint32_t *out);
+void exr_jph_mel_init(exr_jph_mel_reader *r, const uint8_t *data,
+                      size_t size);
+exr_result exr_jph_mel_get_run(exr_jph_mel_reader *r, uint32_t *zero_run,
+                               int *has_one);
+
+#define EXR_JPH_TAGTREE_MAX_LEVELS 32
+typedef struct exr_jph_tag_tree {
+    uint32_t num_levels;
+    uint32_t width[EXR_JPH_TAGTREE_MAX_LEVELS];
+    uint32_t height[EXR_JPH_TAGTREE_MAX_LEVELS];
+    size_t offset[EXR_JPH_TAGTREE_MAX_LEVELS];
+    size_t node_count;
+    uint32_t *value;
+    uint8_t *known;
+} exr_jph_tag_tree;
+
+exr_result exr_jph_tag_tree_init(const exr_allocator *a,
+                                 exr_jph_tag_tree *tree, uint32_t width,
+                                 uint32_t height);
+void exr_jph_tag_tree_free(const exr_allocator *a, exr_jph_tag_tree *tree);
+exr_result exr_jph_tag_tree_decode(exr_jph_tag_tree *tree,
+                                   exr_jph_bitreader *br, uint32_t leaf_x,
+                                   uint32_t leaf_y, uint32_t threshold,
+                                   uint32_t *out_value);
 
 /* Raw zlib (DEFLATE) inflate used by ZIP/ZIPS/PXR24. Returns the number of
  * decoded bytes in *out_size; fails on truncation/corruption. */
@@ -368,6 +538,23 @@ void exr_fpnge_lookup_avx2(const exr_fpnge_table *t, const uint8_t *src,
                            size_t count, uint8_t *nb, uint8_t *blo, uint8_t *bhi);
 #endif
 
+/* SIMD bit-pack stage: combine consecutive code pairs into 32-bit groups so the
+ * scalar bit-writer runs at half the call count. combined[k] = code(2k) |
+ * (code(2k+1) << nb(2k)); cnb[k] = nb(2k)+nb(2k+1). Returns count/2 pairs; the
+ * caller emits a trailing odd byte. Bit-identical to per-byte emission (codes
+ * <= 15 bits keep the float-exponent shift exact). */
+size_t exr_fpnge_pack16_scalar(const uint8_t *nb, const uint8_t *blo,
+                               const uint8_t *bhi, size_t count,
+                               uint32_t *combined, uint32_t *cnb);
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+size_t exr_fpnge_pack16_sse41(const uint8_t *nb, const uint8_t *blo,
+                              const uint8_t *bhi, size_t count,
+                              uint32_t *combined, uint32_t *cnb);
+size_t exr_fpnge_pack16_avx2(const uint8_t *nb, const uint8_t *blo,
+                             const uint8_t *bhi, size_t count,
+                             uint32_t *combined, uint32_t *cnb);
+#endif
+
 /* Literal-only zlib stream over src[0..n). use_simd selects the PSHUFB lookup
  * when SSE4.1 is available. Allocates *out_data (caller frees). */
 exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src, size_t n,
@@ -382,8 +569,15 @@ exr_result exr_zip_compress(const exr_allocator *a, const uint8_t *src,
                             size_t n, uint8_t **out_data, size_t *out_size);
 exr_result exr_piz_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_pxr24_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                              size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_b44_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                            size_t n, uint8_t **out_data, size_t *out_size,
+                            int optimize_flat);
 exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
                              size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                            size_t n, uint8_t **out_data, size_t *out_size);
 
 /* Encode dispatch: compress one canonical block per ctx->compression. */
 exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,

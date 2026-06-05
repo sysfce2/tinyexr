@@ -42,6 +42,9 @@ exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
         return exr_b44_decompress(ctx, src, src_size, dst, dst_size, 1);
     case EXR_COMPRESSION_ZSTD:
         return exr_zstd_decompress(ctx->alloc, src, src_size, dst, dst_size);
+    case EXR_COMPRESSION_HTJ2K256:
+    case EXR_COMPRESSION_HTJ2K32:
+        return exr_jph_decompress(ctx, src, src_size, dst, dst_size);
     case EXR_COMPRESSION_DWAA:
     case EXR_COMPRESSION_DWAB:
         return EXR_ERROR_UNSUPPORTED;
@@ -68,8 +71,17 @@ exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
         return exr_zip_compress(ctx->alloc, block, n, out_data, out_size);
     case EXR_COMPRESSION_PIZ:
         return exr_piz_compress(ctx, block, n, out_data, out_size);
+    case EXR_COMPRESSION_PXR24:
+        return exr_pxr24_compress(ctx, block, n, out_data, out_size);
+    case EXR_COMPRESSION_B44:
+        return exr_b44_compress(ctx, block, n, out_data, out_size, 0);
+    case EXR_COMPRESSION_B44A:
+        return exr_b44_compress(ctx, block, n, out_data, out_size, 1);
     case EXR_COMPRESSION_ZSTD:
         return exr_zstd_compress(ctx->alloc, block, n, out_data, out_size);
+    case EXR_COMPRESSION_HTJ2K256:
+    case EXR_COMPRESSION_HTJ2K32:
+        return exr_jph_compress(ctx, block, n, out_data, out_size);
     default:
         return EXR_ERROR_UNSUPPORTED;
     }

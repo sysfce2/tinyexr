@@ -83,6 +83,8 @@ typedef enum exr_compression {
     EXR_COMPRESSION_B44A = 7,  /* B44 with flat-block packing, 32/block */
     EXR_COMPRESSION_DWAA = 8,  /* not yet supported */
     EXR_COMPRESSION_DWAB = 9,  /* not yet supported */
+    EXR_COMPRESSION_HTJ2K256 = 10, /* HTJ2K/JPH, 256 scanlines/block */
+    EXR_COMPRESSION_HTJ2K32 = 11,  /* HTJ2K/JPH, 32 scanlines/block */
     EXR_COMPRESSION_ZSTD = 12  /* zstd, 32 scanlines/block */
 } exr_compression;
 
@@ -175,10 +177,16 @@ typedef struct exr_part {
      */
     void **images;
 
-    /* Deep storage (is_deep != 0). */
+    /*
+     * Deep storage (is_deep != 0). deep_sample_counts[y*width+x] holds the
+     * sample count per pixel. deep_images[c] is a contiguous array of all
+     * samples for channel c, in pixel (row-major) order, native pixel type;
+     * the samples for pixel p start at offset sum(deep_sample_counts[0..p-1]).
+     */
     uint8_t is_deep;
-    int32_t *deep_sample_counts;  /* width*height entries, or NULL */
-    void ***deep_images;          /* [channel][pixel] -> sample array, or NULL */
+    int32_t *deep_sample_counts; /* width*height entries, or NULL */
+    void **deep_images;          /* [channel] -> contiguous samples, or NULL */
+    uint64_t deep_total_samples; /* sum of deep_sample_counts */
 } exr_part;
 
 typedef struct exr_image {
@@ -190,6 +198,11 @@ typedef struct exr_image {
 /* Release everything an exr_image owns (channels, pixels, deep arrays, parts).
  * Safe to call on a zero-initialized image. */
 void exr_image_free(exr_image *img);
+
+/* Release a single part filled by the mid-level reader (exr_reader_read_part /
+ * _read_scanlines / _read_tile). Pass the allocator the reader was opened with
+ * (NULL for the default). Safe on a zero-initialized part. */
+void exr_part_free(const exr_allocator *a, exr_part *part);
 
 /* ============================================================================
  * High-level load / save

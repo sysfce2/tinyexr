@@ -88,8 +88,10 @@ int exr_lines_per_block(exr_compression c) {
     case EXR_COMPRESSION_PIZ:
     case EXR_COMPRESSION_B44:
     case EXR_COMPRESSION_B44A:
+    case EXR_COMPRESSION_HTJ2K32:
     case EXR_COMPRESSION_ZSTD: return 32;
     case EXR_COMPRESSION_DWAA: return 32;
+    case EXR_COMPRESSION_HTJ2K256:
     case EXR_COMPRESSION_DWAB: return 256;
     }
     return 1;
@@ -232,33 +234,33 @@ void exr_header_free(const exr_allocator *a, exr_header *hdr) {
  * Image lifetime
  * ========================================================================== */
 
+void exr_part_free(const exr_allocator *a, exr_part *p) {
+    int32_t c, nch;
+    if (!p) return;
+    if (!a) a = exr_default_allocator();
+    nch = p->header.num_channels;
+    if (p->images) {
+        for (c = 0; c < nch; ++c) exr_free(a, p->images[c]);
+        exr_free(a, p->images);
+    }
+    if (p->deep_images) {
+        for (c = 0; c < nch; ++c) exr_free(a, p->deep_images[c]);
+        exr_free(a, p->deep_images);
+    }
+    exr_free(a, p->deep_sample_counts);
+    exr_header_free(a, &p->header);
+    memset(p, 0, sizeof(*p));
+}
+
 void exr_image_free(exr_image *img) {
-    int32_t i, c;
+    int32_t i;
     const exr_allocator *a;
     if (!img || !img->parts) {
         if (img) memset(img, 0, sizeof(*img));
         return;
     }
     a = &img->alloc;
-    for (i = 0; i < img->num_parts; ++i) {
-        exr_part *p = &img->parts[i];
-        int32_t nch = p->header.num_channels;
-        if (p->images) {
-            for (c = 0; c < nch; ++c) exr_free(a, p->images[c]);
-            exr_free(a, p->images);
-        }
-        if (p->deep_images) {
-            for (c = 0; c < nch; ++c) {
-                if (p->deep_images[c]) {
-                    /* deep sample arrays are stored contiguously per channel */
-                    exr_free(a, p->deep_images[c]);
-                }
-            }
-            exr_free(a, p->deep_images);
-        }
-        exr_free(a, p->deep_sample_counts);
-        exr_header_free(a, &p->header);
-    }
+    for (i = 0; i < img->num_parts; ++i) exr_part_free(a, &img->parts[i]);
     exr_free(a, img->parts);
     memset(img, 0, sizeof(*img));
 }
