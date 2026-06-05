@@ -53,6 +53,11 @@ gitleaks detect --source . --log-opts="$RANGE" --no-banner --redact
 Both should report "no leaks found" / `verified_secrets: 0` and exit 0. If either
 flags something, do not push — rewrite history to drop the secret and rotate it.
 
+`.gitleaks.toml` (auto-loaded from the repo root) allowlists the vendored
+`deps/zstd/` amalgamation, whose xxHash key-mixing intrinsics (`key_lo`/`key_hi`)
+trip the generic-api-key heuristic — those are upstream constants, not secrets.
+Keep first-party code out of the allowlist.
+
 ## Conventions
 
 - Every new file gets the BSD-3-Clause header. Ported code keeps upstream
