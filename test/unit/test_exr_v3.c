@@ -30,6 +30,23 @@ static int g_pass = 0, g_fail = 0;
         }                                                                      \
     } while (0)
 
+typedef struct test_alloc_stats {
+    int allocs;
+    int frees;
+} test_alloc_stats;
+
+static void *test_counting_alloc(void *user, size_t size) {
+    test_alloc_stats *stats = (test_alloc_stats *)user;
+    if (stats) stats->allocs++;
+    return malloc(size ? size : 1);
+}
+
+static void test_counting_free(void *user, void *ptr) {
+    test_alloc_stats *stats = (test_alloc_stats *)user;
+    if (stats && ptr) stats->frees++;
+    free(ptr);
+}
+
 /* Load a file expected to succeed; check dims + channel count of part 0. */
 static void expect_load(const char *path, int parts, int w, int h, int nch) {
     exr_image img;
@@ -257,6 +274,584 @@ static void zstd_corruption_rejects(const char *path) {
     exr_image_free(&src);
 }
 
+static int test_put_u8(uint8_t **p, uint8_t *end, uint8_t v) {
+    if (*p >= end) return 0;
+    *(*p)++ = v;
+    return 1;
+}
+
+static int test_put_be16(uint8_t **p, uint8_t *end, uint16_t v) {
+    return test_put_u8(p, end, (uint8_t)(v >> 8)) &&
+           test_put_u8(p, end, (uint8_t)v);
+}
+
+static int test_put_be32(uint8_t **p, uint8_t *end, uint32_t v) {
+    return test_put_u8(p, end, (uint8_t)(v >> 24)) &&
+           test_put_u8(p, end, (uint8_t)(v >> 16)) &&
+           test_put_u8(p, end, (uint8_t)(v >> 8)) &&
+           test_put_u8(p, end, (uint8_t)v);
+}
+
+static int test_put_bytes(uint8_t **p, uint8_t *end, const uint8_t *src,
+                          size_t n) {
+    if ((size_t)(end - *p) < n) return 0;
+    memcpy(*p, src, n);
+    *p += n;
+    return 1;
+}
+
+static size_t test_make_jph_profile_n(uint8_t *buf, size_t cap, uint16_t nch,
+                                      uint8_t mc_trans,
+                                      const uint8_t *tile_payload,
+                                      size_t tile_payload_size) {
+    uint8_t *p = buf;
+    uint8_t *end = buf + cap;
+    uint32_t psot;
+    size_t i, payload_len;
+
+    if (!buf || !tile_payload || nch == 0) return 0;
+    if (tile_payload_size > UINT32_MAX - 14u) return 0;
+    payload_len = 2u + (size_t)nch * 2u;
+    if (payload_len > UINT32_MAX) return 0;
+    psot = 14u + (uint32_t)tile_payload_size;
+
+    if (!test_put_be16(&p, end, 0x4854u) ||
+        !test_put_be32(&p, end, (uint32_t)payload_len) ||
+        !test_put_be16(&p, end, nch))
+        return 0;
+    for (i = 0; i < nch; ++i)
+        if (!test_put_be16(&p, end, (uint16_t)i)) return 0;
+    if (!test_put_be16(&p, end, 0xff4fu) ||
+        !test_put_be16(&p, end, 0xff51u) ||
+        !test_put_be16(&p, end, (uint16_t)(38u + 3u * nch)) ||
+        !test_put_be16(&p, end, 0x4000u) ||
+        !test_put_be32(&p, end, 1u) || !test_put_be32(&p, end, 1u) ||
+        !test_put_be32(&p, end, 0u) || !test_put_be32(&p, end, 0u) ||
+        !test_put_be32(&p, end, 1u) || !test_put_be32(&p, end, 1u) ||
+        !test_put_be32(&p, end, 0u) || !test_put_be32(&p, end, 0u) ||
+        !test_put_be16(&p, end, nch))
+        return 0;
+    for (i = 0; i < nch; ++i) {
+        if (!test_put_u8(&p, end, 0x8fu) ||
+            !test_put_u8(&p, end, 1u) || !test_put_u8(&p, end, 1u))
+            return 0;
+    }
+    if (!test_put_be16(&p, end, 0xff50u) ||
+        !test_put_be16(&p, end, 6u) ||
+        !test_put_be32(&p, end, 0x00020000u) ||
+        !test_put_be16(&p, end, 0xff52u) ||
+        !test_put_be16(&p, end, 12u) ||
+        !test_put_u8(&p, end, 0u) || !test_put_u8(&p, end, 2u) ||
+        !test_put_be16(&p, end, 1u) ||
+        !test_put_u8(&p, end, mc_trans) || !test_put_u8(&p, end, 5u) ||
+        !test_put_u8(&p, end, 5u) || !test_put_u8(&p, end, 3u) ||
+        !test_put_u8(&p, end, 0x40u) || !test_put_u8(&p, end, 1u) ||
+        !test_put_be16(&p, end, 0xff5cu) ||
+        !test_put_be16(&p, end, 19u) ||
+        !test_put_u8(&p, end, 0u))
+        return 0;
+    for (i = 0; i < 16; ++i)
+        if (!test_put_u8(&p, end, 0x40u)) return 0;
+    if (!test_put_be16(&p, end, 0xff76u) ||
+        !test_put_be16(&p, end, 6u) ||
+        !test_put_be16(&p, end, 0xffffu) ||
+        !test_put_u8(&p, end, 0x8fu) || !test_put_u8(&p, end, 3u) ||
+        !test_put_be16(&p, end, 0xff90u) ||
+        !test_put_be16(&p, end, 10u) ||
+        !test_put_be16(&p, end, 0u) ||
+        !test_put_be32(&p, end, psot) ||
+        !test_put_u8(&p, end, 0u) || !test_put_u8(&p, end, 1u) ||
+        !test_put_be16(&p, end, 0xff93u) ||
+        !test_put_bytes(&p, end, tile_payload, tile_payload_size) ||
+        !test_put_be16(&p, end, 0xffd9u))
+        return 0;
+    return (size_t)(p - buf);
+}
+
+static size_t test_make_jph_profile(uint8_t *buf, size_t cap,
+                                    const uint8_t *tile_payload,
+                                    size_t tile_payload_size) {
+    return test_make_jph_profile_n(buf, cap, 1u, 0u, tile_payload,
+                                   tile_payload_size);
+}
+
+static void jph_frontend_rejects_malformed(void) {
+    exr_channel ch;
+    exr_channel ch3[3];
+    exr_codec_ctx ctx;
+    exr_codec_ctx ctx3;
+    uint8_t dst[2] = {0, 0};
+    uint8_t dst3[6] = {1, 2, 3, 4, 5, 6};
+    uint8_t packet_ok[256];
+    uint8_t packet_short[256];
+    uint8_t packet_bad_scup[256];
+    uint8_t packet_empty[256];
+    uint8_t packet_empty_rct[256];
+    uint8_t packet_bad_stuffing[256];
+    size_t packet_ok_size, packet_short_size, packet_bad_scup_size;
+    size_t packet_empty_size, packet_empty_rct_size, packet_bad_stuffing_size;
+    const uint8_t bad_magic[] = {0x00, 0x00, 0x00, 0x00};
+    const uint8_t no_codestream[] = {
+        0x48, 0x54, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00
+    };
+    const uint8_t only_soc[] = {
+        0x48, 0x54, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00,
+        0xff, 0x4f
+    };
+    const uint8_t valid_profile_unsupported[] = {
+        /* OpenEXR HT wrapper: magic, payload length, one-channel map. */
+        0x48, 0x54, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00,
+        /* SOC */
+        0xff, 0x4f,
+        /* SIZ: HT profile, 1x1 image/tile, one signed 16-bit component. */
+        0xff, 0x51, 0x00, 0x29, 0x40, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x8f, 0x01, 0x01,
+        /* CAP: Pcap bit for HTJ2K. */
+        0xff, 0x50, 0x00, 0x06, 0x00, 0x02, 0x00, 0x00,
+        /* COD: RPCL, one layer, no RCT, 5 decomps, 128x32 HT block, 5/3. */
+        0xff, 0x52, 0x00, 0x0c, 0x00, 0x02, 0x00, 0x01,
+        0x00, 0x05, 0x05, 0x03, 0x40, 0x01,
+        /* QCD: reversible scalar quantization for 16 subbands. */
+        0xff, 0x5c, 0x00, 0x13, 0x00,
+        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+        /* NLT: component 0, signed 16-bit, type 3. */
+        0xff, 0x76, 0x00, 0x06, 0x00, 0x00, 0x8f, 0x03,
+        /* SOT/SOD: one-byte tile payload, then EOC. */
+        0xff, 0x90, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x0f, 0x00, 0x01, 0xff, 0x93, 0x00, 0xff, 0xd9
+    };
+    const uint8_t nonempty_packet_payload[] = {
+        0xe2, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    const uint8_t short_packet_payload[] = {0xe2, 0x02};
+    const uint8_t bad_scup_packet_payload[] = {0xe2, 0x00, 0x00};
+    const uint8_t bad_stuffing_packet_payload[] = {
+        0xe4, 0xff, 0x80, 0x02, 0x00
+    };
+    const uint8_t empty_packet_payload[] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    const uint8_t empty_rct_packet_payload[] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    memset(&ch, 0, sizeof(ch));
+    strcpy(ch.name, "A");
+    ch.pixel_type = EXR_PIXEL_HALF;
+    ch.x_sampling = 1;
+    ch.y_sampling = 1;
+    memset(ch3, 0, sizeof(ch3));
+    strcpy(ch3[0].name, "B");
+    strcpy(ch3[1].name, "G");
+    strcpy(ch3[2].name, "R");
+    ch3[0].pixel_type = EXR_PIXEL_HALF;
+    ch3[1].pixel_type = EXR_PIXEL_HALF;
+    ch3[2].pixel_type = EXR_PIXEL_HALF;
+    ch3[0].x_sampling = ch3[1].x_sampling = ch3[2].x_sampling = 1;
+    ch3[0].y_sampling = ch3[1].y_sampling = ch3[2].y_sampling = 1;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.compression = EXR_COMPRESSION_HTJ2K32;
+    ctx.channels = &ch;
+    ctx.num_channels = 1;
+    ctx.width = 1;
+    ctx.num_lines = 1;
+    memset(&ctx3, 0, sizeof(ctx3));
+    ctx3.compression = EXR_COMPRESSION_HTJ2K32;
+    ctx3.channels = ch3;
+    ctx3.num_channels = 3;
+    ctx3.width = 1;
+    ctx3.num_lines = 1;
+
+    packet_ok_size = test_make_jph_profile(packet_ok, sizeof(packet_ok),
+                                           nonempty_packet_payload,
+                                           sizeof(nonempty_packet_payload));
+    packet_short_size = test_make_jph_profile(packet_short,
+                                              sizeof(packet_short),
+                                              short_packet_payload,
+                                              sizeof(short_packet_payload));
+    packet_bad_scup_size = test_make_jph_profile(packet_bad_scup,
+                                                 sizeof(packet_bad_scup),
+                                                 bad_scup_packet_payload,
+                                                 sizeof(bad_scup_packet_payload));
+    packet_empty_size = test_make_jph_profile(packet_empty,
+                                              sizeof(packet_empty),
+                                              empty_packet_payload,
+                                              sizeof(empty_packet_payload));
+    packet_empty_rct_size =
+        test_make_jph_profile_n(packet_empty_rct, sizeof(packet_empty_rct),
+                                3u, 1u, empty_rct_packet_payload,
+                                sizeof(empty_rct_packet_payload));
+    packet_bad_stuffing_size =
+        test_make_jph_profile(packet_bad_stuffing,
+                              sizeof(packet_bad_stuffing),
+                              bad_stuffing_packet_payload,
+                              sizeof(bad_stuffing_packet_payload));
+
+    CHECK(exr_lines_per_block(EXR_COMPRESSION_HTJ2K32) == 32,
+          "HTJ2K32 line count");
+    CHECK(exr_lines_per_block(EXR_COMPRESSION_HTJ2K256) == 256,
+          "HTJ2K256 line count");
+    CHECK(exr_jph_decompress(&ctx, bad_magic, sizeof(bad_magic), dst,
+                             sizeof(dst)) == EXR_ERROR_CORRUPT,
+          "JPH bad magic rejected");
+    CHECK(exr_jph_decompress(&ctx, no_codestream, sizeof(no_codestream), dst,
+                             sizeof(dst)) == EXR_ERROR_CORRUPT,
+          "JPH empty codestream rejected");
+    CHECK(exr_jph_decompress(&ctx, only_soc, sizeof(only_soc), dst,
+                             sizeof(dst)) == EXR_ERROR_CORRUPT,
+          "JPH truncated codestream rejected");
+    CHECK(exr_jph_decompress(&ctx, valid_profile_unsupported,
+                             sizeof(valid_profile_unsupported), dst,
+                             sizeof(dst)) == EXR_ERROR_CORRUPT,
+          "JPH incomplete RPCL packet sequence rejected");
+    dst[0] = 0x7a;
+    dst[1] = 0x55;
+    CHECK(packet_empty_size != 0 &&
+              exr_jph_decompress(&ctx, packet_empty, packet_empty_size, dst,
+                                 sizeof(dst)) == EXR_SUCCESS &&
+              dst[0] == 0 && dst[1] == 0,
+          "JPH complete all-empty packet sequence decodes zero block");
+    CHECK(packet_empty_rct_size != 0 &&
+              exr_jph_decompress(&ctx3, packet_empty_rct,
+                                 packet_empty_rct_size, dst3,
+                                 sizeof(dst3)) == EXR_SUCCESS &&
+              memcmp(dst3, "\0\0\0\0\0\0", sizeof(dst3)) == 0,
+          "JPH all-empty RCT packet sequence decodes zero RGB block");
+    {
+        test_alloc_stats stats;
+        exr_allocator counting_alloc;
+        memset(&stats, 0, sizeof(stats));
+        counting_alloc.user = &stats;
+        counting_alloc.alloc = test_counting_alloc;
+        counting_alloc.free = test_counting_free;
+        ctx.alloc = &counting_alloc;
+        dst[0] = 0x11;
+        dst[1] = 0x22;
+        CHECK(exr_jph_decompress(&ctx, packet_empty, packet_empty_size, dst,
+                                 sizeof(dst)) == EXR_SUCCESS &&
+                  stats.allocs == stats.frees &&
+                  dst[0] == 0 && dst[1] == 0,
+              "JPH decode balances custom allocator allocations");
+        ctx.alloc = NULL;
+    }
+    CHECK(packet_ok_size != 0 &&
+              exr_jph_decompress(&ctx, packet_ok, packet_ok_size, dst,
+                                 sizeof(dst)) == EXR_ERROR_UNSUPPORTED,
+          "JPH non-empty packet metadata reaches entropy decoder boundary");
+    CHECK(packet_short_size != 0 &&
+              exr_jph_decompress(&ctx, packet_short, packet_short_size, dst,
+                                 sizeof(dst)) == EXR_ERROR_CORRUPT,
+          "JPH packet codeblock byte overrun rejected");
+    CHECK(packet_bad_scup_size != 0 &&
+              exr_jph_decompress(&ctx, packet_bad_scup,
+                                 packet_bad_scup_size, dst,
+                                 sizeof(dst)) == EXR_ERROR_CORRUPT,
+          "JPH packet cleanup segment footer rejected");
+    CHECK(packet_bad_stuffing_size != 0 &&
+              exr_jph_decompress(&ctx, packet_bad_stuffing,
+                                 packet_bad_stuffing_size, dst,
+                                 sizeof(dst)) == EXR_ERROR_CORRUPT,
+          "JPH packet stuffed MagSgn byte rejected");
+    printf("  ok: HTJ2K/JPH front end rejects malformed payloads\n");
+}
+
+static int64_t test_floor_div_pow2(int64_t v, unsigned shift) {
+    int64_t d = (int64_t)1 << shift;
+    if (v >= 0) return v / d;
+    return -(((-v) + d - 1) / d);
+}
+
+static void test_forward_53(const int32_t *src, size_t n, int32_t *low,
+                            int32_t *high) {
+    size_t nl = (n + 1u) / 2u;
+    size_t nh = n / 2u;
+    size_t i;
+    for (i = 0; i < nh; ++i) {
+        int64_t e0 = src[2u * i];
+        int64_t e1 = (i + 1u < nl) ? src[2u * (i + 1u)] : e0;
+        high[i] = (int32_t)((int64_t)src[2u * i + 1u] -
+                            test_floor_div_pow2(e0 + e1, 1));
+    }
+    for (i = 0; i < nl; ++i) {
+        int64_t dl = high[i > 0 ? i - 1u : 0u];
+        int64_t dr = high[i < nh ? i : nh - 1u];
+        low[i] = (int32_t)((int64_t)src[2u * i] +
+                           test_floor_div_pow2(dl + dr + 2, 2));
+    }
+}
+
+static size_t test_ceil_div_pow2_size(size_t v, unsigned shift) {
+    while (shift--) v = (v + 1u) / 2u;
+    return v;
+}
+
+static void test_forward_53_2d(int32_t *data, size_t width, size_t height,
+                               unsigned levels) {
+    unsigned level;
+    for (level = 1; level <= levels; ++level) {
+        size_t rw = test_ceil_div_pow2_size(width, level - 1u);
+        size_t rh = test_ceil_div_pow2_size(height, level - 1u);
+        size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
+        size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
+        int32_t temp[32], line[8], low[8], high[8];
+        size_t x, y;
+
+        memset(temp, 0, sizeof(temp));
+        for (x = 0; x < rw; ++x) {
+            for (y = 0; y < rh; ++y) line[y] = data[y * width + x];
+            test_forward_53(line, rh, low, high);
+            for (y = 0; y < lh; ++y) temp[y * rw + x] = low[y];
+            for (y = 0; y < hh; ++y) temp[(lh + y) * rw + x] = high[y];
+        }
+        for (y = 0; y < rh; ++y) {
+            test_forward_53(temp + y * rw, rw, low, high);
+            for (x = 0; x < lw; ++x) data[y * width + x] = low[x];
+            for (x = 0; x < hw; ++x) data[y * width + lw + x] = high[x];
+        }
+    }
+}
+
+static void jph_transforms_roundtrip(void) {
+    const int32_t signal[] = {7, -3, 12, 19, -8, 5, 4, -11, 2};
+    const int32_t tile_src[20] = {
+        5, -1, 7,  9, -4,
+        2, 11, 0, -3,  8,
+       -6,  4, 3, 12, -9,
+        1, -8, 6, 10,  2
+    };
+    int32_t tile[20];
+    int32_t low[5], high[4], recon[9];
+    int32_t r[] = {10, -20, 300, -400};
+    int32_t g[] = {3, 8, -30, 100};
+    int32_t b[] = {-5, 40, 7, -9};
+    int32_t y[4], db[4], dr[4];
+    int32_t nlt16[] = {-32768, -123, -1, 0, 1, 32767};
+    const int32_t nlt16_orig[] = {-32768, -123, -1, 0, 1, 32767};
+    int32_t nlt32[] = {INT32_MIN, -1000000, -1, 0, 1, INT32_MAX};
+    const int32_t nlt32_orig[] = {INT32_MIN, -1000000, -1, 0, 1, INT32_MAX};
+    size_t i;
+
+    test_forward_53(signal, 9, low, high);
+    memset(recon, 0, sizeof(recon));
+    CHECK(exr_jph_inverse_53_i32(low, 5, high, 4, recon, 9) == EXR_SUCCESS &&
+              memcmp(signal, recon, sizeof(signal)) == 0,
+          "JPH inverse 5/3 roundtrip");
+    memcpy(tile, tile_src, sizeof(tile));
+    test_forward_53_2d(tile, 5, 4, 2);
+    CHECK(exr_jph_inverse_53_2d_i32(NULL, tile, 5, 4, 2) == EXR_SUCCESS &&
+              memcmp(tile, tile_src, sizeof(tile)) == 0,
+          "JPH inverse 2D 5/3 roundtrip");
+
+    for (i = 0; i < 4; ++i) {
+        y[i] = (int32_t)test_floor_div_pow2((int64_t)r[i] + 2 * (int64_t)g[i] +
+                                                (int64_t)b[i],
+                                            2);
+        db[i] = b[i] - g[i];
+        dr[i] = r[i] - g[i];
+    }
+    CHECK(exr_jph_inverse_rct_i32(y, db, dr, 4) == EXR_SUCCESS,
+          "JPH inverse RCT returns success");
+    CHECK(memcmp(y, r, sizeof(r)) == 0 && memcmp(db, g, sizeof(g)) == 0 &&
+              memcmp(dr, b, sizeof(b)) == 0,
+          "JPH inverse RCT roundtrip");
+    CHECK(exr_jph_apply_nlt_type3_i32(nlt16, 6, 16) == EXR_SUCCESS &&
+              exr_jph_apply_nlt_type3_i32(nlt16, 6, 16) == EXR_SUCCESS &&
+              memcmp(nlt16, nlt16_orig, sizeof(nlt16)) == 0,
+          "JPH NLT type 3 16-bit involution");
+    CHECK(exr_jph_apply_nlt_type3_i32(nlt32, 6, 32) == EXR_SUCCESS &&
+              exr_jph_apply_nlt_type3_i32(nlt32, 6, 32) == EXR_SUCCESS &&
+              memcmp(nlt32, nlt32_orig, sizeof(nlt32)) == 0,
+          "JPH NLT type 3 32-bit involution");
+    printf("  ok: HTJ2K/JPH reversible transforms round-trip\n");
+}
+
+static void jph_packet_helpers(void) {
+    const exr_allocator *a = exr_default_allocator();
+    exr_jph_bitreader br;
+    exr_jph_ht_forward_reader fr;
+    exr_jph_ht_reverse_reader rr;
+    exr_jph_mel_reader mr;
+    exr_jph_tag_tree tree;
+    uint32_t v = 0;
+    int has_one = 0;
+    const uint8_t bits_a5[] = {0xa5};
+    const uint8_t stuffed[] = {0xff, 0x00};
+    const uint8_t marker[] = {0xff, 0x90};
+    const uint8_t ht_forward[] = {0x0d, 0xff, 0x7f};
+    const uint8_t ht_forward_bad[] = {0xff, 0x80};
+    const uint8_t ht_reverse[] = {0x12, 0x34};
+    const uint8_t ht_reverse_stuffed[] = {0x7f, 0x90};
+    const uint8_t ht_reverse_bad[] = {0xff, 0x90};
+    const uint8_t mel_term[] = {0x00};
+    const uint8_t mel_progress[] = {0xe0};
+    const uint8_t mel_stuffed[] = {0xff, 0x8f};
+    const uint8_t mel_bad[] = {0xff, 0x90};
+    const uint8_t tag_known_zero[] = {0x80};
+    const uint8_t tag_value_one[] = {0x40};
+    const uint8_t pass_one[] = {0x00};
+    const uint8_t pass_two[] = {0x80};
+    const uint8_t pass_three[] = {0xc0};
+    const uint8_t pass_four[] = {0xd0};
+    const uint8_t len_one[] = {0x50};
+    const uint8_t len_two[] = {0x68};
+    const uint8_t len_three[] = {0x79};
+    const uint8_t len_extended[] = {0xd4};
+    const uint8_t len_placeholder[] = {0x28};
+    const uint8_t len_bad_cleanup[] = {0x10};
+    uint32_t raw = 0, active = 0, groups = 0, lengths[2] = {0, 0};
+
+    exr_jph_bitreader_init(&br, bits_a5, sizeof(bits_a5));
+    CHECK(exr_jph_bitreader_read(&br, 4, &v) == EXR_SUCCESS && v == 0xau,
+          "JPH packet bitreader high nibble");
+    CHECK(exr_jph_bitreader_read(&br, 4, &v) == EXR_SUCCESS && v == 0x5u,
+          "JPH packet bitreader low nibble");
+
+    exr_jph_bitreader_init(&br, stuffed, sizeof(stuffed));
+    CHECK(exr_jph_bitreader_read(&br, 15, &v) == EXR_SUCCESS && v == 0x7f80u,
+          "JPH packet bitreader byte stuffing");
+    exr_jph_bitreader_init(&br, marker, sizeof(marker));
+    CHECK(exr_jph_bitreader_read(&br, 9, &v) == EXR_ERROR_CORRUPT,
+          "JPH packet bitreader marker guard");
+
+    exr_jph_ht_forward_init(&fr, ht_forward, sizeof(ht_forward), 0xff);
+    CHECK(exr_jph_ht_forward_read(&fr, 4, &v) == EXR_SUCCESS && v == 0xdu,
+          "JPH HT forward reader low nibble first");
+    CHECK(exr_jph_ht_forward_read(&fr, 4, &v) == EXR_SUCCESS && v == 0,
+          "JPH HT forward reader high nibble second");
+    CHECK(exr_jph_ht_forward_read(&fr, 15, &v) == EXR_SUCCESS && v == 0x7fffu,
+          "JPH HT forward reader byte unstuffing");
+    exr_jph_ht_forward_init(&fr, ht_forward_bad, sizeof(ht_forward_bad), 0);
+    CHECK(exr_jph_ht_forward_read(&fr, 9, &v) == EXR_ERROR_CORRUPT,
+          "JPH HT forward reader rejects stuffed high bit");
+
+    exr_jph_ht_reverse_init(&rr, ht_reverse, sizeof(ht_reverse), 0, 0);
+    CHECK(exr_jph_ht_reverse_read(&rr, 8, &v) == EXR_SUCCESS && v == 0x34u,
+          "JPH HT reverse reader starts at end");
+    CHECK(exr_jph_ht_reverse_read(&rr, 8, &v) == EXR_SUCCESS && v == 0x12u,
+          "JPH HT reverse reader moves backward");
+    exr_jph_ht_reverse_init(&rr, ht_reverse_stuffed,
+                            sizeof(ht_reverse_stuffed), 0, 0);
+    CHECK(exr_jph_ht_reverse_read(&rr, 15, &v) == EXR_SUCCESS &&
+              v == 0x7f90u,
+          "JPH HT reverse reader byte unstuffing");
+    exr_jph_ht_reverse_init(&rr, ht_reverse_bad, sizeof(ht_reverse_bad), 0, 0);
+    CHECK(exr_jph_ht_reverse_read(&rr, 15, &v) == EXR_ERROR_CORRUPT,
+          "JPH HT reverse reader rejects stuffed high bit");
+
+    exr_jph_mel_init(&mr, mel_term, sizeof(mel_term));
+    CHECK(exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              v == 0 && has_one == 1,
+          "JPH MEL terminating zero run");
+    exr_jph_mel_init(&mr, mel_progress, sizeof(mel_progress));
+    CHECK(exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              v == 0 && has_one == 0 &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              v == 0 && has_one == 0 &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              v == 0 && has_one == 0 &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              v == 0 && has_one == 1,
+          "JPH MEL state progression");
+    exr_jph_mel_init(&mr, mel_stuffed, sizeof(mel_stuffed));
+    CHECK(exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS,
+          "JPH MEL accepts 0x8f stuffed byte");
+    exr_jph_mel_init(&mr, mel_bad, sizeof(mel_bad));
+    CHECK(exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
+              exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_ERROR_CORRUPT,
+          "JPH MEL rejects overlarge stuffed byte");
+
+    CHECK(exr_jph_tag_tree_init(a, &tree, 1, 1) == EXR_SUCCESS,
+          "JPH tag tree init 1x1");
+    exr_jph_bitreader_init(&br, tag_known_zero, sizeof(tag_known_zero));
+    CHECK(exr_jph_tag_tree_decode(&tree, &br, 0, 0, 1, &v) == EXR_SUCCESS &&
+              v == 0,
+          "JPH tag tree value zero");
+    exr_jph_tag_tree_free(a, &tree);
+
+    CHECK(exr_jph_tag_tree_init(a, &tree, 1, 1) == EXR_SUCCESS,
+          "JPH tag tree init 1x1 second");
+    exr_jph_bitreader_init(&br, tag_value_one, sizeof(tag_value_one));
+    CHECK(exr_jph_tag_tree_decode(&tree, &br, 0, 0, 2, &v) == EXR_SUCCESS &&
+              v == 1,
+          "JPH tag tree value one");
+    exr_jph_tag_tree_free(a, &tree);
+
+    exr_jph_bitreader_init(&br, pass_one, sizeof(pass_one));
+    CHECK(exr_jph_packet_read_pass_count(&br, &raw, &active, &groups) ==
+              EXR_SUCCESS &&
+              raw == 1 && active == 1 && groups == 0,
+          "JPH packet one pass");
+    exr_jph_bitreader_init(&br, pass_two, sizeof(pass_two));
+    CHECK(exr_jph_packet_read_pass_count(&br, &raw, &active, &groups) ==
+              EXR_SUCCESS &&
+              raw == 2 && active == 2 && groups == 0,
+          "JPH packet two passes");
+    exr_jph_bitreader_init(&br, pass_three, sizeof(pass_three));
+    CHECK(exr_jph_packet_read_pass_count(&br, &raw, &active, &groups) ==
+              EXR_SUCCESS &&
+              raw == 3 && active == 3 && groups == 0,
+          "JPH packet three passes");
+    exr_jph_bitreader_init(&br, pass_four, sizeof(pass_four));
+    CHECK(exr_jph_packet_read_pass_count(&br, &raw, &active, &groups) ==
+              EXR_SUCCESS &&
+              raw == 4 && active == 1 && groups == 1,
+          "JPH packet placeholder pass group");
+
+    exr_jph_bitreader_init(&br, len_one, sizeof(len_one));
+    CHECK(exr_jph_packet_read_pass_lengths(&br, 1, 0, lengths) ==
+              EXR_SUCCESS &&
+              lengths[0] == 5 && lengths[1] == 0,
+          "JPH packet one pass length");
+    exr_jph_bitreader_init(&br, len_two, sizeof(len_two));
+    CHECK(exr_jph_packet_read_pass_lengths(&br, 2, 0, lengths) ==
+              EXR_SUCCESS &&
+              lengths[0] == 6 && lengths[1] == 4,
+          "JPH packet two pass lengths");
+    exr_jph_bitreader_init(&br, len_three, sizeof(len_three));
+    CHECK(exr_jph_packet_read_pass_lengths(&br, 3, 0, lengths) ==
+              EXR_SUCCESS &&
+              lengths[0] == 7 && lengths[1] == 9,
+          "JPH packet three pass lengths");
+    exr_jph_bitreader_init(&br, len_extended, sizeof(len_extended));
+    CHECK(exr_jph_packet_read_pass_lengths(&br, 1, 0, lengths) ==
+              EXR_SUCCESS &&
+              lengths[0] == 20 && lengths[1] == 0,
+          "JPH packet extended Lblock length");
+    exr_jph_bitreader_init(&br, len_placeholder, sizeof(len_placeholder));
+    CHECK(exr_jph_packet_read_pass_lengths(&br, 1, 1, lengths) ==
+              EXR_SUCCESS &&
+              lengths[0] == 5 && lengths[1] == 0,
+          "JPH packet placeholder length bits");
+    exr_jph_bitreader_init(&br, len_bad_cleanup, sizeof(len_bad_cleanup));
+    CHECK(exr_jph_packet_read_pass_lengths(&br, 1, 0, lengths) ==
+              EXR_ERROR_CORRUPT,
+          "JPH packet rejects short cleanup segment");
+    printf("  ok: HTJ2K/JPH packet bitreader and tag tree\n");
+}
+
 /* fpnge PSHUFB literal encoder: SIMD output must equal scalar, and both must
  * round-trip through the inflater. */
 static void fpnge_check(void) {
@@ -367,6 +962,9 @@ int main(void) {
     tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZIP, "ZIP");
     tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZSTD, "ZSTD");
     zstd_corruption_rejects("asakusa.exr");
+    jph_frontend_rejects_malformed();
+    jph_transforms_roundtrip();
+    jph_packet_helpers();
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();
