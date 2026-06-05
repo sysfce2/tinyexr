@@ -262,3 +262,188 @@ done:
     exr_free(a, emitted);
     return rc;
 }
+
+/* ---- encode --------------------------------------------------------------- */
+
+static int b44_shift_round(int x, int shift) {
+    int a, b;
+    x <<= 1;
+    a = (1 << shift) - 1;
+    shift += 1;
+    b = (x >> shift) & 1;
+    return (x + a + b) >> shift;
+}
+
+/* Pack a 4x4 block of HALF values into 14 bytes (or 3 for a flat block). */
+static int b44_pack(uint8_t *out, const uint16_t *blk, int flatfields) {
+    int d[16], r[15], rMin, rMax, shift = -1, i;
+    uint16_t t[16], tMax = 0;
+    const int bias = 0x20;
+    for (i = 0; i < 16; ++i) {
+        if ((blk[i] & 0x7c00) == 0x7c00) t[i] = 0x8000;
+        else if (blk[i] & 0x8000) t[i] = (uint16_t)~blk[i];
+        else t[i] = (uint16_t)(blk[i] | 0x8000);
+    }
+    for (i = 0; i < 16; ++i) if (tMax < t[i]) tMax = t[i];
+    do {
+        shift += 1;
+        for (i = 0; i < 16; ++i) d[i] = b44_shift_round(tMax - t[i], shift);
+        r[0] = d[0] - d[4] + bias;   r[1] = d[4] - d[8] + bias;
+        r[2] = d[8] - d[12] + bias;  r[3] = d[0] - d[1] + bias;
+        r[4] = d[4] - d[5] + bias;   r[5] = d[8] - d[9] + bias;
+        r[6] = d[12] - d[13] + bias; r[7] = d[1] - d[2] + bias;
+        r[8] = d[5] - d[6] + bias;   r[9] = d[9] - d[10] + bias;
+        r[10] = d[13] - d[14] + bias; r[11] = d[2] - d[3] + bias;
+        r[12] = d[6] - d[7] + bias;  r[13] = d[10] - d[11] + bias;
+        r[14] = d[14] - d[15] + bias;
+        rMin = rMax = r[0];
+        for (i = 1; i < 15; ++i) { if (rMin > r[i]) rMin = r[i]; if (rMax < r[i]) rMax = r[i]; }
+    } while (rMin < 0 || rMax > 0x3f);
+
+    if (rMin == bias && rMax == bias && flatfields) {
+        out[0] = (uint8_t)(t[0] >> 8);
+        out[1] = (uint8_t)t[0];
+        out[2] = 0xfc;
+        return 3;
+    }
+    t[0] = (uint16_t)(tMax - (uint16_t)(d[0] << shift)); /* exactmax */
+    out[0] = (uint8_t)(t[0] >> 8);
+    out[1] = (uint8_t)t[0];
+    out[2] = (uint8_t)((shift << 2) | (r[0] >> 4));
+    out[3] = (uint8_t)((r[0] << 4) | (r[1] >> 2));
+    out[4] = (uint8_t)((r[1] << 6) | r[2]);
+    out[5] = (uint8_t)((r[3] << 2) | (r[4] >> 4));
+    out[6] = (uint8_t)((r[4] << 4) | (r[5] >> 2));
+    out[7] = (uint8_t)((r[5] << 6) | r[6]);
+    out[8] = (uint8_t)((r[7] << 2) | (r[8] >> 4));
+    out[9] = (uint8_t)((r[8] << 4) | (r[9] >> 2));
+    out[10] = (uint8_t)((r[9] << 6) | r[10]);
+    out[11] = (uint8_t)((r[11] << 2) | (r[12] >> 4));
+    out[12] = (uint8_t)((r[12] << 4) | (r[13] >> 2));
+    out[13] = (uint8_t)((r[13] << 6) | r[14]);
+    return 14;
+}
+
+exr_result exr_b44_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                            size_t n, uint8_t **out_data, size_t *out_size,
+                            int optimize_flat) {
+    const exr_allocator *a = ctx->alloc;
+    int xmin = ctx->x, xmax = ctx->x + ctx->width - 1;
+    uint16_t **hp = NULL;
+    uint8_t **np = NULL;
+    int *cw = NULL, *ch = NULL, *emit = NULL;
+    int c, line, need_tables = 0;
+    size_t maxout = 0, pos = 0;
+    uint8_t *out = NULL;
+    const uint8_t *bp;
+    exr_result rc = EXR_SUCCESS;
+
+    *out_data = NULL;
+    *out_size = 0;
+    for (c = 0; c < ctx->num_channels; ++c)
+        if (ctx->channels[c].p_linear) need_tables = 1;
+    if (need_tables) b44_init_tables();
+
+    hp = (uint16_t **)exr_calloc(a, (size_t)ctx->num_channels, sizeof(*hp));
+    np = (uint8_t **)exr_calloc(a, (size_t)ctx->num_channels, sizeof(*np));
+    cw = (int *)exr_calloc(a, (size_t)ctx->num_channels, sizeof(int));
+    ch = (int *)exr_calloc(a, (size_t)ctx->num_channels, sizeof(int));
+    emit = (int *)exr_calloc(a, (size_t)ctx->num_channels, sizeof(int));
+    if (!hp || !np || !cw || !ch || !emit) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+
+    for (c = 0; c < ctx->num_channels; ++c) {
+        int xs = ctx->channels[c].x_sampling, ys = ctx->channels[c].y_sampling;
+        int w, h;
+        if (xs <= 0 || ys <= 0) { rc = EXR_ERROR_CORRUPT; goto done; }
+        w = exr_num_samples(xmin, xmax, xs);
+        h = exr_num_samples(ctx->y, ctx->y + ctx->num_lines - 1, ys);
+        if (w < 0) w = 0;
+        if (h < 0) h = 0;
+        cw[c] = w;
+        ch[c] = h;
+        if (ctx->channels[c].pixel_type == EXR_PIXEL_HALF) {
+            int nbx = (w + 3) / 4, nby = (h + 3) / 4;
+            maxout += (size_t)nbx * nby * 14;
+            hp[c] = (uint16_t *)exr_calloc(a, (size_t)(w ? w : 1) * (h ? h : 1),
+                                           sizeof(uint16_t));
+            if (!hp[c]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        } else {
+            maxout += (size_t)w * h * 4;
+            np[c] = (uint8_t *)exr_calloc(a, (size_t)(w ? w : 1) * (h ? h : 1) * 4, 1);
+            if (!np[c]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        }
+    }
+
+    /* reorganize canonical block (dense per line/channel) -> channel planar */
+    bp = block;
+    for (line = 0; line < ctx->num_lines; ++line) {
+        int yy = ctx->y + line;
+        for (c = 0; c < ctx->num_channels; ++c) {
+            int ys = ctx->channels[c].y_sampling, x, row, w = cw[c];
+            if ((yy % ys) != 0) continue;
+            row = emit[c]++;
+            if (ctx->channels[c].pixel_type == EXR_PIXEL_HALF) {
+                uint16_t *dst = hp[c] + (size_t)row * w;
+                for (x = 0; x < w; ++x) { dst[x] = exr_rd_u16(bp); bp += 2; }
+            } else {
+                uint8_t *dst = np[c] + (size_t)row * w * 4;
+                memcpy(dst, bp, (size_t)w * 4);
+                bp += (size_t)w * 4;
+            }
+        }
+    }
+
+    out = (uint8_t *)exr_malloc(a, maxout ? maxout : 1);
+    if (!out) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+
+    for (c = 0; c < ctx->num_channels; ++c) {
+        int w = cw[c], h = ch[c];
+        if (ctx->channels[c].pixel_type == EXR_PIXEL_HALF) {
+            int nbx = (w + 3) / 4, nby = (h + 3) / 4, by, bx;
+            int plinear = ctx->channels[c].p_linear;
+            for (by = 0; by < nby; ++by) {
+                for (bx = 0; bx < nbx; ++bx) {
+                    uint16_t blk[16];
+                    int dy;
+                    for (dy = 0; dy < 4; ++dy) {
+                        int yy = by * 4 + dy, sy = (yy >= h) ? (h - 1) : yy, dx;
+                        for (dx = 0; dx < 4; ++dx) {
+                            int xx = bx * 4 + dx, sx = (xx >= w) ? (w - 1) : xx;
+                            uint16_t v = (w > 0 && h > 0) ? hp[c][(size_t)sy * w + sx] : 0;
+                            if (plinear) v = g_b44_log_table[v];
+                            blk[dy * 4 + dx] = v;
+                        }
+                    }
+                    pos += (size_t)b44_pack(out + pos, blk, optimize_flat);
+                }
+            }
+        } else {
+            size_t cb = (size_t)w * h * 4;
+            memcpy(out + pos, np[c], cb);
+            pos += cb;
+        }
+    }
+
+    if (pos >= n) { /* store the canonical block raw */
+        exr_free(a, out);
+        out = (uint8_t *)exr_malloc(a, n ? n : 1);
+        if (!out) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        memcpy(out, block, n);
+        *out_data = out;
+        *out_size = n;
+        out = NULL;
+        goto done;
+    }
+    *out_data = out;
+    *out_size = pos;
+    out = NULL;
+
+done:
+    if (hp) { for (c = 0; c < ctx->num_channels; ++c) exr_free(a, hp[c]); exr_free(a, hp); }
+    if (np) { for (c = 0; c < ctx->num_channels; ++c) exr_free(a, np[c]); exr_free(a, np); }
+    exr_free(a, cw);
+    exr_free(a, ch);
+    exr_free(a, emit);
+    exr_free(a, out);
+    return rc;
+}
