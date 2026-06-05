@@ -1072,6 +1072,8 @@ int main(void) {
               EXR_COMPRESSION_HTJ2K256, "HTJ2K256");
     roundtrip("openexr-images/TestImages/AllHalfValues.exr",
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32 AllHalfValues");
+    roundtrip("openexr-images/TestImages/AllHalfValues.exr",
+              EXR_COMPRESSION_HTJ2K256, "HTJ2K256 AllHalfValues");
     roundtrip("openexr-images/TestImages/RgbRampsDiagonal.exr",
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32 RgbRampsDiagonal");
     jph_encode_unsupported_sampling("test/unit/regression/2by2.exr",
