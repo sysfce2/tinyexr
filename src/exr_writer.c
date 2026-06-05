@@ -111,7 +111,7 @@ static void write_box2i(obuf *b, const char *name, const exr_box2i *w) {
 
 static void write_header(obuf *b, const exr_header *h, const int *order,
                          exr_compression comp, int multipart,
-                         uint32_t chunk_count) {
+                         uint32_t chunk_count, int32_t max_samples) {
     /* channels */
     {
         obuf cl;
@@ -183,6 +183,18 @@ static void write_header(obuf *b, const exr_header *h, const int *order,
             ob_attr(b, "chunkCount", "int", t, 4);
         }
     }
+    if (h->part_type == EXR_PART_DEEP_SCANLINE ||
+        h->part_type == EXR_PART_DEEP_TILED) {
+        uint8_t t[4];
+        if (!multipart) {
+            const char *ty = part_type_string(h->part_type);
+            ob_attr(b, "type", "string", ty, (uint32_t)strlen(ty));
+        }
+        exr_wr_i32(t, 1);
+        ob_attr(b, "version", "int", t, 4); /* deep data version */
+        exr_wr_i32(t, max_samples);
+        ob_attr(b, "maxSamplesPerPixel", "int", t, 4);
+    }
     ob_u8(b, 0); /* end of header */
 }
 
@@ -241,6 +253,86 @@ static void gather_tile_block(const exr_header *h, const int *order,
     }
 }
 
+/* Gather a tile from a level image into the canonical block. level_img[c] is
+ * the channel's sampled grid (exr_num_samples(0,lw-1,xs) wide). x0/y0 are the
+ * tile's level-local pixel origin. */
+static void gather_level_tile(const exr_header *h, const int *order,
+                              void *const *level_img, int lw, int x0, int y0,
+                              int tw, int th, uint8_t *block) {
+    size_t off = 0;
+    int row, oi;
+    for (row = 0; row < th; ++row) {
+        int yy = y0 + row;
+        for (oi = 0; oi < h->num_channels; ++oi) {
+            int c = order[oi];
+            int xs = h->channels[c].x_sampling < 1 ? 1 : h->channels[c].x_sampling;
+            int ys = h->channels[c].y_sampling < 1 ? 1 : h->channels[c].y_sampling;
+            size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+            int gw, g0, cnt;
+            if ((yy % ys) != 0) continue;
+            gw = exr_num_samples(0, lw - 1, xs);    /* grid width */
+            g0 = ((x0 + xs - 1) / xs);              /* first sampled col idx */
+            cnt = exr_num_samples(x0, x0 + tw - 1, xs);
+            if (cnt > 0)
+                memcpy(block + off,
+                       (const uint8_t *)level_img[c] +
+                           ((size_t)(yy / ys) * gw + g0) * ps,
+                       (size_t)cnt * ps);
+            off += (size_t)cnt * ps;
+        }
+    }
+}
+
+/* Emit every tile of one deep level (lx,ly) to the output buffer. */
+static exr_result emit_deep_tile_level(obuf *b, const exr_allocator *a,
+                                       exr_compression comp, const exr_part *lvl,
+                                       const uint64_t *lpfx, int p, int multipart,
+                                       int lx, int ly, uint64_t *offtab,
+                                       uint32_t *ci) {
+    int tx = (int)lvl->header.tile_x_size, ty = (int)lvl->header.tile_y_size;
+    int nxt = (lvl->width + tx - 1) / tx, nyt = (lvl->height + ty - 1) / ty;
+    int txi, tyi;
+    exr_result rc = EXR_SUCCESS;
+    for (tyi = 0; tyi < nyt && EXR_OK(rc); ++tyi) {
+        for (txi = 0; txi < nxt; ++txi) {
+            int x0 = txi * tx, y0 = tyi * ty;
+            int tw = (tx < lvl->width - x0) ? tx : (lvl->width - x0);
+            int th = (ty < lvl->height - y0) ? ty : (lvl->height - y0);
+            uint8_t *poff = NULL, *psamp = NULL;
+            size_t poff_sz = 0, psamp_sz = 0;
+            uint64_t uoff = 0, usamp = 0;
+            rc = exr_deep_encode_tile(a, comp, lvl, lpfx, x0, y0, tw, th, &poff,
+                                      &poff_sz, &uoff, &psamp, &psamp_sz, &usamp);
+            if (!EXR_OK(rc)) break;
+            offtab[(*ci)++] = (uint64_t)b->len;
+            if (multipart) ob_i32(b, p);
+            ob_i32(b, txi);
+            ob_i32(b, tyi);
+            ob_i32(b, lx);
+            ob_i32(b, ly);
+            ob_u64(b, (uint64_t)poff_sz);
+            ob_u64(b, (uint64_t)psamp_sz);
+            ob_u64(b, usamp);
+            ob_bytes(b, poff, poff_sz);
+            ob_bytes(b, psamp, psamp_sz);
+            exr_free(a, poff);
+            exr_free(a, psamp);
+            (void)uoff;
+            if (b->err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+        }
+    }
+    return rc;
+}
+
+/* Prefix-sum a deep part's sample counts into a freshly allocated array. */
+static uint64_t *deep_prefix(const exr_allocator *a, const exr_part *pt) {
+    size_t npix = (size_t)pt->width * pt->height, i;
+    uint64_t acc = 0, *pfx = (uint64_t *)exr_malloc(a, (npix ? npix : 1) * sizeof(uint64_t));
+    if (!pfx) return NULL;
+    for (i = 0; i < npix; ++i) { pfx[i] = acc; acc += (uint64_t)pt->deep_sample_counts[i]; }
+    return pfx;
+}
+
 /* ---- serialize a set of parts -------------------------------------------- */
 
 static exr_result serialize(const exr_allocator *a, const exr_part *parts,
@@ -265,15 +357,12 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
     for (p = 0; p < num_parts; ++p) {
         if (parts[p].header.tiled) {
             any_tiled = 1;
-            /* mip/ripmap writing would require generating downsampled levels */
-            if (parts[p].header.level_mode != EXR_TILE_ONE_LEVEL)
-                return EXR_ERROR_UNSUPPORTED;
+            /* ONE_LEVEL + MIPMAP + RIPMAP supported (flat and deep). */
             if (parts[p].header.tile_x_size == 0 || parts[p].header.tile_y_size == 0)
                 return EXR_ERROR_INVALID_ARGUMENT;
         }
-        if (parts[p].is_deep) any_deep = 1;
+        if (parts[p].is_deep) any_deep = 1; /* deep tiled allowed (ONE_LEVEL) */
     }
-    if (any_deep) return EXR_ERROR_UNSUPPORTED;
 
     orders = (int **)exr_calloc(a, (size_t)num_parts, sizeof(int *));
     sorted_chans = (exr_channel **)exr_calloc(a, (size_t)num_parts, sizeof(exr_channel *));
@@ -300,9 +389,40 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
             sorted_chans[p][ci2] = pt->header.channels[orders[p][ci2]];
         if (pt->header.tiled) {
             int tx = (int)pt->header.tile_x_size, ty = (int)pt->header.tile_y_size;
-            uint32_t nx = (uint32_t)((pt->width + tx - 1) / tx);
-            uint32_t ny = (uint32_t)((pt->height + ty - 1) / ty);
-            chunk_counts[p] = nx * ny;
+            if (pt->header.level_mode == EXR_TILE_MIPMAP_LEVELS) {
+                int up = (pt->header.rounding_mode == EXR_TILE_ROUND_UP);
+                int ww = pt->width, hh = pt->height;
+                uint32_t total = 0;
+                for (;;) {
+                    uint32_t nx = (uint32_t)((ww + tx - 1) / tx);
+                    uint32_t ny = (uint32_t)((hh + ty - 1) / ty);
+                    total += nx * ny;
+                    if (ww <= 1 && hh <= 1) break;
+                    ww = up ? (ww + 1) / 2 : ww / 2; if (ww < 1) ww = 1;
+                    hh = up ? (hh + 1) / 2 : hh / 2; if (hh < 1) hh = 1;
+                }
+                chunk_counts[p] = total;
+            } else if (pt->header.level_mode == EXR_TILE_RIPMAP_LEVELS) {
+                /* sum_{lx,ly} ceil(lw/tx)*ceil(lh/ty) = (sum_lx ..)*(sum_ly ..) */
+                int up = (pt->header.rounding_mode == EXR_TILE_ROUND_UP);
+                uint32_t sx = 0, sy = 0;
+                int s;
+                for (s = pt->width;;) {
+                    sx += (uint32_t)((s + tx - 1) / tx);
+                    if (s <= 1) break;
+                    s = up ? (s + 1) / 2 : s / 2; if (s < 1) s = 1;
+                }
+                for (s = pt->height;;) {
+                    sy += (uint32_t)((s + ty - 1) / ty);
+                    if (s <= 1) break;
+                    s = up ? (s + 1) / 2 : s / 2; if (s < 1) s = 1;
+                }
+                chunk_counts[p] = sx * sy;
+            } else {
+                uint32_t nx = (uint32_t)((pt->width + tx - 1) / tx);
+                uint32_t ny = (uint32_t)((pt->height + ty - 1) / ty);
+                chunk_counts[p] = nx * ny;
+            }
         } else {
             lpb = exr_lines_per_block(comp);
             chunk_counts[p] = (uint32_t)(((int64_t)pt->height + lpb - 1) / lpb);
@@ -315,7 +435,8 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
     {
         uint32_t ver = EXR_VERSION_NUMBER;
         if (multipart) ver |= EXR_VERSION_FLAG_MULTIPART;
-        else if (any_tiled) ver |= EXR_VERSION_FLAG_TILED;
+        else if (any_tiled && !any_deep) ver |= EXR_VERSION_FLAG_TILED;
+        if (any_deep) ver |= EXR_VERSION_FLAG_NON_IMAGE;
         ob_u32(&b, ver);
     }
 
@@ -324,7 +445,15 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
         const exr_part *pt = &parts[p];
         exr_compression comp =
             comp_override >= 0 ? (exr_compression)comp_override : pt->header.compression;
-        write_header(&b, &pt->header, orders[p], comp, multipart, chunk_counts[p]);
+        int32_t max_samples = 0;
+        if (pt->is_deep && pt->deep_sample_counts) {
+            size_t npix = (size_t)pt->width * pt->height, i;
+            for (i = 0; i < npix; ++i)
+                if (pt->deep_sample_counts[i] > max_samples)
+                    max_samples = pt->deep_sample_counts[i];
+        }
+        write_header(&b, &pt->header, orders[p], comp, multipart,
+                     chunk_counts[p], max_samples);
     }
     if (multipart) ob_u8(&b, 0); /* end of header list */
 
@@ -349,7 +478,231 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
         int xmin = h->data_window.min_x, ymin = h->data_window.min_y;
         int ymax = h->data_window.max_y;
 
-        if (h->tiled) {
+        if (pt->is_deep) {
+            int lpb = exr_lines_per_block(comp);
+            uint64_t *prefix = NULL;
+            size_t npix = (size_t)pt->width * pt->height, i;
+            uint64_t acc = 0;
+            uint32_t ci;
+            prefix = (uint64_t *)exr_malloc(a, (npix ? npix : 1) * sizeof(uint64_t));
+            if (!prefix) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+            for (i = 0; i < npix; ++i) {
+                prefix[i] = acc;
+                acc += (uint64_t)pt->deep_sample_counts[i];
+            }
+            if (h->tiled) {
+                int up = (h->rounding_mode == EXR_TILE_ROUND_UP);
+                uint32_t ci = 0;
+                if (h->level_mode == EXR_TILE_MIPMAP_LEVELS) {
+                    int ww = pt->width, hh = pt->height, L = 0;
+                    for (;;) {
+                        if (L == 0) {
+                            rc = emit_deep_tile_level(&b, a, comp, pt, prefix, p,
+                                                      multipart, 0, 0,
+                                                      offset_tables[p], &ci);
+                        } else {
+                            exr_part lvl;
+                            uint64_t *lpfx;
+                            rc = exr_deep_build_level(a, pt, prefix, ww, hh, &lvl);
+                            if (EXR_OK(rc)) {
+                                lpfx = deep_prefix(a, &lvl);
+                                if (!lpfx) rc = EXR_ERROR_OUT_OF_MEMORY;
+                                else {
+                                    rc = emit_deep_tile_level(&b, a, comp, &lvl,
+                                                              lpfx, p, multipart, L,
+                                                              L, offset_tables[p],
+                                                              &ci);
+                                    exr_free(a, lpfx);
+                                }
+                                exr_deep_level_free(a, &lvl);
+                            }
+                        }
+                        if (!EXR_OK(rc) || (ww <= 1 && hh <= 1)) break;
+                        ww = up ? (ww + 1) / 2 : ww / 2; if (ww < 1) ww = 1;
+                        hh = up ? (hh + 1) / 2 : hh / 2; if (hh < 1) hh = 1;
+                        L++;
+                    }
+                } else if (h->level_mode == EXR_TILE_RIPMAP_LEVELS) {
+                    int nxl = 0, nyl = 0, s, lx, ly;
+                    for (s = pt->width;;) { nxl++; if (s <= 1) break; s = up ? (s + 1) / 2 : s / 2; if (s < 1) s = 1; }
+                    for (s = pt->height;;) { nyl++; if (s <= 1) break; s = up ? (s + 1) / 2 : s / 2; if (s < 1) s = 1; }
+                    for (ly = 0; ly < nyl && EXR_OK(rc); ++ly) {
+                        for (lx = 0; lx < nxl && EXR_OK(rc); ++lx) {
+                            int lw = pt->width, lh = pt->height, t;
+                            for (t = 0; t < lx; ++t) { lw = up ? (lw + 1) / 2 : lw / 2; if (lw < 1) lw = 1; }
+                            for (t = 0; t < ly; ++t) { lh = up ? (lh + 1) / 2 : lh / 2; if (lh < 1) lh = 1; }
+                            if (lx == 0 && ly == 0) {
+                                rc = emit_deep_tile_level(&b, a, comp, pt, prefix, p,
+                                                          multipart, 0, 0,
+                                                          offset_tables[p], &ci);
+                            } else {
+                                exr_part lvl;
+                                uint64_t *lpfx;
+                                rc = exr_deep_build_level(a, pt, prefix, lw, lh, &lvl);
+                                if (EXR_OK(rc)) {
+                                    lpfx = deep_prefix(a, &lvl);
+                                    if (!lpfx) rc = EXR_ERROR_OUT_OF_MEMORY;
+                                    else {
+                                        rc = emit_deep_tile_level(&b, a, comp, &lvl,
+                                                                  lpfx, p, multipart,
+                                                                  lx, ly,
+                                                                  offset_tables[p],
+                                                                  &ci);
+                                        exr_free(a, lpfx);
+                                    }
+                                    exr_deep_level_free(a, &lvl);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    rc = emit_deep_tile_level(&b, a, comp, pt, prefix, p, multipart,
+                                              0, 0, offset_tables[p], &ci);
+                }
+                exr_free(a, prefix);
+                if (!EXR_OK(rc)) goto done;
+                continue;
+            }
+            for (ci = 0; ci < chunk_counts[p]; ++ci) {
+                int y0 = ymin + (int)ci * lpb;
+                int nlines = (y0 + lpb - 1 > ymax) ? (ymax - y0 + 1) : lpb;
+                uint8_t *poff = NULL, *psamp = NULL;
+                size_t poff_sz = 0, psamp_sz = 0;
+                uint64_t uoff = 0, usamp = 0;
+                rc = exr_deep_encode_block(a, comp, pt, prefix, y0, nlines, &poff,
+                                           &poff_sz, &uoff, &psamp, &psamp_sz,
+                                           &usamp);
+                if (!EXR_OK(rc)) { exr_free(a, prefix); goto done; }
+                offset_tables[p][ci] = (uint64_t)b.len;
+                if (multipart) ob_i32(&b, p);
+                ob_i32(&b, y0);
+                ob_u64(&b, (uint64_t)poff_sz);
+                ob_u64(&b, (uint64_t)psamp_sz);
+                ob_u64(&b, usamp);
+                ob_bytes(&b, poff, poff_sz);
+                ob_bytes(&b, psamp, psamp_sz);
+                exr_free(a, poff);
+                exr_free(a, psamp);
+                (void)uoff;
+                if (b.err) { exr_free(a, prefix); rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+            }
+            exr_free(a, prefix);
+        } else if (h->tiled && h->level_mode == EXR_TILE_MIPMAP_LEVELS) {
+            int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
+            int L, txi, tyi;
+            uint32_t ci = 0;
+            exr_mip_pyramid pyr;
+            rc = exr_mip_generate(a, pt, h->rounding_mode == EXR_TILE_ROUND_UP,
+                                  &pyr);
+            if (!EXR_OK(rc)) goto done;
+            for (L = 0; L < pyr.num_levels; ++L) {
+                int lw = pyr.lw[L], lh = pyr.lh[L];
+                int nxt = (lw + tx - 1) / tx, nyt = (lh + ty - 1) / ty;
+                for (tyi = 0; tyi < nyt && EXR_OK(rc); ++tyi) {
+                    for (txi = 0; txi < nxt; ++txi) {
+                        int x0 = txi * tx, y0 = tyi * ty;
+                        int tw = (tx < lw - x0) ? tx : (lw - x0);
+                        int th = (ty < lh - y0) ? ty : (lh - y0);
+                        size_t blk_size, payload_size = 0;
+                        uint8_t *block, *payload = NULL;
+                        exr_codec_ctx cx;
+                        rc = exr_block_uncompressed_size(sorted_chans[p],
+                                                         h->num_channels, x0, y0,
+                                                         tw, th, &blk_size);
+                        if (!EXR_OK(rc)) break;
+                        block = (uint8_t *)exr_malloc(a, blk_size ? blk_size : 1);
+                        if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+                        gather_level_tile(h, orders[p], pyr.img[L], lw, x0, y0, tw,
+                                          th, block);
+                        cx.alloc = a;
+                        cx.compression = comp;
+                        cx.channels = sorted_chans[p];
+                        cx.num_channels = h->num_channels;
+                        cx.x = x0;
+                        cx.y = y0;
+                        cx.width = tw;
+                        cx.num_lines = th;
+                        rc = exr_compress_block(&cx, block, blk_size, &payload,
+                                                &payload_size);
+                        exr_free(a, block);
+                        if (!EXR_OK(rc)) break;
+                        offset_tables[p][ci++] = (uint64_t)b.len;
+                        if (multipart) ob_i32(&b, p);
+                        ob_i32(&b, txi);
+                        ob_i32(&b, tyi);
+                        ob_i32(&b, L);
+                        ob_i32(&b, L);
+                        ob_i32(&b, (int32_t)payload_size);
+                        ob_bytes(&b, payload, payload_size);
+                        exr_free(a, payload);
+                        if (b.err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+                    }
+                }
+                if (!EXR_OK(rc)) break;
+            }
+            exr_mip_free(&pyr);
+            if (!EXR_OK(rc)) goto done;
+            continue;
+        } else if (h->tiled && h->level_mode == EXR_TILE_RIPMAP_LEVELS) {
+            int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
+            int lx, ly, txi, tyi;
+            uint32_t ci = 0;
+            exr_ripmap_pyramid pyr;
+            rc = exr_ripmap_generate(a, pt, h->rounding_mode == EXR_TILE_ROUND_UP,
+                                     &pyr);
+            if (!EXR_OK(rc)) goto done;
+            /* offset-table order: ly outer, lx inner (matches the reader). */
+            for (ly = 0; ly < pyr.num_y_levels && EXR_OK(rc); ++ly) {
+                for (lx = 0; lx < pyr.num_x_levels && EXR_OK(rc); ++lx) {
+                    int lw = pyr.lw[lx], lh = pyr.lh[ly];
+                    void **limg = pyr.img[lx * pyr.num_y_levels + ly];
+                    int nxt = (lw + tx - 1) / tx, nyt = (lh + ty - 1) / ty;
+                    for (tyi = 0; tyi < nyt && EXR_OK(rc); ++tyi) {
+                        for (txi = 0; txi < nxt; ++txi) {
+                            int x0 = txi * tx, y0 = tyi * ty;
+                            int tw = (tx < lw - x0) ? tx : (lw - x0);
+                            int th = (ty < lh - y0) ? ty : (lh - y0);
+                            size_t blk_size, payload_size = 0;
+                            uint8_t *block, *payload = NULL;
+                            exr_codec_ctx cx;
+                            rc = exr_block_uncompressed_size(sorted_chans[p],
+                                                             h->num_channels, x0,
+                                                             y0, tw, th, &blk_size);
+                            if (!EXR_OK(rc)) break;
+                            block = (uint8_t *)exr_malloc(a, blk_size ? blk_size : 1);
+                            if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+                            gather_level_tile(h, orders[p], limg, lw, x0, y0, tw,
+                                              th, block);
+                            cx.alloc = a;
+                            cx.compression = comp;
+                            cx.channels = sorted_chans[p];
+                            cx.num_channels = h->num_channels;
+                            cx.x = x0;
+                            cx.y = y0;
+                            cx.width = tw;
+                            cx.num_lines = th;
+                            rc = exr_compress_block(&cx, block, blk_size, &payload,
+                                                    &payload_size);
+                            exr_free(a, block);
+                            if (!EXR_OK(rc)) break;
+                            offset_tables[p][ci++] = (uint64_t)b.len;
+                            if (multipart) ob_i32(&b, p);
+                            ob_i32(&b, txi);
+                            ob_i32(&b, tyi);
+                            ob_i32(&b, lx);
+                            ob_i32(&b, ly);
+                            ob_i32(&b, (int32_t)payload_size);
+                            ob_bytes(&b, payload, payload_size);
+                            exr_free(a, payload);
+                            if (b.err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+                        }
+                    }
+                }
+            }
+            exr_ripmap_free(&pyr);
+            if (!EXR_OK(rc)) goto done;
+            continue;
+        } else if (h->tiled) {
             int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
             int nxt = (pt->width + tx - 1) / tx;
             int nyt = (pt->height + ty - 1) / ty;
