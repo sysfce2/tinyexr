@@ -41,28 +41,48 @@ exr_result exr_reader_open_source(const exr_data_source *src,
     if (!src || !src->read || !out) return EXR_ERROR_INVALID_ARGUMENT;
     if (!alloc) alloc = exr_default_allocator();
 
-    /* Phase 1: support synchronous, size-known sources by buffering the whole
-     * file. True incremental streaming/suspend lands in Phase 9. */
+    /* The whole file is buffered into `mem` incrementally; the source `read`
+     * callback may return EXR_WOULD_BLOCK, in which case the host fetches the
+     * pending range and feeds it via exr_reader_supply(). */
     if (src->total_size == 0) return EXR_ERROR_UNSUPPORTED;
     buf = (uint8_t *)exr_malloc(alloc, (size_t)src->total_size);
     if (!buf) return EXR_ERROR_OUT_OF_MEMORY;
-    rc = src->read(src->user, 0, src->total_size, buf);
-    if (rc == EXR_WOULD_BLOCK) rc = EXR_ERROR_UNSUPPORTED;
-    if (!EXR_OK(rc)) {
-        exr_free(alloc, buf);
-        return rc;
-    }
     r = (exr_reader *)exr_calloc(alloc, 1, sizeof(*r));
     if (!r) {
         exr_free(alloc, buf);
         return EXR_ERROR_OUT_OF_MEMORY;
     }
+    (void)rc;
     r->alloc = *alloc;
-    r->kind = EXR_SRC_MEMORY;
+    r->kind = EXR_SRC_CALLBACK;
+    r->src = *src;
     r->mem = buf;
     r->mem_size = (size_t)src->total_size;
+    r->filled = 0;
     r->free_mem = 1;
     *out = r;
+    return EXR_SUCCESS;
+}
+
+/* Fill the streaming buffer up to total_size. Returns EXR_WOULD_BLOCK (with
+ * r->pending set) when the source has no more bytes available right now. */
+exr_result exr_reader_ensure_buffered(exr_reader *r) {
+    if (r->kind != EXR_SRC_CALLBACK) return EXR_SUCCESS;
+    while (r->filled < r->mem_size) {
+        uint64_t off = r->filled, len = r->mem_size - r->filled;
+        exr_result rc = r->src.read(r->src.user, off, len,
+                                    (uint8_t *)r->mem + r->filled);
+        if (rc == EXR_WOULD_BLOCK) {
+            r->have_pending = 1;
+            r->pending.offset = off;
+            r->pending.size = len;
+            return EXR_WOULD_BLOCK;
+        }
+        if (!EXR_OK(rc)) return rc;
+        /* a synchronous read fills the entire requested range */
+        r->filled = r->mem_size;
+    }
+    r->have_pending = 0;
     return EXR_SUCCESS;
 }
 
@@ -93,14 +113,14 @@ void exr_reader_close(exr_reader *r) {
 
 exr_result exr_reader_fetch(exr_reader *r, uint64_t offset, size_t size,
                             void *scratch, const uint8_t **out_ptr) {
-    if (r->kind == EXR_SRC_MEMORY) {
-        if (offset > (uint64_t)r->mem_size) return EXR_ERROR_CORRUPT;
-        if (size > r->mem_size - (size_t)offset) return EXR_ERROR_CORRUPT;
-        *out_ptr = r->mem + (size_t)offset;
-        return EXR_SUCCESS;
-    }
-    (void)scratch; /* callback path: Phase 9 */
-    return EXR_ERROR_UNSUPPORTED;
+    /* Both paths read from `mem`; the callback path has buffered `filled`
+     * bytes (== mem_size once exr_reader_ensure_buffered has succeeded). */
+    size_t avail = (r->kind == EXR_SRC_MEMORY) ? r->mem_size : r->filled;
+    (void)scratch;
+    if (offset > (uint64_t)avail) return EXR_ERROR_CORRUPT;
+    if (size > avail - (size_t)offset) return EXR_ERROR_CORRUPT;
+    *out_ptr = r->mem + (size_t)offset;
+    return EXR_SUCCESS;
 }
 
 /* ============================================================================
@@ -439,7 +459,8 @@ exr_result exr_reader_parse_header(exr_reader *r) {
 
     if (!r) return EXR_ERROR_INVALID_ARGUMENT;
     if (r->parsed) return EXR_SUCCESS;
-    if (r->kind != EXR_SRC_MEMORY) return EXR_ERROR_UNSUPPORTED;
+    rc = exr_reader_ensure_buffered(r);
+    if (rc != EXR_SUCCESS) return rc; /* EXR_WOULD_BLOCK or error */
 
     if (r->mem_size < 8) return EXR_ERROR_INVALID_FILE;
     if (exr_rd_u32(r->mem) != EXR_MAGIC) return EXR_ERROR_INVALID_FILE;
@@ -850,7 +871,7 @@ exr_result exr_reader_read_part(exr_reader *r, int32_t part, exr_part *out) {
     exr_result rc;
     if (!r || !out) return EXR_ERROR_INVALID_ARGUMENT;
     rc = exr_reader_parse_header(r);
-    if (!EXR_OK(rc)) return rc;
+    if (rc != EXR_SUCCESS) return rc; /* propagate EXR_WOULD_BLOCK / error */
     if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
     p = &r->parts[part];
 
@@ -868,44 +889,308 @@ exr_result exr_reader_read_part(exr_reader *r, int32_t part, exr_part *out) {
         rc = read_tiled_part(r, p, part, out);
         break;
     case EXR_PART_DEEP_SCANLINE:
+        rc = exr_read_deep_scanline_part(r, p, part, out);
+        break;
     case EXR_PART_DEEP_TILED:
+        rc = exr_read_deep_tiled_part(r, p, part, out);
+        break;
     default:
-        rc = EXR_ERROR_UNSUPPORTED; /* Phase 6 */
+        rc = EXR_ERROR_UNSUPPORTED;
         break;
     }
-    if (!EXR_OK(rc)) {
-        /* free partial channel buffers; header freed by caller via image_free */
-        if (out->images) {
-            int c;
-            for (c = 0; c < out->header.num_channels; ++c)
-                exr_free(&r->alloc, out->images[c]);
-            exr_free(&r->alloc, out->images);
-            out->images = NULL;
-        }
-    }
+    if (!EXR_OK(rc)) exr_part_free(&r->alloc, out); /* on error, out owns nothing */
     return rc;
 }
 
 exr_result exr_reader_read_scanlines(exr_reader *r, int32_t part,
                                      int32_t y_start, int32_t y_count,
                                      exr_part *out) {
-    (void)y_start;
-    (void)y_count;
-    /* Phase 5 exposes partial reads; for now read the whole part. */
-    return exr_reader_read_part(r, part, out);
+    exr_int_part *p;
+    const exr_header *h;
+    const exr_allocator *a;
+    int lpb, ymin, ymax, y_end, c, blk, first_blk, last_blk;
+    uint8_t *block = NULL;
+    size_t block_cap = 0;
+    exr_result rc;
+
+    if (!r || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    p = &r->parts[part];
+    h = &p->header;
+    a = &r->alloc;
+    if (h->part_type != EXR_PART_SCANLINE)
+        return exr_reader_read_part(r, part, out); /* only scanline is partial */
+
+    ymin = h->data_window.min_y;
+    ymax = h->data_window.max_y;
+    if (y_count <= 0 || y_start < ymin || y_start + y_count - 1 > ymax)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    y_end = y_start + y_count - 1;
+
+    memset(out, 0, sizeof(*out));
+    rc = exr_header_copy(a, &out->header, h);
+    if (!EXR_OK(rc)) return rc;
+    out->width = p->width;
+    out->height = y_count;
+
+    out->images = (void **)exr_calloc(a, (size_t)h->num_channels, sizeof(void *));
+    if (!out->images) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    for (c = 0; c < h->num_channels; ++c) {
+        int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+        int cw = nsamp(h->data_window.min_x, h->data_window.max_x, xs);
+        int ch = nsamp(y_start, y_end, ys);
+        size_t n, bytes;
+        if (cw < 0) cw = 0;
+        if (ch < 0) ch = 0;
+        if (exr_mul_ovf((size_t)cw, (size_t)ch, &n) ||
+            exr_mul_ovf(n, exr_pixel_size(h->channels[c].pixel_type), &bytes)) {
+            rc = EXR_ERROR_CORRUPT;
+            goto fail;
+        }
+        out->images[c] = exr_calloc(a, bytes ? bytes : 1, 1);
+        if (!out->images[c]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    }
+
+    lpb = exr_lines_per_block(h->compression);
+    first_blk = (y_start - ymin) / lpb;
+    last_blk = (y_end - ymin) / lpb;
+    for (blk = first_blk; blk <= last_blk; ++blk) {
+        uint64_t off;
+        const uint8_t *hdr, *cdata;
+        size_t hdr_size = r->is_multipart ? 12 : 8;
+        int32_t y0, data_size, nlines, line;
+        size_t dst_size, want, boff;
+        exr_codec_ctx ctx;
+
+        if ((uint32_t)blk >= p->num_chunks) { rc = EXR_ERROR_CORRUPT; goto fail; }
+        off = p->offsets[blk];
+        rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+        if (!EXR_OK(rc)) goto fail;
+        if (r->is_multipart) {
+            if (exr_rd_i32(hdr) != part) { rc = EXR_ERROR_CORRUPT; goto fail; }
+            hdr += 4;
+        }
+        y0 = exr_rd_i32(hdr);
+        data_size = exr_rd_i32(hdr + 4);
+        if (data_size < 0 || y0 < ymin || y0 > ymax) { rc = EXR_ERROR_CORRUPT; goto fail; }
+        nlines = lpb;
+        if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
+
+        rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                         h->data_window.min_x, y0, p->width,
+                                         nlines, &dst_size);
+        if (!EXR_OK(rc)) goto fail;
+        if (exr_add_ovf((size_t)off, hdr_size, &want)) { rc = EXR_ERROR_CORRUPT; goto fail; }
+        rc = exr_reader_fetch(r, want, (size_t)data_size, NULL, &cdata);
+        if (!EXR_OK(rc)) goto fail;
+        if (dst_size > block_cap) {
+            exr_free(a, block);
+            block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+            if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+            block_cap = dst_size;
+        }
+        ctx.alloc = a;
+        ctx.compression = h->compression;
+        ctx.channels = h->channels;
+        ctx.num_channels = h->num_channels;
+        ctx.x = h->data_window.min_x;
+        ctx.y = y0;
+        ctx.width = p->width;
+        ctx.num_lines = nlines;
+        rc = exr_decompress_block(&ctx, cdata, (size_t)data_size, block, dst_size);
+        if (!EXR_OK(rc)) goto fail;
+
+        /* scatter only rows within [y_start, y_end] into the output */
+        boff = 0;
+        for (line = 0; line < nlines; ++line) {
+            int yy = y0 + line;
+            for (c = 0; c < h->num_channels; ++c) {
+                int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+                size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+                int nx, cw, row;
+                size_t bytes;
+                if ((yy % ys) != 0) continue;
+                nx = nsamp(h->data_window.min_x, h->data_window.max_x, xs);
+                if (nx <= 0) continue;
+                cw = nx;
+                bytes = (size_t)nx * ps;
+                if (boff + bytes > dst_size) { rc = EXR_ERROR_CORRUPT; goto fail; }
+                if (yy >= y_start && yy <= y_end) {
+                    row = nsamp(y_start, yy, ys) - 1;
+                    memcpy((uint8_t *)out->images[c] + (size_t)row * cw * ps,
+                           block + boff, bytes);
+                }
+                boff += bytes;
+            }
+        }
+    }
+    exr_free(a, block);
+    return EXR_SUCCESS;
+
+fail:
+    exr_free(a, block);
+    exr_part_free(a, out); /* on error, out owns nothing */
+    return rc;
+}
+
+/* Offset-table index of a tile (tx,ty) at level (lx,ly). */
+static uint32_t tile_index(const exr_int_part *p, int tx, int ty, int lx, int ly) {
+    uint32_t index = 0;
+    int l, nxt, nyt, mode = p->header.level_mode;
+    if (mode == EXR_TILE_MIPMAP_LEVELS) {
+        for (l = 0; l < lx; ++l) {
+            tiled_level_size(p, l, l, NULL, NULL, &nxt, &nyt);
+            index += (uint32_t)(nxt * nyt);
+        }
+        tiled_level_size(p, lx, ly, NULL, NULL, &nxt, NULL);
+        return index + (uint32_t)(ty * nxt + tx);
+    }
+    if (mode == EXR_TILE_RIPMAP_LEVELS) {
+        int yy, xx;
+        for (yy = 0; yy < ly; ++yy)
+            for (xx = 0; xx < p->num_x_levels; ++xx) {
+                tiled_level_size(p, xx, yy, NULL, NULL, &nxt, &nyt);
+                index += (uint32_t)(nxt * nyt);
+            }
+        for (xx = 0; xx < lx; ++xx) {
+            tiled_level_size(p, xx, ly, NULL, NULL, &nxt, &nyt);
+            index += (uint32_t)(nxt * nyt);
+        }
+        tiled_level_size(p, lx, ly, NULL, NULL, &nxt, NULL);
+        return index + (uint32_t)(ty * nxt + tx);
+    }
+    /* ONE_LEVEL */
+    tiled_level_size(p, 0, 0, NULL, NULL, &nxt, NULL);
+    return (uint32_t)(ty * nxt + tx);
 }
 
 exr_result exr_reader_read_tile(exr_reader *r, int32_t part, int32_t tile_x,
                                 int32_t tile_y, int32_t level_x, int32_t level_y,
                                 exr_part *out) {
-    (void)r;
-    (void)part;
-    (void)tile_x;
-    (void)tile_y;
-    (void)level_x;
-    (void)level_y;
-    (void)out;
-    return EXR_ERROR_UNSUPPORTED; /* Phase 5 */
+    exr_int_part *p;
+    const exr_header *h;
+    const exr_allocator *a;
+    int lw, lh, nxt, nyt, tw, th, abs_x0, abs_y0, c, line;
+    int tx, ty;
+    uint32_t idx;
+    uint64_t off;
+    const uint8_t *hdr, *cdata;
+    size_t hdr_size, dst_size, want, boff;
+    int32_t data_size;
+    uint8_t *block = NULL;
+    exr_codec_ctx ctx;
+    exr_result rc;
+
+    if (!r || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    p = &r->parts[part];
+    h = &p->header;
+    a = &r->alloc;
+    if (h->part_type != EXR_PART_TILED) return EXR_ERROR_INVALID_ARGUMENT;
+    if (level_x < 0 || level_x >= p->num_x_levels || level_y < 0 ||
+        level_y >= p->num_y_levels)
+        return EXR_ERROR_INVALID_ARGUMENT;
+
+    tiled_level_size(p, level_x, level_y, &lw, &lh, &nxt, &nyt);
+    if (tile_x < 0 || tile_x >= nxt || tile_y < 0 || tile_y >= nyt)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    tx = (int)h->tile_x_size;
+    ty = (int)h->tile_y_size;
+    tw = (tx < lw - tile_x * tx) ? tx : (lw - tile_x * tx);
+    th = (ty < lh - tile_y * ty) ? ty : (lh - tile_y * ty);
+    abs_x0 = h->data_window.min_x + tile_x * tx;
+    abs_y0 = h->data_window.min_y + tile_y * ty;
+
+    idx = tile_index(p, tile_x, tile_y, level_x, level_y);
+    if (idx >= p->num_chunks) return EXR_ERROR_CORRUPT;
+    off = p->offsets[idx];
+    hdr_size = r->is_multipart ? 24 : 20;
+    rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+    if (!EXR_OK(rc)) return rc;
+    if (r->is_multipart) {
+        if (exr_rd_i32(hdr) != part) return EXR_ERROR_CORRUPT;
+        hdr += 4;
+    }
+    if (exr_rd_i32(hdr) != tile_x || exr_rd_i32(hdr + 4) != tile_y ||
+        exr_rd_i32(hdr + 8) != level_x || exr_rd_i32(hdr + 12) != level_y)
+        return EXR_ERROR_CORRUPT;
+    data_size = exr_rd_i32(hdr + 16);
+    if (data_size < 0) return EXR_ERROR_CORRUPT;
+
+    memset(out, 0, sizeof(*out));
+    rc = exr_header_copy(a, &out->header, h);
+    if (!EXR_OK(rc)) return rc;
+    out->width = tw;
+    out->height = th;
+    out->images = (void **)exr_calloc(a, (size_t)h->num_channels, sizeof(void *));
+    if (!out->images) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    for (c = 0; c < h->num_channels; ++c) {
+        int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+        int cw = nsamp(abs_x0, abs_x0 + tw - 1, xs);
+        int ch = nsamp(abs_y0, abs_y0 + th - 1, ys);
+        size_t n, bytes;
+        if (cw < 0) cw = 0;
+        if (ch < 0) ch = 0;
+        if (exr_mul_ovf((size_t)cw, (size_t)ch, &n) ||
+            exr_mul_ovf(n, exr_pixel_size(h->channels[c].pixel_type), &bytes)) {
+            rc = EXR_ERROR_CORRUPT;
+            goto fail;
+        }
+        out->images[c] = exr_calloc(a, bytes ? bytes : 1, 1);
+        if (!out->images[c]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    }
+
+    rc = exr_block_uncompressed_size(h->channels, h->num_channels, abs_x0, abs_y0,
+                                     tw, th, &dst_size);
+    if (!EXR_OK(rc)) goto fail;
+    if (exr_add_ovf((size_t)off, hdr_size, &want)) { rc = EXR_ERROR_CORRUPT; goto fail; }
+    rc = exr_reader_fetch(r, want, (size_t)data_size, NULL, &cdata);
+    if (!EXR_OK(rc)) goto fail;
+    block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+    if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    ctx.alloc = a;
+    ctx.compression = h->compression;
+    ctx.channels = h->channels;
+    ctx.num_channels = h->num_channels;
+    ctx.x = abs_x0;
+    ctx.y = abs_y0;
+    ctx.width = tw;
+    ctx.num_lines = th;
+    rc = exr_decompress_block(&ctx, cdata, (size_t)data_size, block, dst_size);
+    if (!EXR_OK(rc)) goto fail;
+
+    /* scatter the tile block into the tile-sized output (origin 0,0) */
+    boff = 0;
+    for (line = 0; line < th; ++line) {
+        int yy = abs_y0 + line;
+        for (c = 0; c < h->num_channels; ++c) {
+            int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+            size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+            int nx, cw, row;
+            size_t bytes;
+            if ((yy % ys) != 0) continue;
+            nx = nsamp(abs_x0, abs_x0 + tw - 1, xs);
+            if (nx <= 0) continue;
+            cw = nx;
+            row = nsamp(abs_y0, yy, ys) - 1;
+            bytes = (size_t)nx * ps;
+            if (boff + bytes > dst_size) { rc = EXR_ERROR_CORRUPT; goto fail; }
+            memcpy((uint8_t *)out->images[c] + (size_t)row * cw * ps, block + boff,
+                   bytes);
+            boff += bytes;
+        }
+    }
+    exr_free(a, block);
+    return EXR_SUCCESS;
+
+fail:
+    exr_free(a, block);
+    exr_part_free(a, out); /* on error, out owns nothing */
+    return rc;
 }
 
 /* ============================================================================
@@ -920,8 +1205,13 @@ exr_result exr_reader_pending(const exr_reader *r, exr_pending_read *out) {
 }
 
 exr_result exr_reader_supply(exr_reader *r, const void *data, size_t size) {
-    (void)r;
-    (void)data;
-    (void)size;
-    return EXR_ERROR_UNSUPPORTED;
+    if (!r || (!data && size)) return EXR_ERROR_INVALID_ARGUMENT;
+    if (r->kind != EXR_SRC_CALLBACK) return EXR_ERROR_INVALID_ARGUMENT;
+    /* Append the fetched bytes to the streaming buffer (host may feed the
+     * pending range in pieces). Then re-call the reader function to resume. */
+    if (size > r->mem_size - r->filled) return EXR_ERROR_INVALID_ARGUMENT;
+    memcpy((uint8_t *)r->mem + r->filled, data, size);
+    r->filled += size;
+    r->have_pending = 0;
+    return EXR_SUCCESS;
 }
