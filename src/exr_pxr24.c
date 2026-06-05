@@ -125,3 +125,126 @@ done:
     exr_free(a, buf);
     return rc;
 }
+
+/* float -> 24-bit (top 3 bytes, round-to-nearest). Inverse of the decode's
+ * (p0<<24|p1<<16|p2<<8) reconstruction. */
+static uint32_t float_to_float24(float f) {
+    union { float f; uint32_t i; } u;
+    uint32_t s, e, m, i;
+    u.f = f;
+    s = u.i & 0x80000000u;
+    e = u.i & 0x7f800000u;
+    m = u.i & 0x007fffffu;
+    if (e == 0x7f800000u) {
+        if (m) {
+            m >>= 8;
+            return (s >> 8) | (e >> 8) | m | (m == 0 ? 1u : 0u);
+        }
+        return (s >> 8) | (e >> 8);
+    }
+    i = ((e | m) + (m & 0x00000080u)) >> 8;
+    if (i >= 0x7f8000u) i = (e | m) >> 8;
+    return (s >> 8) | i;
+}
+
+exr_result exr_pxr24_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                              size_t n, uint8_t **out_data, size_t *out_size) {
+    const exr_allocator *a = ctx->alloc;
+    int xmin = ctx->x, xmax = ctx->x + ctx->width - 1;
+    int line, c;
+    size_t inter = 0;
+    uint8_t *buf, *comp = NULL;
+    const uint8_t *in;
+    uint8_t *op;
+    size_t clen = 0;
+    exr_result rc;
+
+    *out_data = NULL;
+    *out_size = 0;
+
+    for (line = 0; line < ctx->num_lines; ++line) {
+        int yy = ctx->y + line;
+        for (c = 0; c < ctx->num_channels; ++c) {
+            int ys = ctx->channels[c].y_sampling, xs = ctx->channels[c].x_sampling;
+            int w;
+            if (ys <= 0 || xs <= 0) return EXR_ERROR_CORRUPT;
+            if ((yy % ys) != 0) continue;
+            w = exr_num_samples(xmin, xmax, xs);
+            if (w < 0) w = 0;
+            inter += (size_t)w * pxr_bpc(ctx->channels[c].pixel_type);
+        }
+    }
+    buf = (uint8_t *)exr_malloc(a, inter ? inter : 1);
+    if (!buf) return EXR_ERROR_OUT_OF_MEMORY;
+
+    in = block;
+    op = buf;
+    for (line = 0; line < ctx->num_lines; ++line) {
+        int yy = ctx->y + line;
+        for (c = 0; c < ctx->num_channels; ++c) {
+            int ys = ctx->channels[c].y_sampling, xs = ctx->channels[c].x_sampling;
+            int w, x;
+            uint32_t prev = 0;
+            if ((yy % ys) != 0) continue;
+            w = exr_num_samples(xmin, xmax, xs);
+            switch (ctx->channels[c].pixel_type) {
+            case EXR_PIXEL_UINT: {
+                uint8_t *p0 = op, *p1 = op + w, *p2 = op + 2 * w, *p3 = op + 3 * w;
+                op += (size_t)w * 4;
+                for (x = 0; x < w; ++x) {
+                    uint32_t px = exr_rd_u32(in), d;
+                    in += 4;
+                    d = px - prev;
+                    prev = px;
+                    p0[x] = (uint8_t)(d >> 24);
+                    p1[x] = (uint8_t)(d >> 16);
+                    p2[x] = (uint8_t)(d >> 8);
+                    p3[x] = (uint8_t)d;
+                }
+                break;
+            }
+            case EXR_PIXEL_HALF: {
+                uint8_t *p0 = op, *p1 = op + w;
+                op += (size_t)w * 2;
+                for (x = 0; x < w; ++x) {
+                    uint32_t px = exr_rd_u16(in), d;
+                    in += 2;
+                    d = px - prev;
+                    prev = px;
+                    p0[x] = (uint8_t)(d >> 8);
+                    p1[x] = (uint8_t)d;
+                }
+                break;
+            }
+            case EXR_PIXEL_FLOAT: {
+                uint8_t *p0 = op, *p1 = op + w, *p2 = op + 2 * w;
+                op += (size_t)w * 3;
+                for (x = 0; x < w; ++x) {
+                    uint32_t px = float_to_float24(exr_rd_f32(in)), d;
+                    in += 4;
+                    d = px - prev;
+                    prev = px;
+                    p0[x] = (uint8_t)(d >> 16);
+                    p1[x] = (uint8_t)(d >> 8);
+                    p2[x] = (uint8_t)d;
+                }
+                break;
+            }
+            }
+        }
+    }
+
+    rc = exr_deflate_zlib(a, buf, inter, &comp, &clen);
+    exr_free(a, buf);
+    if (!EXR_OK(rc) || clen >= n) { /* store the canonical block raw */
+        exr_free(a, comp);
+        *out_data = (uint8_t *)exr_malloc(a, n ? n : 1);
+        if (!*out_data) return EXR_ERROR_OUT_OF_MEMORY;
+        memcpy(*out_data, block, n);
+        *out_size = n;
+        return EXR_SUCCESS;
+    }
+    *out_data = comp;
+    *out_size = clen;
+    return EXR_SUCCESS;
+}
