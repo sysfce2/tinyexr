@@ -145,6 +145,91 @@ void exr_fpnge_lookup_avx2(const exr_fpnge_table *t, const uint8_t *src,
         exr_fpnge_lookup_scalar(t, src + i, count - i, nb + i, blo + i, bhi + i);
 }
 
+/* SIMD bit-pack stage: combine code pairs into 32-bit groups. The variable
+ * "odd << nb_even" shift uses the float-exponent trick on SSE (codes <= 15 bits
+ * fit exactly in a float mantissa, so multiplying by 2^nb_even is exact). */
+EXR_TARGET("sse4.1")
+size_t exr_fpnge_pack16_sse41(const uint8_t *nb, const uint8_t *blo,
+                              const uint8_t *bhi, size_t count,
+                              uint32_t *combined, uint32_t *cnb) {
+    size_t i = 0, np = count / 2, k;
+    const __m128i m16 = _mm_set1_epi32(0xFFFF);
+    const __m128i one16 = _mm_set1_epi16(1);
+    const __m128i zero = _mm_setzero_si128();
+    for (; i + 16 <= count; i += 16) {
+        __m128i vblo = _mm_loadu_si128((const __m128i *)(blo + i));
+        __m128i vbhi = _mm_loadu_si128((const __m128i *)(bhi + i));
+        __m128i vnb = _mm_loadu_si128((const __m128i *)(nb + i));
+        __m128i clo = _mm_unpacklo_epi8(vblo, vbhi); /* codes for bytes 0..7 */
+        __m128i chi = _mm_unpackhi_epi8(vblo, vbhi); /* codes for bytes 8..15 */
+        __m128i nlo = _mm_unpacklo_epi8(vnb, zero);
+        __m128i nhi = _mm_unpackhi_epi8(vnb, zero);
+        __m128i e0 = _mm_and_si128(clo, m16), o0 = _mm_srli_epi32(clo, 16);
+        __m128i ne0 = _mm_and_si128(nlo, m16);
+        __m128i ob0 = _mm_add_epi32(_mm_castps_si128(_mm_cvtepi32_ps(o0)),
+                                    _mm_slli_epi32(ne0, 23));
+        __m128i cm0 = _mm_or_si128(e0, _mm_cvtps_epi32(_mm_castsi128_ps(ob0)));
+        __m128i e1 = _mm_and_si128(chi, m16), o1 = _mm_srli_epi32(chi, 16);
+        __m128i ne1 = _mm_and_si128(nhi, m16);
+        __m128i ob1 = _mm_add_epi32(_mm_castps_si128(_mm_cvtepi32_ps(o1)),
+                                    _mm_slli_epi32(ne1, 23));
+        __m128i cm1 = _mm_or_si128(e1, _mm_cvtps_epi32(_mm_castsi128_ps(ob1)));
+        _mm_storeu_si128((__m128i *)(combined + i / 2), cm0);
+        _mm_storeu_si128((__m128i *)(combined + i / 2 + 4), cm1);
+        _mm_storeu_si128((__m128i *)(cnb + i / 2), _mm_madd_epi16(nlo, one16));
+        _mm_storeu_si128((__m128i *)(cnb + i / 2 + 4), _mm_madd_epi16(nhi, one16));
+    }
+    for (k = i / 2; k < np; ++k) {
+        uint32_t e = (uint32_t)blo[2 * k] | ((uint32_t)bhi[2 * k] << 8);
+        uint32_t o = (uint32_t)blo[2 * k + 1] | ((uint32_t)bhi[2 * k + 1] << 8);
+        combined[k] = e | (o << nb[2 * k]);
+        cnb[k] = (uint32_t)nb[2 * k] + nb[2 * k + 1];
+    }
+    return np;
+}
+
+EXR_TARGET("avx2")
+size_t exr_fpnge_pack16_avx2(const uint8_t *nb, const uint8_t *blo,
+                             const uint8_t *bhi, size_t count,
+                             uint32_t *combined, uint32_t *cnb) {
+    size_t i = 0, np = count / 2, k;
+    const __m256i m16 = _mm256_set1_epi32(0xFFFF);
+    const __m256i one16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+    for (; i + 32 <= count; i += 32) {
+        __m256i vblo = _mm256_loadu_si256((const __m256i *)(blo + i));
+        __m256i vbhi = _mm256_loadu_si256((const __m256i *)(bhi + i));
+        __m256i vnb = _mm256_loadu_si256((const __m256i *)(nb + i));
+        /* unpack is per-128-lane: clo = bytes {0..7, 16..23}, chi = {8..15,24..31} */
+        __m256i clo = _mm256_unpacklo_epi8(vblo, vbhi);
+        __m256i chi = _mm256_unpackhi_epi8(vblo, vbhi);
+        __m256i nlo = _mm256_unpacklo_epi8(vnb, zero);
+        __m256i nhi = _mm256_unpackhi_epi8(vnb, zero);
+        __m256i e0 = _mm256_and_si256(clo, m16), o0 = _mm256_srli_epi32(clo, 16);
+        __m256i cm0 = _mm256_or_si256(e0, _mm256_sllv_epi32(o0, _mm256_and_si256(nlo, m16)));
+        __m256i e1 = _mm256_and_si256(chi, m16), o1 = _mm256_srli_epi32(chi, 16);
+        __m256i cm1 = _mm256_or_si256(e1, _mm256_sllv_epi32(o1, _mm256_and_si256(nhi, m16)));
+        __m256i sn0 = _mm256_madd_epi16(nlo, one16);
+        __m256i sn1 = _mm256_madd_epi16(nhi, one16);
+        /* reassemble sequential pair order across the 128-bit lanes */
+        _mm256_storeu_si256((__m256i *)(combined + i / 2),
+                            _mm256_permute2x128_si256(cm0, cm1, 0x20));
+        _mm256_storeu_si256((__m256i *)(combined + i / 2 + 8),
+                            _mm256_permute2x128_si256(cm0, cm1, 0x31));
+        _mm256_storeu_si256((__m256i *)(cnb + i / 2),
+                            _mm256_permute2x128_si256(sn0, sn1, 0x20));
+        _mm256_storeu_si256((__m256i *)(cnb + i / 2 + 8),
+                            _mm256_permute2x128_si256(sn0, sn1, 0x31));
+    }
+    for (k = i / 2; k < np; ++k) {
+        uint32_t e = (uint32_t)blo[2 * k] | ((uint32_t)bhi[2 * k] << 8);
+        uint32_t o = (uint32_t)blo[2 * k + 1] | ((uint32_t)bhi[2 * k + 1] << 8);
+        combined[k] = e | (o << nb[2 * k]);
+        cnb[k] = (uint32_t)nb[2 * k] + nb[2 * k + 1];
+    }
+    return np;
+}
+
 EXR_TARGET("avx2")
 void exr_interleave_avx2(const uint8_t *src, uint8_t *dst, size_t n) {
     size_t half = (n + 1) / 2, n2 = n / 2, i = 0;

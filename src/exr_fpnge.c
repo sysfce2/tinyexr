@@ -169,15 +169,26 @@ typedef struct {
     int bits;
     int err;
 } fbw;
+/* fpnge-style emit: caller guarantees n <= 56 (residual is always < 8 bits, so
+ * residual + n <= 63, no overflow). One 8-byte store per call instead of a
+ * byte-at-a-time loop; ofs advances by whole bytes, the rest is overwritten by
+ * the next call. The eight byte stores fold to a single 64-bit store on
+ * little-endian targets. */
 static void fbw_put(fbw *w, uint32_t val, int n) {
+    size_t o = w->ofs, nbytes;
+    uint64_t b;
     w->buf |= ((uint64_t)val) << w->bits;
     w->bits += n;
-    while (w->bits >= 8) {
-        if (w->ofs >= w->cap) { w->err = 1; w->bits = 0; return; }
-        w->dst[w->ofs++] = (uint8_t)w->buf;
-        w->buf >>= 8;
-        w->bits -= 8;
-    }
+    b = w->buf;
+    if (o + 8 > w->cap) { w->err = 1; return; }
+    w->dst[o + 0] = (uint8_t)b;        w->dst[o + 1] = (uint8_t)(b >> 8);
+    w->dst[o + 2] = (uint8_t)(b >> 16); w->dst[o + 3] = (uint8_t)(b >> 24);
+    w->dst[o + 4] = (uint8_t)(b >> 32); w->dst[o + 5] = (uint8_t)(b >> 40);
+    w->dst[o + 6] = (uint8_t)(b >> 48); w->dst[o + 7] = (uint8_t)(b >> 56);
+    nbytes = (size_t)(w->bits >> 3);
+    w->ofs = o + nbytes;
+    w->bits &= 7;
+    w->buf = b >> (nbytes * 8);
 }
 static void fbw_flush(fbw *w) {
     while (w->bits > 0) {
@@ -232,6 +243,20 @@ void exr_fpnge_lookup_scalar(const exr_fpnge_table *t, const uint8_t *src,
 }
 
 /* Public: literal-only zlib stream over src[0..n). Allocates *out. */
+/* Scalar reference for the SIMD pair-combine bit-pack stage. */
+size_t exr_fpnge_pack16_scalar(const uint8_t *nb, const uint8_t *blo,
+                               const uint8_t *bhi, size_t count,
+                               uint32_t *combined, uint32_t *cnb) {
+    size_t k, np = count / 2;
+    for (k = 0; k < np; ++k) {
+        uint32_t e = (uint32_t)blo[2 * k] | ((uint32_t)bhi[2 * k] << 8);
+        uint32_t o = (uint32_t)blo[2 * k + 1] | ((uint32_t)bhi[2 * k + 1] << 8);
+        combined[k] = e | (o << nb[2 * k]);
+        cnb[k] = (uint32_t)nb[2 * k] + nb[2 * k + 1];
+    }
+    return np;
+}
+
 exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
                              size_t n, uint8_t **out_data, size_t *out_size,
                              int use_simd) {
@@ -239,6 +264,7 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
     uint64_t collected[286];
     exr_fpnge_table t;
     uint8_t *out, *nb = NULL, *blo = NULL, *bhi = NULL;
+    uint32_t *combined = NULL, *cnb = NULL;
     size_t cap, i, off;
     fbw w;
     uint32_t adler;
@@ -256,8 +282,11 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
     nb = (uint8_t *)exr_malloc(a, CH);
     blo = (uint8_t *)exr_malloc(a, CH);
     bhi = (uint8_t *)exr_malloc(a, CH);
-    if (!out || !nb || !blo || !bhi) {
+    combined = (uint32_t *)exr_malloc(a, (CH / 2) * sizeof(uint32_t));
+    cnb = (uint32_t *)exr_malloc(a, (CH / 2) * sizeof(uint32_t));
+    if (!out || !nb || !blo || !bhi || !combined || !cnb) {
         exr_free(a, out); exr_free(a, nb); exr_free(a, blo); exr_free(a, bhi);
+        exr_free(a, combined); exr_free(a, cnb);
         return EXR_ERROR_OUT_OF_MEMORY;
     }
     out[0] = 0x78;
@@ -286,16 +315,22 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
 
     for (off = 0; off < n; off += CH) {
         size_t c = (n - off < CH) ? (n - off) : CH;
-        size_t j;
+        size_t np, k;
 #if defined(EXR_X86)
         if (simd == 2) exr_fpnge_lookup_avx2(&t, src + off, c, nb, blo, bhi);
         else if (simd == 1) exr_fpnge_lookup_sse41(&t, src + off, c, nb, blo, bhi);
         else exr_fpnge_lookup_scalar(&t, src + off, c, nb, blo, bhi);
+        if (simd == 2) np = exr_fpnge_pack16_avx2(nb, blo, bhi, c, combined, cnb);
+        else if (simd == 1) np = exr_fpnge_pack16_sse41(nb, blo, bhi, c, combined, cnb);
+        else np = exr_fpnge_pack16_scalar(nb, blo, bhi, c, combined, cnb);
 #else
         exr_fpnge_lookup_scalar(&t, src + off, c, nb, blo, bhi);
+        np = exr_fpnge_pack16_scalar(nb, blo, bhi, c, combined, cnb);
 #endif
-        for (j = 0; j < c; ++j)
-            fbw_put(&w, (uint32_t)blo[j] | ((uint32_t)bhi[j] << 8), nb[j]);
+        /* each combined group holds two codes (<= 30 bits): safe for fbw_put */
+        for (k = 0; k < np; ++k) fbw_put(&w, combined[k], (int)cnb[k]);
+        if (c & 1) /* trailing odd byte */
+            fbw_put(&w, (uint32_t)blo[c - 1] | ((uint32_t)bhi[c - 1] << 8), nb[c - 1]);
     }
 
     fbw_put(&w, t.end_bits, t.nbits[256]); /* end of block */
@@ -304,6 +339,8 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
     exr_free(a, nb);
     exr_free(a, blo);
     exr_free(a, bhi);
+    exr_free(a, combined);
+    exr_free(a, cnb);
     if (w.err) { exr_free(a, out); return EXR_ERROR_CORRUPT; }
 
     adler = exr_adler32(src, n, 1);
