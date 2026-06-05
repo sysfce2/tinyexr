@@ -78,6 +78,20 @@ bench: $(V3_OBJ) $(ZSTD_OBJ) benchmark/bench.c | build
 	  benchmark/bench.c $(V3_OBJ) $(ZSTD_OBJ) -lm -o build/bench
 	./build/bench
 
+# Coverage-guided fuzzer (clang+libFuzzer over the whole library).
+#   ./build/fuzz_v3 -max_total_time=60 test/unit/regression
+fuzz: test/fuzzer/fuzz_v3.c | build
+	clang $(V3_CSTD) $(V3_INC) -O1 -g -w -fsanitize=fuzzer,address,undefined \
+	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_v3
+	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -max_total_time=60 test/unit/regression"
+
+# Deterministic corpus replay under ASan+UBSan (no libFuzzer needed; CI gate).
+fuzz-corpus: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o test/fuzzer/fuzz_v3.c | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \
+	  test/fuzzer/fuzz_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o -lm \
+	  -o build/fuzz_replay
+	./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
+
 clean:
 	rm -rf $(TARGET) miniz.o build
 
@@ -86,3 +100,6 @@ help:
 	@echo "make lib    - pure-C11 v3 library (build/libtinyexr3.a)"
 	@echo "make test-c - run pure-C11 v3 reader unit test (ASan+UBSan)"
 	@echo "make c11-gate - strict C11 -Werror compile of all src/*.c"
+	@echo "make bench  - codec/SIMD throughput benchmark"
+	@echo "make fuzz   - build libFuzzer target (build/fuzz_v3)"
+	@echo "make fuzz-corpus - replay regression corpus under ASan+UBSan+LSan"
