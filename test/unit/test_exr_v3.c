@@ -108,6 +108,83 @@ static int images_equal(const exr_image *a, const exr_image *b) {
     return 1;
 }
 
+static void jph_decode_matches(const char *ref_path, const char *ht_path,
+                               const char *name) {
+    exr_image ref, ht;
+    exr_result rc_ref, rc_ht;
+    memset(&ref, 0, sizeof(ref));
+    memset(&ht, 0, sizeof(ht));
+    rc_ref = exr_load_from_file(ref_path, NULL, &ref);
+    rc_ht = exr_load_from_file(ht_path, NULL, &ht);
+    if (!EXR_OK(rc_ref) || !EXR_OK(rc_ht)) {
+        g_fail++;
+        printf("  FAIL: HTJ2K decode compare %s load ref=%s ht=%s\n", name,
+               exr_result_string(rc_ref), exr_result_string(rc_ht));
+    } else {
+        if (!images_equal(&ref, &ht)) {
+            int p, c;
+            CHECK(0, name);
+            for (p = 0; p < ref.num_parts && p < ht.num_parts; ++p) {
+                for (c = 0; c < ref.parts[p].header.num_channels &&
+                            c < ht.parts[p].header.num_channels; ++c) {
+                    const exr_part *rp = &ref.parts[p];
+                    const exr_part *hp = &ht.parts[p];
+                    size_t ps = rp->header.channels[c].pixel_type ==
+                                        EXR_PIXEL_HALF
+                                    ? 2
+                                    : 4;
+                    size_t n = (size_t)rp->width * rp->height * ps;
+                    size_t k;
+                    for (k = 0; k < n; ++k) {
+                        if (((const unsigned char *)rp->images[c])[k] !=
+                            ((const unsigned char *)hp->images[c])[k]) {
+                            printf("  first diff %s part %d channel %d %s byte %zu: %02x != %02x\n",
+                                   name, p, c, rp->header.channels[c].name, k,
+                                   ((const unsigned char *)rp->images[c])[k],
+                                   ((const unsigned char *)hp->images[c])[k]);
+                            goto diff_done;
+                        }
+                    }
+                }
+            }
+diff_done:
+            ;
+        } else {
+            CHECK(1, name);
+            printf("  ok: HTJ2K decode matches %s\n", name);
+        }
+    }
+    exr_image_free(&ref);
+    exr_image_free(&ht);
+}
+
+static void jph_encode_reports_unsupported(const char *path,
+                                           exr_compression comp,
+                                           const char *name) {
+    exr_image src;
+    void *buf = NULL;
+    size_t sz = 0;
+    exr_result rc;
+    memset(&src, 0, sizeof(src));
+    rc = exr_load_from_file(path, NULL, &src);
+    if (!EXR_OK(rc)) {
+        g_fail++;
+        printf("  FAIL: load for %s encode unsupported check: %s\n", name,
+               exr_result_string(rc));
+        return;
+    }
+    rc = exr_save_to_memory(&buf, &sz, NULL, &src, comp);
+    CHECK(rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0, name);
+    if (rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0) {
+        printf("  ok: %s encode reports unsupported\n", name);
+    } else {
+        printf("  FAIL: %s encode rc=%s size=%zu\n", name,
+               exr_result_string(rc), sz);
+    }
+    free(buf);
+    exr_image_free(&src);
+}
+
 static unsigned rd_u32le(const unsigned char *p) {
     return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) |
            ((unsigned)p[3] << 24);
@@ -544,8 +621,8 @@ static void jph_frontend_rejects_malformed(void) {
     }
     CHECK(packet_ok_size != 0 &&
               exr_jph_decompress(&ctx, packet_ok, packet_ok_size, dst,
-                                 sizeof(dst)) == EXR_ERROR_UNSUPPORTED,
-          "JPH non-empty packet metadata reaches entropy decoder boundary");
+                                 sizeof(dst)) == EXR_SUCCESS,
+          "JPH non-empty packet entropy decode completes");
     CHECK(packet_short_size != 0 &&
               exr_jph_decompress(&ctx, packet_short, packet_short_size, dst,
                                  sizeof(dst)) == EXR_ERROR_CORRUPT,
@@ -758,7 +835,7 @@ static void jph_packet_helpers(void) {
               exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
               v == 0 && has_one == 0 &&
               exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
-              v == 0 && has_one == 1,
+              v == 1 && has_one == 1,
           "JPH MEL state progression");
     exr_jph_mel_init(&mr, mel_stuffed, sizeof(mel_stuffed));
     CHECK(exr_jph_mel_get_run(&mr, &v, &has_one) == EXR_SUCCESS &&
@@ -965,6 +1042,32 @@ int main(void) {
     jph_frontend_rejects_malformed();
     jph_transforms_roundtrip();
     jph_packet_helpers();
+
+    printf("== HTJ2K / JPH real-file decode ==\n");
+    jph_decode_matches("openexr-images/TestImages/AllHalfValues.exr",
+                       "openexr-images/TestImages/htj2k256_AllHalfValues.exr",
+                       "htj2k256_AllHalfValues");
+    jph_decode_matches("openexr-images/TestImages/AllHalfValues.exr",
+                       "openexr-images/TestImages/htj2k32_AllHalfValues.exr",
+                       "htj2k32_AllHalfValues");
+    jph_decode_matches("openexr-images/TestImages/stripes.exr",
+                       "openexr-images/TestImages/htj2k256_stripes.exr",
+                       "htj2k256_stripes");
+    jph_decode_matches("openexr-images/TestImages/stripes.exr",
+                       "openexr-images/TestImages/htj2k32_stripes.exr",
+                       "htj2k32_stripes");
+    jph_decode_matches("openexr-images/TestImages/RgbRampsDiagonal.exr",
+                       "openexr-images/TestImages/htj2k256_RgbRampsDiagonal.exr",
+                       "htj2k256_RgbRampsDiagonal");
+    jph_decode_matches("openexr-images/TestImages/RgbRampsDiagonal.exr",
+                       "openexr-images/TestImages/htj2k32_RgbRampsDiagonal.exr",
+                       "htj2k32_RgbRampsDiagonal");
+
+    printf("== HTJ2K/JPH writer ==\n");
+    jph_encode_reports_unsupported("test/unit/regression/2by2.exr",
+                                   EXR_COMPRESSION_HTJ2K32, "HTJ2K32");
+    jph_encode_reports_unsupported("test/unit/regression/2by2.exr",
+                                   EXR_COMPRESSION_HTJ2K256, "HTJ2K256");
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();

@@ -254,7 +254,7 @@ static exr_result interpret_header(exr_reader *r, exr_int_part *part) {
 
     at = exr_attr_find(h->attrs, "compression");
     if (at && at->size >= 1) {
-        if (at->data[0] > 9 && at->data[0] != 12) return EXR_ERROR_CORRUPT;
+        if (at->data[0] > 12) return EXR_ERROR_CORRUPT;
         h->compression = (exr_compression)at->data[0];
     }
 

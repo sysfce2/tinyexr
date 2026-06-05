@@ -576,6 +576,13 @@ exr_result exr_b44_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             int optimize_flat);
 exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
                              size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_jph_forward_53_2d_i32(const exr_allocator *a,
+                                      int32_t *data, size_t width,
+                                      size_t height, unsigned levels);
+exr_result exr_jph_forward_rct_i32(int32_t *c0, int32_t *c1, int32_t *c2,
+                                   size_t count);
+exr_result exr_jph_forward_nlt_type3_i32(int32_t *data, size_t count,
+                                         uint32_t bit_depth);
 exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size);
 

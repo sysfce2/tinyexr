@@ -21,7 +21,10 @@ exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
         memcpy(dst, src, dst_size);
         return EXR_SUCCESS;
     }
-    if (src_size > dst_size) return EXR_ERROR_CORRUPT;
+    if (src_size > dst_size &&
+        ctx->compression != EXR_COMPRESSION_HTJ2K256 &&
+        ctx->compression != EXR_COMPRESSION_HTJ2K32)
+        return EXR_ERROR_CORRUPT;
 
     switch (ctx->compression) {
     case EXR_COMPRESSION_NONE:
