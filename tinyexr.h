@@ -323,7 +323,7 @@ typedef struct TEXRHeader {
 
   int compression_type;        // compression type(TINYEXR_COMPRESSIONTYPE_*)
   int *requested_pixel_types;  // Filled initially by
-                               // ParseEXRHeaderFrom(Meomory|File), then users
+                               // ParseEXRHeaderFrom(Memory|File), then users
                                // can edit it(only valid for HALF pixel type
                                // channel)
   // name attribute required for multipart files;
