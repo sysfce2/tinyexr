@@ -14,3 +14,7 @@ test/unit/*.o
 test_tinyexr_v3
 test/unit/bench-v3
 test/unit/test_exr_v3
+test/v3/parse_harness
+test/v3/compare_exr
+test/v3/encode_harness
+test/v3/__pycache__/

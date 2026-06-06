@@ -74,6 +74,13 @@ typedef struct {
     uint8_t qcd_exp[16];
     uint8_t qcd_count;
     uint8_t qcd_guard_bits;
+    /* Optional per-component quantization (QCC). Each array is [csiz]; a
+     * qcc_count[c] of 0 means component c uses the default QCD. Mixed-precision
+     * files (e.g. 16-bit half channels plus a 32-bit float Z) carry a QCC for
+     * the wider component. */
+    uint8_t (*qcc_exp)[16];
+    uint8_t *qcc_count;
+    uint8_t *qcc_guard_bits;
     uint8_t num_decomps;
     uint8_t mc_trans;
     int saw_siz, saw_cap, saw_cod, saw_qcd, saw_sot;
@@ -138,6 +145,16 @@ typedef struct {
     uint32_t w;
     uint32_t h;
 } JphComponentPlane;
+
+/* Decode-side coefficient plane. Reversible 5/3 detail coefficients of a B-bit
+ * component need up to ~B+2 bits, so 32-bit (float/uint) components overflow an
+ * int32 plane; the decode path therefore carries int64 coefficients and only
+ * narrows to the final 16/32-bit sample at store time. */
+typedef struct {
+    int64_t *data;
+    uint32_t w;
+    uint32_t h;
+} JphPlane64;
 
 static uint16_t jph_be16(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
@@ -782,6 +799,131 @@ done_level:
     return EXR_SUCCESS;
 }
 
+/* ---- int64 decode variants -----------------------------------------------
+ * These mirror the exported i32 transforms above but keep full int64 width so
+ * that >=32-bit-precision components (whose reversible-wavelet coefficients can
+ * exceed int32) decode losslessly. The final samples fit in 16/32 bits and are
+ * narrowed back to int32 at store time. */
+static exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
+                                     const int64_t *high, size_t high_count,
+                                     int64_t *out, size_t out_count) {
+    size_t i;
+    size_t expected_low = (out_count + 1u) / 2u;
+    size_t expected_high = out_count / 2u;
+    if (!out && out_count) return EXR_ERROR_INVALID_ARGUMENT;
+    if (low_count != expected_low || high_count != expected_high)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if ((!low && low_count) || (!high && high_count))
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (out_count == 0) return EXR_SUCCESS;
+    if (high_count == 0) {
+        out[0] = low[0];
+        return EXR_SUCCESS;
+    }
+    for (i = 0; i < low_count; ++i) {
+        int64_t dl = high[i > 0 ? i - 1u : 0u];
+        int64_t dr = high[i < high_count ? i : high_count - 1u];
+        out[2u * i] = low[i] - jph_floor_div_pow2(dl + dr + 2, 2);
+    }
+    for (i = 0; i < high_count; ++i) {
+        int64_t e0 = out[2u * i];
+        int64_t e1 = (i + 1u < low_count) ? out[2u * (i + 1u)] : e0;
+        out[2u * i + 1u] = high[i] + jph_floor_div_pow2(e0 + e1, 1);
+    }
+    return EXR_SUCCESS;
+}
+
+static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
+                                        size_t width, size_t height,
+                                        unsigned levels) {
+    unsigned level;
+    if (!a) a = exr_default_allocator();
+    if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
+    if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
+    if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
+
+    for (level = levels; level > 0; --level) {
+        size_t rw = jph_ceil_div_pow2_size(width, level - 1u);
+        size_t rh = jph_ceil_div_pow2_size(height, level - 1u);
+        size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
+        size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
+        size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
+        int64_t *temp = NULL, *col_low = NULL, *col_high = NULL, *col_out = NULL;
+        size_t y, x;
+        exr_result rc = EXR_SUCCESS;
+
+        if (rw == 0 || rh == 0) return EXR_ERROR_CORRUPT;
+        if (exr_mul_ovf(rw, rh, &temp_count) ||
+            exr_mul_ovf(temp_count, sizeof(int64_t), &temp_bytes))
+            return EXR_ERROR_CORRUPT;
+        scratch_len = rw > rh ? rw : rh;
+        if (exr_mul_ovf(scratch_len, sizeof(int64_t), &scratch_bytes))
+            return EXR_ERROR_CORRUPT;
+
+        temp = (int64_t *)exr_malloc(a, temp_bytes);
+        col_low = (int64_t *)exr_malloc(a, scratch_bytes);
+        col_high = (int64_t *)exr_malloc(a, scratch_bytes);
+        col_out = (int64_t *)exr_malloc(a, scratch_bytes);
+        if (!temp || !col_low || !col_high || !col_out) {
+            exr_free(a, temp);
+            exr_free(a, col_low);
+            exr_free(a, col_high);
+            exr_free(a, col_out);
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+
+        for (y = 0; y < rh; ++y) {
+            const int64_t *row = data + y * width;
+            rc = jph_inverse_53_i64(row, lw, row + lw, hw, temp + y * rw, rw);
+            if (rc != EXR_SUCCESS) goto done_level64;
+        }
+        for (x = 0; x < rw; ++x) {
+            for (y = 0; y < lh; ++y) col_low[y] = temp[y * rw + x];
+            for (y = 0; y < hh; ++y) col_high[y] = temp[(lh + y) * rw + x];
+            rc = jph_inverse_53_i64(col_low, lh, col_high, hh, col_out, rh);
+            if (rc != EXR_SUCCESS) goto done_level64;
+            for (y = 0; y < rh; ++y) data[y * width + x] = col_out[y];
+        }
+
+done_level64:
+        exr_free(a, temp);
+        exr_free(a, col_low);
+        exr_free(a, col_high);
+        exr_free(a, col_out);
+        if (rc != EXR_SUCCESS) return rc;
+    }
+    return EXR_SUCCESS;
+}
+
+static exr_result jph_inverse_rct_i64(int64_t *c0, int64_t *c1, int64_t *c2,
+                                      size_t count) {
+    size_t i;
+    if ((!c0 || !c1 || !c2) && count) return EXR_ERROR_INVALID_ARGUMENT;
+    for (i = 0; i < count; ++i) {
+        int64_t y = c0[i];
+        int64_t db = c1[i];
+        int64_t dr = c2[i];
+        int64_t g = y - jph_floor_div_pow2(db + dr, 2);
+        c0[i] = dr + g; /* r */
+        c1[i] = g;      /* g */
+        c2[i] = db + g; /* b */
+    }
+    return EXR_SUCCESS;
+}
+
+static exr_result jph_apply_nlt_type3_i64(int64_t *data, size_t count,
+                                          uint32_t bit_depth) {
+    size_t i;
+    int64_t bias;
+    if (!data && count) return EXR_ERROR_INVALID_ARGUMENT;
+    if (bit_depth == 0 || bit_depth > 32u) return EXR_ERROR_INVALID_ARGUMENT;
+    bias = ((int64_t)1 << (bit_depth - 1u)) + 1;
+    for (i = 0; i < count; ++i) {
+        if (data[i] < 0) data[i] = -data[i] - bias;
+    }
+    return EXR_SUCCESS;
+}
+
 static exr_result jph_validate_siz_component(const exr_codec_ctx *ctx,
                                              const JphProfile *jp,
                                              const uint16_t *map,
@@ -850,7 +992,11 @@ static exr_result jph_parse_siz(const exr_allocator *a, JphReader *r,
     jp->xrsiz = (uint8_t *)exr_malloc(a, csiz ? csiz : 1);
     jp->yrsiz = (uint8_t *)exr_malloc(a, csiz ? csiz : 1);
     jp->nlt_type = (uint8_t *)exr_calloc(a, csiz ? csiz : 1, 1);
-    if (!jp->ssiz || !jp->xrsiz || !jp->yrsiz || !jp->nlt_type)
+    jp->qcc_exp = (uint8_t (*)[16])exr_calloc(a, csiz ? csiz : 1, 16);
+    jp->qcc_count = (uint8_t *)exr_calloc(a, csiz ? csiz : 1, 1);
+    jp->qcc_guard_bits = (uint8_t *)exr_calloc(a, csiz ? csiz : 1, 1);
+    if (!jp->ssiz || !jp->xrsiz || !jp->yrsiz || !jp->nlt_type ||
+        !jp->qcc_exp || !jp->qcc_count || !jp->qcc_guard_bits)
         return EXR_ERROR_OUT_OF_MEMORY;
     for (i = 0; i < csiz; ++i) {
         jp->ssiz[i] = r->p[0];
@@ -907,7 +1053,7 @@ static exr_result jph_parse_cod(JphReader *r, JphProfile *jp) {
 }
 
 static exr_result jph_parse_quant(JphReader *r, JphProfile *jp, int is_qcc) {
-    uint16_t len;
+    uint16_t len, comp_idx = 0;
     size_t payload, comp_bytes = 0, pos;
     uint8_t sq;
 
@@ -916,7 +1062,6 @@ static exr_result jph_parse_quant(JphReader *r, JphProfile *jp, int is_qcc) {
     if ((size_t)(r->end - r->p) < (size_t)(len - 2)) return EXR_ERROR_CORRUPT;
     payload = (size_t)(len - 2);
     if (is_qcc) {
-        uint16_t comp_idx;
         if (!jp->saw_siz) return EXR_ERROR_CORRUPT;
         comp_bytes = (jp->csiz < 257u) ? 1u : 2u;
         if (payload < comp_bytes + 1u) return EXR_ERROR_CORRUPT;
@@ -938,9 +1083,15 @@ static exr_result jph_parse_quant(JphReader *r, JphProfile *jp, int is_qcc) {
         if (expn == 0) return EXR_ERROR_CORRUPT;
         pos++;
     }
-    if (!is_qcc) {
-        if (payload == 0 || payload > sizeof(jp->qcd_exp))
+    if (payload == 0 || payload > sizeof(jp->qcd_exp))
+        return EXR_ERROR_CORRUPT;
+    if (is_qcc) {
+        if (!jp->qcc_exp || !jp->qcc_count || !jp->qcc_guard_bits)
             return EXR_ERROR_CORRUPT;
+        memcpy(jp->qcc_exp[comp_idx], r->p, payload);
+        jp->qcc_count[comp_idx] = (uint8_t)payload;
+        jp->qcc_guard_bits[comp_idx] = (uint8_t)(sq >> 5);
+    } else {
         memcpy(jp->qcd_exp, r->p, payload);
         jp->qcd_count = (uint8_t)payload;
         jp->qcd_guard_bits = (uint8_t)(sq >> 5);
@@ -1195,15 +1346,28 @@ static uint32_t jph_band_quant_index(uint32_t res, uint32_t band) {
     return res ? (res - 1u) * 3u + band : 0u;
 }
 
-static exr_result jph_band_kmax(const JphProfile *jp, uint32_t res,
-                                uint32_t band, uint32_t *out_kmax) {
-    uint32_t idx, expn, bits;
-    if (!jp || !out_kmax || jp->qcd_count == 0) return EXR_ERROR_CORRUPT;
+static exr_result jph_band_kmax(const JphProfile *jp, uint32_t comp,
+                                uint32_t res, uint32_t band,
+                                uint32_t *out_kmax) {
+    uint32_t idx, expn, bits, count, guard;
+    const uint8_t *exps;
+    if (!jp || !out_kmax) return EXR_ERROR_CORRUPT;
+    /* Per-component QCC overrides the default QCD when present. */
+    if (jp->qcc_count && comp < (uint32_t)jp->csiz && jp->qcc_count[comp]) {
+        exps = jp->qcc_exp[comp];
+        count = jp->qcc_count[comp];
+        guard = jp->qcc_guard_bits[comp];
+    } else {
+        exps = jp->qcd_exp;
+        count = jp->qcd_count;
+        guard = jp->qcd_guard_bits;
+    }
+    if (count == 0) return EXR_ERROR_CORRUPT;
     idx = jph_band_quant_index(res, band);
-    if (idx >= jp->qcd_count) idx = (uint32_t)jp->qcd_count - 1u;
-    expn = (uint32_t)(jp->qcd_exp[idx] >> 3);
+    if (idx >= count) idx = count - 1u;
+    expn = (uint32_t)(exps[idx] >> 3);
     bits = expn ? expn - 1u : 0u;
-    *out_kmax = bits + (uint32_t)jp->qcd_guard_bits;
+    *out_kmax = bits + guard;
     return EXR_SUCCESS;
 }
 
@@ -1240,7 +1404,7 @@ static exr_result jph_build_band_geoms(const JphProfile *jp, uint32_t comp,
         bands[0].cb_w = 128u;
         bands[0].cb_h = 32u;
         bands[0].exists = (rs.w != 0u && rs.h != 0u);
-        return jph_band_kmax(jp, 0, 0, &bands[0].kmax);
+        return jph_band_kmax(jp, comp, 0, 0, &bands[0].kmax);
     }
 
     bands[1].w = rs.w >> 1u;
@@ -1254,7 +1418,7 @@ static exr_result jph_build_band_geoms(const JphProfile *jp, uint32_t comp,
         bands[b].cb_h = 32u;
         bands[b].exists = (bands[b].w != 0u && bands[b].h != 0u);
         if (bands[b].exists) {
-            exr_result rc = jph_band_kmax(jp, res, b, &bands[b].kmax);
+            exr_result rc = jph_band_kmax(jp, comp, res, b, &bands[b].kmax);
             if (rc != EXR_SUCCESS) return rc;
         }
     }
@@ -1503,13 +1667,13 @@ static void jph_advance_precinct(JphPrecinctState *st) {
 typedef struct {
     const exr_allocator *a;
     const JphProfile *jp;
-    JphComponentPlane *planes;
+    JphPlane64 *planes;
     uint16_t num_planes;
     size_t codeblocks;
 } JphDecodeState;
 
 static void jph_free_component_planes(const exr_allocator *a,
-                                      JphComponentPlane *planes,
+                                      JphPlane64 *planes,
                                       uint16_t num_planes) {
     uint16_t c;
     if (!a) a = exr_default_allocator();
@@ -1520,13 +1684,13 @@ static void jph_free_component_planes(const exr_allocator *a,
 
 static exr_result jph_alloc_component_planes(const exr_allocator *a,
                                              const JphProfile *jp,
-                                             JphComponentPlane **out_planes) {
-    JphComponentPlane *planes;
+                                             JphPlane64 **out_planes) {
+    JphPlane64 *planes;
     uint16_t c;
     if (!out_planes || !jp || jp->csiz == 0) return EXR_ERROR_INVALID_ARGUMENT;
     if (!a) a = exr_default_allocator();
     *out_planes = NULL;
-    planes = (JphComponentPlane *)exr_calloc(a, jp->csiz, sizeof(*planes));
+    planes = (JphPlane64 *)exr_calloc(a, jp->csiz, sizeof(*planes));
     if (!planes) return EXR_ERROR_OUT_OF_MEMORY;
     for (c = 0; c < jp->csiz; ++c) {
         JphSize s = jph_component_size(jp, c);
@@ -1534,11 +1698,11 @@ static exr_result jph_alloc_component_planes(const exr_allocator *a,
         planes[c].w = s.w;
         planes[c].h = s.h;
         if (exr_mul_ovf((size_t)s.w, (size_t)s.h, &count) ||
-            exr_mul_ovf(count, sizeof(int32_t), &count)) {
+            exr_mul_ovf(count, sizeof(int64_t), &count)) {
             jph_free_component_planes(a, planes, jp->csiz);
             return EXR_ERROR_CORRUPT;
         }
-        planes[c].data = (int32_t *)exr_calloc(a, count ? count : 1u, 1);
+        planes[c].data = (int64_t *)exr_calloc(a, count ? count : 1u, 1);
         if (!planes[c].data) {
             jph_free_component_planes(a, planes, jp->csiz);
             return EXR_ERROR_OUT_OF_MEMORY;
@@ -1586,7 +1750,7 @@ static exr_result jph_store_sample(uint8_t *dst, size_t dst_size, size_t *off,
 
 static exr_result jph_store_component_planes_to_block(
     const exr_codec_ctx *ctx, const JphProfile *jp, const uint16_t *map,
-    const JphComponentPlane *planes, uint8_t *dst, size_t dst_size) {
+    const JphPlane64 *planes, uint8_t *dst, size_t dst_size) {
     size_t off = 0;
     int32_t line, file_c;
     if (!ctx || !jp || !map || !planes || !dst) return EXR_ERROR_INVALID_ARGUMENT;
@@ -1614,8 +1778,13 @@ static exr_result jph_store_component_planes_to_block(
                 return EXR_ERROR_CORRUPT;
             for (x = 0; x < nx; ++x) {
                 size_t idx = (size_t)row * planes[comp].w + (uint32_t)x;
-                rc = jph_store_sample(dst, dst_size, &off, ch->pixel_type,
-                                      planes[comp].data[idx]);
+                int32_t sv;
+                /* The reconstructed sample is a 16/32-bit value; narrow the
+                 * int64 coefficient back to int32 (rejecting out-of-range
+                 * garbage) before serialising it. */
+                rc = jph_i64_to_i32(planes[comp].data[idx], &sv);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_store_sample(dst, dst_size, &off, ch->pixel_type, sv);
                 if (rc != EXR_SUCCESS) return rc;
             }
         }
@@ -1625,14 +1794,14 @@ static exr_result jph_store_component_planes_to_block(
 
 static exr_result jph_postprocess_component_planes(const exr_allocator *a,
                                                    const JphProfile *jp,
-                                                   JphComponentPlane *planes) {
+                                                   JphPlane64 *planes) {
     uint16_t c;
     if (!jp || !planes) return EXR_ERROR_INVALID_ARGUMENT;
     for (c = 0; c < jp->csiz; ++c) {
         exr_result rc;
         if (!planes[c].data) return EXR_ERROR_CORRUPT;
-        rc = exr_jph_inverse_53_2d_i32(a, planes[c].data, planes[c].w,
-                                       planes[c].h, jp->num_decomps);
+        rc = jph_inverse_53_2d_i64(a, planes[c].data, planes[c].w,
+                                   planes[c].h, jp->num_decomps);
         if (rc != EXR_SUCCESS) return rc;
     }
     if (jp->mc_trans) {
@@ -1644,9 +1813,9 @@ static exr_result jph_postprocess_component_planes(const exr_allocator *a,
         if (exr_mul_ovf((size_t)planes[0].w, (size_t)planes[0].h, &count))
             return EXR_ERROR_CORRUPT;
         {
-            exr_result rc = exr_jph_inverse_rct_i32(planes[0].data,
-                                                    planes[1].data,
-                                                    planes[2].data, count);
+            exr_result rc = jph_inverse_rct_i64(planes[0].data,
+                                                planes[1].data,
+                                                planes[2].data, count);
             if (rc != EXR_SUCCESS) return rc;
         }
     }
@@ -1657,8 +1826,7 @@ static exr_result jph_postprocess_component_planes(const exr_allocator *a,
             exr_result rc;
             if (exr_mul_ovf((size_t)planes[c].w, (size_t)planes[c].h, &count))
                 return EXR_ERROR_CORRUPT;
-            rc = exr_jph_apply_nlt_type3_i32(planes[c].data, count,
-                                             bit_depth);
+            rc = jph_apply_nlt_type3_i64(planes[c].data, count, bit_depth);
             if (rc != EXR_SUCCESS) return rc;
         } else if (jp->nlt_type && jp->nlt_type[c] != 0u) {
             return EXR_ERROR_UNSUPPORTED;
@@ -2079,6 +2247,13 @@ typedef struct {
     uint32_t size;
     uint32_t total_size;
     uint32_t bit_pos;
+    /* Incremental read cursor tracking the byte/bit position of bit_pos under
+     * the bit-unstuffing rule (a 0xff byte is followed by a 7-bit byte). This
+     * makes fetch/advance O(1) instead of re-walking from the stream start on
+     * every sample (which made block decode O(n^2)). */
+    uint32_t c_byte;   /* byte index containing bit_pos */
+    uint32_t c_bit;    /* bit offset within that byte's usable bits */
+    uint32_t c_prevff; /* whether the byte before c_byte was 0xff (=> 7 bits) */
     uint8_t fill;
 } JphMagSgn;
 
@@ -2158,66 +2333,58 @@ static exr_result jph_magsgn_init(JphMagSgn *m, const uint8_t *data,
     return jph_forward_bits_init(m, data, size, 0xffu);
 }
 
-static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
-    uint32_t out = 0u;
-    uint32_t need;
-    if (!m) return 0u;
-    for (need = 0u; need < 32u; ++need) {
-        uint32_t pos = m->bit_pos + need;
-        uint32_t byte = 0u;
-        uint32_t prev_ff = 0u;
-        for (;;) {
-            uint32_t nbits;
-            uint8_t b;
-            if (byte < m->total_size && m->start) {
-                b = m->start[byte];
-            } else {
-                b = m->fill;
-            }
-            nbits = prev_ff ? 7u : 8u;
-            if (pos < nbits) {
-                out |= ((uint32_t)((b >> pos) & 1u)) << need;
-                break;
-            }
-            pos -= nbits;
-            prev_ff = (b == 0xffu) ? 1u : 0u;
-            ++byte;
+static uint8_t jph_magsgn_byte(const JphMagSgn *m, uint32_t idx) {
+    return (idx < m->total_size && m->start) ? m->start[idx] : m->fill;
+}
+
+/* Peek `count` (<=64) bits starting at the current cursor, applying the same
+ * 0xff-then-7-bit unstuffing as the original absolute-position reader, but
+ * starting from the cached cursor instead of byte 0. */
+static uint64_t jph_magsgn_peek(const JphMagSgn *m, uint32_t count) {
+    uint64_t out = 0u;
+    uint32_t by = m->c_byte, bit = m->c_bit, prevff = m->c_prevff, need;
+    for (need = 0u; need < count; ++need) {
+        uint8_t b = jph_magsgn_byte(m, by);
+        uint32_t nbits = prevff ? 7u : 8u;
+        out |= ((uint64_t)((b >> bit) & 1u)) << need;
+        if (++bit >= nbits) {
+            prevff = (b == 0xffu) ? 1u : 0u;
+            ++by;
+            bit = 0u;
         }
     }
     return out;
+}
+
+static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
+    if (!m) return 0u;
+    return (uint32_t)jph_magsgn_peek(m, 32u);
 }
 
 static uint64_t jph_magsgn_fetch64(JphMagSgn *m) {
-    uint64_t out = 0u;
-    uint32_t need;
     if (!m) return 0u;
-    for (need = 0u; need < 64u; ++need) {
-        uint32_t pos = m->bit_pos + need;
-        uint32_t byte = 0u;
-        uint32_t prev_ff = 0u;
-        for (;;) {
-            uint32_t nbits;
-            uint8_t b;
-            if (byte < m->total_size && m->start) {
-                b = m->start[byte];
-            } else {
-                b = m->fill;
-            }
-            nbits = prev_ff ? 7u : 8u;
-            if (pos < nbits) {
-                out |= ((uint64_t)((b >> pos) & 1u)) << need;
-                break;
-            }
-            pos -= nbits;
-            prev_ff = (b == 0xffu) ? 1u : 0u;
-            ++byte;
-        }
-    }
-    return out;
+    return jph_magsgn_peek(m, 64u);
 }
 
 static void jph_magsgn_advance(JphMagSgn *m, uint32_t n) {
-    if (m) m->bit_pos += n;
+    uint32_t i, by, bit, prevff;
+    if (!m) return;
+    by = m->c_byte;
+    bit = m->c_bit;
+    prevff = m->c_prevff;
+    for (i = 0u; i < n; ++i) {
+        uint8_t b = jph_magsgn_byte(m, by);
+        uint32_t nbits = prevff ? 7u : 8u;
+        if (++bit >= nbits) {
+            prevff = (b == 0xffu) ? 1u : 0u;
+            ++by;
+            bit = 0u;
+        }
+    }
+    m->c_byte = by;
+    m->c_bit = bit;
+    m->c_prevff = prevff;
+    m->bit_pos += n;
 }
 
 static uint64_t jph_decode_magsgn_sample64(JphMagSgn *magsgn, uint32_t inf,
@@ -2248,7 +2415,7 @@ static uint64_t jph_decode_magsgn_sample64(JphMagSgn *magsgn, uint32_t inf,
 
 static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                                              const JphHtTables *htab,
-                                             int32_t *out,
+                                             int64_t *out,
                                              uint32_t out_stride,
                                              uint32_t kmax) {
     uint32_t width = seg->width;
@@ -2610,18 +2777,13 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
             for (x = 0u; x < width; ++x) {
                 uint64_t v = buf[y * sstr + x];
                 uint64_t mag = (v & UINT64_C(0x7fffffffffffffff)) >> shift;
-                int64_t sv;
-                if (mag > UINT64_C(2147483648)) {
-                    rc = EXR_ERROR_CORRUPT;
-                    goto done;
-                }
-                sv = (v & UINT64_C(0x8000000000000000)) ? -(int64_t)mag
-                                                        : (int64_t)mag;
-                if (sv < (int64_t)INT32_MIN || sv > (int64_t)INT32_MAX) {
-                    rc = EXR_ERROR_CORRUPT;
-                    goto done;
-                }
-                out[y * out_stride + x] = (int32_t)sv;
+                /* Reversible 5/3 coefficients of a 32-bit component can exceed
+                 * int32; keep full int64 width here. The mask is 63-bit so
+                 * `mag` always fits a signed int64. The final sample is range-
+                 * checked when narrowed to int32 at store time. */
+                out[y * out_stride + x] =
+                    (v & UINT64_C(0x8000000000000000)) ? -(int64_t)mag
+                                                       : (int64_t)mag;
             }
         }
     }
@@ -2634,12 +2796,12 @@ done:
     return rc;
 }
 
-/* Decode a single HT codeblock and write the resulting signed int32
- * coefficient samples into `out`, indexed by row*stride + col.
- * kmax is the band's K_max (for shift normalization). */
+/* Decode a single HT codeblock and write the resulting signed coefficient
+ * samples into `out` (int64; 32-bit components can exceed int32), indexed by
+ * row*stride + col. kmax is the band's K_max (for shift normalization). */
 static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                                     const JphHtTables *htab,
-                                    int32_t *out, uint32_t out_stride,
+                                    int64_t *out, uint32_t out_stride,
                                     uint32_t kmax) {
     uint32_t width = seg->width;
     uint32_t height = seg->height;
@@ -3330,8 +3492,8 @@ done:
 /* Subband-to-component-plane coordinate mapping. */
 static exr_result jph_subband_to_plane(const JphCodeblockSeg *seg,
                                        const JphBandGeom *band,
-                                       const int32_t *cb, uint32_t cb_stride,
-                                       JphComponentPlane *plane,
+                                       const int64_t *cb, uint32_t cb_stride,
+                                       JphPlane64 *plane,
                                        uint32_t num_decomps) {
     uint32_t row_off, col_off;
     uint32_t x, y;
@@ -3383,7 +3545,7 @@ static exr_result jph_decode_codeblock(void *user,
     JphDecodeState *st = (JphDecodeState *)user;
     JphBandGeom bands[4];
     JphHtTables *htab = NULL;
-    int32_t *cb = NULL;
+    int64_t *cb = NULL;
     uint32_t cb_stride, cb_size;
     exr_result rc;
     if (!st || !seg || !seg->data || seg->data_size == 0)
@@ -3410,11 +3572,11 @@ static exr_result jph_decode_codeblock(void *user,
         size_t cb_bytes = 0;
         if (exr_mul_ovf((size_t)cb_stride, (size_t)seg->height, &cb_bytes))
             return EXR_ERROR_CORRUPT;
-        if (exr_mul_ovf(cb_bytes, sizeof(int32_t), &cb_bytes))
+        if (exr_mul_ovf(cb_bytes, sizeof(int64_t), &cb_bytes))
             return EXR_ERROR_CORRUPT;
         cb_size = (uint32_t)cb_bytes;
     }
-    cb = (int32_t *)exr_calloc(st->a ? st->a : exr_default_allocator(),
+    cb = (int64_t *)exr_calloc(st->a ? st->a : exr_default_allocator(),
                                cb_size ? cb_size : 1u, 1);
     if (!cb) return EXR_ERROR_OUT_OF_MEMORY;
 
@@ -3445,7 +3607,6 @@ static exr_result jph_parse_tile_packets(const exr_codec_ctx *ctx,
     exr_result rc;
 
     if (out_codeblocks) *out_codeblocks = 0;
-    if (jp->saw_qcc) return EXR_ERROR_UNSUPPORTED;
     if (jp->num_decomps > 31u) return EXR_ERROR_CORRUPT;
     if (exr_mul_ovf((size_t)jp->csiz, (size_t)jp->num_decomps + 1u,
                     &state_count))
@@ -3654,6 +3815,17 @@ static exr_result jph_validate_profile(const exr_codec_ctx *ctx,
         rc = EXR_ERROR_CORRUPT;
         goto done;
     }
+    /* Any per-component QCC must describe the same subband structure. */
+    if (jp.qcc_count) {
+        uint16_t qc;
+        for (qc = 0; qc < jp.csiz; ++qc) {
+            if (jp.qcc_count[qc] != 0u &&
+                jp.qcc_count[qc] != (uint8_t)(1u + 3u * jp.num_decomps)) {
+                rc = EXR_ERROR_CORRUPT;
+                goto done;
+            }
+        }
+    }
     if (jp.csiz != (uint16_t)ctx->num_channels) { rc = EXR_ERROR_CORRUPT; goto done; }
     if ((jp.rsiz & 0x4000u) == 0) { rc = EXR_ERROR_UNSUPPORTED; goto done; }
     if (jp.xosiz != 0u || jp.yosiz != 0u || jp.xtosiz != 0u || jp.ytosiz != 0u)
@@ -3677,6 +3849,9 @@ done:
     exr_free(a, jp.xrsiz);
     exr_free(a, jp.yrsiz);
     exr_free(a, jp.nlt_type);
+    exr_free(a, jp.qcc_exp);
+    exr_free(a, jp.qcc_count);
+    exr_free(a, jp.qcc_guard_bits);
     return rc;
 }
 
@@ -3878,10 +4053,104 @@ exr_result exr_jph_forward_nlt_type3_i32(int32_t *data, size_t count,
     return EXR_SUCCESS;
 }
 
+/* ---- int64 forward variants (for >=32-bit-precision components) ----------
+ * Mirror the exported i32 forward transforms but keep full int64 width so that
+ * a 32-bit component's reversible-5/3 coefficients (which can exceed int32) are
+ * encoded losslessly. They produce identical results to the i32 versions for
+ * values that fit int32, so half/all-float output is unchanged. */
+static exr_result jph_forward_53_i64(const int64_t *src, size_t n,
+                                     int64_t *low, size_t low_count,
+                                     int64_t *high, size_t high_count) {
+    size_t nl = (n + 1u) / 2u, nh = n / 2u, i;
+    if (!src || !low || !high) return EXR_ERROR_INVALID_ARGUMENT;
+    if (low_count != nl || high_count != nh) return EXR_ERROR_INVALID_ARGUMENT;
+    if (n == 0) return EXR_SUCCESS;
+    for (i = 0; i < nh; ++i) {
+        int64_t e0 = src[2u * i];
+        int64_t e1 = (i + 1u < nl) ? src[2u * (i + 1u)] : e0;
+        high[i] = src[2u * i + 1u] - jph_floor_div_pow2(e0 + e1, 1);
+    }
+    for (i = 0; i < nl; ++i) {
+        int64_t dl = (nh > 0) ? ((i > 0) ? high[i - 1u] : high[0]) : 0;
+        int64_t dr = (nh > 0) ? ((i < nh) ? high[i] : high[nh - 1u]) : 0;
+        low[i] = src[2u * i] + jph_floor_div_pow2(dl + dr + 2, 2);
+    }
+    return EXR_SUCCESS;
+}
+
+static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
+                                        size_t width, size_t height,
+                                        unsigned levels) {
+    unsigned level;
+    if (!a) a = exr_default_allocator();
+    if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
+    if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
+    if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
+
+    for (level = 1; level <= levels; ++level) {
+        size_t rw = jph_ceil_div_pow2_size(width, level - 1u);
+        size_t rh = jph_ceil_div_pow2_size(height, level - 1u);
+        size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
+        size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
+        size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
+        int64_t *temp = NULL, *col_low = NULL, *col_high = NULL;
+        size_t y, x;
+        exr_result rc = EXR_SUCCESS;
+
+        if (rw == 0 || rh == 0) return EXR_ERROR_CORRUPT;
+        if (exr_mul_ovf(rw, rh, &temp_count) ||
+            exr_mul_ovf(temp_count, sizeof(int64_t), &temp_bytes))
+            return EXR_ERROR_CORRUPT;
+        scratch_len = rw > rh ? rw : rh;
+        if (exr_mul_ovf(scratch_len, sizeof(int64_t), &scratch_bytes))
+            return EXR_ERROR_CORRUPT;
+
+        temp = (int64_t *)exr_malloc(a, temp_bytes);
+        col_low = (int64_t *)exr_malloc(a, scratch_bytes);
+        col_high = (int64_t *)exr_malloc(a, scratch_bytes);
+        if (!temp || !col_low || !col_high) {
+            exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+
+        for (x = 0; x < rw; ++x) {
+            for (y = 0; y < rh; ++y) col_low[y] = data[y * width + x];
+            rc = jph_forward_53_i64(col_low, rh, col_low, lh, col_high, hh);
+            if (rc != EXR_SUCCESS) goto done_fwd64;
+            for (y = 0; y < lh; ++y) temp[y * rw + x] = col_low[y];
+            for (y = 0; y < hh; ++y) temp[(lh + y) * rw + x] = col_high[y];
+        }
+        for (y = 0; y < rh; ++y) {
+            rc = jph_forward_53_i64(temp + y * rw, rw, col_low, lw, col_high, hw);
+            if (rc != EXR_SUCCESS) goto done_fwd64;
+            for (x = 0; x < lw; ++x) data[y * width + x] = col_low[x];
+            for (x = 0; x < hw; ++x) data[y * width + lw + x] = col_high[x];
+        }
+
+done_fwd64:
+        exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+        if (rc != EXR_SUCCESS) return rc;
+    }
+    return EXR_SUCCESS;
+}
+
+static exr_result jph_forward_nlt_type3_i64(int64_t *data, size_t count,
+                                            uint32_t bit_depth) {
+    size_t i;
+    int64_t bias;
+    if (!data && count) return EXR_ERROR_INVALID_ARGUMENT;
+    if (bit_depth == 0 || bit_depth > 32u) return EXR_ERROR_INVALID_ARGUMENT;
+    bias = ((int64_t)1 << (bit_depth - 1u)) + 1;
+    for (i = 0; i < count; ++i) {
+        if (data[i] < 0) data[i] = -data[i] - bias;
+    }
+    return EXR_SUCCESS;
+}
+
 /* Deinterleave a packed EXR block into component planes. */
 static exr_result jph_deinterleave_block(const exr_codec_ctx *ctx,
                                          const uint8_t *block, size_t n,
-                                         JphComponentPlane *planes) {
+                                         JphPlane64 *planes) {
     uint32_t c, x, y, pixel_type, ps;
     size_t off = 0;
     if (!ctx || !block || !planes) return EXR_ERROR_INVALID_ARGUMENT;
@@ -3904,14 +4173,14 @@ static exr_result jph_deinterleave_block(const exr_codec_ctx *ctx,
                 if (off + ps > n) return EXR_ERROR_CORRUPT;
                 if (pixel_type == EXR_PIXEL_HALF) {
                     int16_t v = (int16_t)(block[off] | ((uint16_t)block[off+1] << 8));
-                    planes[c].data[idx] = (int32_t)v;
+                    planes[c].data[idx] = (int64_t)v;
                     off += 2;
                 } else {
                     uint32_t v = (uint32_t)block[off] |
                                  ((uint32_t)block[off+1] << 8) |
                                  ((uint32_t)block[off+2] << 16) |
                                  ((uint32_t)block[off+3] << 24);
-                    planes[c].data[idx] = (int32_t)v;
+                    planes[c].data[idx] = (int64_t)(int32_t)v;
                     off += 4;
                 }
             }
@@ -4217,23 +4486,24 @@ static int jph_clz64(uint64_t v) {
     return n;
 }
 
-static uint32_t jph_abs_i32_to_u32(int32_t v) {
-    if (v < 0) return (uint32_t)(-(int64_t)v);
-    return (uint32_t)v;
+/* abs() of a coefficient that may exceed int32 (32-bit-precision components). */
+static uint64_t jph_abs_i64_to_u64(int64_t v) {
+    if (v < 0) return (uint64_t)(-(v + 1)) + 1u; /* avoids -INT64_MIN UB */
+    return (uint64_t)v;
 }
 
-static uint64_t jph_encode_block_sample(const int32_t *plane_data,
+static uint64_t jph_encode_block_sample(const int64_t *plane_data,
                                         uint32_t plane_stride,
                                         uint32_t cb_x0, uint32_t cb_y0,
                                         uint32_t x, uint32_t y,
                                         uint32_t shift) {
-    int32_t sv = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
+    int64_t sv = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
     uint64_t sign = sv < 0 ? UINT64_C(0x8000000000000000) : 0u;
-    uint64_t mag = jph_abs_i32_to_u32(sv);
+    uint64_t mag = jph_abs_i64_to_u64(sv);
     return sign | (mag << shift);
 }
 
-static void jph_encode_block_prepare_sample(const int32_t *plane_data,
+static void jph_encode_block_prepare_sample(const int64_t *plane_data,
                                             uint32_t plane_stride,
                                             uint32_t cb_x0, uint32_t cb_y0,
                                             uint32_t x, uint32_t y,
@@ -4328,7 +4598,7 @@ static exr_result jph_encode_mag_bits(JphMsEnc *ms, uint64_t s,
 }
 
 /* Encode one HT codeblock. */
-static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
+static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
                                     uint32_t plane_stride,
                                     uint32_t cb_x0, uint32_t cb_y0,
                                     uint32_t cb_w, uint32_t cb_h,
@@ -4359,8 +4629,8 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
     uint64_t max_val = 0;
     for (uint32_t y = 0; y < cb_h; ++y) {
         for (uint32_t x = 0; x < cb_w; ++x) {
-            int32_t v = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
-            uint64_t absv = jph_abs_i32_to_u32(v);
+            int64_t v = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
+            uint64_t absv = jph_abs_i64_to_u64(v);
             if (absv > max_val) max_val = absv;
         }
     }
@@ -5146,7 +5416,7 @@ static void jph_encoded_cb_free_all(const exr_allocator *a,
 static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                                                      uint8_t **p,
                                                      uint8_t *end,
-                                                     const JphComponentPlane *pl,
+                                                     const JphPlane64 *pl,
                                                      JphSize comp_size,
                                                      uint32_t res,
                                                      uint32_t num_decomps,
@@ -5349,15 +5619,13 @@ done:
 exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size) {
     const exr_allocator *a = ctx->alloc ? ctx->alloc : exr_default_allocator();
-    JphComponentPlane *planes = NULL;
+    JphPlane64 *planes = NULL;
     uint8_t *buf = NULL;
     size_t buf_cap, buf_pos = 0;
     uint32_t c;
     exr_result rc;
     int mc_trans = 0;
     uint32_t kmax = 20u;
-    int saw_half = 0;
-    int saw_float = 0;
 
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
@@ -5372,13 +5640,13 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
             (ch->y_sampling != 0 && ch->y_sampling != 1)) {
             return EXR_ERROR_UNSUPPORTED;
         }
-        if (ch->pixel_type == EXR_PIXEL_HALF) saw_half = 1;
-        if (ch->pixel_type == EXR_PIXEL_FLOAT) {
-            saw_float = 1;
-            kmax = 33u;
-        }
+        /* Any 32-bit float component widens kmax to 33; this single value is
+         * written in the QCD and applies to every component (incl. mixed
+         * half/float files, which are supported). The float component's
+         * reversible-5/3 coefficients can exceed int32, so the encode pipeline
+         * below carries int64 coefficients. */
+        if (ch->pixel_type == EXR_PIXEL_FLOAT) kmax = 33u;
     }
-    if (saw_half && saw_float) return EXR_ERROR_UNSUPPORTED;
 
     jph_ensure_uvlc_enc_tables();
     jph_ensure_vlc_enc_tables();
@@ -5387,7 +5655,7 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
     {
         uint16_t nch = (uint16_t)ctx->num_channels;
         if (nch == 0) return EXR_ERROR_INVALID_ARGUMENT;
-        planes = (JphComponentPlane *)exr_calloc(a, nch, sizeof(*planes));
+        planes = (JphPlane64 *)exr_calloc(a, nch, sizeof(*planes));
         if (!planes) return EXR_ERROR_OUT_OF_MEMORY;
         for (c = 0; c < nch; ++c) {
             const exr_channel *ch = &ctx->channels[c];
@@ -5399,8 +5667,8 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
             planes[c].w = (uint32_t)pw;
             planes[c].h = (uint32_t)ph;
             if (exr_mul_ovf(pw, ph, &pw)) { rc = EXR_ERROR_CORRUPT; goto done; }
-            if (exr_mul_ovf(pw, sizeof(int32_t), &pw)) { rc = EXR_ERROR_CORRUPT; goto done; }
-            planes[c].data = (int32_t *)exr_calloc(a, pw ? pw : 1u, 1);
+            if (exr_mul_ovf(pw, sizeof(int64_t), &pw)) { rc = EXR_ERROR_CORRUPT; goto done; }
+            planes[c].data = (int64_t *)exr_calloc(a, pw ? pw : 1u, 1);
             if (!planes[c].data) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
         }
     }
@@ -5412,14 +5680,14 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
         size_t count = (size_t)planes[c].w * planes[c].h;
         const exr_channel *ch = &ctx->channels[c];
         uint32_t bit_depth = ch->pixel_type == EXR_PIXEL_HALF ? 16u : 32u;
-        rc = exr_jph_forward_nlt_type3_i32(planes[c].data, count, bit_depth);
+        rc = jph_forward_nlt_type3_i64(planes[c].data, count, bit_depth);
         if (rc != EXR_SUCCESS) goto done;
     }
 
     (void)mc_trans;
 
     for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
-        rc = exr_jph_forward_53_2d_i32(a, planes[c].data, planes[c].w, planes[c].h, 5);
+        rc = jph_forward_53_2d_i64(a, planes[c].data, planes[c].w, planes[c].h, 5);
         if (rc != EXR_SUCCESS) goto done;
     }
 
@@ -5444,7 +5712,7 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
 
         for (uint32_t res = 0u; res <= 5u; ++res) {
             for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
-                JphComponentPlane *pl = &planes[c];
+                JphPlane64 *pl = &planes[c];
                 JphSize cs;
                 cs.w = pl->w;
                 cs.h = pl->h;

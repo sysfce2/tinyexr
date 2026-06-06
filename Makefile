@@ -20,7 +20,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c c11-gate fuzz-corpus fuzz-corpus-asan
+.PHONY: all test clean help lib test-c c11-gate fuzz-corpus fuzz-corpus-asan parse-test
 
 all: $(TARGET)
 
@@ -103,8 +103,18 @@ fuzz-corpus-asan: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o test/fuzzer/fuzz_v3.c
 	  -o build/fuzz_replay
 	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
 
+# Parse/load every *.exr under $(EXR_IMAGES) and classify PASS/XFAIL/FAIL.
+# Override the corpus dir with: make parse-test EXR_IMAGES=/path/to/images
+EXR_IMAGES ?= $(HOME)/work/openexr-images
+PARSE_HARNESS = test/v3/parse_harness
+
+parse-test: lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -Iinclude -O2 \
+	  test/v3/parse_harness.c build/libtinyexr3.a -lm -o $(PARSE_HARNESS)
+	python3 test/v3/parse-tester.py --harness $(PARSE_HARNESS) $(EXR_IMAGES)
+
 clean:
-	rm -rf $(TARGET) miniz.o build
+	rm -rf $(TARGET) miniz.o build $(PARSE_HARNESS)
 
 help:
 	@echo "make        - legacy v1 test (test_tinyexr)"
@@ -115,3 +125,4 @@ help:
 	@echo "make fuzz   - build libFuzzer target (build/fuzz_v3)"
 	@echo "make fuzz-corpus - replay regression corpus under ASan+UBSan+LSan"
 	@echo "make fuzz-corpus-asan - replay corpus with LSan disabled for ptrace sandboxes"
+	@echo "make parse-test - parse/load openexr-images corpus, classify PASS/XFAIL/FAIL"

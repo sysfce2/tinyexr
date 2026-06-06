@@ -187,18 +187,23 @@ static void jph_encode_unsupported_sampling(const char *path,
     exr_image_free(&src);
 }
 
-static void jph_encode_rejects_mixed_precision(void) {
-    exr_image img;
+/* Mixed half + float channels in one HTJ2K codestream must encode and then
+ * decode back losslessly (reversible 5/3 + per-component bit depth). */
+static void jph_encode_mixed_precision_roundtrip(void) {
+    exr_image img, dec;
     exr_part part;
     exr_channel channels[2];
     void *images[2];
-    uint16_t half_pixels[4] = {0, 0, 0, 0};
-    float float_pixels[4] = {0.0f, 1.0f, -2.0f, 3.0f};
+    /* 2x2 half "A" and 2x2 float "Z" with non-trivial values. */
+    uint16_t half_pixels[4] = {0x3c00, 0x4000, 0xbc00, 0x0001};
+    float float_pixels[4] = {0.0f, 1.5f, -2.5f, 12345.678f};
     void *buf = NULL;
     size_t sz = 0;
     exr_result rc;
+    int ok = 0;
 
     memset(&img, 0, sizeof(img));
+    memset(&dec, 0, sizeof(dec));
     memset(&part, 0, sizeof(part));
     memset(channels, 0, sizeof(channels));
     memset(images, 0, sizeof(images));
@@ -234,14 +239,23 @@ static void jph_encode_rejects_mixed_precision(void) {
     img.parts = &part;
 
     rc = exr_save_to_memory(&buf, &sz, NULL, &img, EXR_COMPRESSION_HTJ2K32);
-    CHECK(rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0,
-          "HTJ2K encode rejects mixed HALF/FLOAT channels");
-    if (rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0) {
-        printf("  ok: HTJ2K encode rejects mixed HALF/FLOAT channels\n");
-    } else {
-        printf("  FAIL: HTJ2K mixed precision encode rc=%s size=%zu\n",
-               exr_result_string(rc), sz);
+    if (rc == EXR_SUCCESS && buf && sz) {
+        rc = exr_load_from_memory(buf, sz, NULL, &dec);
+        if (rc == EXR_SUCCESS && dec.num_parts == 1 &&
+            dec.parts[0].header.num_channels == 2) {
+            /* channels come back sorted by name: A (half), Z (float) */
+            const exr_part *dp = &dec.parts[0];
+            ok = memcmp(dp->images[0], half_pixels, sizeof(half_pixels)) == 0 &&
+                 memcmp(dp->images[1], float_pixels, sizeof(float_pixels)) == 0;
+        }
     }
+    CHECK(ok, "HTJ2K mixed HALF/FLOAT encode round-trips losslessly");
+    if (ok)
+        printf("  ok: HTJ2K mixed HALF/FLOAT encode round-trips losslessly\n");
+    else
+        printf("  FAIL: HTJ2K mixed precision round-trip rc=%s size=%zu\n",
+               exr_result_string(rc), sz);
+    if (EXR_OK(rc)) exr_image_free(&dec);
     free(buf);
 }
 
@@ -1155,7 +1169,7 @@ int main(void) {
     jph_encode_unsupported_sampling("test/unit/regression/2by2.exr",
                                     EXR_COMPRESSION_HTJ2K32,
                                     "HTJ2K32 unsupported sampling");
-    jph_encode_rejects_mixed_precision();
+    jph_encode_mixed_precision_roundtrip();
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();
