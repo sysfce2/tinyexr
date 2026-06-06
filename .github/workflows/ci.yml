@@ -135,8 +135,12 @@ jobs:
           $CC $CFLAGS -I../../deps/miniz -c ../../deps/miniz/miniz.c -o miniz.o
           $CXX $CXXFLAGS -I../../ -I../../deps/miniz -o tester tester.cc miniz.o
           ./tester "[spectral],[fuzzing]"
-          $CXX $CXXFLAGS -I../../ -I../../deps/miniz -o tester-v2 tester-v2.cc miniz.o
-          ./tester-v2 "~[PIZ]"
+          if [ -f tester-v2.cc ]; then
+            $CXX $CXXFLAGS -I../../ -I../../deps/miniz -o tester-v2 tester-v2.cc miniz.o
+            ./tester-v2 "~[PIZ]"
+          else
+            echo "tester-v2.cc not present on this branch; skipping v2 unit tests"
+          fi
 
       - name: Setup MSVC Developer Command Prompt
         if: matrix.family == 'windows'
@@ -170,14 +174,22 @@ jobs:
         working-directory: test/unit
         shell: cmd
         run: |
-          cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester-v2.cc miniz.obj /Fe:tester-v2.exe
+          if exist tester-v2.cc (
+            cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz tester-v2.cc miniz.obj /Fe:tester-v2.exe
+          ) else (
+            echo tester-v2.cc not present on this branch; skipping v2 unit tests
+          )
 
       - name: Compile Windows v2 unit tests
         if: matrix.family == 'windows' && !matrix.run_tests
         working-directory: test/unit
         shell: cmd
         run: |
-          cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz /c tester-v2.cc /Fo:tester-v2.obj
+          if exist tester-v2.cc (
+            cl.exe /EHsc /O2 /std:c++14 /I..\.. /I..\..\deps\miniz /c tester-v2.cc /Fo:tester-v2.obj
+          ) else (
+            echo tester-v2.cc not present on this branch; skipping v2 unit tests
+          )
 
       - name: Run Windows unit tests
         if: matrix.family == 'windows' && matrix.run_tests
@@ -185,7 +197,7 @@ jobs:
         shell: cmd
         run: |
           tester.exe "[spectral],[fuzzing]"
-          tester-v2.exe "~[PIZ]"
+          if exist tester-v2.exe tester-v2.exe "~[PIZ]"
 
   lsan-fuzz-corpus:
     name: linux-x64-lsan-fuzz-corpus
