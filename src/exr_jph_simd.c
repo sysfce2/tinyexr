@@ -69,4 +69,49 @@ void jph_nlt_type3_i64_avx2(int64_t *data, size_t count, int64_t bias) {
         if (data[i] < 0) data[i] = -data[i] - bias;
 }
 
+/* ----------------------------------------------------------------------------
+ * Pixel pack: int32 plane sample -> little-endian uint16, by truncation (low 16
+ * bits), the all-HALF decode store. A byte shuffle (vpshufb) gathers the low two
+ * bytes of each int32 lane; truncation (not saturation) keeps it bit-identical
+ * to the scalar (uint16_t)v store even for out-of-range/corrupt coefficients.
+ * ------------------------------------------------------------------------- */
+
+EXR_TARGET("sse4.1")
+void jph_pack_i32_to_half_sse41(uint8_t *dst, const int32_t *src, size_t n) {
+    size_t i = 0;
+    const __m128i sh = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13,
+                                     -1, -1, -1, -1, -1, -1, -1, -1);
+    for (; i + 4 <= n; i += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i s = _mm_shuffle_epi8(v, sh);
+        _mm_storel_epi64((__m128i *)(dst + 2u * i), s);
+    }
+    for (; i < n; ++i) {
+        uint16_t b = (uint16_t)src[i];
+        dst[2u * i] = (uint8_t)b;
+        dst[2u * i + 1u] = (uint8_t)(b >> 8);
+    }
+}
+
+EXR_TARGET("avx2")
+void jph_pack_i32_to_half_avx2(uint8_t *dst, const int32_t *src, size_t n) {
+    size_t i = 0;
+    const __m256i sh = _mm256_setr_epi8(
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1);
+    for (; i + 8 <= n; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i s = _mm256_shuffle_epi8(v, sh); /* per-128-lane gather */
+        _mm_storel_epi64((__m128i *)(dst + 2u * i),
+                         _mm256_castsi256_si128(s));
+        _mm_storel_epi64((__m128i *)(dst + 2u * i + 8u),
+                         _mm256_extracti128_si256(s, 1));
+    }
+    for (; i < n; ++i) {
+        uint16_t b = (uint16_t)src[i];
+        dst[2u * i] = (uint8_t)b;
+        dst[2u * i + 1u] = (uint8_t)(b >> 8);
+    }
+}
+
 #endif /* EXR_X86 */

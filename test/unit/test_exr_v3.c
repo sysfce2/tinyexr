@@ -1114,6 +1114,36 @@ static void jph_simd_check(void) {
     CHECK(ok, "JPH NLT type3 SIMD == scalar");
     if (ok) printf("  ok: JPH NLT type3 SIMD == scalar\n");
     free(orig); free(ref); free(got);
+
+    /* int32 -> uint16 pack (all-HALF store): truncation must match scalar even
+     * for out-of-int16 values. */
+    {
+        const size_t pn = 1003;
+        int32_t *ps = (int32_t *)malloc(pn * sizeof(int32_t));
+        uint8_t *pr = (uint8_t *)malloc(pn * 2);
+        uint8_t *px = (uint8_t *)malloc(pn * 2);
+        int pok = 1;
+        if (ps && pr && px) {
+            size_t i;
+            uint32_t r2 = 0x12345u;
+            for (i = 0; i < pn; ++i) {
+                r2 = r2 * 1664525u + 1013904223u;
+                ps[i] = (int32_t)r2; /* full int32 range incl. out-of-int16 */
+            }
+            jph_pack_i32_to_half_scalar(pr, ps, pn);
+            if (caps & EXR_SIMD_SSE41) {
+                jph_pack_i32_to_half_sse41(px, ps, pn);
+                if (memcmp(pr, px, pn * 2) != 0) pok = 0;
+            }
+            if (caps & EXR_SIMD_AVX2) {
+                jph_pack_i32_to_half_avx2(px, ps, pn);
+                if (memcmp(pr, px, pn * 2) != 0) pok = 0;
+            }
+            CHECK(pok, "JPH pack i32->half SIMD == scalar");
+            if (pok) printf("  ok: JPH pack i32->half SIMD == scalar\n");
+        }
+        free(ps); free(pr); free(px);
+    }
 #endif
 }
 

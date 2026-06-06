@@ -1785,6 +1785,25 @@ static exr_result jph_store_sample(uint8_t *dst, size_t dst_size, size_t *off,
     return EXR_SUCCESS;
 }
 
+/* Scalar reference (source of truth) for the all-HALF int32->uint16 pack. */
+void jph_pack_i32_to_half_scalar(uint8_t *dst, const int32_t *src, size_t n) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        uint16_t b = (uint16_t)src[i];
+        dst[2u * i] = (uint8_t)b;
+        dst[2u * i + 1u] = (uint8_t)(b >> 8);
+    }
+}
+
+static void jph_pack_i32_to_half(uint8_t *dst, const int32_t *src, size_t n) {
+#if defined(EXR_X86)
+    uint32_t caps = exr_cpu_caps();
+    if (caps & EXR_SIMD_AVX2) { jph_pack_i32_to_half_avx2(dst, src, n); return; }
+    if (caps & EXR_SIMD_SSE41) { jph_pack_i32_to_half_sse41(dst, src, n); return; }
+#endif
+    jph_pack_i32_to_half_scalar(dst, src, n);
+}
+
 static exr_result jph_store_component_planes_to_block(
     const exr_codec_ctx *ctx, const JphProfile *jp, const uint16_t *map,
     const JphPlaneD *planes, uint8_t *dst, size_t dst_size) {
@@ -1813,17 +1832,25 @@ static exr_result jph_store_component_planes_to_block(
             row = (uint32_t)row_i;
             if (row >= planes[comp].h || (uint32_t)nx > planes[comp].w)
                 return EXR_ERROR_CORRUPT;
+            /* Fast path: int32 plane is only used when every component is HALF,
+             * so the whole contiguous row packs int32 -> uint16 (vectorised),
+             * with a single bounds check instead of one per sample. */
+            if (planes[comp].d32) {
+                const int32_t *srow =
+                    &planes[comp].d32[(size_t)row * planes[comp].w];
+                size_t span = (size_t)(uint32_t)nx * 2u;
+                if (off > dst_size || span > dst_size - off)
+                    return EXR_ERROR_CORRUPT;
+                jph_pack_i32_to_half(dst + off, srow, (size_t)(uint32_t)nx);
+                off += span;
+                continue;
+            }
             for (x = 0; x < nx; ++x) {
                 size_t idx = (size_t)row * planes[comp].w + (uint32_t)x;
                 int32_t sv;
-                /* The reconstructed sample is a 16/32-bit value; the int32 plane
-                 * is already in range, the int64 plane is range-checked. */
-                if (planes[comp].d32) {
-                    sv = planes[comp].d32[idx];
-                } else {
-                    rc = jph_i64_to_i32(planes[comp].d64[idx], &sv);
-                    if (rc != EXR_SUCCESS) return rc;
-                }
+                /* int64 plane (mixed/float): range-check then serialise. */
+                rc = jph_i64_to_i32(planes[comp].d64[idx], &sv);
+                if (rc != EXR_SUCCESS) return rc;
                 rc = jph_store_sample(dst, dst_size, &off, ch->pixel_type, sv);
                 if (rc != EXR_SUCCESS) return rc;
             }

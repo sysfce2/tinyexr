@@ -346,6 +346,31 @@ static void bench_jph_kernels(void) {
                    base > 0 ? base / t : 1.0);
         }
     }
+    /* int32 -> uint16 pixel pack (all-HALF store). */
+    {
+        int32_t *src = (int32_t *)buf; /* reuse */
+        uint8_t *dst = (uint8_t *)malloc(n * 2);
+        struct { const char *nm; void (*f)(uint8_t *, const int32_t *, size_t);
+                 int ok; } v[] = {
+            {"pack scalar", jph_pack_i32_to_half_scalar, 1},
+#if defined(EXR_X86)
+            {"pack sse4.1", jph_pack_i32_to_half_sse41, (caps & EXR_SIMD_SSE41) != 0},
+            {"pack avx2", jph_pack_i32_to_half_avx2, (caps & EXR_SIMD_AVX2) != 0},
+#endif
+        };
+        double base = 0;
+        if (dst) for (k = 0; k < sizeof(v) / sizeof(v[0]); ++k) {
+            double t0, t; long it = 0;
+            if (!v[k].ok) { printf("  %-12s (unavailable)\n", v[k].nm); continue; }
+            t0 = now_sec();
+            do { v[k].f(dst, src, n); ++it; } while (now_sec() - t0 < 0.3);
+            t = (now_sec() - t0) / it;
+            if (k == 0) base = t;
+            printf("  %-12s %8.1f M/s (%.2fx)\n", v[k].nm, n / t / 1e6,
+                   base > 0 ? base / t : 1.0);
+        }
+        free(dst);
+    }
     free(buf);
 }
 

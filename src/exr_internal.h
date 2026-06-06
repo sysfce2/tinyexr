@@ -149,10 +149,15 @@ void exr_float_to_half_f16c(const float *src, uint16_t *dst, size_t count);
  * variants must be bit-identical. Dispatched at runtime via exr_cpu_caps(). */
 void jph_nlt_type3_i64_sse2(int64_t *data, size_t count, int64_t bias);
 void jph_nlt_type3_i64_avx2(int64_t *data, size_t count, int64_t bias);
+/* Pack n int32 plane samples (all-HALF fast path) to little-endian uint16 by
+ * truncation (low 16 bits), matching the scalar (uint16_t)v store. */
+void jph_pack_i32_to_half_sse41(uint8_t *dst, const int32_t *src, size_t n);
+void jph_pack_i32_to_half_avx2(uint8_t *dst, const int32_t *src, size_t n);
 #endif
 
 /* Scalar reference for the JPH NLT type-3 involution (v<0 -> -v-bias). */
 void jph_nlt_type3_i64_scalar(int64_t *data, size_t count, int64_t bias);
+void jph_pack_i32_to_half_scalar(uint8_t *dst, const int32_t *src, size_t n);
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define EXR_NEON 1
 void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n);
