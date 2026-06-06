@@ -16,8 +16,7 @@ miniz.o:
 miniz-v3.o:
 	$(CC) -c $(CFLAGS) ../../deps/miniz/miniz.c -o miniz-v3.o
 
-# Compile as C++ to enable V2 compression support (PIZ, PXR24, B44)
-tinyexr_c_impl.o: ../../tinyexr_c_impl.c ../../tinyexr_c.h ../../tinyexr_huffman.hh ../../tinyexr_piz.hh ../../tinyexr_v2_impl.hh
+tinyexr_c_impl.o: ../../tinyexr_c_impl.c ../../tinyexr_c.h ../../tinyexr_huffman.hh ../../tinyexr_piz.hh
 	$(CXX) -c $(CXXFLAGS_V3) -x c++ ../../tinyexr_c_impl.c -I ../.. -o tinyexr_c_impl.o
 
 tester: tester.cc ../../tinyexr.h miniz.o
@@ -26,7 +25,7 @@ tester: tester.cc ../../tinyexr.h miniz.o
 tester-v3: tester-v3.cc ../../tinyexr_v3.hh ../../tinyexr_c.h tinyexr_c_impl.o miniz-v3.o
 	$(CXX) $(CXXFLAGS_V3) -o tester-v3 tester-v3.cc tinyexr_c_impl.o miniz-v3.o -I ../..
 
-tinyexr_c_impl_bench.o: ../../tinyexr_c_impl.c ../../tinyexr_c.h ../../tinyexr_huffman.hh ../../tinyexr_piz.hh ../../tinyexr_v2_impl.hh
+tinyexr_c_impl_bench.o: ../../tinyexr_c_impl.c ../../tinyexr_c.h ../../tinyexr_huffman.hh ../../tinyexr_piz.hh
 	$(CXX) -c $(CXXFLAGS_BENCH) -x c++ ../../tinyexr_c_impl.c -I ../.. -o tinyexr_c_impl_bench.o
 
 miniz-bench.o:
@@ -43,4 +42,3 @@ check-v3: tester-v3
 
 clean:
 	rm -rf tester tester-v3 bench-v3 miniz.o miniz-v3.o miniz-bench.o tinyexr_c_impl.o tinyexr_c_impl_bench.o
-

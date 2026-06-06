@@ -1,8 +1,11 @@
 # TinyEXR V2 API - Enhanced Error Reporting and Safer Memory Access
 
-## ⚠️ EXPERIMENTAL - NOT FOR PRODUCTION USE
+## Deprecated - Reference Only
 
-**Status:** This is an experimental API that may change without notice. For production use, please use the stable V1 API in `tinyexr.h`.
+**Status:** The experimental V2 API has been retired to `attic/`. It is no
+longer built, tested, or maintained in the active TinyEXR tree. For production
+use, use the stable V1 API in `tinyexr.h`; for the current rewrite, use the
+pure-C11 v3 API under `include/exr.h` + `src/`.
 
 ## Overview
 

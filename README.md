@@ -588,48 +588,13 @@ for (auto tile : part.tiles(0)) {
 
 **Status**: Beta - suitable for evaluation and testing. V1 API remains stable for production use.
 
-## V2 API (Experimental)
+## V2 API (Deprecated)
 
-TinyEXR includes an experimental V2 API in separate header files that provides:
+The experimental TinyEXR V2 API has been retired and moved to `attic/` for
+reference only. It is no longer built, tested, or maintained in the active tree.
 
-- **Modern C++ interface**: `Result<T>` return types, `std::vector`-based data
-- **Enhanced error reporting**: Error stack with context, positions, and human-readable messages
-- **Header-only**: `tinyexr_v2.hh` + `tinyexr_v2_impl.hh`
-- **Safe memory access**: `StreamReader`/`StreamWriter` with bounds checking
-- **All compression formats**: Including PIZ, B44/B44A, PXR24 encoding
-
-### V2 Features
-
-| Feature | V1 API | V2 API |
-|---------|--------|--------|
-| Error handling | Error codes + strings | `Result<T>` with error stack |
-| Memory safety | Manual bounds checking | Automatic bounds checking |
-| Deep images | Load only | Load + Save (scanline & tiled) |
-| Spectral EXR | Full support | Full support |
-| Tiled writing | Basic | Full (mipmap/ripmap) |
-| Custom attributes | Basic | Full read/write API |
-
-### V2 Quick Example
-
-```cpp
-#include "tinyexr_v2.hh"
-#include "tinyexr_v2_impl.hh"
-
-using namespace tinyexr::v2;
-
-// Load
-auto result = LoadFromFile("input.exr");
-if (!result.success) {
-    printf("Error: %s\n", result.error_string().c_str());
-    return 1;
-}
-ImageData& image = result.value;
-
-// Save
-auto save_result = SaveToFile("output.exr", image);
-```
-
-**Note**: V2 API is experimental and subject to change. V1 API remains stable and recommended for production use.
+Use the stable V1 API (`tinyexr.h`) for production code, or the pure-C11 v3 API
+under `include/exr.h` + `src/` for the current rewrite.
 
 ## Unit tests
 

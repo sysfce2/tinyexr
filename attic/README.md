@@ -3,10 +3,14 @@
 This directory holds the **previous TinyEXR v3 C/C++ implementation**, retired in
 favour of the pure-C11 rewrite under `include/exr.h` + `src/`.
 
-It is kept for reference only (it is no longer built or maintained). The old v3
-was a Vulkan-style command-buffer API whose `tinyexr_c_impl.c` was actually
-compiled as C++ (it depended on `tinyexr_piz.hh`, `tinyexr_huffman.hh`,
-`tinyexr_simd.hh`, `tinyexr_v2_impl.hh`) and delegated PIZ decoding to C++.
+It also holds the retired experimental TinyEXR v2 API. Everything in this
+directory is kept for reference only; it is no longer built, tested, or
+maintained as part of the active tree.
+
+The old v3 was a Vulkan-style command-buffer API whose `tinyexr_c_impl.c` was
+actually compiled as C++ (it depended on `tinyexr_piz.hh`,
+`tinyexr_huffman.hh`, `tinyexr_simd.hh`, `tinyexr_v2_impl.hh`) and delegated
+PIZ decoding to C++.
 
 Notable salvage references used by the rewrite:
 
