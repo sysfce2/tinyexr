@@ -1075,6 +1075,48 @@ static void fpnge_check(void) {
 #endif
 }
 
+/* JPH SIMD kernels must be bit-identical to their scalar reference. */
+static void jph_simd_check(void) {
+#if defined(EXR_X86)
+    uint32_t caps = exr_simd_capabilities();
+    const size_t n = 1003; /* not a multiple of 4 -> exercises SIMD tails */
+    int64_t *orig = (int64_t *)malloc(n * sizeof(int64_t));
+    int64_t *ref = (int64_t *)malloc(n * sizeof(int64_t));
+    int64_t *got = (int64_t *)malloc(n * sizeof(int64_t));
+    uint32_t rng = 0xC0FFEEu;
+    int bds[2] = {16, 32};
+    int ok = 1, k;
+    if (!orig || !ref || !got) { free(orig); free(ref); free(got); return; }
+    for (k = 0; k < 2; ++k) {
+        uint32_t bd = (uint32_t)bds[k];
+        int64_t bias = ((int64_t)1 << (bd - 1)) + 1;
+        size_t i;
+        for (i = 0; i < n; ++i) {
+            int64_t v;
+            rng = rng * 1664525u + 1013904223u;
+            v = (int64_t)(int32_t)rng;                  /* full int32 range */
+            if (bd == 32u && (rng & 7u) == 0u) v *= 41; /* widen beyond int32 */
+            orig[i] = v;
+        }
+        memcpy(ref, orig, n * sizeof(int64_t));
+        jph_nlt_type3_i64_scalar(ref, n, bias);
+        if (caps & EXR_SIMD_SSE2) {
+            memcpy(got, orig, n * sizeof(int64_t));
+            jph_nlt_type3_i64_sse2(got, n, bias);
+            if (memcmp(ref, got, n * sizeof(int64_t)) != 0) ok = 0;
+        }
+        if (caps & EXR_SIMD_AVX2) {
+            memcpy(got, orig, n * sizeof(int64_t));
+            jph_nlt_type3_i64_avx2(got, n, bias);
+            if (memcmp(ref, got, n * sizeof(int64_t)) != 0) ok = 0;
+        }
+    }
+    CHECK(ok, "JPH NLT type3 SIMD == scalar");
+    if (ok) printf("  ok: JPH NLT type3 SIMD == scalar\n");
+    free(orig); free(ref); free(got);
+#endif
+}
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -1170,6 +1212,9 @@ int main(void) {
                                     EXR_COMPRESSION_HTJ2K32,
                                     "HTJ2K32 unsupported sampling");
     jph_encode_mixed_precision_roundtrip();
+
+    printf("== JPH SIMD kernels ==\n");
+    jph_simd_check();
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();

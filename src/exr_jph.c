@@ -911,16 +911,34 @@ static exr_result jph_inverse_rct_i64(int64_t *c0, int64_t *c1, int64_t *c2,
     return EXR_SUCCESS;
 }
 
+/* Scalar reference (source of truth) for the NLT type-3 involution. */
+void jph_nlt_type3_i64_scalar(int64_t *data, size_t count, int64_t bias) {
+    size_t i;
+    for (i = 0; i < count; ++i) {
+        if (data[i] < 0) data[i] = -data[i] - bias;
+    }
+}
+
 static exr_result jph_apply_nlt_type3_i64(int64_t *data, size_t count,
                                           uint32_t bit_depth) {
-    size_t i;
     int64_t bias;
     if (!data && count) return EXR_ERROR_INVALID_ARGUMENT;
     if (bit_depth == 0 || bit_depth > 32u) return EXR_ERROR_INVALID_ARGUMENT;
     bias = ((int64_t)1 << (bit_depth - 1u)) + 1;
-    for (i = 0; i < count; ++i) {
-        if (data[i] < 0) data[i] = -data[i] - bias;
+#if defined(EXR_X86)
+    {
+        uint32_t caps = exr_cpu_caps();
+        if (caps & EXR_SIMD_AVX2) {
+            jph_nlt_type3_i64_avx2(data, count, bias);
+            return EXR_SUCCESS;
+        }
+        if (caps & EXR_SIMD_SSE2) {
+            jph_nlt_type3_i64_sse2(data, count, bias);
+            return EXR_SUCCESS;
+        }
     }
+#endif
+    jph_nlt_type3_i64_scalar(data, count, bias);
     return EXR_SUCCESS;
 }
 
@@ -4134,17 +4152,11 @@ done_fwd64:
     return EXR_SUCCESS;
 }
 
+/* Forward NLT type-3 is the same involution as the inverse; share the
+ * dispatched implementation. */
 static exr_result jph_forward_nlt_type3_i64(int64_t *data, size_t count,
                                             uint32_t bit_depth) {
-    size_t i;
-    int64_t bias;
-    if (!data && count) return EXR_ERROR_INVALID_ARGUMENT;
-    if (bit_depth == 0 || bit_depth > 32u) return EXR_ERROR_INVALID_ARGUMENT;
-    bias = ((int64_t)1 << (bit_depth - 1u)) + 1;
-    for (i = 0; i < count; ++i) {
-        if (data[i] < 0) data[i] = -data[i] - bias;
-    }
-    return EXR_SUCCESS;
+    return jph_apply_nlt_type3_i64(data, count, bit_depth);
 }
 
 /* Deinterleave a packed EXR block into component planes. */

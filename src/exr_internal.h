@@ -143,7 +143,16 @@ void exr_interleave_sse2(const uint8_t *src, uint8_t *dst, size_t n);
 void exr_interleave_avx2(const uint8_t *src, uint8_t *dst, size_t n);
 void exr_half_to_float_f16c(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half_f16c(const float *src, uint16_t *dst, size_t count);
+
+/* JPH (HTJ2K) SIMD kernels (src/exr_jph_simd.c). Each has a scalar reference of
+ * the same name with a `_scalar` suffix that is the source of truth; the SIMD
+ * variants must be bit-identical. Dispatched at runtime via exr_cpu_caps(). */
+void jph_nlt_type3_i64_sse2(int64_t *data, size_t count, int64_t bias);
+void jph_nlt_type3_i64_avx2(int64_t *data, size_t count, int64_t bias);
 #endif
+
+/* Scalar reference for the JPH NLT type-3 involution (v<0 -> -v-bias). */
+void jph_nlt_type3_i64_scalar(int64_t *data, size_t count, int64_t bias);
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define EXR_NEON 1
 void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n);
