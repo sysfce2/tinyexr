@@ -187,6 +187,64 @@ static void jph_encode_unsupported_sampling(const char *path,
     exr_image_free(&src);
 }
 
+static void jph_encode_rejects_mixed_precision(void) {
+    exr_image img;
+    exr_part part;
+    exr_channel channels[2];
+    void *images[2];
+    uint16_t half_pixels[4] = {0, 0, 0, 0};
+    float float_pixels[4] = {0.0f, 1.0f, -2.0f, 3.0f};
+    void *buf = NULL;
+    size_t sz = 0;
+    exr_result rc;
+
+    memset(&img, 0, sizeof(img));
+    memset(&part, 0, sizeof(part));
+    memset(channels, 0, sizeof(channels));
+    memset(images, 0, sizeof(images));
+
+    strcpy(channels[0].name, "A");
+    channels[0].pixel_type = EXR_PIXEL_HALF;
+    channels[0].x_sampling = 1;
+    channels[0].y_sampling = 1;
+    strcpy(channels[1].name, "Z");
+    channels[1].pixel_type = EXR_PIXEL_FLOAT;
+    channels[1].x_sampling = 1;
+    channels[1].y_sampling = 1;
+    images[0] = half_pixels;
+    images[1] = float_pixels;
+
+    part.header.part_type = EXR_PART_SCANLINE;
+    part.header.compression = EXR_COMPRESSION_HTJ2K32;
+    part.header.line_order = EXR_LINEORDER_INCREASING_Y;
+    part.header.data_window.min_x = 0;
+    part.header.data_window.min_y = 0;
+    part.header.data_window.max_x = 1;
+    part.header.data_window.max_y = 1;
+    part.header.display_window = part.header.data_window;
+    part.header.pixel_aspect_ratio = 1.0f;
+    part.header.screen_window_width = 1.0f;
+    part.header.num_channels = 2;
+    part.header.channels = channels;
+    part.width = 2;
+    part.height = 2;
+    part.images = images;
+
+    img.num_parts = 1;
+    img.parts = &part;
+
+    rc = exr_save_to_memory(&buf, &sz, NULL, &img, EXR_COMPRESSION_HTJ2K32);
+    CHECK(rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0,
+          "HTJ2K encode rejects mixed HALF/FLOAT channels");
+    if (rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0) {
+        printf("  ok: HTJ2K encode rejects mixed HALF/FLOAT channels\n");
+    } else {
+        printf("  FAIL: HTJ2K mixed precision encode rc=%s size=%zu\n",
+               exr_result_string(rc), sz);
+    }
+    free(buf);
+}
+
 static unsigned rd_u32le(const unsigned char *p) {
     return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) |
            ((unsigned)p[3] << 24);
@@ -1097,6 +1155,7 @@ int main(void) {
     jph_encode_unsupported_sampling("test/unit/regression/2by2.exr",
                                     EXR_COMPRESSION_HTJ2K32,
                                     "HTJ2K32 unsupported sampling");
+    jph_encode_rejects_mixed_precision();
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();

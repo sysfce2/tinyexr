@@ -1172,6 +1172,12 @@ static exr_result jph_validate_ht_codeblock_segments(const uint8_t *data,
         return EXR_ERROR_CORRUPT;
     if (active_passes == 0u || active_passes > 3u)
         return EXR_ERROR_CORRUPT;
+    if (active_passes > 1u && length1 == 0u)
+        return EXR_ERROR_CORRUPT;
+    if (missing_msbs > 62u)
+        return EXR_ERROR_CORRUPT;
+    if (missing_msbs >= 30u && active_passes > 1u)
+        return EXR_ERROR_UNSUPPORTED;
     {
         exr_result rc = jph_split_ht_codeblock_streams(data, data_size,
                                                        length0, length1,
@@ -1179,9 +1185,7 @@ static exr_result jph_validate_ht_codeblock_segments(const uint8_t *data,
         if (rc != EXR_SUCCESS) return rc;
     }
 
-    if (active_passes > 1u && length1 == 0u) active_passes = 1u;
     if (missing_msbs > 30u) return EXR_SUCCESS;
-    if (missing_msbs == 30u && active_passes > 1u) return EXR_ERROR_CORRUPT;
     if (missing_msbs == 29u && active_passes > 1u) active_passes = 1u;
     (void)streams;
     return EXR_SUCCESS;
@@ -2057,6 +2061,14 @@ static uint32_t jph_load_u32_from_u16(const uint16_t *p) {
     return ((uint32_t)p[0]) | ((uint32_t)p[1] << 16u);
 }
 
+static uint32_t jph_mask32(uint32_t nbits) {
+    return nbits >= 32u ? UINT32_MAX : ((UINT32_C(1) << nbits) - 1u);
+}
+
+static uint64_t jph_mask64(uint32_t nbits) {
+    return nbits >= 64u ? UINT64_MAX : ((UINT64_C(1) << nbits) - 1u);
+}
+
 /* ----- MagSgn forward reader (feeds 0xff when exhausted) ----- */
 typedef struct {
     const uint8_t *start;
@@ -2210,13 +2222,20 @@ static void jph_magsgn_advance(JphMagSgn *m, uint32_t n) {
 
 static uint64_t jph_decode_magsgn_sample64(JphMagSgn *magsgn, uint32_t inf,
                                            uint32_t bit, uint32_t u_q,
-                                           uint32_t p, uint64_t *v_n) {
+                                           uint32_t p, uint64_t *v_n,
+                                           exr_result *rc) {
     uint64_t val = 0u;
     *v_n = 0u;
+    if (rc) *rc = EXR_SUCCESS;
     if (inf & (1u << (4u + bit))) {
         uint64_t ms_val = jph_magsgn_fetch64(magsgn);
         uint32_t m_n = u_q - ((inf >> (12u + bit)) & 1u);
-        uint64_t mask = m_n >= 64u ? UINT64_MAX : ((UINT64_C(1) << m_n) - 1u);
+        uint64_t mask;
+        if (m_n >= 63u || p == 0u) {
+            if (rc) *rc = EXR_ERROR_CORRUPT;
+            return 0u;
+        }
+        mask = jph_mask64(m_n);
         jph_magsgn_advance(magsgn, m_n);
         val = ms_val << 63u;
         *v_n = ms_val & mask;
@@ -2466,17 +2485,23 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
             uint32_t inf = sp[0];
             uint32_t u_q = sp[1];
             uint64_t v_n;
+            exr_result sample_rc;
             if (u_q > mmsbp2) {
                 rc = EXR_ERROR_CORRUPT;
                 goto done;
             }
-            dp[0] = jph_decode_magsgn_sample64(&magsgn, inf, 0u, u_q, p, &v_n);
+            dp[0] = jph_decode_magsgn_sample64(&magsgn, inf, 0u, u_q, p,
+                                                &v_n, &sample_rc);
+            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             if (1u < height) {
                 dp[sstr] =
-                    jph_decode_magsgn_sample64(&magsgn, inf, 1u, u_q, p, &v_n);
+                    jph_decode_magsgn_sample64(&magsgn, inf, 1u, u_q, p,
+                                               &v_n, &sample_rc);
             } else {
-                (void)jph_decode_magsgn_sample64(&magsgn, inf, 1u, u_q, p, &v_n);
+                (void)jph_decode_magsgn_sample64(&magsgn, inf, 1u, u_q, p,
+                                                 &v_n, &sample_rc);
             }
+            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             vp[0] = prev_v_n | v_n;
             prev_v_n = 0u;
             ++dp;
@@ -2485,13 +2510,18 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                 ++vp;
                 break;
             }
-            dp[0] = jph_decode_magsgn_sample64(&magsgn, inf, 2u, u_q, p, &v_n);
+            dp[0] = jph_decode_magsgn_sample64(&magsgn, inf, 2u, u_q, p,
+                                                &v_n, &sample_rc);
+            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             if (1u < height) {
                 dp[sstr] =
-                    jph_decode_magsgn_sample64(&magsgn, inf, 3u, u_q, p, &v_n);
+                    jph_decode_magsgn_sample64(&magsgn, inf, 3u, u_q, p,
+                                               &v_n, &sample_rc);
             } else {
-                (void)jph_decode_magsgn_sample64(&magsgn, inf, 3u, u_q, p, &v_n);
+                (void)jph_decode_magsgn_sample64(&magsgn, inf, 3u, u_q, p,
+                                                 &v_n, &sample_rc);
             }
+            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             prev_v_n = v_n;
             ++dp;
             ++x;
@@ -2516,6 +2546,7 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                 uint64_t emax_src;
                 uint32_t lz = 0u, emax, kappa, u_q_eff;
                 uint64_t v_n;
+                exr_result sample_rc;
                 gamma &= gamma - 0x10u;
                 emax_src = vp[0] | vp[1] | 2u;
                 while ((emax_src & UINT64_C(0x8000000000000000)) == 0u) {
@@ -2530,14 +2561,17 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     goto done;
                 }
                 dp[0] = jph_decode_magsgn_sample64(&magsgn, inf, 0u, u_q_eff,
-                                                    p, &v_n);
+                                                    p, &v_n, &sample_rc);
+                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 if (y + 1u < height) {
                     dp[sstr] = jph_decode_magsgn_sample64(&magsgn, inf, 1u,
-                                                          u_q_eff, p, &v_n);
+                                                          u_q_eff, p, &v_n,
+                                                          &sample_rc);
                 } else {
                     (void)jph_decode_magsgn_sample64(&magsgn, inf, 1u, u_q_eff,
-                                                     p, &v_n);
+                                                     p, &v_n, &sample_rc);
                 }
+                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 vp[0] = prev_v_n | v_n;
                 prev_v_n = 0u;
                 ++dp;
@@ -2547,14 +2581,17 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     break;
                 }
                 dp[0] = jph_decode_magsgn_sample64(&magsgn, inf, 2u, u_q_eff,
-                                                    p, &v_n);
+                                                    p, &v_n, &sample_rc);
+                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 if (y + 1u < height) {
                     dp[sstr] = jph_decode_magsgn_sample64(&magsgn, inf, 3u,
-                                                          u_q_eff, p, &v_n);
+                                                          u_q_eff, p, &v_n,
+                                                          &sample_rc);
                 } else {
                     (void)jph_decode_magsgn_sample64(&magsgn, inf, 3u, u_q_eff,
-                                                     p, &v_n);
+                                                     p, &v_n, &sample_rc);
                 }
+                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 prev_v_n = v_n;
                 ++dp;
                 ++x;
@@ -2857,7 +2894,8 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
             uint32_t v_n = 0, val = 0;
 
             if (U_q > mmsbp2) {
-                U_q = mmsbp2;
+                rc = EXR_ERROR_CORRUPT;
+                goto done;
             }
             bit = 0u;
             if (inf & (1u << (4u + bit))) {
@@ -2865,7 +2903,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 m_n = U_q - ((inf >> (12u + bit)) & 1u);
                 jph_magsgn_advance(&magsgn, m_n);
                 val = ms_val << 31;
-                v_n = ms_val & ((1u << m_n) - 1u);
+                v_n = ms_val & jph_mask32(m_n);
                 v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                 v_n |= 1u;
                 val |= (v_n + 2u) << (p - 1u);
@@ -2879,7 +2917,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 m_n = U_q - ((inf >> (12u + bit)) & 1u);
                 jph_magsgn_advance(&magsgn, m_n);
                 val = ms_val << 31;
-                v_n = ms_val & ((1u << m_n) - 1u);
+                v_n = ms_val & jph_mask32(m_n);
                 v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                 v_n |= 1u;
                 val |= (v_n + 2u) << (p - 1u);
@@ -2903,7 +2941,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 m_n = U_q - ((inf >> (12u + bit)) & 1u);
                 jph_magsgn_advance(&magsgn, m_n);
                 val = ms_val << 31;
-                v_n = ms_val & ((1u << m_n) - 1u);
+                v_n = ms_val & jph_mask32(m_n);
                 v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                 v_n |= 1u;
                 val |= (v_n + 2u) << (p - 1u);
@@ -2917,7 +2955,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 m_n = U_q - ((inf >> (12u + bit)) & 1u);
                 jph_magsgn_advance(&magsgn, m_n);
                 val = ms_val << 31;
-                v_n = ms_val & ((1u << m_n) - 1u);
+                v_n = ms_val & jph_mask32(m_n);
                 v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                 v_n |= 1u;
                 val |= (v_n + 2u) << (p - 1u);
@@ -2975,7 +3013,8 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 kappa = gamma ? emax : 1u;
                 U_q = u_q + kappa;
                 if (U_q > mmsbp2) {
-                    U_q = mmsbp2;
+                    rc = EXR_ERROR_CORRUPT;
+                    goto done;
                 }
 
                 {
@@ -2985,7 +3024,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                         m_n = U_q - ((inf >> (12u + bit)) & 1u);
                         jph_magsgn_advance(&magsgn, m_n);
                         val = ms_val << 31;
-                        v_n = ms_val & ((1u << m_n) - 1u);
+                        v_n = ms_val & jph_mask32(m_n);
                         v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                         v_n |= 1u;
                         val |= (v_n + 2u) << (p - 1u);
@@ -2999,7 +3038,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                         m_n = U_q - ((inf >> (12u + bit)) & 1u);
                         jph_magsgn_advance(&magsgn, m_n);
                         val = ms_val << 31;
-                        v_n = ms_val & ((1u << m_n) - 1u);
+                        v_n = ms_val & jph_mask32(m_n);
                         v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                         v_n |= 1u;
                         val |= (v_n + 2u) << (p - 1u);
@@ -3023,7 +3062,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                         m_n = U_q - ((inf >> (12u + bit)) & 1u);
                         jph_magsgn_advance(&magsgn, m_n);
                         val = ms_val << 31;
-                        v_n = ms_val & ((1u << m_n) - 1u);
+                        v_n = ms_val & jph_mask32(m_n);
                         v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                         v_n |= 1u;
                         val |= (v_n + 2u) << (p - 1u);
@@ -3037,7 +3076,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                         m_n = U_q - ((inf >> (12u + bit)) & 1u);
                         jph_magsgn_advance(&magsgn, m_n);
                         val = ms_val << 31;
-                        v_n = ms_val & ((1u << m_n) - 1u);
+                        v_n = ms_val & jph_mask32(m_n);
                         v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
                         v_n |= 1u;
                         val |= (v_n + 2u) << (p - 1u);
@@ -4044,14 +4083,18 @@ static exr_result jph_ms_encode64(JphMsEnc *m, uint64_t cwd, int cwd_len) {
     return EXR_SUCCESS;
 }
 
-static void jph_ms_terminate(JphMsEnc *m) {
+static exr_result jph_ms_terminate(JphMsEnc *m) {
     if (m->used_bits) {
         int t = m->max_bits - m->used_bits;
         m->tmp |= (0xFF & ((1U << t) - 1)) << m->used_bits;
-        if (m->tmp != 0xFFu) m->buf[m->pos++] = (uint8_t)m->tmp;
+        if (m->tmp != 0xFFu) {
+            if (m->pos >= m->cap) return EXR_ERROR_CORRUPT;
+            m->buf[m->pos++] = (uint8_t)m->tmp;
+        }
     } else if (m->max_bits == 7 && m->pos > 0u) {
         m->pos--;
     }
+    return EXR_SUCCESS;
 }
 
 /* MEL encoder structure */
@@ -4281,7 +4324,7 @@ static exr_result jph_encode_mag_bits(JphMsEnc *ms, uint64_t s,
     int m = (rho & bit) ? Uq - ((tuple & bit) ? 1 : 0) : 0;
     if (m <= 0) return EXR_SUCCESS;
     if (m >= 64) return EXR_ERROR_CORRUPT;
-    return jph_ms_encode64(ms, s & ((UINT64_C(1) << m) - 1u), m);
+    return jph_ms_encode64(ms, s & jph_mask64((uint32_t)m), m);
 }
 
 /* Encode one HT codeblock. */
@@ -4631,8 +4674,10 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
     }
 
     /* Terminate encoders and assemble cleanup pass */
-    jph_ms_terminate(&ms);
-    jph_mel_vlc_terminate(&mel, &vlc);
+    rc = jph_ms_terminate(&ms);
+    if (rc != EXR_SUCCESS) return rc;
+    rc = jph_mel_vlc_terminate(&mel, &vlc);
+    if (rc != EXR_SUCCESS) return rc;
 
     /* Assemble output: MagSgn segment + MEL+VLC segment + Scup */
     int lcup = (int)ms.pos + (int)mel.pos + (int)vlc.pos;
@@ -5169,7 +5214,7 @@ static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                     uint32_t lengths[2] = {0u, 0u};
                     size_t out_sz = 0u, idx = (size_t)y * cbw + x;
                     uint8_t *coded;
-                    size_t coded_cap = 24576u;
+                    size_t coded_cap = 65536u + 3072u + 2u;
                     if (bwid > 128u) bwid = 128u;
                     if (bhgt > 32u) bhgt = 32u;
                     coded = (uint8_t *)exr_malloc(a, coded_cap);
@@ -5311,6 +5356,8 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
     exr_result rc;
     int mc_trans = 0;
     uint32_t kmax = 20u;
+    int saw_half = 0;
+    int saw_float = 0;
 
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
@@ -5325,8 +5372,13 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
             (ch->y_sampling != 0 && ch->y_sampling != 1)) {
             return EXR_ERROR_UNSUPPORTED;
         }
-        if (ch->pixel_type == EXR_PIXEL_FLOAT) kmax = 33u;
+        if (ch->pixel_type == EXR_PIXEL_HALF) saw_half = 1;
+        if (ch->pixel_type == EXR_PIXEL_FLOAT) {
+            saw_float = 1;
+            kmax = 33u;
+        }
     }
+    if (saw_half && saw_float) return EXR_ERROR_UNSUPPORTED;
 
     jph_ensure_uvlc_enc_tables();
     jph_ensure_vlc_enc_tables();
@@ -5428,6 +5480,11 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
     }
 
 done:
+    if (rc != EXR_SUCCESS) {
+        exr_free(a, *out_data);
+        *out_data = NULL;
+        *out_size = 0;
+    }
     exr_free(a, buf);
     if (planes) {
         for (c = 0; c < (uint32_t)ctx->num_channels; ++c)
