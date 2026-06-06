@@ -1070,6 +1070,12 @@ int main(void) {
     jph_decode_matches("openexr-images/TestImages/RgbRampsDiagonal.exr",
                        "openexr-images/TestImages/htj2k32_RgbRampsDiagonal.exr",
                        "htj2k32_RgbRampsDiagonal");
+    jph_decode_matches("openexr-images/TestImages/WideFloatRange.exr",
+                       "openexr-images/TestImages/htj2k256_WideFloatRange.exr",
+                       "htj2k256_WideFloatRange");
+    jph_decode_matches("openexr-images/TestImages/WideFloatRange.exr",
+                       "openexr-images/TestImages/htj2k32_WideFloatRange.exr",
+                       "htj2k32_WideFloatRange");
 
     printf("== HTJ2K/JPH writer ==\n");
     roundtrip("test/unit/regression/2by2.exr",
@@ -1084,6 +1090,10 @@ int main(void) {
               EXR_COMPRESSION_HTJ2K256, "HTJ2K256 BrightRingsNanInf");
     roundtrip("openexr-images/TestImages/RgbRampsDiagonal.exr",
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32 RgbRampsDiagonal");
+    roundtrip("openexr-images/TestImages/WideFloatRange.exr",
+              EXR_COMPRESSION_HTJ2K32, "HTJ2K32 WideFloatRange");
+    roundtrip("openexr-images/TestImages/WideFloatRange.exr",
+              EXR_COMPRESSION_HTJ2K256, "HTJ2K256 WideFloatRange");
     jph_encode_unsupported_sampling("test/unit/regression/2by2.exr",
                                     EXR_COMPRESSION_HTJ2K32,
                                     "HTJ2K32 unsupported sampling");
