@@ -4,6 +4,8 @@
 #   make lib        - build the pure-C11 v3 library (build/libtinyexr3.a)
 #   make test-c     - build + run the pure-C11 v3 reader unit test (ASan+UBSan)
 #   make c11-gate   - compile every src/*.c as strict C11 -Werror (no C++)
+#   make fuzz-corpus - replay regression corpus under ASan+UBSan+LSan
+#   make fuzz-corpus-asan - same replay with LSan disabled for ptrace sandboxes
 #   make clean
 
 CC  ?= gcc
@@ -18,7 +20,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c c11-gate
+.PHONY: all test clean help lib test-c c11-gate fuzz-corpus fuzz-corpus-asan
 
 all: $(TARGET)
 
@@ -92,6 +94,15 @@ fuzz-corpus: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o test/fuzzer/fuzz_v3.c | bu
 	  -o build/fuzz_replay
 	./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
 
+# Some local sandboxes/debug wrappers use ptrace. LeakSanitizer cannot run
+# under ptrace, so this target preserves ASan+UBSan corpus coverage there while
+# keeping fuzz-corpus as the strict LSan gate for CI/native hosts.
+fuzz-corpus-asan: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o test/fuzzer/fuzz_v3.c | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \
+	  test/fuzzer/fuzz_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o -lm \
+	  -o build/fuzz_replay
+	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
+
 clean:
 	rm -rf $(TARGET) miniz.o build
 
@@ -103,3 +114,4 @@ help:
 	@echo "make bench  - codec/SIMD throughput benchmark"
 	@echo "make fuzz   - build libFuzzer target (build/fuzz_v3)"
 	@echo "make fuzz-corpus - replay regression corpus under ASan+UBSan+LSan"
+	@echo "make fuzz-corpus-asan - replay corpus with LSan disabled for ptrace sandboxes"

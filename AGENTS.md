@@ -22,6 +22,10 @@ untouched.
 - `make test-c`     — unit tests under ASan+UBSan (note: runs with `detect_leaks=0`).
 - `make fuzz-corpus`— replay `test/unit/regression/*` under ASan+UBSan+**LSan**
   (this is what catches error-path leaks; keep it green).
+- `make fuzz-corpus-asan` — same corpus replay with `ASAN_OPTIONS=detect_leaks=0`;
+  use only in ptrace/sandboxed local sessions where LSan aborts with
+  "LeakSanitizer does not work under ptrace". It is a crash/ASan/UBSan fallback,
+  not a replacement for the LSan gate.
 - `make fuzz`       — clang/libFuzzer coverage-guided target (`build/fuzz_v3`).
 - `make bench`      — codec + SIMD-kernel throughput.
 

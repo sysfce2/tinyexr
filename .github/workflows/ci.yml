@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: ["release", "master"]
   pull_request:
@@ -185,3 +186,16 @@ jobs:
         run: |
           tester.exe "[spectral],[fuzzing]"
           tester-v2.exe "~[PIZ]"
+
+  lsan-fuzz-corpus:
+    name: linux-x64-lsan-fuzz-corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Replay regression corpus under ASan/UBSan/LSan
+        run: make fuzz-corpus
