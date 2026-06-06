@@ -106,7 +106,12 @@ exr_result exr_mip_generate(const exr_allocator *a, const exr_part *part,
             size_t ps = exr_pixel_size(ch->pixel_type);
             int cw = exr_num_samples(0, ww - 1, xs); /* channel-grid dims */
             int chh = exr_num_samples(0, hh - 1, ys);
-            size_t bytes = (size_t)cw * chh * ps;
+            size_t bytes;
+            if (cw < 0 || chh < 0 ||
+                exr_mul_ovf((size_t)cw, (size_t)chh, &bytes) ||
+                exr_mul_ovf(bytes, ps, &bytes)) {
+                rc = EXR_ERROR_CORRUPT; goto fail;
+            }
             out->img[L][c] = exr_malloc(a, bytes ? bytes : 1);
             if (!out->img[L][c]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
             if (L == 0) {
@@ -187,8 +192,14 @@ exr_result exr_ripmap_generate(const exr_allocator *a, const exr_part *part,
                 int xs = ch->x_sampling < 1 ? 1 : ch->x_sampling;
                 int ys = ch->y_sampling < 1 ? 1 : ch->y_sampling;
                 size_t ps = exr_pixel_size(ch->pixel_type);
-                size_t bytes = (size_t)exr_num_samples(0, out->lw[lx] - 1, xs) *
-                               exr_num_samples(0, out->lh[ly] - 1, ys) * ps;
+                int rw = exr_num_samples(0, out->lw[lx] - 1, xs);
+                int rh = exr_num_samples(0, out->lh[ly] - 1, ys);
+                size_t bytes;
+                if (rw < 0 || rh < 0 ||
+                    exr_mul_ovf((size_t)rw, (size_t)rh, &bytes) ||
+                    exr_mul_ovf(bytes, ps, &bytes)) {
+                    rc = EXR_ERROR_CORRUPT; goto fail;
+                }
                 slot[c] = exr_malloc(a, bytes ? bytes : 1);
                 if (!slot[c]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
             }
