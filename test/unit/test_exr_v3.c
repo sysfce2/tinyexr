@@ -1052,6 +1052,12 @@ int main(void) {
     jph_decode_matches("openexr-images/TestImages/AllHalfValues.exr",
                        "openexr-images/TestImages/htj2k32_AllHalfValues.exr",
                        "htj2k32_AllHalfValues");
+    jph_decode_matches("openexr-images/TestImages/BrightRingsNanInf.exr",
+                       "openexr-images/TestImages/htj2k256_BrightRingsNanInf.exr",
+                       "htj2k256_BrightRingsNanInf");
+    jph_decode_matches("openexr-images/TestImages/BrightRingsNanInf.exr",
+                       "openexr-images/TestImages/htj2k32_BrightRingsNanInf.exr",
+                       "htj2k32_BrightRingsNanInf");
     jph_decode_matches("openexr-images/TestImages/stripes.exr",
                        "openexr-images/TestImages/htj2k256_stripes.exr",
                        "htj2k256_stripes");
@@ -1074,6 +1080,8 @@ int main(void) {
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32 AllHalfValues");
     roundtrip("openexr-images/TestImages/AllHalfValues.exr",
               EXR_COMPRESSION_HTJ2K256, "HTJ2K256 AllHalfValues");
+    roundtrip("openexr-images/TestImages/BrightRingsNanInf.exr",
+              EXR_COMPRESSION_HTJ2K256, "HTJ2K256 BrightRingsNanInf");
     roundtrip("openexr-images/TestImages/RgbRampsDiagonal.exr",
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32 RgbRampsDiagonal");
     jph_encode_unsupported_sampling("test/unit/regression/2by2.exr",

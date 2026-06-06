@@ -3850,11 +3850,12 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int32_t *plane_data,
                                     size_t out_cap,
                                     size_t *out_size) {
     /* Buffer allocation for the three segments */
-    uint8_t ms_buf[4096];
+    uint8_t ms_buf[(16384u * 16u + 14u) / 15u];
     uint8_t mel_vlc_buf[3072];
     uint8_t *mel_buf = mel_vlc_buf;
     uint8_t *vlc_buf = mel_vlc_buf + 192;
-    uint32_t ms_cap = 4096, mel_cap = 192, vlc_cap = 3072 - 192;
+    uint32_t ms_cap = (uint32_t)sizeof(ms_buf), mel_cap = 192;
+    uint32_t vlc_cap = 3072u - 192u;
     uint32_t shift, p;
     exr_result rc;
 
@@ -4715,7 +4716,7 @@ static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                     uint32_t lengths[2] = {0u, 0u};
                     size_t out_sz = 0u, idx = (size_t)y * cbw + x;
                     uint8_t *coded;
-                    size_t coded_cap = 8192u;
+                    size_t coded_cap = 24576u;
                     if (bwid > 128u) bwid = 128u;
                     if (bhgt > 32u) bhgt = 32u;
                     coded = (uint8_t *)exr_malloc(a, coded_cap);
