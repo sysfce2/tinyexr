@@ -588,48 +588,91 @@ for (auto tile : part.tiles(0)) {
 
 **Status**: Beta - suitable for evaluation and testing. V1 API remains stable for production use.
 
-## V2 API (Experimental)
+## V2 API (Deprecated)
 
-TinyEXR includes an experimental V2 API in separate header files that provides:
+The experimental TinyEXR V2 API has been retired and moved to `attic/` for
+reference only. It is no longer built, tested, or maintained in the active tree.
 
-- **Modern C++ interface**: `Result<T>` return types, `std::vector`-based data
-- **Enhanced error reporting**: Error stack with context, positions, and human-readable messages
-- **Header-only**: `tinyexr_v2.hh` + `tinyexr_v2_impl.hh`
-- **Safe memory access**: `StreamReader`/`StreamWriter` with bounds checking
-- **All compression formats**: Including PIZ, B44/B44A, PXR24 encoding
+Use the stable V1 API (`tinyexr.h`) for production code, or the pure-C11 v3 API
+under `include/exr.h` + `src/` for the current rewrite.
 
-### V2 Features
+### Streaming block I/O (bounded working memory)
 
-| Feature | V1 API | V2 API |
-|---------|--------|--------|
-| Error handling | Error codes + strings | `Result<T>` with error stack |
-| Memory safety | Manual bounds checking | Automatic bounds checking |
-| Deep images | Load only | Load + Save (scanline & tiled) |
-| Spectral EXR | Full support | Full support |
-| Tiled writing | Basic | Full (mipmap/ripmap) |
-| Custom attributes | Basic | Full read/write API |
+The pure-C11 v3 API (`include/exr.h`) can decode and encode an EXR one block at
+a time — one scanline block or one tile — so peak working memory is a single
+block rather than the whole image. This covers scanline, tiled
+(ONE_LEVEL/MIPMAP/RIPMAP), and deep parts.
 
-### V2 Quick Example
+**Decode** — iterate the chunks of a part, decode each into a small caller
+buffer, and unpack the channels you need:
 
-```cpp
-#include "tinyexr_v2.hh"
-#include "tinyexr_v2_impl.hh"
-
-using namespace tinyexr::v2;
-
-// Load
-auto result = LoadFromFile("input.exr");
-if (!result.success) {
-    printf("Error: %s\n", result.error_string().c_str());
-    return 1;
+```c
+exr_reader *r;
+exr_reader_open_memory(data, size, NULL, &r);     /* or _open_source for I/O */
+uint32_t n;
+exr_reader_num_blocks(r, /*part*/0, &n);
+for (uint32_t i = 0; i < n; ++i) {
+    exr_block_info bi;
+    exr_reader_block_info(r, 0, i, &bi);          /* geometry, no pixel I/O */
+    void *blk = malloc(bi.uncompressed_size);
+    exr_reader_decode_block(r, 0, i, blk, bi.uncompressed_size);
+    for (int c = 0; c < header->num_channels; ++c) {
+        /* per-channel planar samples for this block */
+        exr_block_extract_channel(header, &bi, blk, bi.uncompressed_size, c, dst);
+    }
+    free(blk);
 }
-ImageData& image = result.value;
-
-// Save
-auto save_result = SaveToFile("output.exr", image);
+exr_reader_close(r);
 ```
 
-**Note**: V2 API is experimental and subject to change. V1 API remains stable and recommended for production use.
+Deep parts use the two-step `exr_reader_decode_deep_counts` (to size buffers)
+then `exr_reader_decode_deep_samples`.
+
+**Encode** — describe parts with `exr_writer_add_part`, then stream blocks to a
+file (or a custom seekable `exr_data_sink`); the offset table is backpatched at
+`end_stream`:
+
+```c
+exr_writer *w;
+exr_writer_create(NULL, &w);
+exr_writer_add_part(w, &header, NULL);            /* geometry/channels/tiling */
+exr_writer_begin_stream_file(w, "out.exr", EXR_COMPRESSION_ZIP);
+for (int y = ymin; y <= ymax; y += lines_per_block)
+    exr_writer_write_scanline_block(w, 0, y, channel_rows);  /* block-local */
+exr_writer_end_stream(w);                          /* backpatch + close */
+exr_writer_destroy(w);
+```
+
+Tiles use `exr_writer_write_tile` (the caller supplies each level's tiles for
+mipmap/ripmap); deep parts use `exr_writer_write_deep_scanline_block` /
+`exr_writer_write_deep_tile`.
+
+### Freestanding / embedded / WASM
+
+The v3 core (`src/*.c` except `src/exr_stdio.c`) is freestanding: it depends only
+on `<stdint.h>`, `<stddef.h>`, and `<limits.h>` — no `<stdio.h>`, `<stdlib.h>`,
+`<string.h>`, or `<math.h>`.
+
+- **No stdio in the core.** All file I/O lives in the optional `src/exr_stdio.c`
+  (`exr_load_from_file`, `exr_save_to_file`, `exr_writer_finalize_to_file`,
+  `exr_writer_begin_stream_file`, `exr_reader_open_file`). Link it for the
+  convenient path-based helpers; omit it for embedded/WASM. Everything else does
+  I/O through caller callbacks: `exr_data_source` (read) for the reader and
+  `exr_data_sink` (write/seek/close) for the streaming writer.
+- **`-DEXR_FREESTANDING`** drops the default malloc/free allocator (the caller
+  must pass an `exr_allocator`; `exr_default_allocator()` returns NULL) and uses
+  the internal mem/str implementations in `src/exr_freestanding.c` instead of
+  `<string.h>`. `-DEXR_NO_ZSTD` drops the vendored zstd codec (and its
+  allocator); `-DEXR_NO_B44` drops the B44 codec. The B44 perceptual tables are
+  precomputed (`src/exr_b44_tables.inc`, generated by `tools/gen_b44_tables.c`),
+  so the core needs no `<math.h>` even in hosted builds.
+- `make freestanding-gate` proves the core builds with no libc (scans every
+  object with `nm` for forbidden symbols) and runs a memory round-trip.
+
+**WASM** (`make wasm`, needs `emcc`): builds `build/exr_v3.mjs` + `.wasm` from
+the core plus the pure-C binding `examples/wasm/exr_wasm.c`
+(`exrw_decode_rgba` / `exrw_encode_rgba` / `exrw_free`), with `FILESYSTEM=0`.
+See `examples/wasm/README.md` and the `node examples/wasm/test.mjs` smoke test.
 
 ## Unit tests
 
