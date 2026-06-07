@@ -1144,6 +1144,51 @@ static void jph_simd_check(void) {
         }
         free(ps); free(pr); free(px);
     }
+
+    /* inverse 5/3 1D wavelet: AVX2 must match scalar (output AND return code,
+     * incl. CORRUPT on out-of-int32 reconstruction) over many sizes/magnitudes. */
+    if (caps & EXR_SIMD_AVX2) {
+        uint32_t rng = 0xABCDEFu;
+        int wok = 1;
+        size_t trial;
+        int32_t *low = (int32_t *)malloc(2048 * sizeof(int32_t));
+        int32_t *high = (int32_t *)malloc(2048 * sizeof(int32_t));
+        int32_t *o0 = (int32_t *)malloc(4096 * sizeof(int32_t));
+        int32_t *o1 = (int32_t *)malloc(4096 * sizeof(int32_t));
+        int64_t *ev = (int64_t *)malloc(2048 * sizeof(int64_t));
+        int64_t *od = (int64_t *)malloc(2048 * sizeof(int64_t));
+        if (low && high && o0 && o1 && ev && od) {
+            for (trial = 0; trial < 4000 && wok; ++trial) {
+                size_t oc, lc, hc, i;
+                exr_result r0, r1;
+                int shiftbits;
+                rng = rng * 1664525u + 1013904223u;
+                oc = (trial < 130) ? trial : (rng % 2000u);
+                lc = (oc + 1u) / 2u;
+                hc = oc / 2u;
+                /* vary magnitude: small (no overflow) ... up to full int32 */
+                shiftbits = (int)(trial % 32u);
+                for (i = 0; i < lc; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    low[i] = (int32_t)((int32_t)rng >> shiftbits);
+                }
+                for (i = 0; i < hc; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    high[i] = (int32_t)((int32_t)rng >> shiftbits);
+                }
+                memset(o0, 0x5a, 4096 * sizeof(int32_t));
+                memset(o1, 0x5a, 4096 * sizeof(int32_t));
+                r0 = exr_jph_inverse_53_i32(low, lc, high, hc, o0, oc);
+                r1 = jph_inverse_53_i32_avx2(low, lc, high, hc, o1, oc, ev, od);
+                if (r0 != r1) { wok = 0; break; }
+                if (r0 == EXR_SUCCESS &&
+                    memcmp(o0, o1, oc * sizeof(int32_t)) != 0) { wok = 0; break; }
+            }
+            CHECK(wok, "JPH inverse 5/3 1D AVX2 == scalar");
+            if (wok) printf("  ok: JPH inverse 5/3 1D AVX2 == scalar\n");
+        }
+        free(low); free(high); free(o0); free(o1); free(ev); free(od);
+    }
 #endif
 }
 

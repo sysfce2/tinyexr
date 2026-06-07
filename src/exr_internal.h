@@ -153,6 +153,14 @@ void jph_nlt_type3_i64_avx2(int64_t *data, size_t count, int64_t bias);
  * truncation (low 16 bits), matching the scalar (uint16_t)v store. */
 void jph_pack_i32_to_half_sse41(uint8_t *dst, const int32_t *src, size_t n);
 void jph_pack_i32_to_half_avx2(uint8_t *dst, const int32_t *src, size_t n);
+/* AVX2 inverse reversible 5/3 1D lifting (int32, int64 intermediates, 4 lanes).
+ * Bit-identical to exr_jph_inverse_53_i32; returns EXR_ERROR_CORRUPT iff a
+ * reconstructed sample exceeds int32 (matching the scalar). ev/od are caller
+ * scratch of >= low_count / >= high_count int64 each. */
+exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
+                                   const int32_t *high, size_t high_count,
+                                   int32_t *out, size_t out_count,
+                                   int64_t *ev, int64_t *od);
 #endif
 
 /* Scalar reference for the JPH NLT type-3 involution (v<0 -> -v-bias). */

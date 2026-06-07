@@ -752,18 +752,23 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
                                      size_t width, size_t height,
                                      unsigned levels) {
     unsigned level;
+    int use_avx2 = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
+#if defined(EXR_X86)
+    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
 
     for (level = levels; level > 0; --level) {
         size_t rw = jph_ceil_div_pow2_size(width, level - 1u);
         size_t rh = jph_ceil_div_pow2_size(height, level - 1u);
         size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
-        size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
+        size_t temp_count, temp_bytes, scratch_len, scratch_bytes, sb64;
         int32_t *temp = NULL, *col_low = NULL, *col_high = NULL, *col_out = NULL;
+        int64_t *ev = NULL, *od = NULL; /* AVX2 1D scratch */
         size_t y, x;
         exr_result rc = EXR_SUCCESS;
 
@@ -772,31 +777,48 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
             exr_mul_ovf(temp_count, sizeof(int32_t), &temp_bytes))
             return EXR_ERROR_CORRUPT;
         scratch_len = rw > rh ? rw : rh;
-        if (exr_mul_ovf(scratch_len, sizeof(int32_t), &scratch_bytes))
+        if (exr_mul_ovf(scratch_len, sizeof(int32_t), &scratch_bytes) ||
+            exr_mul_ovf(scratch_len, sizeof(int64_t), &sb64))
             return EXR_ERROR_CORRUPT;
 
         temp = (int32_t *)exr_malloc(a, temp_bytes);
         col_low = (int32_t *)exr_malloc(a, scratch_bytes);
         col_high = (int32_t *)exr_malloc(a, scratch_bytes);
         col_out = (int32_t *)exr_malloc(a, scratch_bytes);
-        if (!temp || !col_low || !col_high || !col_out) {
-            exr_free(a, temp);
-            exr_free(a, col_low);
-            exr_free(a, col_high);
-            exr_free(a, col_out);
+        if (use_avx2) {
+            ev = (int64_t *)exr_malloc(a, sb64);
+            od = (int64_t *)exr_malloc(a, sb64);
+        }
+        if (!temp || !col_low || !col_high || !col_out ||
+            (use_avx2 && (!ev || !od))) {
+            exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+            exr_free(a, col_out); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
 
         for (y = 0; y < rh; ++y) {
             const int32_t *row = data + y * width;
-            rc = exr_jph_inverse_53_i32(row, lw, row + lw, hw,
-                                        temp + y * rw, rw);
+#if defined(EXR_X86)
+            if (use_avx2)
+                rc = jph_inverse_53_i32_avx2(row, lw, row + lw, hw,
+                                             temp + y * rw, rw, ev, od);
+            else
+#endif
+                rc = exr_jph_inverse_53_i32(row, lw, row + lw, hw,
+                                            temp + y * rw, rw);
             if (rc != EXR_SUCCESS) goto done_level;
         }
         for (x = 0; x < rw; ++x) {
             for (y = 0; y < lh; ++y) col_low[y] = temp[y * rw + x];
             for (y = 0; y < hh; ++y) col_high[y] = temp[(lh + y) * rw + x];
-            rc = exr_jph_inverse_53_i32(col_low, lh, col_high, hh, col_out, rh);
+#if defined(EXR_X86)
+            if (use_avx2)
+                rc = jph_inverse_53_i32_avx2(col_low, lh, col_high, hh, col_out,
+                                             rh, ev, od);
+            else
+#endif
+                rc = exr_jph_inverse_53_i32(col_low, lh, col_high, hh, col_out,
+                                            rh);
             if (rc != EXR_SUCCESS) goto done_level;
             for (y = 0; y < rh; ++y) data[y * width + x] = col_out[y];
         }
@@ -806,6 +828,8 @@ done_level:
         exr_free(a, col_low);
         exr_free(a, col_high);
         exr_free(a, col_out);
+        exr_free(a, ev);
+        exr_free(a, od);
         if (rc != EXR_SUCCESS) return rc;
     }
     return EXR_SUCCESS;
