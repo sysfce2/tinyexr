@@ -10,9 +10,6 @@
 
 #include "exr_internal.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-
 /* ---- growable output buffer ---------------------------------------------- */
 
 typedef struct {
@@ -842,32 +839,7 @@ exr_result exr_save_to_memory(void **out_data, size_t *out_size,
                      (uint8_t **)out_data, out_size);
 }
 
-exr_result exr_save_to_file(const char *path, const exr_image *img,
-                            exr_compression compression) {
-    void *data = NULL;
-    size_t size = 0;
-    exr_result rc;
-    FILE *fp;
-    const exr_allocator *a = exr_default_allocator();
-
-    if (!path || !img) return EXR_ERROR_INVALID_ARGUMENT;
-    rc = exr_save_to_memory(&data, &size, a, img, compression);
-    if (!EXR_OK(rc)) return rc;
-
-    fp = fopen(path, "wb");
-    if (!fp) {
-        exr_free(a, data);
-        return EXR_ERROR_IO;
-    }
-    if (fwrite(data, 1, size, fp) != size) {
-        fclose(fp);
-        exr_free(a, data);
-        return EXR_ERROR_IO;
-    }
-    fclose(fp);
-    exr_free(a, data);
-    return EXR_SUCCESS;
-}
+/* exr_save_to_file lives in src/exr_stdio.c (the only stdio translation unit). */
 
 /* ---- mid-level writer ---------------------------------------------------- */
 
@@ -879,7 +851,7 @@ struct exr_writer {
     /* streaming-encode state (active between begin_stream and end_stream) */
     int streaming;
     exr_data_sink sink;
-    FILE *fp;             /* non-NULL for the file-backed sink */
+    int sink_open;        /* 1 once the writer owns the sink (call close once) */
     uint64_t pos;         /* current write offset */
     exr_compression scomp;
     int smultipart;
@@ -891,6 +863,12 @@ struct exr_writer {
     uint64_t *smax_pos;    /* [part] file offset of maxSamplesPerPixel value (deep) */
     int32_t *smax;         /* [part] running max sample count (deep) */
 };
+
+/* Internal: the allocator a writer was created with (used by exr_stdio.c to free
+ * buffers returned by exr_writer_finalize_to_memory). */
+const exr_allocator *exr_writer_allocator(const exr_writer *w) {
+    return &w->alloc;
+}
 
 exr_result exr_writer_create(const exr_allocator *alloc, exr_writer **out) {
     exr_writer *w;
@@ -975,25 +953,7 @@ exr_result exr_writer_finalize_to_memory(exr_writer *w, void **out_data,
                      (uint8_t **)out_data, out_size);
 }
 
-exr_result exr_writer_finalize_to_file(exr_writer *w, const char *path) {
-    void *data = NULL;
-    size_t size = 0;
-    exr_result rc;
-    FILE *fp;
-    if (!w || !path) return EXR_ERROR_INVALID_ARGUMENT;
-    rc = exr_writer_finalize_to_memory(w, &data, &size);
-    if (!EXR_OK(rc)) return rc;
-    fp = fopen(path, "wb");
-    if (!fp) { exr_free(&w->alloc, data); return EXR_ERROR_IO; }
-    if (fwrite(data, 1, size, fp) != size) {
-        fclose(fp);
-        exr_free(&w->alloc, data);
-        return EXR_ERROR_IO;
-    }
-    fclose(fp);
-    exr_free(&w->alloc, data);
-    return EXR_SUCCESS;
-}
+/* exr_writer_finalize_to_file lives in src/exr_stdio.c (the only stdio TU). */
 
 /* ---- streaming (block-at-a-time) writer ---------------------------------- */
 
@@ -1154,17 +1114,6 @@ static exr_result sink_write(exr_writer *w, const void *p, size_t n) {
     return rc;
 }
 
-static exr_result file_sink_write(void *user, const void *data, size_t len) {
-    FILE *fp = (FILE *)user;
-    if (len && fwrite(data, 1, len, fp) != len) return EXR_ERROR_IO;
-    return EXR_SUCCESS;
-}
-static exr_result file_sink_seek(void *user, uint64_t off) {
-    FILE *fp = (FILE *)user;
-    if (fseek(fp, (long)off, SEEK_SET) != 0) return EXR_ERROR_IO;
-    return EXR_SUCCESS;
-}
-
 static void stream_free_state(exr_writer *w) {
     int p;
     if (w->sorder) {
@@ -1187,7 +1136,10 @@ static void stream_free_state(exr_writer *w) {
     exr_free(&w->alloc, w->smax_pos); w->smax_pos = NULL;
     exr_free(&w->alloc, w->smax); w->smax = NULL;
     w->streaming = 0;
-    if (w->fp) { fclose(w->fp); w->fp = NULL; }
+    /* Release the sink once (e.g. fclose for the file-backed sink). Ownership
+     * is taken only when begin_stream fully succeeds (sink_open == 1). */
+    if (w->sink_open && w->sink.close) w->sink.close(w->sink.user);
+    w->sink_open = 0;
 }
 
 /* Find maxSamplesPerPixel's 4-byte value offset within a serialized header. */
@@ -1309,29 +1261,17 @@ exr_result exr_writer_begin_stream(exr_writer *w, const exr_data_sink *sink,
     }
 
     w->streaming = 1;
+    w->sink_open = 1; /* writer now owns the sink; close it exactly once */
     return EXR_SUCCESS;
 
 fail:
+    /* sink_open is still 0: ownership has not transferred, so we do NOT close
+     * the caller's sink here (the caller, e.g. begin_stream_file, owns it). */
     stream_free_state(w);
     return rc;
 }
 
-exr_result exr_writer_begin_stream_file(exr_writer *w, const char *path,
-                                        exr_compression comp) {
-    exr_data_sink sink;
-    exr_result rc;
-    FILE *fp;
-    if (!w || !path) return EXR_ERROR_INVALID_ARGUMENT;
-    fp = fopen(path, "wb+");
-    if (!fp) return EXR_ERROR_IO;
-    sink.user = fp;
-    sink.write = file_sink_write;
-    sink.seek = file_sink_seek;
-    rc = exr_writer_begin_stream(w, &sink, comp);
-    if (!EXR_OK(rc)) { fclose(fp); return rc; }
-    w->fp = fp; /* stream_free_state / end_stream will close it */
-    return EXR_SUCCESS;
-}
+/* exr_writer_begin_stream_file lives in src/exr_stdio.c (the only stdio TU). */
 
 /* Emit one flat chunk: record its offset, write the chunk header + payload. */
 static exr_result stream_emit_flat(exr_writer *w, int part, uint32_t ci,

@@ -247,6 +247,10 @@ exr_result exr_reader_open_memory(const void *data, size_t size,
                                   const exr_allocator *alloc, exr_reader **out);
 exr_result exr_reader_open_source(const exr_data_source *src,
                                   const exr_allocator *alloc, exr_reader **out);
+/* Convenience: open a reader on a file path (stdio). Defined in the optional
+ * exr_stdio.c module; unavailable in freestanding builds that omit it. */
+exr_result exr_reader_open_file(const char *path, const exr_allocator *alloc,
+                                exr_reader **out);
 void exr_reader_close(exr_reader *r);
 
 /* Parse the file/version + all part headers + offset tables (no pixel I/O).
@@ -364,11 +368,15 @@ exr_result exr_reader_decode_deep_samples(exr_reader *r, int32_t part,
 /* ---- streaming encode ---- */
 
 /* Seekable output sink. write() appends `len` bytes; seek() repositions for the
- * offset-table backpatch at end_stream. Both return EXR_SUCCESS or an error. */
+ * offset-table backpatch at end_stream. close() is optional (may be NULL) and is
+ * invoked exactly once when the stream finishes or the writer is destroyed — it
+ * lets a sink release its resource (e.g. fclose) without the core touching libc.
+ * write/seek/close return EXR_SUCCESS or an error. */
 typedef struct exr_data_sink {
     void *user;
     exr_result (*write)(void *user, const void *data, size_t len);
     exr_result (*seek)(void *user, uint64_t off);
+    exr_result (*close)(void *user); /* optional; may be NULL */
 } exr_data_sink;
 
 /* Begin a streaming encode. Parts must already be described via

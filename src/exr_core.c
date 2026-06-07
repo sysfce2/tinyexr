@@ -7,8 +7,9 @@
 
 #include "exr_internal.h"
 
-#include <stdlib.h>
-#include <stdio.h>
+#ifndef EXR_FREESTANDING
+#include <stdlib.h> /* malloc/free for the default allocator only */
+#endif
 
 /* ============================================================================
  * Result strings
@@ -32,6 +33,7 @@ const char *exr_result_string(exr_result r) {
  * Allocator
  * ========================================================================== */
 
+#ifndef EXR_FREESTANDING
 static void *default_alloc(void *user, size_t size) {
     (void)user;
     return malloc(size);
@@ -44,8 +46,14 @@ static const exr_allocator g_default_allocator = {NULL, default_alloc,
                                                   default_free};
 
 const exr_allocator *exr_default_allocator(void) { return &g_default_allocator; }
+#else
+/* Freestanding: no libc allocator. Callers MUST supply an exr_allocator;
+ * passing NULL degrades to a clean out-of-memory failure (see exr_malloc). */
+const exr_allocator *exr_default_allocator(void) { return NULL; }
+#endif
 
 void *exr_malloc(const exr_allocator *a, size_t size) {
+    if (!a || !a->alloc) return NULL;
     if (size == 0) size = 1;
     return a->alloc(a->user, size);
 }
@@ -53,6 +61,7 @@ void *exr_malloc(const exr_allocator *a, size_t size) {
 void *exr_calloc(const exr_allocator *a, size_t count, size_t size) {
     size_t total;
     void *p;
+    if (!a || !a->alloc) return NULL;
     if (exr_mul_ovf(count, size, &total)) return NULL;
     if (total == 0) total = 1;
     p = a->alloc(a->user, total);
@@ -61,12 +70,13 @@ void *exr_calloc(const exr_allocator *a, size_t count, size_t size) {
 }
 
 void exr_free(const exr_allocator *a, void *ptr) {
-    if (ptr) a->free(a->user, ptr);
+    if (a && a->free && ptr) a->free(a->user, ptr);
 }
 
 char *exr_strdup(const exr_allocator *a, const char *s) {
     size_t n;
     char *p;
+    if (!a || !a->alloc) return NULL;
     if (!s) s = "";
     n = strlen(s) + 1;
     p = (char *)a->alloc(a->user, n);
@@ -314,46 +324,4 @@ exr_result exr_load_from_memory(const void *data, size_t size,
     return rc;
 }
 
-exr_result exr_load_from_file(const char *path, const exr_allocator *alloc,
-                              exr_image *out) {
-    FILE *fp;
-    long sz;
-    size_t n;
-    uint8_t *buf;
-    exr_result rc;
-
-    if (!path || !out) return EXR_ERROR_INVALID_ARGUMENT;
-    if (!alloc) alloc = exr_default_allocator();
-    memset(out, 0, sizeof(*out));
-
-    fp = fopen(path, "rb");
-    if (!fp) return EXR_ERROR_IO;
-    if (fseek(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
-        return EXR_ERROR_IO;
-    }
-    sz = ftell(fp);
-    if (sz < 0) {
-        fclose(fp);
-        return EXR_ERROR_IO;
-    }
-    if (fseek(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
-        return EXR_ERROR_IO;
-    }
-    buf = (uint8_t *)exr_malloc(alloc, (size_t)sz);
-    if (!buf) {
-        fclose(fp);
-        return EXR_ERROR_OUT_OF_MEMORY;
-    }
-    n = fread(buf, 1, (size_t)sz, fp);
-    fclose(fp);
-    if (n != (size_t)sz) {
-        exr_free(alloc, buf);
-        return EXR_ERROR_IO;
-    }
-
-    rc = exr_load_from_memory(buf, (size_t)sz, alloc, out);
-    exr_free(alloc, buf);
-    return rc;
-}
+/* exr_load_from_file lives in src/exr_stdio.c (the only stdio translation unit). */

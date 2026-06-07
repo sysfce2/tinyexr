@@ -468,7 +468,6 @@ exr_result exr_inflate_zlib(const uint8_t *src, size_t src_size, uint8_t *dst,
  * original to TinyEXR. See the top-level NOTICE file.
  * ========================================================================= */
 
-#include <stdlib.h>
 
 uint32_t exr_adler32(const uint8_t *data, size_t n, uint32_t adler) {
     uint32_t s1 = adler & 0xffff, s2 = (adler >> 16) & 0xffff;

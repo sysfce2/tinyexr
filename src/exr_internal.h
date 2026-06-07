@@ -12,7 +12,23 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * Freestanding builds (EXR_FREESTANDING) must not pull hosted <string.h>. We
+ * declare the handful of mem/str symbols we use (and that the compiler may
+ * emit) and define them in src/exr_freestanding.c. Hosted builds use the libc
+ * versions as before; no call sites change either way.
+ */
+#ifdef EXR_FREESTANDING
+void *memcpy(void *dst, const void *src, size_t n);
+void *memmove(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
+size_t strlen(const char *s);
+int strcmp(const char *a, const char *b);
+#else
 #include <string.h>
+#endif
 
 /* ============================================================================
  * EXR format constants
@@ -231,6 +247,10 @@ exr_result exr_parse_chlist(const exr_allocator *a, const uint8_t *data,
 exr_result exr_header_copy(const exr_allocator *a, exr_header *dst,
                            const exr_header *src);
 void exr_header_free(const exr_allocator *a, exr_header *hdr);
+
+/* The allocator a writer was created with (exr_stdio.c frees finalize buffers
+ * with it). exr_writer is opaque outside exr_writer.c. */
+const exr_allocator *exr_writer_allocator(const exr_writer *w);
 
 /* ============================================================================
  * Internal per-part state held by the reader

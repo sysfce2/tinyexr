@@ -11,7 +11,6 @@
 
 #include "exr_internal.h"
 
-#include <stdlib.h>
 
 static int level_dim_step(int s, int up) {
     int n = up ? (s + 1) / 2 : s / 2;
