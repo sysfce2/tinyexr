@@ -1192,13 +1192,15 @@ static void stream_free_state(exr_writer *w) {
 
 /* Find maxSamplesPerPixel's 4-byte value offset within a serialized header. */
 static int find_max_samples_pos(const uint8_t *hdr, size_t len, size_t *rel) {
-    static const char key[] = "maxSamplesPerPixel";
-    size_t klen = sizeof(key) - 1, i;
-    if (len < klen) return 0;
-    for (i = 0; i + klen <= len; ++i) {
-        if (memcmp(hdr + i, key, klen) == 0) {
-            /* name\0 ("...PerPixel\0") + "int\0" + size(i32) -> value */
-            *rel = i + klen + 1 + 4 + 4;
+    /* Anchor on the full attribute prologue "maxSamplesPerPixel\0int\0" so a
+     * stray substring inside some other attribute's value can't false-match. */
+    static const char key[] = "maxSamplesPerPixel"; /* name (no NUL) */
+    size_t klen = sizeof(key) - 1, need = klen + 1 + 4 + 4, i; /* +\0int\0 +size */
+    if (len < need) return 0;
+    for (i = 0; i + need <= len; ++i) {
+        if (memcmp(hdr + i, key, klen) == 0 && hdr[i + klen] == 0 &&
+            memcmp(hdr + i + klen + 1, "int", 3) == 0 && hdr[i + klen + 4] == 0) {
+            *rel = i + klen + 1 + 4 + 4; /* name\0 + "int\0" + size(i32) -> value */
             return 1;
         }
     }
