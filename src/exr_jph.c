@@ -691,6 +691,13 @@ exr_result exr_jph_inverse_rct_i32(int32_t *c0, int32_t *c1, int32_t *c2,
     return EXR_SUCCESS;
 }
 
+/* Scalar reference: if v<0, v = ~v - biasm1 (== -v-bias for bit_depth<=31). */
+void jph_nlt_type3_i32_scalar(int32_t *data, size_t count, int32_t biasm1) {
+    size_t i;
+    for (i = 0; i < count; ++i)
+        if (data[i] < 0) data[i] = ~data[i] - biasm1;
+}
+
 exr_result exr_jph_apply_nlt_type3_i32(int32_t *data, size_t count,
                                        uint32_t bit_depth) {
     size_t i;
@@ -698,6 +705,26 @@ exr_result exr_jph_apply_nlt_type3_i32(int32_t *data, size_t count,
     if (!data && count) return EXR_ERROR_INVALID_ARGUMENT;
     if (bit_depth == 0 || bit_depth > 32u) return EXR_ERROR_INVALID_ARGUMENT;
     bias = ((int64_t)1 << (bit_depth - 1u)) + 1;
+    /* For bit_depth <= 31, -v-bias always lands in int32 (~v in [0,2^31-1],
+     * minus a non-negative bias-1), so it equals ~v-(bias-1) computed purely in
+     * int32 - no range check needed; dispatch to SIMD. */
+    if (bit_depth <= 31u) {
+        int32_t biasm1 = (int32_t)(bias - 1);
+#if defined(EXR_X86)
+        uint32_t caps = exr_cpu_caps();
+        if (caps & EXR_SIMD_AVX2) {
+            jph_nlt_type3_i32_avx2(data, count, biasm1);
+            return EXR_SUCCESS;
+        }
+        if (caps & EXR_SIMD_SSE2) {
+            jph_nlt_type3_i32_sse2(data, count, biasm1);
+            return EXR_SUCCESS;
+        }
+#endif
+        jph_nlt_type3_i32_scalar(data, count, biasm1);
+        return EXR_SUCCESS;
+    }
+    /* bit_depth == 32 (not reached on the all-HALF int32 fast path). */
     for (i = 0; i < count; ++i) {
         int64_t v = data[i];
         if (v < 0) {

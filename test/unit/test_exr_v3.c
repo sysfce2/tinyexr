@@ -1145,6 +1145,43 @@ static void jph_simd_check(void) {
         free(ps); free(pr); free(px);
     }
 
+    /* int32 NLT type3: SIMD must match scalar over several bit depths. */
+    {
+        const size_t nn = 1003;
+        int32_t *ref = (int32_t *)malloc(nn * sizeof(int32_t));
+        int32_t *got = (int32_t *)malloc(nn * sizeof(int32_t));
+        int32_t *src = (int32_t *)malloc(nn * sizeof(int32_t));
+        int bds[3] = {16, 24, 31};
+        int nok = 1, k;
+        uint32_t rng = 0x9e3779b9u;
+        if (ref && got && src) {
+            for (k = 0; k < 3 && nok; ++k) {
+                int32_t biasm1 = (int32_t)((int64_t)1 << (bds[k] - 1));
+                size_t i;
+                for (i = 0; i < nn; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    /* mix of small and large, positive and negative */
+                    src[i] = (int32_t)rng >> (int)(rng % 24u);
+                }
+                memcpy(ref, src, nn * sizeof(int32_t));
+                jph_nlt_type3_i32_scalar(ref, nn, biasm1);
+                if (caps & EXR_SIMD_SSE2) {
+                    memcpy(got, src, nn * sizeof(int32_t));
+                    jph_nlt_type3_i32_sse2(got, nn, biasm1);
+                    if (memcmp(ref, got, nn * sizeof(int32_t)) != 0) nok = 0;
+                }
+                if (caps & EXR_SIMD_AVX2) {
+                    memcpy(got, src, nn * sizeof(int32_t));
+                    jph_nlt_type3_i32_avx2(got, nn, biasm1);
+                    if (memcmp(ref, got, nn * sizeof(int32_t)) != 0) nok = 0;
+                }
+            }
+            CHECK(nok, "JPH NLT type3 i32 SIMD == scalar");
+            if (nok) printf("  ok: JPH NLT type3 i32 SIMD == scalar\n");
+        }
+        free(ref); free(got); free(src);
+    }
+
     /* inverse 5/3 1D wavelet: AVX2 must match scalar (output AND return code,
      * incl. CORRUPT on out-of-int32 reconstruction) over many sizes/magnitudes. */
     if (caps & EXR_SIMD_AVX2) {

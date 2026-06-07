@@ -69,6 +69,44 @@ void jph_nlt_type3_i64_avx2(int64_t *data, size_t count, int64_t bias) {
         if (data[i] < 0) data[i] = -data[i] - bias;
 }
 
+/* int32 NLT type-3 (bit_depth<=31): if v<0, v = ~v - biasm1 (== -v-bias, which
+ * always fits int32 there). Pure int32, masked - no overflow, native compare. */
+
+EXR_TARGET("sse2")
+void jph_nlt_type3_i32_sse2(int32_t *data, size_t count, int32_t biasm1) {
+    size_t i = 0;
+    __m128i vb = _mm_set1_epi32(biasm1);
+    __m128i ones = _mm_set1_epi32(-1);
+    __m128i zero = _mm_setzero_si128();
+    for (; i + 4 <= count; i += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(data + i));
+        __m128i neg = _mm_sub_epi32(_mm_xor_si128(v, ones), vb); /* ~v - biasm1 */
+        __m128i mask = _mm_cmplt_epi32(v, zero);
+        __m128i r = _mm_or_si128(_mm_and_si128(mask, neg),
+                                 _mm_andnot_si128(mask, v));
+        _mm_storeu_si128((__m128i *)(data + i), r);
+    }
+    for (; i < count; ++i)
+        if (data[i] < 0) data[i] = ~data[i] - biasm1;
+}
+
+EXR_TARGET("avx2")
+void jph_nlt_type3_i32_avx2(int32_t *data, size_t count, int32_t biasm1) {
+    size_t i = 0;
+    __m256i vb = _mm256_set1_epi32(biasm1);
+    __m256i ones = _mm256_set1_epi32(-1);
+    __m256i zero = _mm256_setzero_si256();
+    for (; i + 8 <= count; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(data + i));
+        __m256i neg = _mm256_sub_epi32(_mm256_xor_si256(v, ones), vb);
+        __m256i mask = _mm256_cmpgt_epi32(zero, v); /* v < 0 */
+        __m256i r = _mm256_blendv_epi8(v, neg, mask);
+        _mm256_storeu_si256((__m256i *)(data + i), r);
+    }
+    for (; i < count; ++i)
+        if (data[i] < 0) data[i] = ~data[i] - biasm1;
+}
+
 /* ----------------------------------------------------------------------------
  * Pixel pack: int32 plane sample -> little-endian uint16, by truncation (low 16
  * bits), the all-HALF decode store. A byte shuffle (vpshufb) gathers the low two

@@ -149,6 +149,10 @@ void exr_float_to_half_f16c(const float *src, uint16_t *dst, size_t count);
  * variants must be bit-identical. Dispatched at runtime via exr_cpu_caps(). */
 void jph_nlt_type3_i64_sse2(int64_t *data, size_t count, int64_t bias);
 void jph_nlt_type3_i64_avx2(int64_t *data, size_t count, int64_t bias);
+/* int32 NLT type-3 (all-HALF / bit_depth<=31 path): if v<0, v = ~v - biasm1
+ * (== -v-bias, which always fits int32 for bit_depth<=31). 8/4-lane masked. */
+void jph_nlt_type3_i32_sse2(int32_t *data, size_t count, int32_t biasm1);
+void jph_nlt_type3_i32_avx2(int32_t *data, size_t count, int32_t biasm1);
 /* Pack n int32 plane samples (all-HALF fast path) to little-endian uint16 by
  * truncation (low 16 bits), matching the scalar (uint16_t)v store. */
 void jph_pack_i32_to_half_sse41(uint8_t *dst, const int32_t *src, size_t n);
@@ -163,8 +167,9 @@ exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
                                    int64_t *ev, int64_t *od);
 #endif
 
-/* Scalar reference for the JPH NLT type-3 involution (v<0 -> -v-bias). */
+/* Scalar references for the JPH NLT type-3 involution (v<0 -> -v-bias). */
 void jph_nlt_type3_i64_scalar(int64_t *data, size_t count, int64_t bias);
+void jph_nlt_type3_i32_scalar(int32_t *data, size_t count, int32_t biasm1);
 void jph_pack_i32_to_half_scalar(uint8_t *dst, const int32_t *src, size_t n);
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define EXR_NEON 1
