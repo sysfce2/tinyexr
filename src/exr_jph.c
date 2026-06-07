@@ -4079,6 +4079,13 @@ static exr_result jph_validate_profile(const exr_codec_ctx *ctx,
                     if (rc != EXR_SUCCESS) break;
                     continue;
                 }
+                /* Benign tile-part markers that don't affect decode: skip. */
+                if (marker == JPH_MARK_DFS || marker == JPH_MARK_ADS ||
+                    marker == JPH_MARK_ATK || marker == JPH_MARK_POC) {
+                    rc = jph_skip_segment(&r);
+                    if (rc != EXR_SUCCESS) break;
+                    continue;
+                }
                 rc = EXR_ERROR_UNSUPPORTED;
                 break;
             }
@@ -4091,7 +4098,7 @@ static exr_result jph_validate_profile(const exr_codec_ctx *ctx,
         case JPH_MARK_DFS:
         case JPH_MARK_ADS:
         case JPH_MARK_ATK:
-            rc = EXR_ERROR_UNSUPPORTED;
+            rc = jph_skip_segment(&r);
             break;
         default:
             rc = EXR_ERROR_UNSUPPORTED;
