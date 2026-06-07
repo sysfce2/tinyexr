@@ -51,7 +51,11 @@ exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
 #endif
     case EXR_COMPRESSION_HTJ2K256:
     case EXR_COMPRESSION_HTJ2K32:
+#ifdef EXR_NO_JPH
+        return EXR_ERROR_UNSUPPORTED;
+#else
         return exr_jph_decompress(ctx, src, src_size, dst, dst_size);
+#endif
     case EXR_COMPRESSION_DWAA:
     case EXR_COMPRESSION_DWAB:
         return EXR_ERROR_UNSUPPORTED;
@@ -92,7 +96,11 @@ exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
 #endif
     case EXR_COMPRESSION_HTJ2K256:
     case EXR_COMPRESSION_HTJ2K32:
+#ifdef EXR_NO_JPH
+        return EXR_ERROR_UNSUPPORTED;
+#else
         return exr_jph_compress(ctx, block, n, out_data, out_size);
+#endif
     default:
         return EXR_ERROR_UNSUPPORTED;
     }
