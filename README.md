@@ -541,60 +541,28 @@ int EXRGetWavelengths(const EXRHeader* header, float* wavelengths, int max);
 
 See `examples/spectral/` for a complete read/write example.
 
-## V3 API (Beta)
+## v3 C API (experimental)
 
-TinyEXR V3 is a modern, production-quality C API with C++17 wrapper. It provides:
+The next major release of TinyEXR is a ground-up rewrite as a **pure-C11**
+library (`include/exr.h` + `src/*.c`) — the **v3 C API**. It is **experimental**
+today and will become the main release in the next major version. Until then the
+stable v1 single-header API (`tinyexr.h`) remains the recommended choice for
+production.
 
-- **Pure C11/C17 core**: No C++ dependencies in the C API
-- **C++17 wrapper**: RAII, `Result<T>`, range-based iteration
-- **Vulkan-style API**: Command buffers, fences, explicit synchronization
-- **Async/WASM-friendly**: Asyncify support, streaming I/O callbacks
-- **Exception-free**: Compatible with `-fno-exceptions -fno-rtti`
+Highlights:
 
-### V3 Feature Comparison
+- **Pure C11 core** — no C++ in the library; the public header is C++-safe.
+- **Full codec coverage** — read **and** write for NONE / RLE / ZIP / ZIPS / PIZ
+  / PXR24 / B44 / B44A, plus ZSTD and HTJ2K; scanline and tiled
+  (ONE_LEVEL / MIPMAP / RIPMAP), multipart, and deep images. (DWAA/DWAB are
+  intentionally unsupported.)
+- **Streaming block I/O** for bounded working memory (see below).
+- **Freestanding-capable core** with callback file I/O and an Emscripten WASM
+  build (see below).
+- Optional **allocator hook**, runtime **SIMD** dispatch (SSE2/SSE4.1/AVX2/F16C,
+  NEON), and a fuzzed, sanitizer-clean test suite.
 
-| Feature | V1 API | V3 API |
-|---------|--------|--------|
-| Error handling | Error codes + strings | `Result<T>` with error stack |
-| I/O model | Synchronous | Async with callbacks |
-| Threading | OpenMP | Command buffers, fences |
-| API style | Direct pointers | Opaque handles |
-| Memory | Manual | RAII (C++), explicit (C) |
-| Compression (read) | All except DWAA/DWAB | All except DWAA/DWAB |
-| Compression (write) | ZIP only | NONE, RLE, ZIP, ZIPS, PIZ, PXR24, B44 |
-| Deep images | Load only | Detection only (TODO) |
-
-### V3 Quick Example (C++)
-
-```cpp
-#include "tinyexr_v3.hh"
-
-using namespace tinyexr::v3;
-
-auto ctx = Context::create().value;
-auto decoder = Decoder::from_file(ctx, "input.exr").value;
-auto image = decoder.parse_header().value;
-
-auto part = image.get_part(0).value;
-std::cout << "Size: " << part.width() << "x" << part.height() << "\n";
-
-// Range-based tile iteration
-for (auto tile : part.tiles(0)) {
-    // Load tile at (tile.tile_x, tile.tile_y)
-}
-```
-
-**See**: [TINYEXR_V3_README.md](TINYEXR_V3_README.md) for complete documentation.
-
-**Status**: Beta - suitable for evaluation and testing. V1 API remains stable for production use.
-
-## V2 API (Deprecated)
-
-The experimental TinyEXR V2 API has been retired and moved to `attic/` for
-reference only. It is no longer built, tested, or maintained in the active tree.
-
-Use the stable V1 API (`tinyexr.h`) for production code, or the pure-C11 v3 API
-under `include/exr.h` + `src/` for the current rewrite.
+Build: `make lib` (`build/libtinyexr3.a`), `make test-c`, `make c11-gate`.
 
 ### Streaming block I/O (bounded working memory)
 
