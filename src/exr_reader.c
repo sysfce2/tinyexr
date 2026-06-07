@@ -11,7 +11,6 @@
 
 #include "exr_internal.h"
 
-#include <stdlib.h>
 
 /* ============================================================================
  * Open / close
@@ -1278,8 +1277,12 @@ static exr_result block_geometry(const exr_int_part *p, uint32_t idx,
     } else {
         int lpb = exr_lines_per_block(h->compression);
         int ymin = h->data_window.min_y, ymax = h->data_window.max_y;
-        int y0 = ymin + (int)idx * lpb, nlines;
-        if (y0 > ymax) return EXR_ERROR_CORRUPT;
+        /* compute in 64-bit: idx*lpb can exceed INT_MAX for a crafted file with
+         * a huge chunkCount, which would be signed-overflow UB in int. */
+        int64_t y0_64 = (int64_t)ymin + (int64_t)idx * lpb;
+        int y0, nlines;
+        if (y0_64 > ymax) return EXR_ERROR_CORRUPT;
+        y0 = (int)y0_64;
         nlines = lpb;
         if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
         bi->x0 = h->data_window.min_x;

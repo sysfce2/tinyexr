@@ -11,7 +11,6 @@
 
 #include "exr_internal.h"
 
-#include <stdlib.h>
 
 #define PIZ_BITMAP_SIZE 8192
 #define PIZ_USHORT_RANGE 65536
@@ -150,10 +149,17 @@ static void hrefill(uint64_t *c, int *lc, const uint8_t **in, const uint8_t *e) 
         *lc += 8;
     }
 }
-static uint64_t hgetbits(int nb, uint64_t *c, int *lc, const uint8_t **in) {
+/* Bounds-aware bit reader: refills from [*in, end) and zero-fills once the
+ * input is exhausted, so a crafted Huffman table cannot read past `end`. */
+static uint64_t hgetbits(int nb, uint64_t *c, int *lc, const uint8_t **in,
+                         const uint8_t *end) {
     while (*lc < nb) {
-        *c = (*c << 8) | (uint64_t)(**in);
-        (*in)++;
+        if (*in < end) {
+            *c = (*c << 8) | (uint64_t)(**in);
+            (*in)++;
+        } else {
+            *c = (*c << 8); /* zero-fill past the end */
+        }
         *lc += 8;
     }
     *lc -= nb;
@@ -180,18 +186,19 @@ static void canonical_code_table(int64_t *hcode) {
 static int unpack_enc_table(const uint8_t **pcode, int ni, int im, int iM,
                             int64_t *hcode) {
     const uint8_t *p = *pcode;
+    const uint8_t *end = *pcode + ni;
     uint64_t c = 0;
     int lc = 0;
     memset(hcode, 0, sizeof(int64_t) * PIZ_HUF_ENCSIZE);
     for (; im <= iM; im++) {
         int64_t l;
         if (p - *pcode >= ni) return 0;
-        l = (int64_t)hgetbits(6, &c, &lc, &p);
+        l = (int64_t)hgetbits(6, &c, &lc, &p, end);
         hcode[im] = l;
         if (l == (int64_t)LONG_ZEROCODE_RUN) {
             int zerun;
             if (p - *pcode > ni) return 0;
-            zerun = (int)hgetbits(8, &c, &lc, &p) + SHORTEST_LONG_RUN;
+            zerun = (int)hgetbits(8, &c, &lc, &p, end) + SHORTEST_LONG_RUN;
             if (im + zerun > iM + 1) return 0;
             while (zerun--) hcode[im++] = 0;
             im--;

@@ -2514,6 +2514,12 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
     int i;
     exr_result rc;
 
+    /* Defense-in-depth: HT codeblocks are at most 128x32 (callers/validation
+     * enforce this). Re-check locally so the fixed-size scratch math below
+     * cannot be driven OOB if a future caller skips the guard. */
+    if (width == 0u || height == 0u || width > 128u || height > 32u)
+        return EXR_ERROR_CORRUPT;
+
     if (num_passes > 1u && lengths2 == 0u) num_passes = 1u;
     if (num_passes < 1u || num_passes > 3u) return EXR_ERROR_UNSUPPORTED;
     if (missing_msbs > 62u) return EXR_ERROR_CORRUPT;

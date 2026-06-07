@@ -12,7 +12,6 @@
 
 #include "exr_internal.h"
 
-#include <stdlib.h>
 
 /* Decompress deep payload (offset table or sample data) into dst[unpacked]. */
 static exr_result deep_decompress(const exr_allocator *a, exr_compression comp,
@@ -495,8 +494,13 @@ exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
             for (rr = 0; rr < th; ++rr) {
                 for (x = 0; x < tw; ++x) {
                     int32_t cum = otab[rr * tw + x];
+                    int64_t cnt = (int64_t)cum - (int64_t)prev;
                     size_t pix = (size_t)(tyi * ty + rr) * width + (txi * tx + x);
-                    out->deep_sample_counts[pix] = (int32_t)((uint64_t)cum - prev);
+                    /* The offset table is attacker-controlled (stored verbatim
+                     * for NONE); a non-monotonic table would yield negative
+                     * counts -> wrapped prefix sums and heap OOB in pass 2. */
+                    if (cnt < 0) { rc = EXR_ERROR_CORRUPT; goto done; }
+                    out->deep_sample_counts[pix] = (int32_t)cnt;
                     prev = (uint64_t)cum;
                 }
             }

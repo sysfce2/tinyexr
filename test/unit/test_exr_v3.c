@@ -1589,6 +1589,89 @@ static void stream_tiled_levels_check(const char *path, exr_tile_level_mode lvl,
     free(buf);
 }
 
+/* Regression: a deep-tiled file with a non-monotonic (attacker-controlled)
+ * per-pixel offset table must be rejected, not crash with a heap OOB. Builds a
+ * tiny deep-tiled image, saves it uncompressed (so the offset table is stored
+ * verbatim), corrupts the cumulative table to be decreasing, and reloads. */
+static void deep_tiled_oob_rejects(void) {
+    exr_channel ch;
+    exr_part part;
+    exr_image img, back;
+    int32_t counts[4] = {1, 1, 1, 1};
+    float samples[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    void *zimg[1];
+    void *buf = NULL;
+    size_t sz = 0, i;
+    uint8_t pat[16], rep[16];
+    int found = 0;
+    exr_result rc;
+
+    memset(&ch, 0, sizeof(ch));
+    strcpy(ch.name, "Z");
+    ch.pixel_type = EXR_PIXEL_FLOAT;
+    ch.x_sampling = 1;
+    ch.y_sampling = 1;
+    memset(&part, 0, sizeof(part));
+    part.header.part_type = EXR_PART_DEEP_TILED;
+    part.header.compression = EXR_COMPRESSION_NONE;
+    part.header.data_window.max_x = 1;
+    part.header.data_window.max_y = 1;
+    part.header.display_window = part.header.data_window;
+    part.header.pixel_aspect_ratio = 1.0f;
+    part.header.screen_window_width = 1.0f;
+    part.header.num_channels = 1;
+    part.header.channels = &ch;
+    part.header.tiled = 1;
+    part.header.tile_x_size = 2;
+    part.header.tile_y_size = 2;
+    part.header.level_mode = EXR_TILE_ONE_LEVEL;
+    part.header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    part.width = 2;
+    part.height = 2;
+    part.is_deep = 1;
+    part.deep_sample_counts = counts;
+    zimg[0] = samples;
+    part.deep_images = zimg;
+    part.deep_total_samples = 4;
+    memset(&img, 0, sizeof(img));
+    img.num_parts = 1;
+    img.parts = &part;
+
+    rc = exr_save_to_memory(&buf, &sz, NULL, &img, EXR_COMPRESSION_NONE);
+    if (!EXR_OK(rc)) {
+        g_fail++;
+        printf("  FAIL: deep-tiled OOB test save: %s\n", exr_result_string(rc));
+        return;
+    }
+    /* positive control: the well-formed file loads */
+    memset(&back, 0, sizeof(back));
+    if (EXR_OK(exr_load_from_memory(buf, sz, NULL, &back))) exr_image_free(&back);
+
+    /* offset table stored verbatim = cumulative int32 LE [1,2,3,4]; corrupt to
+     * decreasing [4,3,2,1] so pixel 1 yields a negative count. */
+    for (i = 0; i < 4; ++i) {
+        pat[i * 4 + 0] = (uint8_t)(i + 1); pat[i * 4 + 1] = 0;
+        pat[i * 4 + 2] = 0; pat[i * 4 + 3] = 0;
+        rep[i * 4 + 0] = (uint8_t)(4 - i); rep[i * 4 + 1] = 0;
+        rep[i * 4 + 2] = 0; rep[i * 4 + 3] = 0;
+    }
+    for (i = 0; sz >= 16 && i + 16 <= sz; ++i) {
+        if (memcmp((uint8_t *)buf + i, pat, 16) == 0) {
+            memcpy((uint8_t *)buf + i, rep, 16);
+            found = 1;
+            break;
+        }
+    }
+    CHECK(found, "deep-tiled OOB: located offset table");
+    memset(&back, 0, sizeof(back));
+    rc = exr_load_from_memory(buf, sz, NULL, &back);
+    CHECK(!EXR_OK(rc), "deep-tiled non-monotonic offset table rejected");
+    if (EXR_OK(rc)) exr_image_free(&back);
+    if (found && !EXR_OK(rc))
+        printf("  ok: deep-tiled OOB rejected (%s)\n", exr_result_string(rc));
+    free(buf);
+}
+
 /* Stream a deep scanline part out block-by-block and verify it round-trips. */
 static void stream_deep_check(const char *path, exr_compression comp,
                               const char *name) {
@@ -2145,6 +2228,7 @@ int main(void) {
                               "encode tiled RIPMAP (all levels)");
 
     printf("== streaming deep + suspend/resume + memory bound ==\n");
+    deep_tiled_oob_rejects();
     stream_deep_check("deepscanline.exr", EXR_COMPRESSION_ZIPS,
                       "deep scanline ZIPS");
     stream_would_block_check("asakusa.exr", EXR_COMPRESSION_ZIP,
