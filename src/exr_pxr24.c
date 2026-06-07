@@ -171,7 +171,13 @@ exr_result exr_pxr24_compress(const exr_codec_ctx *ctx, const uint8_t *block,
             if ((yy % ys) != 0) continue;
             w = exr_num_samples(xmin, xmax, xs);
             if (w < 0) w = 0;
-            inter += (size_t)w * pxr_bpc(ctx->channels[c].pixel_type);
+            {
+                size_t add;
+                if (exr_mul_ovf((size_t)w, pxr_bpc(ctx->channels[c].pixel_type),
+                                &add) ||
+                    exr_add_ovf(inter, add, &inter))
+                    return EXR_ERROR_CORRUPT;
+            }
         }
     }
     buf = (uint8_t *)exr_malloc(a, inter ? inter : 1);

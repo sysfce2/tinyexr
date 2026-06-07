@@ -68,9 +68,11 @@ static void do_decode(void *p) {
 
 static void bench_codecs(const char *path) {
     static const exr_compression codecs[] = {
-        EXR_COMPRESSION_NONE, EXR_COMPRESSION_RLE, EXR_COMPRESSION_ZIPS,
-        EXR_COMPRESSION_ZIP, EXR_COMPRESSION_PIZ};
-    static const char *names[] = {"none", "rle", "zips", "zip", "piz"};
+        EXR_COMPRESSION_NONE,  EXR_COMPRESSION_RLE,  EXR_COMPRESSION_ZIPS,
+        EXR_COMPRESSION_ZIP,   EXR_COMPRESSION_PIZ,  EXR_COMPRESSION_HTJ2K32,
+        EXR_COMPRESSION_HTJ2K256};
+    static const char *names[] = {"none", "rle", "zips", "zip", "piz",
+                                  "htj2k32", "htj2k256"};
     exr_image src;
     double mpix;
     size_t i;
@@ -309,6 +311,71 @@ static void bench_deflate(const char *path) {
     exr_image_free(&img);
 }
 
+/* ---- JPH (HTJ2K) SIMD micro-kernels: per-tier throughput vs scalar -------- */
+static void bench_jph_kernels(void) {
+    uint32_t caps = exr_simd_capabilities();
+    size_t n = (size_t)8u << 20; /* 8M int64 coefficients */
+    int64_t *buf = (int64_t *)malloc(n * sizeof(int64_t));
+    int64_t bias = ((int64_t)1 << 31) + 1;
+    size_t i, k;
+    uint32_t rng = 1u;
+    (void)caps;
+    if (!buf) return;
+    for (i = 0; i < n; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        buf[i] = (int64_t)(int32_t)rng;
+    }
+    printf("\n== JPH SIMD kernels (%.0f M int64) ==\n", n / 1e6);
+    {
+        struct { const char *nm; void (*f)(int64_t *, size_t, int64_t); int ok; }
+        v[] = {
+            {"nlt3 scalar", jph_nlt_type3_i64_scalar, 1},
+#if defined(EXR_X86)
+            {"nlt3 sse2", jph_nlt_type3_i64_sse2, (caps & EXR_SIMD_SSE2) != 0},
+            {"nlt3 avx2", jph_nlt_type3_i64_avx2, (caps & EXR_SIMD_AVX2) != 0},
+#endif
+        };
+        double base = 0;
+        for (k = 0; k < sizeof(v) / sizeof(v[0]); ++k) {
+            double t0, t;
+            long it = 0;
+            if (!v[k].ok) { printf("  %-12s (unavailable)\n", v[k].nm); continue; }
+            t0 = now_sec();
+            do { v[k].f(buf, n, bias); ++it; } while (now_sec() - t0 < 0.3);
+            t = (now_sec() - t0) / it;
+            if (k == 0) base = t;
+            printf("  %-12s %8.1f M/s (%.2fx)\n", v[k].nm, n / t / 1e6,
+                   base > 0 ? base / t : 1.0);
+        }
+    }
+    /* int32 -> uint16 pixel pack (all-HALF store). */
+    {
+        int32_t *src = (int32_t *)buf; /* reuse */
+        uint8_t *dst = (uint8_t *)malloc(n * 2);
+        struct { const char *nm; void (*f)(uint8_t *, const int32_t *, size_t);
+                 int ok; } v[] = {
+            {"pack scalar", jph_pack_i32_to_half_scalar, 1},
+#if defined(EXR_X86)
+            {"pack sse4.1", jph_pack_i32_to_half_sse41, (caps & EXR_SIMD_SSE41) != 0},
+            {"pack avx2", jph_pack_i32_to_half_avx2, (caps & EXR_SIMD_AVX2) != 0},
+#endif
+        };
+        double base = 0;
+        if (dst) for (k = 0; k < sizeof(v) / sizeof(v[0]); ++k) {
+            double t0, t; long it = 0;
+            if (!v[k].ok) { printf("  %-12s (unavailable)\n", v[k].nm); continue; }
+            t0 = now_sec();
+            do { v[k].f(dst, src, n); ++it; } while (now_sec() - t0 < 0.3);
+            t = (now_sec() - t0) / it;
+            if (k == 0) base = t;
+            printf("  %-12s %8.1f M/s (%.2fx)\n", v[k].nm, n / t / 1e6,
+                   base > 0 ? base / t : 1.0);
+        }
+        free(dst);
+    }
+    free(buf);
+}
+
 int main(int argc, char **argv) {
     printf("TinyEXR v3 benchmark  |  SIMD: %s (caps=0x%x)\n", exr_simd_info(),
            exr_simd_capabilities());
@@ -320,6 +387,7 @@ int main(int argc, char **argv) {
         bench_codecs("asakusa.exr");
     }
     bench_kernels();
+    bench_jph_kernels();
     bench_deflate(argc > 1 ? argv[1] : "asakusa.exr");
 
     printf("\nNote: 'fpnge PSHUFB-huff' is a literal-only DEFLATE encoder using\n"

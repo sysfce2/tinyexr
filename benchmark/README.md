@@ -10,10 +10,10 @@ make bench                 # build + run on asakusa.exr
 It reports three things:
 
 1. **Codec throughput** — for each codec the writer supports
-   (NONE/RLE/ZIPS/ZIP/PIZ), the encode and decode rate in megapixels/second
-   and the compressed size. Decode covers all codecs in the file; the
-   auto-generated set only exercises the writable ones (pass PXR24/B44/DWA
-   files on the command line to time those decoders too).
+   (NONE/RLE/ZIPS/ZIP/PIZ/HTJ2K32/HTJ2K256), the encode and decode rate in
+   megapixels/second and the compressed size. Decode covers all codecs in the
+   file; the auto-generated set only exercises the writable ones (pass
+   PXR24/B44/DWA files on the command line to time those decoders too).
 
 2. **ZIP decode by forced SIMD tier** — the same ZIP decode run with the
    byte de-interleave kernel forced to scalar / SSE2 / AVX2 (via
