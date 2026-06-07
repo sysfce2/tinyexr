@@ -68,9 +68,11 @@ static void do_decode(void *p) {
 
 static void bench_codecs(const char *path) {
     static const exr_compression codecs[] = {
-        EXR_COMPRESSION_NONE, EXR_COMPRESSION_RLE, EXR_COMPRESSION_ZIPS,
-        EXR_COMPRESSION_ZIP, EXR_COMPRESSION_PIZ};
-    static const char *names[] = {"none", "rle", "zips", "zip", "piz"};
+        EXR_COMPRESSION_NONE,  EXR_COMPRESSION_RLE,  EXR_COMPRESSION_ZIPS,
+        EXR_COMPRESSION_ZIP,   EXR_COMPRESSION_PIZ,  EXR_COMPRESSION_HTJ2K32,
+        EXR_COMPRESSION_HTJ2K256};
+    static const char *names[] = {"none", "rle", "zips", "zip", "piz",
+                                  "htj2k32", "htj2k256"};
     exr_image src;
     double mpix;
     size_t i;

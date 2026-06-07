@@ -108,6 +108,64 @@ static int images_equal(const exr_image *a, const exr_image *b) {
     return 1;
 }
 
+/* Decode an HTJ2K regression fixture and assert each channel's pixels match a
+ * pre-captured expected byte sequence. The expected arrays below were produced
+ * by loading each fixture once via v3 and dumping the raw channel bytes; the
+ * goal is byte-equal regression coverage independent of the openexr-images
+ * corpus (which the v3 test suite intentionally does not depend on). */
+static void jph_decode_known_pixels(const char *path, const char *name,
+                                    const int *expected_w, const int *expected_h,
+                                    const char *const *channel_names,
+                                    const unsigned char *const *expected_bytes,
+                                    const size_t *expected_sizes,
+                                    int n_channels) {
+    exr_image img;
+    exr_result rc;
+    int c;
+    memset(&img, 0, sizeof(img));
+    rc = exr_load_from_file(path, NULL, &img);
+    if (!EXR_OK(rc)) {
+        g_fail++;
+        printf("  FAIL: HTJ2K decode %s load: %s\n", name,
+               exr_result_string(rc));
+        exr_image_free(&img);
+        return;
+    }
+    CHECK(img.num_parts == 1, "HTJ2K decode: one part");
+    CHECK(img.parts[0].width == *expected_w, "HTJ2K decode: width");
+    CHECK(img.parts[0].height == *expected_h, "HTJ2K decode: height");
+    CHECK(img.parts[0].header.num_channels == n_channels,
+          "HTJ2K decode: channel count");
+    for (c = 0; c < n_channels; ++c) {
+        const exr_channel *ch = &img.parts[0].header.channels[c];
+        const unsigned char *got =
+            (const unsigned char *)img.parts[0].images[c];
+        size_t expected_size = expected_sizes[c];
+        if (strcmp(ch->name, channel_names[c]) != 0) {
+            g_fail++;
+            printf("  FAIL: HTJ2K decode %s channel %d name: got %s want %s\n",
+                   name, c, ch->name, channel_names[c]);
+            continue;
+        }
+        if (memcmp(got, expected_bytes[c], expected_size) != 0) {
+            g_fail++;
+            printf("  FAIL: HTJ2K decode %s channel %s pixel mismatch\n", name,
+                   ch->name);
+            printf("    first diff at byte: ");
+            for (size_t b = 0; b < expected_size; ++b) {
+                if (got[b] != expected_bytes[c][b]) {
+                    printf("%zu (got %02x want %02x)\n", b, got[b],
+                           expected_bytes[c][b]);
+                    break;
+                }
+            }
+        }
+    }
+    if (g_fail == 0)
+        printf("  ok: HTJ2K decode known pixels %s\n", name);
+    exr_image_free(&img);
+}
+
 static void jph_decode_matches(const char *ref_path, const char *ht_path,
                                const char *name) {
     exr_image ref, ht;
@@ -158,33 +216,159 @@ diff_done:
     exr_image_free(&ht);
 }
 
-static void jph_encode_unsupported_sampling(const char *path,
-                                            exr_compression comp,
-                                            const char *name) {
-    exr_image src;
-    void *buf = NULL;
-    size_t sz = 0;
+/* Encode with non-1 subsampling and verify the resulting file decodes and has
+ * the expected (sampled-down) dimensions. */
+static void jph_encode_subsampling_roundtrip(void) {
+    exr_image img, dec;
+    exr_part part;
+    exr_channel channels[2];
+    void *images[2];
+    /* 4x2 file: channel A (subsampled 2x1) and channel B (full-res). */
+    uint16_t a_pixels[4] = {0x3c00, 0x4000, 0xbc00, 0x0001};
+    uint16_t b_pixels[8] = {0x0000, 0x3c00, 0x4000, 0xffff,
+                            0xbc00, 0x8000, 0x0001, 0x7bff};
+    size_t i;
     exr_result rc;
-    memset(&src, 0, sizeof(src));
-    rc = exr_load_from_file(path, NULL, &src);
-    if (!EXR_OK(rc)) {
+    memset(&img, 0, sizeof(img));
+    img.num_parts = 1;
+    img.parts = &part;
+    memset(&part, 0, sizeof(part));
+    part.header.num_channels = 2;
+    part.header.channels = channels;
+    memset(channels, 0, sizeof(channels));
+    channels[0] = (exr_channel){"A", EXR_PIXEL_HALF, 2, 1, 0};
+    channels[1] = (exr_channel){"B", EXR_PIXEL_HALF, 1, 1, 0};
+    part.header.data_window.min_x = 0;
+    part.header.data_window.min_y = 0;
+    part.header.data_window.max_x = 3;
+    part.header.data_window.max_y = 1;
+    part.header.display_window = part.header.data_window;
+    part.width = 4;
+    part.height = 2;
+    part.images = images;
+    images[0] = a_pixels;
+    images[1] = b_pixels;
+    part.header.compression = EXR_COMPRESSION_HTJ2K32;
+    {
+        void *buf = NULL;
+        size_t sz = 0;
+        rc = exr_save_to_memory(&buf, &sz, NULL, &img, EXR_COMPRESSION_HTJ2K32);
+        if (rc != EXR_SUCCESS) {
+            g_fail++;
+            printf("  FAIL: HTJ2K subsampling encode: %s\n",
+                   exr_result_string(rc));
+            return;
+        }
+        memset(&dec, 0, sizeof(dec));
+        rc = exr_load_from_memory(buf, sz, NULL, &dec);
+        free(buf);
+        if (!EXR_OK(rc)) {
+            g_fail++;
+            printf("  FAIL: HTJ2K subsampling decode: %s\n",
+                   exr_result_string(rc));
+            return;
+        }
+    }
+    /* Channel A should be 2x2 (sampled 2x1 from 4x2). Channel B 4x2. */
+    if (dec.num_parts != 1) {
         g_fail++;
-        printf("  FAIL: load for %s encode unsupported check: %s\n", name,
-               exr_result_string(rc));
+        printf("  FAIL: HTJ2K subsampling wrong part count\n");
         return;
     }
-    if (src.num_parts > 0 && src.parts[0].header.num_channels > 0)
-        src.parts[0].header.channels[0].x_sampling = 2;
-    rc = exr_save_to_memory(&buf, &sz, NULL, &src, comp);
-    CHECK(rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0, name);
-    if (rc == EXR_ERROR_UNSUPPORTED && buf == NULL && sz == 0) {
-        printf("  ok: %s encode rejects unsupported sampling\n", name);
-    } else {
-        printf("  FAIL: %s encode rc=%s size=%zu\n", name,
-               exr_result_string(rc), sz);
+    if (dec.parts[0].header.num_channels != 2) {
+        g_fail++;
+        printf("  FAIL: HTJ2K subsampling wrong channel count\n");
+        return;
     }
-    free(buf);
-    exr_image_free(&src);
+    for (i = 0; i < 2; ++i) {
+        const exr_channel *ch = &dec.parts[0].header.channels[i];
+        const unsigned char *got =
+            (const unsigned char *)dec.parts[0].images[i];
+        size_t expected_size;
+        if (strcmp(ch->name, "A") == 0) {
+            expected_size = 4 * 2; /* 2x2 half */
+            if (memcmp(got, a_pixels, expected_size) != 0) {
+                g_fail++;
+                printf("  FAIL: HTJ2K subsampling channel A mismatch\n");
+            }
+        } else {
+            expected_size = 8 * 2; /* 4x2 half */
+            if (memcmp(got, b_pixels, expected_size) != 0) {
+                g_fail++;
+                printf("  FAIL: HTJ2K subsampling channel B mismatch\n");
+            }
+        }
+    }
+    if (g_fail == 0) {
+        g_pass++;
+        printf("  ok: HTJ2K subsampling encode round-trips losslessly\n");
+    }
+    exr_image_free(&dec);
+}
+
+/* Encode a UINT-only file and decode it losslessly. */
+static void jph_encode_uint_roundtrip(void) {
+    exr_image img, dec;
+    exr_part part;
+    exr_channel channels[1];
+    void *images[1];
+    /* 3x2 UINT "Z" with a range covering the full 32-bit width including
+     * the high bit, plus zero, to exercise the zero-extension path. */
+    uint32_t pixels[6] = {0u, 1u, 0x7fffffffu, 0x80000000u, 0xffffffffu,
+                          0xdeadbeefu};
+    exr_result rc;
+    memset(&img, 0, sizeof(img));
+    img.num_parts = 1;
+    img.parts = &part;
+    memset(&part, 0, sizeof(part));
+    part.header.num_channels = 1;
+    part.header.channels = channels;
+    memset(channels, 0, sizeof(channels));
+    channels[0] = (exr_channel){"Z", EXR_PIXEL_UINT, 1, 1, 0};
+    part.header.data_window.min_x = 0;
+    part.header.data_window.min_y = 0;
+    part.header.data_window.max_x = 2;
+    part.header.data_window.max_y = 1;
+    part.header.display_window = part.header.data_window;
+    part.width = 3;
+    part.height = 2;
+    part.images = images;
+    images[0] = pixels;
+    part.header.compression = EXR_COMPRESSION_HTJ2K32;
+    {
+        void *buf = NULL;
+        size_t sz = 0;
+        rc = exr_save_to_memory(&buf, &sz, NULL, &img, EXR_COMPRESSION_HTJ2K32);
+        if (rc != EXR_SUCCESS) {
+            g_fail++;
+            printf("  FAIL: HTJ2K UINT encode: %s\n", exr_result_string(rc));
+            return;
+        }
+        memset(&dec, 0, sizeof(dec));
+        rc = exr_load_from_memory(buf, sz, NULL, &dec);
+        free(buf);
+        if (!EXR_OK(rc)) {
+            g_fail++;
+            printf("  FAIL: HTJ2K UINT decode: %s\n", exr_result_string(rc));
+            return;
+        }
+    }
+    if (dec.num_parts != 1 || dec.parts[0].header.num_channels != 1) {
+        g_fail++;
+        printf("  FAIL: HTJ2K UINT roundtrip part/channel count\n");
+    } else {
+        const unsigned char *got =
+            (const unsigned char *)dec.parts[0].images[0];
+        if (memcmp(got, pixels, sizeof(pixels)) != 0) {
+            g_fail++;
+            printf("  FAIL: HTJ2K UINT pixel mismatch\n");
+        }
+    }
+    if (g_fail == 0) {
+        g_pass++;
+        printf("  ok: HTJ2K UINT encode round-trips losslessly\n");
+    }
+    exr_image_free(&dec);
 }
 
 /* Mixed half + float channels in one HTJ2K codestream must encode and then
@@ -1303,6 +1487,33 @@ int main(void) {
                        "openexr-images/TestImages/htj2k32_WideFloatRange.exr",
                        "htj2k32_WideFloatRange");
 
+    {
+        /* test/unit/regression/2by2_htj2k32.exr: 2x2 RGBA HALF, HTJ2K32.
+         * Captured from a known-good v3 decode; used here to assert that
+         * decode produces byte-equal output independent of the openexr-images
+         * corpus. */
+        static const unsigned char px_A[] = {0x00,0x3c, 0x00,0x3c, 0x04,0x34, 0x00,0x3c};
+        static const unsigned char px_B[] = {0x00,0x3c, 0x00,0x00, 0x00,0x3c, 0x00,0x00};
+        static const unsigned char px_G[] = {0x00,0x3c, 0x00,0x00, 0x27,0x37, 0x00,0x00};
+        static const unsigned char px_R[] = {0x00,0x3c, 0x00,0x3c, 0x00,0x00, 0x00,0x00};
+        const unsigned char *exp[] = {px_A, px_B, px_G, px_R};
+        const size_t sizes[] = {sizeof(px_A), sizeof(px_B), sizeof(px_G), sizeof(px_R)};
+        static const char *names[] = {"A", "B", "G", "R"};
+        int w = 2, h = 2;
+        jph_decode_known_pixels("test/unit/regression/2by2_htj2k32.exr",
+                                "2by2_htj2k32", &w, &h, names, exp, sizes, 4);
+    }
+    {
+        /* test/unit/regression/tiled_htj2k256.exr: 1x1 A HALF, HTJ2K256, tiled. */
+        static const unsigned char px_A[] = {0x00,0x3c};
+        const unsigned char *exp[] = {px_A};
+        const size_t sizes[] = {sizeof(px_A)};
+        static const char *names[] = {"A"};
+        int w = 1, h = 1;
+        jph_decode_known_pixels("test/unit/regression/tiled_htj2k256.exr",
+                                "tiled_htj2k256", &w, &h, names, exp, sizes, 1);
+    }
+
     printf("== HTJ2K/JPH writer ==\n");
     roundtrip("test/unit/regression/2by2.exr",
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32");
@@ -1320,9 +1531,8 @@ int main(void) {
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32 WideFloatRange");
     roundtrip("openexr-images/TestImages/WideFloatRange.exr",
               EXR_COMPRESSION_HTJ2K256, "HTJ2K256 WideFloatRange");
-    jph_encode_unsupported_sampling("test/unit/regression/2by2.exr",
-                                    EXR_COMPRESSION_HTJ2K32,
-                                    "HTJ2K32 unsupported sampling");
+    jph_encode_subsampling_roundtrip();
+    jph_encode_uint_roundtrip();
     jph_encode_mixed_precision_roundtrip();
 
     printf("== JPH SIMD kernels ==\n");
