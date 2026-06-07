@@ -17,6 +17,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 struct mem_source {
@@ -32,6 +33,25 @@ static exr_result feed_read(void *user, uint64_t offset, uint64_t len,
     return EXR_SUCCESS;
 }
 
+/* Block-iterate one part: geometry + per-block decode into a bounded buffer. */
+static void drain_blocks(exr_reader *r, int part) {
+    uint32_t n = 0, i;
+    if (!EXR_OK(exr_reader_num_blocks(r, part, &n))) return;
+    for (i = 0; i < n; ++i) {
+        exr_block_info bi;
+        if (!EXR_OK(exr_reader_block_info(r, part, i, &bi))) continue;
+        if (bi.is_deep) continue; /* deep uses the two-step count/sample API */
+        if (bi.uncompressed_size == 0 || bi.uncompressed_size > (64u << 20))
+            continue;
+        {
+            uint8_t *blk = (uint8_t *)malloc((size_t)bi.uncompressed_size);
+            if (!blk) return;
+            exr_reader_decode_block(r, part, i, blk, bi.uncompressed_size);
+            free(blk);
+        }
+    }
+}
+
 static void drain_reader(exr_reader *r) {
     int np, p;
     if (!EXR_OK(exr_reader_parse_header(r))) return;
@@ -40,6 +60,7 @@ static void drain_reader(exr_reader *r) {
         exr_part out;
         memset(&out, 0, sizeof(out));
         if (EXR_OK(exr_reader_read_part(r, p, &out))) exr_part_free(NULL, &out);
+        drain_blocks(r, p);
     }
 }
 

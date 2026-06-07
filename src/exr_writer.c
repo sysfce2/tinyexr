@@ -875,6 +875,21 @@ struct exr_writer {
     exr_allocator alloc;
     exr_part *parts;
     int num_parts, cap;
+
+    /* streaming-encode state (active between begin_stream and end_stream) */
+    int streaming;
+    exr_data_sink sink;
+    FILE *fp;             /* non-NULL for the file-backed sink */
+    uint64_t pos;         /* current write offset */
+    exr_compression scomp;
+    int smultipart;
+    int **sorder;          /* [part][nch] name-sorted channel order */
+    exr_channel **ssorted; /* [part][nch] sorted channel descriptors */
+    uint32_t *schunk;      /* [part] chunk count */
+    uint64_t **soff;       /* [part][chunk] recorded chunk offsets */
+    uint64_t *soff_pos;    /* [part] file offset of the reserved offset table */
+    uint64_t *smax_pos;    /* [part] file offset of maxSamplesPerPixel value (deep) */
+    int32_t *smax;         /* [part] running max sample count (deep) */
 };
 
 exr_result exr_writer_create(const exr_allocator *alloc, exr_writer **out) {
@@ -888,9 +903,12 @@ exr_result exr_writer_create(const exr_allocator *alloc, exr_writer **out) {
     return EXR_SUCCESS;
 }
 
+static void stream_free_state(exr_writer *w);
+
 void exr_writer_destroy(exr_writer *w) {
     int p;
     if (!w) return;
+    if (w->streaming || w->sorder) stream_free_state(w);
     for (p = 0; p < w->num_parts; ++p) {
         exr_free(&w->alloc, w->parts[p].images); /* pixels are caller-owned */
         exr_header_free(&w->alloc, &w->parts[p].header);
@@ -975,4 +993,670 @@ exr_result exr_writer_finalize_to_file(exr_writer *w, const char *path) {
     fclose(fp);
     exr_free(&w->alloc, data);
     return EXR_SUCCESS;
+}
+
+/* ---- streaming (block-at-a-time) writer ---------------------------------- */
+
+/* Deepness is carried by the header's part_type (the writer part is built from
+ * a header alone, so exr_part::is_deep is not populated for streaming). */
+static int header_is_deep(const exr_header *h) {
+    return h->part_type == EXR_PART_DEEP_SCANLINE ||
+           h->part_type == EXR_PART_DEEP_TILED;
+}
+
+/* Gather one block from caller-provided block-local planar channels into the
+ * canonical block layout (per scanline, then per sorted channel). chan[c] holds
+ * this block's samples for original channel c, row 0 = block top. */
+static void gather_block_local(const exr_header *h, const int *order,
+                               const void *const *chan, int x0, int y0, int w,
+                               int hgt, uint8_t *block) {
+    size_t off = 0;
+    int line, oi;
+    for (line = 0; line < hgt; ++line) {
+        int yy = y0 + line;
+        for (oi = 0; oi < h->num_channels; ++oi) {
+            int c = order[oi];
+            int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+            size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+            int nx, row;
+            if (xs < 1) xs = 1;
+            if (ys < 1) ys = 1;
+            if ((yy % ys) != 0) continue;
+            nx = exr_num_samples(x0, x0 + w - 1, xs);
+            if (nx <= 0) continue;
+            row = exr_num_samples(y0, yy, ys) - 1;
+            memcpy(block + off,
+                   (const uint8_t *)chan[c] + (size_t)row * (size_t)nx * ps,
+                   (size_t)nx * ps);
+            off += (size_t)nx * ps;
+        }
+    }
+}
+
+static int w_num_levels_axis(int s, int up) {
+    int n = 1;
+    while (s > 1) { s = up ? (s + 1) / 2 : s / 2; if (s < 1) s = 1; n++; }
+    return n;
+}
+
+/* Pixel dims and tile counts of level (lx,ly), mirroring tiled_level_size(). */
+static void w_level_dims(const exr_header *h, int W, int H, int lx, int ly,
+                         int *lw, int *lh, int *nxt, int *nyt) {
+    int up = (h->rounding_mode == EXR_TILE_ROUND_UP);
+    int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size, i;
+    int w = W, hh = H;
+    if (h->level_mode == EXR_TILE_MIPMAP_LEVELS) {
+        for (i = 0; i < lx; ++i) {
+            w = up ? (w + 1) / 2 : w / 2;
+            hh = up ? (hh + 1) / 2 : hh / 2;
+            if (w < 1) w = 1;
+            if (hh < 1) hh = 1;
+        }
+    } else if (h->level_mode == EXR_TILE_RIPMAP_LEVELS) {
+        for (i = 0; i < lx; ++i) { w = up ? (w + 1) / 2 : w / 2; if (w < 1) w = 1; }
+        for (i = 0; i < ly; ++i) { hh = up ? (hh + 1) / 2 : hh / 2; if (hh < 1) hh = 1; }
+    }
+    if (lw) *lw = w;
+    if (lh) *lh = hh;
+    if (tx > 0 && nxt) *nxt = (w + tx - 1) / tx;
+    if (ty > 0 && nyt) *nyt = (hh + ty - 1) / ty;
+}
+
+/* Offset-table index of tile (tx,ty) at level (lx,ly); mirrors tile_index(). */
+static exr_result w_tile_index(const exr_header *h, int W, int H, int tx, int ty,
+                               int lx, int ly, uint32_t *out) {
+    int up = (h->rounding_mode == EXR_TILE_ROUND_UP);
+    uint32_t index = 0;
+    int nxt, nyt;
+    if (h->level_mode == EXR_TILE_MIPMAP_LEVELS) {
+        int l, nlev = w_num_levels_axis(W > H ? W : H, up);
+        if (lx != ly || lx < 0 || lx >= nlev) return EXR_ERROR_INVALID_ARGUMENT;
+        for (l = 0; l < lx; ++l) {
+            w_level_dims(h, W, H, l, l, NULL, NULL, &nxt, &nyt);
+            index += (uint32_t)(nxt * nyt);
+        }
+        w_level_dims(h, W, H, lx, ly, NULL, NULL, &nxt, NULL);
+        *out = index + (uint32_t)(ty * nxt + tx);
+        return EXR_SUCCESS;
+    }
+    if (h->level_mode == EXR_TILE_RIPMAP_LEVELS) {
+        int nxl = w_num_levels_axis(W, up), nyl = w_num_levels_axis(H, up), xx, yy;
+        if (lx < 0 || lx >= nxl || ly < 0 || ly >= nyl)
+            return EXR_ERROR_INVALID_ARGUMENT;
+        for (yy = 0; yy < ly; ++yy)
+            for (xx = 0; xx < nxl; ++xx) {
+                w_level_dims(h, W, H, xx, yy, NULL, NULL, &nxt, &nyt);
+                index += (uint32_t)(nxt * nyt);
+            }
+        for (xx = 0; xx < lx; ++xx) {
+            w_level_dims(h, W, H, xx, ly, NULL, NULL, &nxt, &nyt);
+            index += (uint32_t)(nxt * nyt);
+        }
+        w_level_dims(h, W, H, lx, ly, NULL, NULL, &nxt, NULL);
+        *out = index + (uint32_t)(ty * nxt + tx);
+        return EXR_SUCCESS;
+    }
+    if (lx != 0 || ly != 0) return EXR_ERROR_INVALID_ARGUMENT;
+    w_level_dims(h, W, H, 0, 0, NULL, NULL, &nxt, NULL);
+    *out = (uint32_t)(ty * nxt + tx);
+    return EXR_SUCCESS;
+}
+
+/* Chunk count of one part under compression `comp` (mirrors serialize()). */
+static exr_result w_chunk_count(const exr_part *pt, exr_compression comp,
+                                uint32_t *out) {
+    const exr_header *h = &pt->header;
+    if (h->tiled) {
+        int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
+        int up = (h->rounding_mode == EXR_TILE_ROUND_UP);
+        if (tx <= 0 || ty <= 0) return EXR_ERROR_INVALID_ARGUMENT;
+        if (h->level_mode == EXR_TILE_MIPMAP_LEVELS) {
+            int ww = pt->width, hh = pt->height;
+            uint32_t total = 0;
+            for (;;) {
+                total += (uint32_t)((ww + tx - 1) / tx) *
+                         (uint32_t)((hh + ty - 1) / ty);
+                if (ww <= 1 && hh <= 1) break;
+                ww = up ? (ww + 1) / 2 : ww / 2; if (ww < 1) ww = 1;
+                hh = up ? (hh + 1) / 2 : hh / 2; if (hh < 1) hh = 1;
+            }
+            *out = total;
+        } else if (h->level_mode == EXR_TILE_RIPMAP_LEVELS) {
+            uint32_t sx = 0, sy = 0;
+            int s;
+            for (s = pt->width;;) {
+                sx += (uint32_t)((s + tx - 1) / tx);
+                if (s <= 1) break;
+                s = up ? (s + 1) / 2 : s / 2; if (s < 1) s = 1;
+            }
+            for (s = pt->height;;) {
+                sy += (uint32_t)((s + ty - 1) / ty);
+                if (s <= 1) break;
+                s = up ? (s + 1) / 2 : s / 2; if (s < 1) s = 1;
+            }
+            *out = sx * sy;
+        } else {
+            *out = (uint32_t)((pt->width + tx - 1) / tx) *
+                   (uint32_t)((pt->height + ty - 1) / ty);
+        }
+    } else {
+        int lpb = exr_lines_per_block(comp);
+        *out = (uint32_t)(((int64_t)pt->height + lpb - 1) / lpb);
+    }
+    return EXR_SUCCESS;
+}
+
+static exr_result sink_write(exr_writer *w, const void *p, size_t n) {
+    exr_result rc;
+    if (n == 0) return EXR_SUCCESS;
+    rc = w->sink.write(w->sink.user, p, n);
+    if (EXR_OK(rc)) w->pos += n;
+    return rc;
+}
+
+static exr_result file_sink_write(void *user, const void *data, size_t len) {
+    FILE *fp = (FILE *)user;
+    if (len && fwrite(data, 1, len, fp) != len) return EXR_ERROR_IO;
+    return EXR_SUCCESS;
+}
+static exr_result file_sink_seek(void *user, uint64_t off) {
+    FILE *fp = (FILE *)user;
+    if (fseek(fp, (long)off, SEEK_SET) != 0) return EXR_ERROR_IO;
+    return EXR_SUCCESS;
+}
+
+static void stream_free_state(exr_writer *w) {
+    int p;
+    if (w->sorder) {
+        for (p = 0; p < w->num_parts; ++p) exr_free(&w->alloc, w->sorder[p]);
+        exr_free(&w->alloc, w->sorder);
+        w->sorder = NULL;
+    }
+    if (w->ssorted) {
+        for (p = 0; p < w->num_parts; ++p) exr_free(&w->alloc, w->ssorted[p]);
+        exr_free(&w->alloc, w->ssorted);
+        w->ssorted = NULL;
+    }
+    if (w->soff) {
+        for (p = 0; p < w->num_parts; ++p) exr_free(&w->alloc, w->soff[p]);
+        exr_free(&w->alloc, w->soff);
+        w->soff = NULL;
+    }
+    exr_free(&w->alloc, w->schunk); w->schunk = NULL;
+    exr_free(&w->alloc, w->soff_pos); w->soff_pos = NULL;
+    exr_free(&w->alloc, w->smax_pos); w->smax_pos = NULL;
+    exr_free(&w->alloc, w->smax); w->smax = NULL;
+    w->streaming = 0;
+    if (w->fp) { fclose(w->fp); w->fp = NULL; }
+}
+
+/* Find maxSamplesPerPixel's 4-byte value offset within a serialized header. */
+static int find_max_samples_pos(const uint8_t *hdr, size_t len, size_t *rel) {
+    static const char key[] = "maxSamplesPerPixel";
+    size_t klen = sizeof(key) - 1, i;
+    if (len < klen) return 0;
+    for (i = 0; i + klen <= len; ++i) {
+        if (memcmp(hdr + i, key, klen) == 0) {
+            /* name\0 ("...PerPixel\0") + "int\0" + size(i32) -> value */
+            *rel = i + klen + 1 + 4 + 4;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+exr_result exr_writer_begin_stream(exr_writer *w, const exr_data_sink *sink,
+                                   exr_compression comp) {
+    int p, any_tiled = 0, any_deep = 0;
+    exr_result rc = EXR_SUCCESS;
+    obuf pre;
+
+    if (!w || !sink || !sink->write || !sink->seek)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (w->streaming || w->num_parts <= 0) return EXR_ERROR_INVALID_ARGUMENT;
+
+    w->sink = *sink;
+    w->pos = 0;
+    w->scomp = comp;
+    w->smultipart = (w->num_parts > 1);
+
+    w->sorder = (int **)exr_calloc(&w->alloc, (size_t)w->num_parts, sizeof(int *));
+    w->ssorted = (exr_channel **)exr_calloc(&w->alloc, (size_t)w->num_parts, sizeof(exr_channel *));
+    w->schunk = (uint32_t *)exr_calloc(&w->alloc, (size_t)w->num_parts, sizeof(uint32_t));
+    w->soff = (uint64_t **)exr_calloc(&w->alloc, (size_t)w->num_parts, sizeof(uint64_t *));
+    w->soff_pos = (uint64_t *)exr_calloc(&w->alloc, (size_t)w->num_parts, sizeof(uint64_t));
+    w->smax_pos = (uint64_t *)exr_calloc(&w->alloc, (size_t)w->num_parts, sizeof(uint64_t));
+    w->smax = (int32_t *)exr_calloc(&w->alloc, (size_t)w->num_parts, sizeof(int32_t));
+    if (!w->sorder || !w->ssorted || !w->schunk || !w->soff || !w->soff_pos ||
+        !w->smax_pos || !w->smax) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+
+    for (p = 0; p < w->num_parts; ++p) {
+        const exr_part *pt = &w->parts[p];
+        int nch = pt->header.num_channels, k;
+        if (pt->header.tiled) {
+            any_tiled = 1;
+            if (pt->header.tile_x_size == 0 || pt->header.tile_y_size == 0) {
+                rc = EXR_ERROR_INVALID_ARGUMENT; goto fail;
+            }
+        }
+        if (header_is_deep(&pt->header)) any_deep = 1;
+        w->sorder[p] = (int *)exr_calloc(&w->alloc, nch ? (size_t)nch : 1, sizeof(int));
+        w->ssorted[p] = (exr_channel *)exr_calloc(&w->alloc, nch ? (size_t)nch : 1, sizeof(exr_channel));
+        if (!w->sorder[p] || !w->ssorted[p]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+        sort_channels(&pt->header, w->sorder[p]);
+        for (k = 0; k < nch; ++k)
+            w->ssorted[p][k] = pt->header.channels[w->sorder[p][k]];
+        rc = w_chunk_count(pt, comp, &w->schunk[p]);
+        if (!EXR_OK(rc)) goto fail;
+        w->soff[p] = (uint64_t *)exr_calloc(&w->alloc, w->schunk[p] ? w->schunk[p] : 1, sizeof(uint64_t));
+        if (!w->soff[p]) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    }
+
+    /* magic + version */
+    memset(&pre, 0, sizeof(pre));
+    pre.a = &w->alloc;
+    ob_u32(&pre, EXR_MAGIC);
+    {
+        uint32_t ver = EXR_VERSION_NUMBER;
+        if (w->smultipart) ver |= EXR_VERSION_FLAG_MULTIPART;
+        else if (any_tiled && !any_deep) ver |= EXR_VERSION_FLAG_TILED;
+        if (any_deep) ver |= EXR_VERSION_FLAG_NON_IMAGE;
+        ob_u32(&pre, ver);
+    }
+    if (pre.err) { exr_free(&w->alloc, pre.data); rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+    rc = sink_write(w, pre.data, pre.len);
+    exr_free(&w->alloc, pre.data);
+    if (!EXR_OK(rc)) goto fail;
+
+    /* part headers (maxSamplesPerPixel patched at end_stream for deep parts) */
+    for (p = 0; p < w->num_parts; ++p) {
+        const exr_part *pt = &w->parts[p];
+        obuf hp;
+        uint64_t base = w->pos;
+        memset(&hp, 0, sizeof(hp));
+        hp.a = &w->alloc;
+        write_header(&hp, &pt->header, w->sorder[p], comp, w->smultipart,
+                     w->schunk[p], 0);
+        if (hp.err) { exr_free(&w->alloc, hp.data); rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+        if (header_is_deep(&pt->header)) {
+            size_t rel;
+            if (find_max_samples_pos(hp.data, hp.len, &rel))
+                w->smax_pos[p] = base + rel;
+        }
+        rc = sink_write(w, hp.data, hp.len);
+        exr_free(&w->alloc, hp.data);
+        if (!EXR_OK(rc)) goto fail;
+    }
+    if (w->smultipart) {
+        uint8_t z = 0;
+        rc = sink_write(w, &z, 1);
+        if (!EXR_OK(rc)) goto fail;
+    }
+
+    /* reserve (zeroed) offset tables */
+    for (p = 0; p < w->num_parts; ++p) {
+        size_t need = (size_t)w->schunk[p] * 8;
+        uint8_t *zeros;
+        w->soff_pos[p] = w->pos;
+        if (need == 0) continue;
+        zeros = (uint8_t *)exr_calloc(&w->alloc, need, 1);
+        if (!zeros) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
+        rc = sink_write(w, zeros, need);
+        exr_free(&w->alloc, zeros);
+        if (!EXR_OK(rc)) goto fail;
+    }
+
+    w->streaming = 1;
+    return EXR_SUCCESS;
+
+fail:
+    stream_free_state(w);
+    return rc;
+}
+
+exr_result exr_writer_begin_stream_file(exr_writer *w, const char *path,
+                                        exr_compression comp) {
+    exr_data_sink sink;
+    exr_result rc;
+    FILE *fp;
+    if (!w || !path) return EXR_ERROR_INVALID_ARGUMENT;
+    fp = fopen(path, "wb+");
+    if (!fp) return EXR_ERROR_IO;
+    sink.user = fp;
+    sink.write = file_sink_write;
+    sink.seek = file_sink_seek;
+    rc = exr_writer_begin_stream(w, &sink, comp);
+    if (!EXR_OK(rc)) { fclose(fp); return rc; }
+    w->fp = fp; /* stream_free_state / end_stream will close it */
+    return EXR_SUCCESS;
+}
+
+/* Emit one flat chunk: record its offset, write the chunk header + payload. */
+static exr_result stream_emit_flat(exr_writer *w, int part, uint32_t ci,
+                                   int tiled, int tx, int ty, int lx, int ly,
+                                   int y0, const uint8_t *payload,
+                                   size_t payload_size) {
+    uint8_t hdr[24];
+    size_t hl = 0;
+    exr_result rc;
+    w->soff[part][ci] = w->pos;
+    if (w->smultipart) { exr_wr_i32(hdr + hl, part); hl += 4; }
+    if (tiled) {
+        exr_wr_i32(hdr + hl, tx); hl += 4;
+        exr_wr_i32(hdr + hl, ty); hl += 4;
+        exr_wr_i32(hdr + hl, lx); hl += 4;
+        exr_wr_i32(hdr + hl, ly); hl += 4;
+    } else {
+        exr_wr_i32(hdr + hl, y0); hl += 4;
+    }
+    exr_wr_i32(hdr + hl, (int32_t)payload_size); hl += 4;
+    rc = sink_write(w, hdr, hl);
+    if (!EXR_OK(rc)) return rc;
+    return sink_write(w, payload, payload_size);
+}
+
+exr_result exr_writer_write_scanline_block(exr_writer *w, int32_t part,
+                                           int32_t y0,
+                                           const void *const *channel_rows) {
+    const exr_part *pt;
+    const exr_header *h;
+    const exr_allocator *a;
+    int ymin, ymax, lpb, nlines;
+    uint32_t ci;
+    size_t blk_size, payload_size = 0;
+    uint8_t *block, *payload = NULL;
+    exr_codec_ctx cx;
+    exr_result rc;
+
+    if (!w || !channel_rows || !w->streaming) return EXR_ERROR_INVALID_ARGUMENT;
+    if (part < 0 || part >= w->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    pt = &w->parts[part];
+    h = &pt->header;
+    a = &w->alloc;
+    if (h->tiled || header_is_deep(h)) return EXR_ERROR_INVALID_ARGUMENT;
+    ymin = h->data_window.min_y;
+    ymax = h->data_window.max_y;
+    lpb = exr_lines_per_block(w->scomp);
+    if (y0 < ymin || y0 > ymax || ((y0 - ymin) % lpb) != 0)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    ci = (uint32_t)((y0 - ymin) / lpb);
+    if (ci >= w->schunk[part]) return EXR_ERROR_INVALID_ARGUMENT;
+    nlines = lpb;
+    if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
+
+    rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                     h->data_window.min_x, y0, pt->width, nlines,
+                                     &blk_size);
+    if (!EXR_OK(rc)) return rc;
+    block = (uint8_t *)exr_malloc(a, blk_size ? blk_size : 1);
+    if (!block) return EXR_ERROR_OUT_OF_MEMORY;
+    gather_block_local(h, w->sorder[part], channel_rows, h->data_window.min_x, y0,
+                       pt->width, nlines, block);
+    cx.alloc = a;
+    cx.compression = w->scomp;
+    cx.channels = w->ssorted[part];
+    cx.num_channels = h->num_channels;
+    cx.x = h->data_window.min_x;
+    cx.y = y0;
+    cx.width = pt->width;
+    cx.num_lines = nlines;
+    rc = exr_compress_block(&cx, block, blk_size, &payload, &payload_size);
+    exr_free(a, block);
+    if (!EXR_OK(rc)) return rc;
+    rc = stream_emit_flat(w, part, ci, 0, 0, 0, 0, 0, y0, payload, payload_size);
+    exr_free(a, payload);
+    return rc;
+}
+
+exr_result exr_writer_write_tile(exr_writer *w, int32_t part, int32_t tile_x,
+                                 int32_t tile_y, int32_t level_x, int32_t level_y,
+                                 const void *const *channel_data) {
+    const exr_part *pt;
+    const exr_header *h;
+    const exr_allocator *a;
+    int lw, lh, nxt, nyt, tsx, tsy, x0l, y0l, tw, th, abs_x0, abs_y0;
+    uint32_t ci;
+    size_t blk_size, payload_size = 0;
+    uint8_t *block, *payload = NULL;
+    exr_codec_ctx cx;
+    exr_result rc;
+
+    if (!w || !channel_data || !w->streaming) return EXR_ERROR_INVALID_ARGUMENT;
+    if (part < 0 || part >= w->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    pt = &w->parts[part];
+    h = &pt->header;
+    a = &w->alloc;
+    if (!h->tiled || header_is_deep(h)) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = w_tile_index(h, pt->width, pt->height, tile_x, tile_y, level_x, level_y,
+                      &ci);
+    if (!EXR_OK(rc)) return rc;
+    if (ci >= w->schunk[part]) return EXR_ERROR_INVALID_ARGUMENT;
+    w_level_dims(h, pt->width, pt->height, level_x, level_y, &lw, &lh, &nxt, &nyt);
+    if (tile_x < 0 || tile_x >= nxt || tile_y < 0 || tile_y >= nyt)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    tsx = (int)h->tile_x_size;
+    tsy = (int)h->tile_y_size;
+    x0l = tile_x * tsx;
+    y0l = tile_y * tsy;
+    tw = (tsx < lw - x0l) ? tsx : (lw - x0l);
+    th = (tsy < lh - y0l) ? tsy : (lh - y0l);
+    abs_x0 = h->data_window.min_x + x0l;
+    abs_y0 = h->data_window.min_y + y0l;
+
+    rc = exr_block_uncompressed_size(h->channels, h->num_channels, abs_x0, abs_y0,
+                                     tw, th, &blk_size);
+    if (!EXR_OK(rc)) return rc;
+    block = (uint8_t *)exr_malloc(a, blk_size ? blk_size : 1);
+    if (!block) return EXR_ERROR_OUT_OF_MEMORY;
+    gather_block_local(h, w->sorder[part], channel_data, abs_x0, abs_y0, tw, th,
+                       block);
+    cx.alloc = a;
+    cx.compression = w->scomp;
+    cx.channels = w->ssorted[part];
+    cx.num_channels = h->num_channels;
+    cx.x = abs_x0;
+    cx.y = abs_y0;
+    cx.width = tw;
+    cx.num_lines = th;
+    rc = exr_compress_block(&cx, block, blk_size, &payload, &payload_size);
+    exr_free(a, block);
+    if (!EXR_OK(rc)) return rc;
+    rc = stream_emit_flat(w, part, ci, 1, tile_x, tile_y, level_x, level_y, 0,
+                          payload, payload_size);
+    exr_free(a, payload);
+    return rc;
+}
+
+/* Track the running max sample count for the deep header backpatch. */
+static void stream_track_max(exr_writer *w, int part, const int32_t *counts,
+                             size_t n) {
+    size_t i;
+    for (i = 0; i < n; ++i)
+        if (counts[i] > w->smax[part]) w->smax[part] = counts[i];
+}
+
+/* Emit one deep chunk (scanline or tile). */
+static exr_result stream_emit_deep(exr_writer *w, int part, uint32_t ci,
+                                   int tiled, int tx, int ty, int lx, int ly,
+                                   int y0, const uint8_t *poff, size_t poff_sz,
+                                   const uint8_t *psamp, size_t psamp_sz,
+                                   uint64_t usamp) {
+    uint8_t hdr[44];
+    size_t hl = 0;
+    exr_result rc;
+    w->soff[part][ci] = w->pos;
+    if (w->smultipart) { exr_wr_i32(hdr + hl, part); hl += 4; }
+    if (tiled) {
+        exr_wr_i32(hdr + hl, tx); hl += 4;
+        exr_wr_i32(hdr + hl, ty); hl += 4;
+        exr_wr_i32(hdr + hl, lx); hl += 4;
+        exr_wr_i32(hdr + hl, ly); hl += 4;
+    } else {
+        exr_wr_i32(hdr + hl, y0); hl += 4;
+    }
+    exr_wr_u64(hdr + hl, (uint64_t)poff_sz); hl += 8;
+    exr_wr_u64(hdr + hl, (uint64_t)psamp_sz); hl += 8;
+    exr_wr_u64(hdr + hl, usamp); hl += 8;
+    rc = sink_write(w, hdr, hl);
+    if (!EXR_OK(rc)) return rc;
+    rc = sink_write(w, poff, poff_sz);
+    if (!EXR_OK(rc)) return rc;
+    return sink_write(w, psamp, psamp_sz);
+}
+
+exr_result exr_writer_write_deep_scanline_block(exr_writer *w, int32_t part,
+                                                int32_t y0, const int32_t *counts,
+                                                const void *const *chan_samp) {
+    const exr_part *pt;
+    const exr_header *h;
+    const exr_allocator *a;
+    int ymin, ymax, lpb, nlines;
+    uint32_t ci;
+    exr_part blk;
+    uint64_t *prefix = NULL;
+    uint8_t *poff = NULL, *psamp = NULL;
+    size_t poff_sz = 0, psamp_sz = 0;
+    uint64_t uoff = 0, usamp = 0;
+    exr_result rc;
+
+    if (!w || !counts || !chan_samp || !w->streaming)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (part < 0 || part >= w->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    pt = &w->parts[part];
+    h = &pt->header;
+    a = &w->alloc;
+    if (h->tiled || !header_is_deep(h)) return EXR_ERROR_INVALID_ARGUMENT;
+    ymin = h->data_window.min_y;
+    ymax = h->data_window.max_y;
+    lpb = exr_lines_per_block(w->scomp);
+    if (y0 < ymin || y0 > ymax || ((y0 - ymin) % lpb) != 0)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    ci = (uint32_t)((y0 - ymin) / lpb);
+    if (ci >= w->schunk[part]) return EXR_ERROR_INVALID_ARGUMENT;
+    nlines = lpb;
+    if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
+
+    /* a block-local deep part: full-width counts/samples for these scanlines */
+    memset(&blk, 0, sizeof(blk));
+    blk.header = *h;                 /* shallow; channels shared, not owned */
+    blk.width = pt->width;
+    blk.height = nlines;
+    blk.is_deep = 1;
+    blk.deep_sample_counts = (int32_t *)counts;
+    blk.deep_images = (void **)chan_samp;
+    blk.header.data_window.min_y = 0; /* so encode's row = y0-ymin maps block-local */
+
+    {
+        size_t npix = (size_t)pt->width * nlines, i;
+        uint64_t acc = 0;
+        prefix = (uint64_t *)exr_malloc(a, (npix ? npix : 1) * sizeof(uint64_t));
+        if (!prefix) return EXR_ERROR_OUT_OF_MEMORY;
+        for (i = 0; i < npix; ++i) { prefix[i] = acc; acc += (uint64_t)counts[i]; }
+    }
+    rc = exr_deep_encode_block(a, w->scomp, &blk, prefix, 0, nlines, &poff,
+                               &poff_sz, &uoff, &psamp, &psamp_sz, &usamp);
+    exr_free(a, prefix);
+    if (!EXR_OK(rc)) return rc;
+    stream_track_max(w, part, counts, (size_t)pt->width * nlines);
+    rc = stream_emit_deep(w, part, ci, 0, 0, 0, 0, 0, y0, poff, poff_sz, psamp,
+                          psamp_sz, usamp);
+    exr_free(a, poff);
+    exr_free(a, psamp);
+    return rc;
+}
+
+exr_result exr_writer_write_deep_tile(exr_writer *w, int32_t part, int32_t tile_x,
+                                      int32_t tile_y, int32_t level_x,
+                                      int32_t level_y, const int32_t *counts,
+                                      const void *const *chan_samp) {
+    const exr_part *pt;
+    const exr_header *h;
+    const exr_allocator *a;
+    int lw, lh, nxt, nyt, tsx, tsy, x0l, y0l, tw, th;
+    uint32_t ci;
+    exr_part blk;
+    uint64_t *prefix = NULL;
+    uint8_t *poff = NULL, *psamp = NULL;
+    size_t poff_sz = 0, psamp_sz = 0;
+    uint64_t uoff = 0, usamp = 0;
+    exr_result rc;
+
+    if (!w || !counts || !chan_samp || !w->streaming)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (part < 0 || part >= w->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    pt = &w->parts[part];
+    h = &pt->header;
+    a = &w->alloc;
+    if (!h->tiled || !header_is_deep(h)) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = w_tile_index(h, pt->width, pt->height, tile_x, tile_y, level_x, level_y,
+                      &ci);
+    if (!EXR_OK(rc)) return rc;
+    if (ci >= w->schunk[part]) return EXR_ERROR_INVALID_ARGUMENT;
+    w_level_dims(h, pt->width, pt->height, level_x, level_y, &lw, &lh, &nxt, &nyt);
+    if (tile_x < 0 || tile_x >= nxt || tile_y < 0 || tile_y >= nyt)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    tsx = (int)h->tile_x_size;
+    tsy = (int)h->tile_y_size;
+    x0l = tile_x * tsx;
+    y0l = tile_y * tsy;
+    tw = (tsx < lw - x0l) ? tsx : (lw - x0l);
+    th = (tsy < lh - y0l) ? tsy : (lh - y0l);
+
+    memset(&blk, 0, sizeof(blk));
+    blk.header = *h;
+    blk.width = tw;
+    blk.height = th;
+    blk.is_deep = 1;
+    blk.deep_sample_counts = (int32_t *)counts;
+    blk.deep_images = (void **)chan_samp;
+
+    {
+        size_t npix = (size_t)tw * th, i;
+        uint64_t acc = 0;
+        prefix = (uint64_t *)exr_malloc(a, (npix ? npix : 1) * sizeof(uint64_t));
+        if (!prefix) return EXR_ERROR_OUT_OF_MEMORY;
+        for (i = 0; i < npix; ++i) { prefix[i] = acc; acc += (uint64_t)counts[i]; }
+    }
+    rc = exr_deep_encode_tile(a, w->scomp, &blk, prefix, 0, 0, tw, th, &poff,
+                              &poff_sz, &uoff, &psamp, &psamp_sz, &usamp);
+    exr_free(a, prefix);
+    if (!EXR_OK(rc)) return rc;
+    stream_track_max(w, part, counts, (size_t)tw * th);
+    rc = stream_emit_deep(w, part, ci, 1, tile_x, tile_y, level_x, level_y, 0,
+                          poff, poff_sz, psamp, psamp_sz, usamp);
+    exr_free(a, poff);
+    exr_free(a, psamp);
+    return rc;
+}
+
+exr_result exr_writer_end_stream(exr_writer *w) {
+    int p;
+    exr_result rc = EXR_SUCCESS;
+    if (!w || !w->streaming) return EXR_ERROR_INVALID_ARGUMENT;
+
+    /* backpatch offset tables */
+    for (p = 0; p < w->num_parts && EXR_OK(rc); ++p) {
+        size_t need = (size_t)w->schunk[p] * 8, k;
+        uint8_t *buf;
+        if (need == 0) continue;
+        buf = (uint8_t *)exr_malloc(&w->alloc, need);
+        if (!buf) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+        for (k = 0; k < w->schunk[p]; ++k)
+            exr_wr_u64(buf + k * 8, w->soff[p][k]);
+        rc = w->sink.seek(w->sink.user, w->soff_pos[p]);
+        if (EXR_OK(rc)) rc = w->sink.write(w->sink.user, buf, need);
+        exr_free(&w->alloc, buf);
+    }
+
+    /* backpatch deep maxSamplesPerPixel */
+    for (p = 0; p < w->num_parts && EXR_OK(rc); ++p) {
+        uint8_t t[4];
+        if (!w->smax_pos[p]) continue;
+        exr_wr_i32(t, w->smax[p]);
+        rc = w->sink.seek(w->sink.user, w->smax_pos[p]);
+        if (EXR_OK(rc)) rc = w->sink.write(w->sink.user, t, 4);
+    }
+
+    stream_free_state(w);
+    return rc;
 }

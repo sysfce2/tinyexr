@@ -1061,6 +1061,575 @@ static void fpnge_check(void) {
 #endif
 }
 
+/* ============================================================================
+ * Streaming block API tests
+ * ========================================================================== */
+
+/* Decode a part block-by-block, reassemble per channel, and compare to a full
+ * read. Assumes x/y sampling == 1 (true for the corpus). Only level-0 blocks
+ * are reconstructed (read_part materializes level 0). */
+static void stream_decode_check(const char *path, exr_compression comp,
+                                int tiled, exr_tile_level_mode lvl,
+                                const char *name) {
+    exr_image src;
+    void *buf = NULL;
+    size_t sz = 0;
+    exr_reader *r = NULL;
+    exr_part ref;
+    const exr_header *h;
+    uint32_t nb = 0, i;
+    int c, ok = 1, xmin, ymin, fullw;
+    uint8_t **recon = NULL;
+    exr_result rc;
+
+    memset(&src, 0, sizeof(src));
+    memset(&ref, 0, sizeof(ref));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src))) {
+        g_fail++;
+        printf("  FAIL: %s load (stream decode %s)\n", path, name);
+        return;
+    }
+    if (tiled) {
+        src.parts[0].header.tiled = 1;
+        src.parts[0].header.part_type = EXR_PART_TILED;
+        src.parts[0].header.tile_x_size = 64;
+        src.parts[0].header.tile_y_size = 64;
+        src.parts[0].header.level_mode = lvl;
+        src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    }
+    rc = exr_save_to_memory(&buf, &sz, NULL, &src, comp);
+    exr_image_free(&src);
+    if (!EXR_OK(rc)) {
+        g_fail++;
+        printf("  FAIL: save (stream decode %s)\n", name);
+        return;
+    }
+    if (!EXR_OK(exr_reader_open_memory(buf, sz, NULL, &r)) ||
+        !EXR_OK(exr_reader_read_part(r, 0, &ref))) {
+        g_fail++;
+        printf("  FAIL: open/read (stream decode %s)\n", name);
+        if (r) exr_reader_close(r);
+        free(buf);
+        return;
+    }
+    h = exr_reader_part_header(r, 0);
+    xmin = h->data_window.min_x;
+    ymin = h->data_window.min_y;
+    fullw = ref.width;
+
+    recon = (uint8_t **)calloc((size_t)h->num_channels, sizeof(uint8_t *));
+    for (c = 0; c < h->num_channels; ++c) {
+        size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+        recon[c] = (uint8_t *)calloc((size_t)ref.width * ref.height, ps);
+    }
+
+    if (!EXR_OK(exr_reader_num_blocks(r, 0, &nb))) ok = 0;
+    for (i = 0; ok && i < nb; ++i) {
+        exr_block_info bi;
+        void *dst;
+        uint8_t *tmp;
+        if (!EXR_OK(exr_reader_block_info(r, 0, i, &bi))) { ok = 0; break; }
+        if (bi.level_x != 0 || bi.level_y != 0) continue; /* level 0 only */
+        dst = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
+        if (!EXR_OK(exr_reader_decode_block(r, 0, i, dst, bi.uncompressed_size))) {
+            free(dst);
+            ok = 0;
+            break;
+        }
+        tmp = (uint8_t *)malloc((size_t)bi.width * bi.height * 4 + 1);
+        for (c = 0; c < h->num_channels; ++c) {
+            size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+            int row0 = bi.y0 - ymin, col0 = bi.x0 - xmin, rr;
+            if (!EXR_OK(exr_block_extract_channel(h, &bi, dst,
+                                                  bi.uncompressed_size, c, tmp))) {
+                ok = 0;
+                break;
+            }
+            for (rr = 0; rr < bi.height; ++rr)
+                memcpy(recon[c] + ((size_t)(row0 + rr) * fullw + col0) * ps,
+                       tmp + (size_t)rr * bi.width * ps, (size_t)bi.width * ps);
+        }
+        free(tmp);
+        free(dst);
+    }
+    if (ok)
+        for (c = 0; c < h->num_channels; ++c) {
+            size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+            if (memcmp(recon[c], ref.images[c],
+                       (size_t)ref.width * ref.height * ps) != 0)
+                ok = 0;
+        }
+    CHECK(ok, name);
+    if (ok) printf("  ok: stream decode %s (%u blocks)\n", name, nb);
+
+    for (c = 0; c < h->num_channels; ++c) free(recon[c]);
+    free(recon);
+    exr_part_free(NULL, &ref);
+    exr_reader_close(r);
+    free(buf);
+}
+
+/* Encode a part block-by-block via the streaming writer, reload, compare. */
+static void stream_encode_check(const char *path, exr_compression comp,
+                                int tiled, const char *name) {
+    exr_image src, back;
+    exr_writer *w = NULL;
+    const char *tmp = "build/_stream_enc.exr";
+    const exr_header *h;
+    int c, ok = 1;
+
+    memset(&src, 0, sizeof(src));
+    memset(&back, 0, sizeof(back));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src))) {
+        g_fail++;
+        printf("  FAIL: %s load (stream encode %s)\n", path, name);
+        return;
+    }
+    if (tiled) {
+        src.parts[0].header.tiled = 1;
+        src.parts[0].header.part_type = EXR_PART_TILED;
+        src.parts[0].header.tile_x_size = 64;
+        src.parts[0].header.tile_y_size = 64;
+        src.parts[0].header.level_mode = EXR_TILE_ONE_LEVEL;
+        src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    }
+    h = &src.parts[0].header;
+    if (!EXR_OK(exr_writer_create(NULL, &w)) ||
+        !EXR_OK(exr_writer_add_part(w, h, NULL)) ||
+        !EXR_OK(exr_writer_begin_stream_file(w, tmp, comp))) {
+        g_fail++;
+        printf("  FAIL: begin (stream encode %s)\n", name);
+        if (w) exr_writer_destroy(w);
+        exr_image_free(&src);
+        return;
+    }
+
+    if (tiled) {
+        int W = src.parts[0].width, H = src.parts[0].height;
+        int tsx = 64, tsy = 64;
+        int nxt = (W + tsx - 1) / tsx, nyt = (H + tsy - 1) / tsy, txi, tyi;
+        const void **cd = (const void **)malloc((size_t)h->num_channels * sizeof(void *));
+        uint8_t **tb = (uint8_t **)malloc((size_t)h->num_channels * sizeof(void *));
+        for (tyi = 0; ok && tyi < nyt; ++tyi)
+            for (txi = 0; ok && txi < nxt; ++txi) {
+                int x0 = txi * tsx, y0 = tyi * tsy;
+                int tw = (tsx < W - x0) ? tsx : (W - x0);
+                int th = (tsy < H - y0) ? tsy : (H - y0), rr;
+                for (c = 0; c < h->num_channels; ++c) {
+                    size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+                    tb[c] = (uint8_t *)malloc((size_t)tw * th * ps);
+                    for (rr = 0; rr < th; ++rr)
+                        memcpy(tb[c] + (size_t)rr * tw * ps,
+                               (uint8_t *)src.parts[0].images[c] +
+                                   ((size_t)(y0 + rr) * W + x0) * ps,
+                               (size_t)tw * ps);
+                    cd[c] = tb[c];
+                }
+                if (!EXR_OK(exr_writer_write_tile(w, 0, txi, tyi, 0, 0,
+                                                  (const void *const *)cd)))
+                    ok = 0;
+                for (c = 0; c < h->num_channels; ++c) free(tb[c]);
+            }
+        free(cd);
+        free(tb);
+    } else {
+        int W = src.parts[0].width;
+        int ymin = h->data_window.min_y, ymax = h->data_window.max_y;
+        int lpb = exr_lines_per_block(comp), y0;
+        const void **cd = (const void **)malloc((size_t)h->num_channels * sizeof(void *));
+        for (y0 = ymin; ok && y0 <= ymax; y0 += lpb) {
+            for (c = 0; c < h->num_channels; ++c) {
+                size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+                cd[c] = (uint8_t *)src.parts[0].images[c] +
+                        (size_t)(y0 - ymin) * W * ps;
+            }
+            if (!EXR_OK(exr_writer_write_scanline_block(w, 0, y0,
+                                                        (const void *const *)cd)))
+                ok = 0;
+        }
+        free(cd);
+    }
+
+    if (ok && !EXR_OK(exr_writer_end_stream(w))) ok = 0;
+    exr_writer_destroy(w);
+    if (ok && !EXR_OK(exr_load_from_file(tmp, NULL, &back))) ok = 0;
+    if (ok) CHECK(images_equal(&src, &back), name);
+    else CHECK(0, name);
+    if (ok) printf("  ok: stream encode %s\n", name);
+    exr_image_free(&src);
+    exr_image_free(&back);
+}
+
+/* Closed-loop check of streaming-encode tile ordering across all levels:
+ * read every tile of a serialize-written mip/ripmap file, re-stream them via
+ * exr_writer_write_tile, then verify the result decodes block-for-block
+ * identically. Exercises w_tile_index / w_chunk_count for every level mode.
+ * Assumes x/y sampling == 1. */
+static void stream_tiled_levels_check(const char *path, exr_tile_level_mode lvl,
+                                      const char *name) {
+    exr_image src;
+    void *buf = NULL;
+    size_t sz = 0;
+    exr_reader *R = NULL, *S = NULL;
+    exr_writer *w = NULL;
+    const char *tmp = "build/_stream_lvl.exr";
+    const exr_header *h;
+    exr_block_info *bis = NULL;
+    uint8_t ***chan = NULL;
+    uint32_t nb = 0, ns = 0, i;
+    int c, nch, ok = 1;
+    exr_result rc;
+
+    memset(&src, 0, sizeof(src));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src))) {
+        g_fail++;
+        printf("  FAIL: %s load (stream levels %s)\n", path, name);
+        return;
+    }
+    src.parts[0].header.tiled = 1;
+    src.parts[0].header.part_type = EXR_PART_TILED;
+    src.parts[0].header.tile_x_size = 32;
+    src.parts[0].header.tile_y_size = 32;
+    src.parts[0].header.level_mode = lvl;
+    src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    rc = exr_save_to_memory(&buf, &sz, NULL, &src, EXR_COMPRESSION_ZIP);
+    exr_image_free(&src);
+    if (!EXR_OK(rc)) { g_fail++; printf("  FAIL: save (stream levels %s)\n", name); return; }
+
+    if (!EXR_OK(exr_reader_open_memory(buf, sz, NULL, &R)) ||
+        !EXR_OK(exr_reader_num_blocks(R, 0, &nb))) {
+        g_fail++; printf("  FAIL: open (stream levels %s)\n", name);
+        if (R) exr_reader_close(R);
+        free(buf); return;
+    }
+    h = exr_reader_part_header(R, 0);
+    nch = h->num_channels;
+    bis = (exr_block_info *)calloc(nb ? nb : 1, sizeof(exr_block_info));
+    chan = (uint8_t ***)calloc(nb ? nb : 1, sizeof(uint8_t **));
+
+    /* gather every tile's per-channel planar data */
+    for (i = 0; ok && i < nb; ++i) {
+        void *blk;
+        if (!EXR_OK(exr_reader_block_info(R, 0, i, &bis[i]))) { ok = 0; break; }
+        blk = malloc(bis[i].uncompressed_size ? bis[i].uncompressed_size : 1);
+        if (!EXR_OK(exr_reader_decode_block(R, 0, i, blk, bis[i].uncompressed_size))) {
+            free(blk); ok = 0; break;
+        }
+        chan[i] = (uint8_t **)calloc(nch ? (size_t)nch : 1, sizeof(uint8_t *));
+        for (c = 0; c < nch; ++c) {
+            size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+            chan[i][c] = (uint8_t *)malloc((size_t)bis[i].width * bis[i].height * ps);
+            if (!EXR_OK(exr_block_extract_channel(h, &bis[i], blk,
+                                                  bis[i].uncompressed_size, c,
+                                                  chan[i][c])))
+                ok = 0;
+        }
+        free(blk);
+    }
+
+    /* re-stream every tile */
+    if (ok && EXR_OK(exr_writer_create(NULL, &w)) &&
+        EXR_OK(exr_writer_add_part(w, h, NULL)) &&
+        EXR_OK(exr_writer_begin_stream_file(w, tmp, EXR_COMPRESSION_ZIP))) {
+        for (i = 0; ok && i < nb; ++i)
+            if (!EXR_OK(exr_writer_write_tile(w, 0, bis[i].tile_x, bis[i].tile_y,
+                                              bis[i].level_x, bis[i].level_y,
+                                              (const void *const *)chan[i])))
+                ok = 0;
+        if (ok && !EXR_OK(exr_writer_end_stream(w))) ok = 0;
+        exr_writer_destroy(w);
+    } else {
+        ok = 0;
+        if (w) exr_writer_destroy(w);
+    }
+
+    /* verify the streamed file decodes block-for-block identically */
+    if (ok) {
+        /* reopen from file via a fresh reader */
+        {
+            void *fb = NULL;
+            size_t fsz = 0;
+            FILE *fp = fopen(tmp, "rb");
+            if (fp) {
+                fseek(fp, 0, SEEK_END); fsz = (size_t)ftell(fp); fseek(fp, 0, SEEK_SET);
+                fb = malloc(fsz ? fsz : 1);
+                if (fb && fread(fb, 1, fsz, fp) != fsz) ok = 0;
+                fclose(fp);
+            } else ok = 0;
+            if (ok && EXR_OK(exr_reader_open_memory(fb, fsz, NULL, &S)) &&
+                EXR_OK(exr_reader_num_blocks(S, 0, &ns)) && ns == nb) {
+                for (i = 0; ok && i < nb; ++i) {
+                    exr_block_info bs;
+                    void *ds, *dr;
+                    if (!EXR_OK(exr_reader_block_info(S, 0, i, &bs))) { ok = 0; break; }
+                    if (bs.uncompressed_size != bis[i].uncompressed_size) { ok = 0; break; }
+                    ds = malloc(bs.uncompressed_size ? bs.uncompressed_size : 1);
+                    dr = malloc(bis[i].uncompressed_size ? bis[i].uncompressed_size : 1);
+                    if (!EXR_OK(exr_reader_decode_block(S, 0, i, ds, bs.uncompressed_size)) ||
+                        !EXR_OK(exr_reader_decode_block(R, 0, i, dr, bis[i].uncompressed_size)) ||
+                        memcmp(ds, dr, bs.uncompressed_size) != 0)
+                        ok = 0;
+                    free(ds); free(dr);
+                }
+            } else ok = 0;
+            if (S) exr_reader_close(S);
+            free(fb);
+        }
+    }
+
+    CHECK(ok, name);
+    if (ok) printf("  ok: stream tiled levels %s (%u blocks)\n", name, nb);
+
+    for (i = 0; i < nb; ++i)
+        if (chan && chan[i]) {
+            for (c = 0; c < nch; ++c) free(chan[i][c]);
+            free(chan[i]);
+        }
+    free(chan);
+    free(bis);
+    exr_reader_close(R);
+    free(buf);
+}
+
+/* Stream a deep scanline part out block-by-block and verify it round-trips. */
+static void stream_deep_check(const char *path, exr_compression comp,
+                              const char *name) {
+    exr_image src, back;
+    exr_writer *w = NULL;
+    const char *tmp = "build/_stream_deep.exr";
+    const exr_header *h;
+    int c, ok = 1, ymin, ymax, lpb, W, y0;
+    uint64_t *prefix = NULL;
+    size_t npix, i;
+
+    memset(&src, 0, sizeof(src));
+    memset(&back, 0, sizeof(back));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src))) {
+        printf("  skip: %s missing (stream deep %s)\n", path, name);
+        return;
+    }
+    if (!src.parts[0].is_deep) {
+        printf("  skip: %s not deep\n", path);
+        exr_image_free(&src);
+        return;
+    }
+    h = &src.parts[0].header;
+    W = src.parts[0].width;
+    ymin = h->data_window.min_y;
+    ymax = h->data_window.max_y;
+    npix = (size_t)W * src.parts[0].height;
+    prefix = (uint64_t *)malloc(npix * sizeof(uint64_t));
+    {
+        uint64_t acc = 0;
+        for (i = 0; i < npix; ++i) {
+            prefix[i] = acc;
+            acc += (uint64_t)src.parts[0].deep_sample_counts[i];
+        }
+    }
+    if (!EXR_OK(exr_writer_create(NULL, &w)) ||
+        !EXR_OK(exr_writer_add_part(w, h, NULL)) ||
+        !EXR_OK(exr_writer_begin_stream_file(w, tmp, comp))) {
+        g_fail++;
+        printf("  FAIL: begin (stream deep %s)\n", name);
+        if (w) exr_writer_destroy(w);
+        free(prefix);
+        exr_image_free(&src);
+        return;
+    }
+    lpb = exr_lines_per_block(comp);
+    {
+        const void **cs = (const void **)malloc((size_t)h->num_channels * sizeof(void *));
+        for (y0 = ymin; ok && y0 <= ymax; y0 += lpb) {
+            size_t fp = (size_t)(y0 - ymin) * W;
+            const int32_t *counts = src.parts[0].deep_sample_counts + fp;
+            for (c = 0; c < h->num_channels; ++c) {
+                size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+                cs[c] = (uint8_t *)src.parts[0].deep_images[c] + prefix[fp] * ps;
+            }
+            if (!EXR_OK(exr_writer_write_deep_scanline_block(
+                    w, 0, y0, counts, (const void *const *)cs)))
+                ok = 0;
+        }
+        free(cs);
+    }
+    if (ok && !EXR_OK(exr_writer_end_stream(w))) ok = 0;
+    exr_writer_destroy(w);
+    free(prefix);
+    if (ok && !EXR_OK(exr_load_from_file(tmp, NULL, &back))) ok = 0;
+    if (ok) {
+        ok = back.parts[0].is_deep &&
+             back.parts[0].deep_total_samples ==
+                 src.parts[0].deep_total_samples &&
+             memcmp(back.parts[0].deep_sample_counts,
+                    src.parts[0].deep_sample_counts,
+                    npix * sizeof(int32_t)) == 0;
+        for (c = 0; ok && c < h->num_channels; ++c) {
+            size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+            if (memcmp(back.parts[0].deep_images[c], src.parts[0].deep_images[c],
+                       (size_t)src.parts[0].deep_total_samples * ps) != 0)
+                ok = 0;
+        }
+    }
+    CHECK(ok, name);
+    if (ok) printf("  ok: stream deep %s\n", name);
+    exr_image_free(&src);
+    exr_image_free(&back);
+}
+
+static exr_result blocking_read(void *user, uint64_t off, uint64_t len,
+                                void *dst) {
+    (void)user; (void)off; (void)len; (void)dst;
+    return EXR_WOULD_BLOCK; /* force the suspend/resume path */
+}
+
+/* Decode block 0 over a streaming source that always blocks; the host feeds the
+ * file incrementally. Result must match the memory-path decode. */
+static void stream_would_block_check(const char *path, exr_compression comp,
+                                     const char *name) {
+    exr_image tmpimg;
+    void *buf = NULL;
+    size_t sz = 0;
+    exr_reader *rm = NULL, *rs = NULL;
+    exr_block_info bi;
+    void *ref = NULL, *got = NULL;
+    uint32_t nb = 0;
+    int ok = 1;
+    exr_data_source dsrc;
+
+    memset(&tmpimg, 0, sizeof(tmpimg));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &tmpimg))) {
+        g_fail++;
+        printf("  FAIL: %s load (would-block %s)\n", path, name);
+        return;
+    }
+    if (!EXR_OK(exr_save_to_memory(&buf, &sz, NULL, &tmpimg, comp))) {
+        g_fail++;
+        exr_image_free(&tmpimg);
+        return;
+    }
+    exr_image_free(&tmpimg);
+
+    if (!EXR_OK(exr_reader_open_memory(buf, sz, NULL, &rm)) ||
+        !EXR_OK(exr_reader_num_blocks(rm, 0, &nb)) ||
+        !EXR_OK(exr_reader_block_info(rm, 0, 0, &bi))) {
+        g_fail++; printf("  FAIL: mem setup (would-block %s)\n", name);
+        if (rm) exr_reader_close(rm);
+        free(buf); return;
+    }
+    ref = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
+    if (!EXR_OK(exr_reader_decode_block(rm, 0, 0, ref, bi.uncompressed_size)))
+        ok = 0;
+    exr_reader_close(rm);
+
+    dsrc.user = NULL;
+    dsrc.read = blocking_read;
+    dsrc.total_size = sz;
+    if (ok && EXR_OK(exr_reader_open_source(&dsrc, NULL, &rs))) {
+        exr_result rc;
+        int guard = 0;
+        for (;;) {
+            rc = exr_reader_parse_header(rs);
+            if (rc == EXR_SUCCESS) break;
+            if (rc != EXR_WOULD_BLOCK) { ok = 0; break; }
+            {
+                exr_pending_read pr;
+                size_t step;
+                if (!EXR_OK(exr_reader_pending(rs, &pr))) { ok = 0; break; }
+                step = 65536;
+                if (step > pr.size) step = (size_t)pr.size;
+                if (!EXR_OK(exr_reader_supply(rs, (uint8_t *)buf + pr.offset,
+                                              step))) { ok = 0; break; }
+            }
+            if (++guard > 1000000) { ok = 0; break; }
+        }
+        if (ok) {
+            got = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
+            if (!EXR_OK(exr_reader_decode_block(rs, 0, 0, got,
+                                                bi.uncompressed_size)))
+                ok = 0;
+            else if (memcmp(ref, got, bi.uncompressed_size) != 0)
+                ok = 0;
+        }
+        exr_reader_close(rs);
+    } else if (ok) {
+        ok = 0;
+    }
+    CHECK(ok, name);
+    if (ok) printf("  ok: stream WOULD_BLOCK %s\n", name);
+    free(ref);
+    free(got);
+    free(buf);
+}
+
+/* Peak-tracking allocator to confirm block streaming bounds working memory. */
+typedef struct { size_t live, peak; } memstat;
+static void *ms_alloc(void *u, size_t n) {
+    memstat *m = (memstat *)u;
+    size_t *p = (size_t *)malloc(n + sizeof(size_t));
+    if (!p) return NULL;
+    p[0] = n;
+    m->live += n;
+    if (m->live > m->peak) m->peak = m->live;
+    return p + 1;
+}
+static void ms_free(void *u, void *ptr) {
+    memstat *m = (memstat *)u;
+    size_t *p;
+    if (!ptr) return;
+    p = (size_t *)ptr - 1;
+    m->live -= p[0];
+    free(p);
+}
+
+static void stream_memory_bound_check(const char *path, exr_compression comp,
+                                      const char *name) {
+    exr_image tmpimg;
+    void *buf = NULL;
+    size_t sz = 0, full_peak, stream_peak;
+    memstat fm = {0, 0}, sm = {0, 0};
+    exr_allocator fa, sa;
+    exr_reader *rf = NULL, *rs = NULL;
+    exr_part ref;
+    uint32_t nb = 0, i;
+
+    memset(&tmpimg, 0, sizeof(tmpimg));
+    memset(&ref, 0, sizeof(ref));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &tmpimg)) ||
+        !EXR_OK(exr_save_to_memory(&buf, &sz, NULL, &tmpimg, comp))) {
+        g_fail++;
+        printf("  FAIL: setup (memory-bound %s)\n", name);
+        if (tmpimg.parts) exr_image_free(&tmpimg);
+        return;
+    }
+    exr_image_free(&tmpimg);
+
+    fa.user = &fm; fa.alloc = ms_alloc; fa.free = ms_free;
+    exr_reader_open_memory(buf, sz, &fa, &rf);
+    exr_reader_read_part(rf, 0, &ref);
+    full_peak = fm.peak;
+    exr_part_free(&fa, &ref);
+    exr_reader_close(rf);
+
+    sa.user = &sm; sa.alloc = ms_alloc; sa.free = ms_free;
+    exr_reader_open_memory(buf, sz, &sa, &rs);
+    exr_reader_num_blocks(rs, 0, &nb);
+    for (i = 0; i < nb; ++i) {
+        exr_block_info bi;
+        void *dst;
+        if (!EXR_OK(exr_reader_block_info(rs, 0, i, &bi))) break;
+        dst = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1); /* caller buffer */
+        exr_reader_decode_block(rs, 0, i, dst, bi.uncompressed_size);
+        free(dst);
+    }
+    stream_peak = sm.peak;
+    exr_reader_close(rs);
+
+    CHECK(stream_peak * 2 < full_peak, name);
+    printf("  %s: full peak=%zu B, stream peak=%zu B\n", name, full_peak,
+           stream_peak);
+    free(buf);
+}
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -1159,6 +1728,48 @@ int main(void) {
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();
+
+    printf("== streaming block decode (parity vs full read) ==\n");
+    stream_decode_check("asakusa.exr", EXR_COMPRESSION_NONE, 0,
+                        EXR_TILE_ONE_LEVEL, "decode scanline NONE");
+    stream_decode_check("asakusa.exr", EXR_COMPRESSION_ZIP, 0,
+                        EXR_TILE_ONE_LEVEL, "decode scanline ZIP");
+    stream_decode_check("asakusa.exr", EXR_COMPRESSION_PIZ, 0,
+                        EXR_TILE_ONE_LEVEL, "decode scanline PIZ");
+    stream_decode_check("test/unit/regression/flaga.exr", EXR_COMPRESSION_ZIP, 0,
+                        EXR_TILE_ONE_LEVEL, "decode scanline ZIP 8ch");
+    stream_decode_check("asakusa.exr", EXR_COMPRESSION_ZIP, 1,
+                        EXR_TILE_ONE_LEVEL, "decode tiled ONE_LEVEL ZIP");
+    stream_decode_check("asakusa.exr", EXR_COMPRESSION_ZIP, 1,
+                        EXR_TILE_MIPMAP_LEVELS, "decode tiled MIPMAP ZIP (L0)");
+    stream_decode_check("asakusa.exr", EXR_COMPRESSION_ZIP, 1,
+                        EXR_TILE_RIPMAP_LEVELS, "decode tiled RIPMAP ZIP (L0)");
+
+    printf("== streaming block encode (round-trip) ==\n");
+    stream_encode_check("asakusa.exr", EXR_COMPRESSION_NONE, 0,
+                        "encode scanline NONE");
+    stream_encode_check("asakusa.exr", EXR_COMPRESSION_ZIP, 0,
+                        "encode scanline ZIP");
+    stream_encode_check("asakusa.exr", EXR_COMPRESSION_PIZ, 0,
+                        "encode scanline PIZ");
+    stream_encode_check("test/unit/regression/flaga.exr", EXR_COMPRESSION_ZIP, 0,
+                        "encode scanline ZIP 8ch");
+    stream_encode_check("asakusa.exr", EXR_COMPRESSION_ZIP, 1,
+                        "encode tiled ONE_LEVEL ZIP");
+    stream_tiled_levels_check("asakusa.exr", EXR_TILE_ONE_LEVEL,
+                              "encode tiled ONE_LEVEL (all tiles)");
+    stream_tiled_levels_check("asakusa.exr", EXR_TILE_MIPMAP_LEVELS,
+                              "encode tiled MIPMAP (all levels)");
+    stream_tiled_levels_check("asakusa.exr", EXR_TILE_RIPMAP_LEVELS,
+                              "encode tiled RIPMAP (all levels)");
+
+    printf("== streaming deep + suspend/resume + memory bound ==\n");
+    stream_deep_check("deepscanline.exr", EXR_COMPRESSION_ZIPS,
+                      "deep scanline ZIPS");
+    stream_would_block_check("asakusa.exr", EXR_COMPRESSION_ZIP,
+                             "asakusa ZIP");
+    stream_memory_bound_check("asakusa.exr", EXR_COMPRESSION_ZIP,
+                              "asakusa ZIP");
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

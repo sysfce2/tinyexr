@@ -317,6 +317,17 @@ exr_result exr_read_deep_scanline_part(exr_reader *r, exr_int_part *p,
 exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
                                     int32_t part_idx, exr_part *out);
 
+/* Deep block streaming decode (exr_deep.c): decode one chunk `idx` block-local.
+ * bw/bh are the block pixel extent (from exr_reader_block_info); is_tiled selects
+ * the chunk-header layout. _counts fills bw*bh per-pixel counts (block row-major);
+ * _samples fills chan_dst[c] with sum(counts) contiguous samples per channel. */
+exr_result exr_deep_decode_counts(exr_reader *r, exr_int_part *p,
+                                  int32_t part_idx, uint32_t idx, int bw, int bh,
+                                  int is_tiled, int32_t *counts);
+exr_result exr_deep_decode_samples(exr_reader *r, exr_int_part *p,
+                                   int32_t part_idx, uint32_t idx, int bw, int bh,
+                                   int is_tiled, void *const *chan_dst);
+
 /* Build a temporary deep part for tile level (lw x lh) by point-subsampling the
  * source: level pixel (x,y) takes the samples of source pixel
  * (x*W/lw, y*H/lh). out shares src's header (channels not owned); free the deep

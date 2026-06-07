@@ -1194,6 +1194,274 @@ fail:
 }
 
 /* ============================================================================
+ * Streaming block I/O (bounded working memory)
+ * ========================================================================== */
+
+/* Inverse of tile_index(): map a tiled chunk `idx` to its (level,tile) coords
+ * by walking the offset table in the same order tile_index() lays it out. */
+static exr_result block_locate(const exr_int_part *p, uint32_t idx, int *out_lx,
+                               int *out_ly, int *out_tx, int *out_ty) {
+    int mode = p->header.level_mode;
+    uint32_t base = 0;
+    int nxt, nyt;
+    if (mode == EXR_TILE_MIPMAP_LEVELS) {
+        int l;
+        for (l = 0; l < p->num_x_levels; ++l) {
+            uint32_t cnt;
+            tiled_level_size(p, l, l, NULL, NULL, &nxt, &nyt);
+            cnt = (uint32_t)nxt * (uint32_t)nyt;
+            if (idx < base + cnt) {
+                uint32_t w = idx - base;
+                *out_lx = l; *out_ly = l;
+                *out_tx = (int)(w % (uint32_t)nxt);
+                *out_ty = (int)(w / (uint32_t)nxt);
+                return EXR_SUCCESS;
+            }
+            base += cnt;
+        }
+    } else if (mode == EXR_TILE_RIPMAP_LEVELS) {
+        int lx, ly;
+        for (ly = 0; ly < p->num_y_levels; ++ly)
+            for (lx = 0; lx < p->num_x_levels; ++lx) {
+                uint32_t cnt;
+                tiled_level_size(p, lx, ly, NULL, NULL, &nxt, &nyt);
+                cnt = (uint32_t)nxt * (uint32_t)nyt;
+                if (idx < base + cnt) {
+                    uint32_t w = idx - base;
+                    *out_lx = lx; *out_ly = ly;
+                    *out_tx = (int)(w % (uint32_t)nxt);
+                    *out_ty = (int)(w / (uint32_t)nxt);
+                    return EXR_SUCCESS;
+                }
+                base += cnt;
+            }
+    } else { /* ONE_LEVEL */
+        tiled_level_size(p, 0, 0, NULL, NULL, &nxt, &nyt);
+        if (nxt <= 0) return EXR_ERROR_CORRUPT;
+        *out_lx = 0; *out_ly = 0;
+        *out_tx = (int)(idx % (uint32_t)nxt);
+        *out_ty = (int)(idx / (uint32_t)nxt);
+        return EXR_SUCCESS;
+    }
+    return EXR_ERROR_CORRUPT;
+}
+
+/* Block geometry for chunk `idx` (no pixel I/O). */
+static exr_result block_geometry(const exr_int_part *p, uint32_t idx,
+                                 exr_block_info *bi) {
+    const exr_header *h = &p->header;
+    int deep = (h->part_type == EXR_PART_DEEP_SCANLINE ||
+                h->part_type == EXR_PART_DEEP_TILED);
+    memset(bi, 0, sizeof(*bi));
+    bi->is_deep = (uint8_t)deep;
+    if (idx >= p->num_chunks) return EXR_ERROR_INVALID_ARGUMENT;
+    if (h->tiled) {
+        int lx, ly, tx, ty, lw, lh, nxt, nyt, tsx, tsy, x0l, y0l, tw, th;
+        exr_result rc = block_locate(p, idx, &lx, &ly, &tx, &ty);
+        if (!EXR_OK(rc)) return rc;
+        tiled_level_size(p, lx, ly, &lw, &lh, &nxt, &nyt);
+        tsx = (int)h->tile_x_size;
+        tsy = (int)h->tile_y_size;
+        if (tsx <= 0 || tsy <= 0) return EXR_ERROR_CORRUPT;
+        x0l = tx * tsx;
+        y0l = ty * tsy;
+        tw = (tsx < lw - x0l) ? tsx : (lw - x0l);
+        th = (tsy < lh - y0l) ? tsy : (lh - y0l);
+        if (tw <= 0 || th <= 0) return EXR_ERROR_CORRUPT;
+        bi->is_tiled = 1;
+        bi->tile_x = tx; bi->tile_y = ty;
+        bi->level_x = lx; bi->level_y = ly;
+        bi->x0 = h->data_window.min_x + x0l;
+        bi->y0 = h->data_window.min_y + y0l;
+        bi->width = tw;
+        bi->height = th;
+    } else {
+        int lpb = exr_lines_per_block(h->compression);
+        int ymin = h->data_window.min_y, ymax = h->data_window.max_y;
+        int y0 = ymin + (int)idx * lpb, nlines;
+        if (y0 > ymax) return EXR_ERROR_CORRUPT;
+        nlines = lpb;
+        if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
+        bi->x0 = h->data_window.min_x;
+        bi->y0 = y0;
+        bi->width = p->width;
+        bi->height = nlines;
+    }
+    if (!deep) {
+        exr_result rc = exr_block_uncompressed_size(
+            h->channels, h->num_channels, bi->x0, bi->y0, bi->width, bi->height,
+            &bi->uncompressed_size);
+        if (!EXR_OK(rc)) return rc;
+    }
+    return EXR_SUCCESS;
+}
+
+exr_result exr_reader_num_blocks(exr_reader *r, int32_t part, uint32_t *out) {
+    exr_result rc;
+    if (!r || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    *out = r->parts[part].num_chunks;
+    return EXR_SUCCESS;
+}
+
+exr_result exr_reader_block_info(exr_reader *r, int32_t part, uint32_t idx,
+                                 exr_block_info *out) {
+    exr_result rc;
+    if (!r || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = block_geometry(&r->parts[part], idx, out);
+    out->part = part;
+    return rc;
+}
+
+exr_result exr_reader_decode_block(exr_reader *r, int32_t part, uint32_t idx,
+                                   void *dst, size_t dst_size) {
+    exr_int_part *p;
+    const exr_header *h;
+    const exr_allocator *a;
+    exr_block_info bi;
+    exr_result rc;
+    uint64_t off;
+    const uint8_t *hdr, *cdata;
+    size_t hdr_size, want;
+    int32_t data_size;
+    exr_codec_ctx ctx;
+
+    if (!r || !dst) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    p = &r->parts[part];
+    h = &p->header;
+    a = &r->alloc;
+    if (h->part_type == EXR_PART_DEEP_SCANLINE ||
+        h->part_type == EXR_PART_DEEP_TILED)
+        return EXR_ERROR_INVALID_ARGUMENT; /* use the deep block API */
+    rc = block_geometry(p, idx, &bi);
+    if (!EXR_OK(rc)) return rc;
+    if (dst_size < bi.uncompressed_size) return EXR_ERROR_INVALID_ARGUMENT;
+
+    off = p->offsets[idx];
+    if (h->tiled) {
+        hdr_size = r->is_multipart ? 24 : 20;
+        rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+        if (!EXR_OK(rc)) return rc;
+        if (r->is_multipart) {
+            if (exr_rd_i32(hdr) != part) return EXR_ERROR_CORRUPT;
+            hdr += 4;
+        }
+        if (exr_rd_i32(hdr) != bi.tile_x || exr_rd_i32(hdr + 4) != bi.tile_y ||
+            exr_rd_i32(hdr + 8) != bi.level_x ||
+            exr_rd_i32(hdr + 12) != bi.level_y)
+            return EXR_ERROR_CORRUPT;
+        data_size = exr_rd_i32(hdr + 16);
+    } else {
+        hdr_size = r->is_multipart ? 12 : 8;
+        rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+        if (!EXR_OK(rc)) return rc;
+        if (r->is_multipart) {
+            if (exr_rd_i32(hdr) != part) return EXR_ERROR_CORRUPT;
+            hdr += 4;
+        }
+        if (exr_rd_i32(hdr) != bi.y0) return EXR_ERROR_CORRUPT;
+        data_size = exr_rd_i32(hdr + 4);
+    }
+    if (data_size < 0) return EXR_ERROR_CORRUPT;
+    if (exr_add_ovf((size_t)off, hdr_size, &want)) return EXR_ERROR_CORRUPT;
+    rc = exr_reader_fetch(r, want, (size_t)data_size, NULL, &cdata);
+    if (!EXR_OK(rc)) return rc;
+
+    ctx.alloc = a;
+    ctx.compression = h->compression;
+    ctx.channels = h->channels;
+    ctx.num_channels = h->num_channels;
+    ctx.x = bi.x0;
+    ctx.y = bi.y0;
+    ctx.width = bi.width;
+    ctx.num_lines = bi.height;
+    return exr_decompress_block(&ctx, cdata, (size_t)data_size, (uint8_t *)dst,
+                                bi.uncompressed_size);
+}
+
+exr_result exr_block_extract_channel(const exr_header *h,
+                                     const exr_block_info *bi, const void *block,
+                                     size_t block_size, int32_t channel,
+                                     void *dst) {
+    const uint8_t *b = (const uint8_t *)block;
+    size_t off = 0;
+    int line, c, x0, y0, w, hgt;
+    if (!h || !bi || !block || !dst) return EXR_ERROR_INVALID_ARGUMENT;
+    if (channel < 0 || channel >= h->num_channels)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    x0 = bi->x0; y0 = bi->y0; w = bi->width; hgt = bi->height;
+    for (line = 0; line < hgt; ++line) {
+        int yy = y0 + line;
+        for (c = 0; c < h->num_channels; ++c) {
+            int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+            size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+            int nx, row;
+            size_t bytes;
+            if (xs < 1) xs = 1;
+            if (ys < 1) ys = 1;
+            if ((yy % ys) != 0) continue;
+            nx = nsamp(x0, x0 + w - 1, xs);
+            if (nx <= 0) continue;
+            bytes = (size_t)nx * ps;
+            if (off + bytes > block_size) return EXR_ERROR_CORRUPT;
+            if (c == channel) {
+                row = nsamp(y0, yy, ys) - 1;
+                memcpy((uint8_t *)dst + (size_t)row * (size_t)nx * ps, b + off,
+                       bytes);
+            }
+            off += bytes;
+        }
+    }
+    return EXR_SUCCESS;
+}
+
+exr_result exr_reader_decode_deep_counts(exr_reader *r, int32_t part,
+                                         uint32_t idx, int32_t *counts) {
+    exr_int_part *p;
+    exr_block_info bi;
+    exr_result rc;
+    if (!r || !counts) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    p = &r->parts[part];
+    if (p->header.part_type != EXR_PART_DEEP_SCANLINE &&
+        p->header.part_type != EXR_PART_DEEP_TILED)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    rc = block_geometry(p, idx, &bi);
+    if (!EXR_OK(rc)) return rc;
+    return exr_deep_decode_counts(r, p, part, idx, bi.width, bi.height,
+                                  bi.is_tiled, counts);
+}
+
+exr_result exr_reader_decode_deep_samples(exr_reader *r, int32_t part,
+                                          uint32_t idx, void *const *chan_dst) {
+    exr_int_part *p;
+    exr_block_info bi;
+    exr_result rc;
+    if (!r || !chan_dst) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_parse_header(r);
+    if (rc != EXR_SUCCESS) return rc;
+    if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    p = &r->parts[part];
+    if (p->header.part_type != EXR_PART_DEEP_SCANLINE &&
+        p->header.part_type != EXR_PART_DEEP_TILED)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    rc = block_geometry(p, idx, &bi);
+    if (!EXR_OK(rc)) return rc;
+    return exr_deep_decode_samples(r, p, part, idx, bi.width, bi.height,
+                                   bi.is_tiled, chan_dst);
+}
+
+/* ============================================================================
  * Streaming suspend/resume (Phase 9 stubs)
  * ========================================================================== */
 

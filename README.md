@@ -596,6 +596,57 @@ reference only. It is no longer built, tested, or maintained in the active tree.
 Use the stable V1 API (`tinyexr.h`) for production code, or the pure-C11 v3 API
 under `include/exr.h` + `src/` for the current rewrite.
 
+### Streaming block I/O (bounded working memory)
+
+The pure-C11 v3 API (`include/exr.h`) can decode and encode an EXR one block at
+a time — one scanline block or one tile — so peak working memory is a single
+block rather than the whole image. This covers scanline, tiled
+(ONE_LEVEL/MIPMAP/RIPMAP), and deep parts.
+
+**Decode** — iterate the chunks of a part, decode each into a small caller
+buffer, and unpack the channels you need:
+
+```c
+exr_reader *r;
+exr_reader_open_memory(data, size, NULL, &r);     /* or _open_source for I/O */
+uint32_t n;
+exr_reader_num_blocks(r, /*part*/0, &n);
+for (uint32_t i = 0; i < n; ++i) {
+    exr_block_info bi;
+    exr_reader_block_info(r, 0, i, &bi);          /* geometry, no pixel I/O */
+    void *blk = malloc(bi.uncompressed_size);
+    exr_reader_decode_block(r, 0, i, blk, bi.uncompressed_size);
+    for (int c = 0; c < header->num_channels; ++c) {
+        /* per-channel planar samples for this block */
+        exr_block_extract_channel(header, &bi, blk, bi.uncompressed_size, c, dst);
+    }
+    free(blk);
+}
+exr_reader_close(r);
+```
+
+Deep parts use the two-step `exr_reader_decode_deep_counts` (to size buffers)
+then `exr_reader_decode_deep_samples`.
+
+**Encode** — describe parts with `exr_writer_add_part`, then stream blocks to a
+file (or a custom seekable `exr_data_sink`); the offset table is backpatched at
+`end_stream`:
+
+```c
+exr_writer *w;
+exr_writer_create(NULL, &w);
+exr_writer_add_part(w, &header, NULL);            /* geometry/channels/tiling */
+exr_writer_begin_stream_file(w, "out.exr", EXR_COMPRESSION_ZIP);
+for (int y = ymin; y <= ymax; y += lines_per_block)
+    exr_writer_write_scanline_block(w, 0, y, channel_rows);  /* block-local */
+exr_writer_end_stream(w);                          /* backpatch + close */
+exr_writer_destroy(w);
+```
+
+Tiles use `exr_writer_write_tile` (the caller supplies each level's tiles for
+mipmap/ripmap); deep parts use `exr_writer_write_deep_scanline_block` /
+`exr_writer_write_deep_tile`.
+
 ## Unit tests
 
 See `test/unit` directory.

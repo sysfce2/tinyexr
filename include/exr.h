@@ -304,6 +304,116 @@ exr_result exr_writer_finalize_to_memory(exr_writer *w, void **out_data,
 exr_result exr_writer_finalize_to_file(exr_writer *w, const char *path);
 
 /* ============================================================================
+ * Streaming block I/O (bounded working memory)
+ *
+ * The calls above materialize a whole part at once. The block API lets a caller
+ * process exactly one scanline-block or one tile at a time, so peak memory is a
+ * single block rather than the entire image. A "block" is one offset-table
+ * chunk: one scanline block for scanline parts, one tile (at one level) for
+ * tiled parts; mipmap/ripmap levels and deep parts are covered too.
+ * ========================================================================== */
+
+/* Geometry of one block (chunk). Filled by exr_reader_block_info(). */
+typedef struct exr_block_info {
+    int32_t part;
+    uint8_t is_tiled;          /* tiled or deep-tiled part */
+    uint8_t is_deep;
+    int32_t y0;                /* block first scanline (data-window y) */
+    int32_t tile_x, tile_y;    /* tiled: tile indices within the level */
+    int32_t level_x, level_y;  /* tiled: level (0,0 for ONE_LEVEL/scanline) */
+    int32_t x0;                /* block origin x (absolute data-window coords) */
+    int32_t width, height;     /* block pixel extent (height == #scanlines) */
+    size_t  uncompressed_size; /* flat parts: bytes for the canonical buffer */
+} exr_block_info;
+
+/* ---- streaming decode ---- */
+
+/* Number of chunks (offset-table entries) in a part, across all levels. */
+exr_result exr_reader_num_blocks(exr_reader *r, int32_t part, uint32_t *out);
+
+/* Geometry + buffer size for block `idx`. Derived from the offset-table / level
+ * math; performs no pixel I/O and never returns EXR_WOULD_BLOCK. */
+exr_result exr_reader_block_info(exr_reader *r, int32_t part, uint32_t idx,
+                                 exr_block_info *out);
+
+/* Flat parts: decode block `idx` into `dst` (>= info.uncompressed_size) in the
+ * canonical layout (per scanline, then per channel in name-sorted order, sample
+ * data only). May return EXR_WOULD_BLOCK in streaming mode (re-call after
+ * supply). Use exr_block_extract_channel() to unpack a single channel. */
+exr_result exr_reader_decode_block(exr_reader *r, int32_t part, uint32_t idx,
+                                   void *dst, size_t dst_size);
+
+/* Copy one channel out of a decoded canonical flat block into a tight planar
+ * buffer: exr_num_samples(x0,x0+w-1,xs) * exr_num_samples(y0,y0+h-1,ys) elements
+ * of that channel's pixel type, row-major. `channel` indexes the name-sorted
+ * channel order (== header->channels order). */
+exr_result exr_block_extract_channel(const exr_header *h,
+                                     const exr_block_info *info,
+                                     const void *block, size_t block_size,
+                                     int32_t channel, void *dst);
+
+/* Deep parts: counts must be known before sample buffers can be sized, so decode
+ * is two-step. `counts` holds info.width*info.height per-pixel counts (block
+ * row-major). After summing them, size chan_dst[c] to sum(counts) elements of
+ * channel c's pixel type and call _decode_deep_samples. Both may WOULD_BLOCK. */
+exr_result exr_reader_decode_deep_counts(exr_reader *r, int32_t part,
+                                         uint32_t idx, int32_t *counts);
+exr_result exr_reader_decode_deep_samples(exr_reader *r, int32_t part,
+                                          uint32_t idx, void *const *chan_dst);
+
+/* ---- streaming encode ---- */
+
+/* Seekable output sink. write() appends `len` bytes; seek() repositions for the
+ * offset-table backpatch at end_stream. Both return EXR_SUCCESS or an error. */
+typedef struct exr_data_sink {
+    void *user;
+    exr_result (*write)(void *user, const void *data, size_t len);
+    exr_result (*seek)(void *user, uint64_t off);
+} exr_data_sink;
+
+/* Begin a streaming encode. Parts must already be described via
+ * exr_writer_add_part (channels, windows, tiling); do NOT call
+ * exr_writer_set_channel. Writes magic+version+headers+zeroed offset tables to
+ * the sink immediately, then expects one write call per block. `comp` overrides
+ * every part's compression (use the part header's value by passing it). After
+ * begin_stream the writer is in streaming mode until end_stream. */
+exr_result exr_writer_begin_stream(exr_writer *w, const exr_data_sink *sink,
+                                   exr_compression comp);
+/* Convenience: stream straight to a file (fwrite + fseek backpatch). */
+exr_result exr_writer_begin_stream_file(exr_writer *w, const char *path,
+                                        exr_compression comp);
+
+/* Feed one flat scanline block. y0 must be a block boundary. channel_rows[c]
+ * points to this block's planar samples for channel c (header->channels order):
+ * exr_num_samples(xmin,xmax,xs) * exr_num_samples(y0,y0+nlines-1,ys) elements. */
+exr_result exr_writer_write_scanline_block(exr_writer *w, int32_t part,
+                                           int32_t y0,
+                                           const void *const *channel_rows);
+
+/* Feed one flat tile at level (level_x,level_y) (0,0 for ONE_LEVEL). For
+ * mipmap/ripmap the caller supplies every (tile,level) itself (no pyramid
+ * auto-generation). channel_data[c] is the tile's planar samples for channel c. */
+exr_result exr_writer_write_tile(exr_writer *w, int32_t part, int32_t tile_x,
+                                 int32_t tile_y, int32_t level_x, int32_t level_y,
+                                 const void *const *channel_data);
+
+/* Deep variants. counts[] holds width*height per-pixel sample counts (block
+ * row-major); chan_samp[c] holds the block's contiguous samples for channel c
+ * in pixel row-major order. */
+exr_result exr_writer_write_deep_scanline_block(exr_writer *w, int32_t part,
+                                                int32_t y0, const int32_t *counts,
+                                                const void *const *chan_samp);
+exr_result exr_writer_write_deep_tile(exr_writer *w, int32_t part,
+                                      int32_t tile_x, int32_t tile_y,
+                                      int32_t level_x, int32_t level_y,
+                                      const int32_t *counts,
+                                      const void *const *chan_samp);
+
+/* Backpatch every offset table (seek + write) and flush. For the file-backed
+ * sink this also closes the file. */
+exr_result exr_writer_end_stream(exr_writer *w);
+
+/* ============================================================================
  * Utilities
  * ========================================================================== */
 
