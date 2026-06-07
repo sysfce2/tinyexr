@@ -4325,6 +4325,19 @@ exr_result exr_jph_forward_rct_i32(int32_t *c0, int32_t *c1, int32_t *c2,
     return EXR_SUCCESS;
 }
 
+static exr_result jph_forward_rct_i64(int64_t *c0, int64_t *c1, int64_t *c2,
+                                      size_t count) {
+    size_t i;
+    if ((!c0 || !c1 || !c2) && count) return EXR_ERROR_INVALID_ARGUMENT;
+    for (i = 0; i < count; ++i) {
+        int64_t r = c0[i], g = c1[i], b = c2[i];
+        c0[i] = jph_floor_div_pow2(r + b + 2 * g, 2);
+        c1[i] = b - g;
+        c2[i] = r - g;
+    }
+    return EXR_SUCCESS;
+}
+
 /* Forward NLT type 3: binary complement of negative values.
  * Inverse of exr_jph_apply_nlt_type3_i32. */
 exr_result exr_jph_forward_nlt_type3_i32(int32_t *data, size_t count,
@@ -5986,7 +5999,30 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
         }
     }
 
-    (void)mc_trans;
+    /* Apply forward RCT on the NLT-transformed first 3 channels for
+     * exactly 3-channel parts (RGB). The decode pipeline is:
+     *   inverse wavelet → inverse RCT → inverse NLT
+     * so the encode pipeline that must be:
+     *   NLT → RCT → wavelet
+     * The RCT decorrelates the colour planes so the wavelet + HT codec
+     * can exploit the reduced entropy. Only enabled for exactly 3-channel
+     * parts because the RCT is defined on the first 3 components. */
+    if (ctx->num_channels == 3) {
+        const exr_channel *ch0 = &ctx->channels[0];
+        const exr_channel *ch1 = &ctx->channels[1];
+        const exr_channel *ch2 = &ctx->channels[2];
+        size_t count0 = (size_t)planes[0].w * planes[0].h;
+        size_t count1 = (size_t)planes[1].w * planes[1].h;
+        size_t count2 = (size_t)planes[2].w * planes[2].h;
+        if (ch0->pixel_type == ch1->pixel_type &&
+            ch0->pixel_type == ch2->pixel_type &&
+            count0 == count1 && count0 == count2) {
+            rc = jph_forward_rct_i64(planes[0].data, planes[1].data,
+                                     planes[2].data, count0);
+            if (rc != EXR_SUCCESS) goto done;
+            mc_trans = 1;
+        }
+    }
 
     for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
         rc = jph_forward_53_2d_i64(a, planes[c].data, planes[c].w, planes[c].h, 5);
