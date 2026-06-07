@@ -14,6 +14,7 @@
 #include "exr.h"
 #include "exr_internal.h" /* exr_fpnge_deflate / exr_inflate_zlib (internal) */
 
+#include <math.h> /* libm reference for the B44 table-correctness test */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1260,6 +1261,60 @@ static void fpnge_check(void) {
 }
 
 /* ============================================================================
+ * B44 perceptual-table correctness (runtime tables == libm reference)
+ * ========================================================================== */
+
+static float b44t_h2f(uint16_t h) {
+    union { uint32_t i; float f; } u;
+    int s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    if (e == 0) {
+        if (m == 0) { u.i = (uint32_t)s << 31; return u.f; }
+        { float f = (float)m / 1024.0f * (1.0f / 16384.0f); return s ? -f : f; }
+    } else if (e == 31) {
+        u.i = ((uint32_t)s << 31) | 0x7f800000u | ((uint32_t)m << 13); return u.f;
+    }
+    u.i = ((uint32_t)s << 31) | ((uint32_t)(e + 112) << 23) | ((uint32_t)m << 13);
+    return u.f;
+}
+static uint16_t b44t_f2h(float f) {
+    union { uint32_t i; float f; } u; int s, e, m;
+    u.f = f; s = (int)((u.i >> 31) & 1); e = (int)((u.i >> 23) & 0xff);
+    m = (int)(u.i & 0x7fffff);
+    if (e == 0) return (uint16_t)(s << 15);
+    if (e == 255) return (uint16_t)((s << 15) | 0x7c00 | (m >> 13));
+    if (e < 113) { if (e < 103) return (uint16_t)(s << 15);
+        m = (m | 0x800000) >> (114 - e); return (uint16_t)((s << 15) | (m >> 13)); }
+    if (e > 142) return (uint16_t)((s << 15) | 0x7c00);
+    return (uint16_t)((s << 15) | ((e - 112) << 10) | (m >> 13));
+}
+
+/* The B44 tables are now computed at runtime with a freestanding exp/log. Verify
+ * they reproduce the libm-built tables bit-for-bit over the whole half domain. */
+static void b44_table_check(void) {
+    const uint16_t *exp_t = NULL, *log_t = NULL;
+    int i, exp_mis = 0, log_mis = 0;
+    exr_b44_debug_tables(&exp_t, &log_t);
+    for (i = 0; i < 65536; ++i) {
+        uint16_t x = (uint16_t)i, ref;
+        if ((x & 0x7c00) == 0x7c00) ref = 0;
+        else if (x >= 0x558c && x < 0x8000) ref = 0x7bff;
+        else ref = b44t_f2h((float)exp((double)b44t_h2f(x) / 8.0));
+        if (ref != exp_t[i]) exp_mis++;
+        if ((x & 0x7c00) == 0x7c00) ref = 0;
+        else if (x > 0x8000) ref = 0;
+        else { float ff = b44t_h2f(x); ref = (ff <= 0.0f) ? 0
+                   : b44t_f2h((float)(8.0 * log((double)ff))); }
+        if (ref != log_t[i]) log_mis++;
+    }
+    CHECK(exp_mis == 0, "B44 exp table matches libm reference");
+    CHECK(log_mis == 0, "B44 log table matches libm reference");
+    if (!exp_mis && !log_mis)
+        printf("  ok: B44 runtime tables == libm reference (131072 entries)\n");
+    else
+        printf("  FAIL: B44 table mismatches exp=%d log=%d\n", exp_mis, log_mis);
+}
+
+/* ============================================================================
  * Streaming block API tests
  * ========================================================================== */
 
@@ -2192,6 +2247,9 @@ int main(void) {
 
     printf("== fpnge PSHUFB Huffman-emit ==\n");
     fpnge_check();
+
+    printf("== B44 perceptual tables ==\n");
+    b44_table_check();
 
     printf("== streaming block decode (parity vs full read) ==\n");
     stream_decode_check("asakusa.exr", EXR_COMPRESSION_NONE, 0,

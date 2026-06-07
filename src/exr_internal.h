@@ -632,6 +632,9 @@ exr_result exr_pxr24_compress(const exr_codec_ctx *ctx, const uint8_t *block,
 exr_result exr_b44_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size,
                             int optimize_flat);
+/* Test hook: force B44 perceptual-table init and expose the two tables so a
+ * hosted test can verify them bit-for-bit against a libm reference. */
+void exr_b44_debug_tables(const uint16_t **exp_tbl, const uint16_t **log_tbl);
 exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
                              size_t n, uint8_t **out_data, size_t *out_size);
 exr_result exr_jph_forward_53_2d_i32(const exr_allocator *a,
