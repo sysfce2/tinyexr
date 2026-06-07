@@ -2315,83 +2315,45 @@ static uint64_t jph_mask64(uint32_t nbits) {
     return nbits >= 64u ? UINT64_MAX : ((UINT64_C(1) << nbits) - 1u);
 }
 
-/* ----- MagSgn forward reader (feeds 0xff when exhausted) ----- */
+/* ----- MagSgn forward reader (feeds the `fill` pattern when exhausted) -----
+ *
+ * Bits are delivered LSB-first with JPEG2000 bit-unstuffing: a 0xff byte is
+ * followed by a 7-bit byte (its MSB is the stuffed bit and dropped). A 128-bit
+ * little-endian accumulator (acc_lo/acc_hi) buffers >= 64 decoded bits so that
+ * fetch/fetch64 are a single mask and advance is a double-shift + refill, rather
+ * than re-walking the stream bit-by-bit per sample. */
 typedef struct {
     const uint8_t *start;
-    const uint8_t *data;
-    uint64_t tmp;
-    uint32_t bits;
-    uint32_t unstuff;
-    uint32_t size;
     uint32_t total_size;
-    uint32_t bit_pos;
-    /* Incremental read cursor tracking the byte/bit position of bit_pos under
-     * the bit-unstuffing rule (a 0xff byte is followed by a 7-bit byte). This
-     * makes fetch/advance O(1) instead of re-walking from the stream start on
-     * every sample (which made block decode O(n^2)). */
-    uint32_t c_byte;   /* byte index containing bit_pos */
-    uint32_t c_bit;    /* bit offset within that byte's usable bits */
-    uint32_t c_prevff; /* whether the byte before c_byte was 0xff (=> 7 bits) */
     uint8_t fill;
+    uint64_t acc_lo, acc_hi; /* buffered bits, next bit at acc_lo bit 0 */
+    uint32_t nbits;          /* number of valid buffered bits (kept >= 64) */
+    uint32_t rd_idx;         /* next source byte to consume */
+    uint32_t rd_prevff;      /* previous source byte was 0xff (=> 7-bit unit) */
 } JphMagSgn;
 
-static JPH_MAYBE_UNUSED exr_result jph_magsgn_read(JphMagSgn *m) {
-    uint32_t val = 0;
-    uint32_t out_bits = 0;
-    uint32_t tmp = 0;
-    if (!m) return EXR_ERROR_INVALID_ARGUMENT;
-    if (m->bits > 32u) return EXR_SUCCESS;
+static uint8_t jph_magsgn_byte(const JphMagSgn *m, uint32_t idx) {
+    return (idx < m->total_size && m->start) ? m->start[idx] : m->fill;
+}
 
-    if (m->data && m->size > 3u) {
-        val = ((uint32_t)m->data[0]) | ((uint32_t)m->data[1] << 8) |
-              ((uint32_t)m->data[2] << 16) | ((uint32_t)m->data[3] << 24);
-        m->data += 4;
-        m->size -= 4u;
-    } else if (m->data && m->size > 0u) {
-        size_t i = 0;
-        val = m->fill ? 0xFFFFFFFFu : 0u;
-        while (m->size > 0u) {
-            val = (val & ~((uint32_t)0xFFu << i)) |
-                  ((uint32_t)(*m->data++) << i);
-            i += 8u;
-            --m->size;
+/* Top up the accumulator to > 64 buffered bits (so a 64-bit fetch is always
+ * serviceable). The `fill` pattern provides an unbounded tail past the stream
+ * end, matching the original feed-on-exhaustion behaviour. */
+static void jph_magsgn_refill(JphMagSgn *m) {
+    while (m->nbits <= 64u) {
+        uint8_t b = jph_magsgn_byte(m, m->rd_idx);
+        uint32_t ub = m->rd_prevff ? 7u : 8u;
+        uint64_t uv = (uint64_t)(b & (uint8_t)((1u << ub) - 1u));
+        if (m->nbits < 64u) {
+            m->acc_lo |= uv << m->nbits;
+            if (m->nbits + ub > 64u) m->acc_hi |= uv >> (64u - m->nbits);
+        } else {
+            m->acc_hi |= uv << (m->nbits - 64u);
         }
-    } else {
-        val = m->fill ? 0xFFFFFFFFu : 0u;
+        m->nbits += ub;
+        m->rd_prevff = (b == 0xffu) ? 1u : 0u;
+        m->rd_idx++;
     }
-
-    {
-        uint8_t b = (uint8_t)val;
-        uint32_t nb = m->unstuff ? 7u : 8u;
-        m->unstuff = (b == 0xFFu) ? 1u : 0u;
-        tmp = b;
-        out_bits = nb;
-    }
-    {
-        uint8_t b = (uint8_t)(val >> 8);
-        uint32_t nb = m->unstuff ? 7u : 8u;
-        m->unstuff = (b == 0xFFu) ? 1u : 0u;
-        tmp |= (uint32_t)b << out_bits;
-        out_bits += nb;
-    }
-    {
-        uint8_t b = (uint8_t)(val >> 16);
-        uint32_t nb = m->unstuff ? 7u : 8u;
-        m->unstuff = (b == 0xFFu) ? 1u : 0u;
-        tmp |= (uint32_t)b << out_bits;
-        out_bits += nb;
-    }
-    {
-        uint8_t b = (uint8_t)(val >> 24);
-        uint32_t nb = m->unstuff ? 7u : 8u;
-        m->unstuff = (b == 0xFFu) ? 1u : 0u;
-        tmp |= (uint32_t)b << out_bits;
-        out_bits += nb;
-    }
-
-    m->tmp |= (uint64_t)tmp << m->bits;
-    m->bits += out_bits;
-    return EXR_SUCCESS;
 }
 
 static exr_result jph_forward_bits_init(JphMagSgn *m, const uint8_t *data,
@@ -2399,8 +2361,6 @@ static exr_result jph_forward_bits_init(JphMagSgn *m, const uint8_t *data,
     if (!m) return EXR_ERROR_INVALID_ARGUMENT;
     memset(m, 0, sizeof(*m));
     m->start = data;
-    m->data = data;
-    m->size = size;
     m->total_size = size;
     m->fill = fill;
     return EXR_SUCCESS;
@@ -2411,59 +2371,36 @@ static exr_result jph_magsgn_init(JphMagSgn *m, const uint8_t *data,
     return jph_forward_bits_init(m, data, size, 0xffu);
 }
 
-static uint8_t jph_magsgn_byte(const JphMagSgn *m, uint32_t idx) {
-    return (idx < m->total_size && m->start) ? m->start[idx] : m->fill;
-}
-
-/* Peek `count` (<=64) bits starting at the current cursor, applying the same
- * 0xff-then-7-bit unstuffing as the original absolute-position reader, but
- * starting from the cached cursor instead of byte 0. */
-static uint64_t jph_magsgn_peek(const JphMagSgn *m, uint32_t count) {
-    uint64_t out = 0u;
-    uint32_t by = m->c_byte, bit = m->c_bit, prevff = m->c_prevff, need;
-    for (need = 0u; need < count; ++need) {
-        uint8_t b = jph_magsgn_byte(m, by);
-        uint32_t nbits = prevff ? 7u : 8u;
-        out |= ((uint64_t)((b >> bit) & 1u)) << need;
-        if (++bit >= nbits) {
-            prevff = (b == 0xffu) ? 1u : 0u;
-            ++by;
-            bit = 0u;
-        }
-    }
-    return out;
-}
-
 static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
     if (!m) return 0u;
-    return (uint32_t)jph_magsgn_peek(m, 32u);
+    jph_magsgn_refill(m);
+    return (uint32_t)m->acc_lo; /* low 32 buffered bits */
 }
 
 static uint64_t jph_magsgn_fetch64(JphMagSgn *m) {
     if (!m) return 0u;
-    return jph_magsgn_peek(m, 64u);
+    jph_magsgn_refill(m);
+    return m->acc_lo; /* low 64 buffered bits */
 }
 
 static void jph_magsgn_advance(JphMagSgn *m, uint32_t n) {
-    uint32_t i, by, bit, prevff;
-    if (!m) return;
-    by = m->c_byte;
-    bit = m->c_bit;
-    prevff = m->c_prevff;
-    for (i = 0u; i < n; ++i) {
-        uint8_t b = jph_magsgn_byte(m, by);
-        uint32_t nbits = prevff ? 7u : 8u;
-        if (++bit >= nbits) {
-            prevff = (b == 0xffu) ? 1u : 0u;
-            ++by;
-            bit = 0u;
-        }
+    if (!m || n == 0u) return;
+    if (n >= 128u) {
+        m->acc_lo = 0u;
+        m->acc_hi = 0u;
+        m->nbits = 0u;
+    } else if (n >= 64u) {
+        m->acc_lo = m->acc_hi >> (n - 64u);
+        m->acc_hi = 0u;
+        m->nbits = (m->nbits > n) ? m->nbits - n : 0u;
+    } else {
+        m->acc_lo = (m->acc_lo >> n) | (m->acc_hi << (64u - n));
+        m->acc_hi >>= n;
+        m->nbits = (m->nbits > n) ? m->nbits - n : 0u;
     }
-    m->c_byte = by;
-    m->c_bit = bit;
-    m->c_prevff = prevff;
-    m->bit_pos += n;
+    jph_magsgn_refill(m);
 }
+
 
 static uint64_t jph_decode_magsgn_sample64(JphMagSgn *magsgn, uint32_t inf,
                                            uint32_t bit, uint32_t u_q,
