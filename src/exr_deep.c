@@ -25,6 +25,8 @@ static exr_result deep_decompress(const exr_allocator *a, exr_compression comp,
     }
     switch (comp) {
     case EXR_COMPRESSION_NONE:
+    case EXR_COMPRESSION_HTJ2K32:
+    case EXR_COMPRESSION_HTJ2K256:
         return EXR_ERROR_CORRUPT;
     case EXR_COMPRESSION_RLE:
         return exr_rle_decompress(a, src, src_size, dst, unpacked);
@@ -198,7 +200,9 @@ static exr_result deep_compress(const exr_allocator *a, exr_compression comp,
                                 const uint8_t *src, size_t n, uint8_t **out,
                                 size_t *out_size) {
     switch (comp) {
-    case EXR_COMPRESSION_NONE: {
+    case EXR_COMPRESSION_NONE:
+    case EXR_COMPRESSION_HTJ2K32:
+    case EXR_COMPRESSION_HTJ2K256: {
         *out = (uint8_t *)exr_malloc(a, n ? n : 1);
         if (!*out) return EXR_ERROR_OUT_OF_MEMORY;
         memcpy(*out, src, n);
