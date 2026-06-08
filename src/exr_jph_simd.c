@@ -357,6 +357,123 @@ exr_result jph_inverse_53_vert_i32_avx2(const int32_t *temp, size_t rw,
 }
 
 /* ---------------------------------------------------------------------------
+ * Inverse reversible 5/3 1D lifting (int64, the float/32-bit decode path).
+ * Bit-identical to jph_inverse_53_i64. Pure int64 -- no narrowing or range
+ * check (the final samples are narrowed to int32 at store). ev/od are caller
+ * scratch of >= low_count / >= high_count int64 each.
+ * ------------------------------------------------------------------------- */
+EXR_TARGET("avx2")
+exr_result jph_inverse_53_i64_avx2(const int64_t *low, size_t low_count,
+                                   const int64_t *high, size_t high_count,
+                                   int64_t *out, size_t out_count,
+                                   int64_t *ev, int64_t *od) {
+    size_t i;
+    size_t expected_low = (out_count + 1u) / 2u;
+    size_t expected_high = out_count / 2u;
+    __m256i two = _mm256_set1_epi64x(2);
+    if (low_count != expected_low || high_count != expected_high)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (out_count == 0) return EXR_SUCCESS;
+    if (high_count == 0) { out[0] = low[0]; return EXR_SUCCESS; }
+
+    /* predict: ev[i] = low[i] - floor((dl+dr+2)/4) */
+    ev[0] = low[0] - jph_sra64_ref(high[0] + high[0] + 2, 2);
+    i = 1;
+    for (; i + 4 <= high_count; i += 4) {
+        __m256i dl = _mm256_loadu_si256((const __m256i *)(high + i - 1));
+        __m256i dr = _mm256_loadu_si256((const __m256i *)(high + i));
+        __m256i lo = _mm256_loadu_si256((const __m256i *)(low + i));
+        __m256i q = jph_sra64x4(_mm256_add_epi64(_mm256_add_epi64(dl, dr), two), 2);
+        _mm256_storeu_si256((__m256i *)(ev + i), _mm256_sub_epi64(lo, q));
+    }
+    for (; i < low_count; ++i) {
+        int64_t dl = high[i - 1];
+        int64_t dr = (i < high_count) ? high[i] : high[high_count - 1];
+        ev[i] = low[i] - jph_sra64_ref(dl + dr + 2, 2);
+    }
+
+    /* update: od[i] = high[i] + floor((ev[i]+ev[i+1])/2) */
+    i = 0;
+    for (; i + 4 <= high_count && i + 4 < low_count; i += 4) {
+        __m256i e0 = _mm256_loadu_si256((const __m256i *)(ev + i));
+        __m256i e1 = _mm256_loadu_si256((const __m256i *)(ev + i + 1));
+        __m256i hi = _mm256_loadu_si256((const __m256i *)(high + i));
+        __m256i q = jph_sra64x4(_mm256_add_epi64(e0, e1), 1);
+        _mm256_storeu_si256((__m256i *)(od + i), _mm256_add_epi64(hi, q));
+    }
+    for (; i < high_count; ++i) {
+        int64_t e0 = ev[i];
+        int64_t e1 = (i + 1u < low_count) ? ev[i + 1] : e0;
+        od[i] = high[i] + jph_sra64_ref(e0 + e1, 1);
+    }
+
+    /* interleave ev/od -> out (no narrowing) */
+    i = 0;
+    for (; i + 4 <= high_count; i += 4) {
+        __m256i e = _mm256_loadu_si256((const __m256i *)(ev + i));
+        __m256i o = _mm256_loadu_si256((const __m256i *)(od + i));
+        __m256i lo = _mm256_unpacklo_epi64(e, o);
+        __m256i hi = _mm256_unpackhi_epi64(e, o);
+        _mm256_storeu_si256((__m256i *)(out + 2u * i),
+                            _mm256_permute2x128_si256(lo, hi, 0x20));
+        _mm256_storeu_si256((__m256i *)(out + 2u * i + 4u),
+                            _mm256_permute2x128_si256(lo, hi, 0x31));
+    }
+    for (; i < high_count; ++i) { out[2u * i] = ev[i]; out[2u * i + 1u] = od[i]; }
+    if (low_count > high_count) out[2u * high_count] = ev[high_count];
+    return EXR_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
+ * Vertical (column) inverse reversible 5/3, int64, row-wise across all columns.
+ * Bit-identical to jph_inverse_53_vert_i64. Pure int64 (no range check). temp:
+ * lh low-rows then hh high-rows (stride rw) -> rh interleaved rows in data
+ * (stride width). temp and data are distinct; even/odd output rows are disjoint.
+ * ------------------------------------------------------------------------- */
+EXR_TARGET("avx2")
+exr_result jph_inverse_53_vert_i64_avx2(const int64_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int64_t *data, size_t width) {
+    size_t i, c;
+    __m256i two = _mm256_set1_epi64x(2);
+    if (lh == 0u) return EXR_SUCCESS;
+    if (hh == 0u) { for (c = 0u; c < rw; ++c) data[c] = temp[c]; return EXR_SUCCESS; }
+
+    /* Phase 1: even rows -> data[2i] */
+    for (i = 0u; i < lh; ++i) {
+        const int64_t *lo = temp + i * rw;
+        const int64_t *hL = temp + (lh + (i > 0u ? i - 1u : 0u)) * rw;
+        const int64_t *hR = temp + (lh + (i < hh ? i : hh - 1u)) * rw;
+        int64_t *dst = data + (2u * i) * width;
+        for (c = 0u; c + 4u <= rw; c += 4u) {
+            __m256i l = _mm256_loadu_si256((const __m256i *)(lo + c));
+            __m256i a = _mm256_loadu_si256((const __m256i *)(hL + c));
+            __m256i b = _mm256_loadu_si256((const __m256i *)(hR + c));
+            __m256i q =
+                jph_sra64x4(_mm256_add_epi64(_mm256_add_epi64(a, b), two), 2);
+            _mm256_storeu_si256((__m256i *)(dst + c), _mm256_sub_epi64(l, q));
+        }
+        for (; c < rw; ++c) dst[c] = lo[c] - jph_sra64_ref(hL[c] + hR[c] + 2, 2);
+    }
+    /* Phase 2: odd rows -> data[2i+1], reading even rows back from data */
+    for (i = 0u; i < hh; ++i) {
+        const int64_t *hi = temp + (lh + i) * rw;
+        const int64_t *e0p = data + (2u * i) * width;
+        const int64_t *e1p = data + (2u * (i + 1u < lh ? i + 1u : i)) * width;
+        int64_t *dst = data + (2u * i + 1u) * width;
+        for (c = 0u; c + 4u <= rw; c += 4u) {
+            __m256i h = _mm256_loadu_si256((const __m256i *)(hi + c));
+            __m256i e0 = _mm256_loadu_si256((const __m256i *)(e0p + c));
+            __m256i e1 = _mm256_loadu_si256((const __m256i *)(e1p + c));
+            __m256i q = jph_sra64x4(_mm256_add_epi64(e0, e1), 1);
+            _mm256_storeu_si256((__m256i *)(dst + c), _mm256_add_epi64(h, q));
+        }
+        for (; c < rw; ++c) dst[c] = hi[c] + jph_sra64_ref(e0p[c] + e1p[c], 1);
+    }
+    return EXR_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
  * Sign-magnitude -> signed int64. Converts a row of OpenJPH codeblock words
  * (bit 31 = sign, bits 0..30 = magnitude) to signed reversible-transform
  * coefficients: mag = (v & 0x7fffffff) >> shift; out = sign ? -mag : mag,

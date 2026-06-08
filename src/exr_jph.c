@@ -905,9 +905,9 @@ done_level:
  * that >=32-bit-precision components (whose reversible-wavelet coefficients can
  * exceed int32) decode losslessly. The final samples fit in 16/32 bits and are
  * narrowed back to int32 at store time. */
-static exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
-                                     const int64_t *high, size_t high_count,
-                                     int64_t *out, size_t out_count) {
+exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
+                              const int64_t *high, size_t high_count,
+                              int64_t *out, size_t out_count) {
     size_t i;
     size_t expected_low = (out_count + 1u) / 2u;
     size_t expected_high = out_count / 2u;
@@ -934,14 +934,53 @@ static exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
     return EXR_SUCCESS;
 }
 
+/* Row-wise (column-parallel) vertical inverse 5/3, int64. Source of truth for
+ * jph_inverse_53_vert_i64_avx2. Mirrors exr_jph_inverse_53_vert_i32 but stays
+ * full int64 (no narrowing / range check): `temp` holds lh low-rows then hh
+ * high-rows (stride rw); writes the rh interleaved rows into `data` (stride
+ * width). Per column this is exactly jph_inverse_53_i64. */
+exr_result jph_inverse_53_vert_i64(const int64_t *temp, size_t rw,
+                                   size_t lh, size_t hh,
+                                   int64_t *data, size_t width) {
+    size_t i, c;
+    if (lh == 0u) return EXR_SUCCESS;
+    if (hh == 0u) { /* rh == 1: copy low row 0 */
+        for (c = 0u; c < rw; ++c) data[c] = temp[c];
+        return EXR_SUCCESS;
+    }
+    /* Phase 1: even rows -> data[2i]. */
+    for (i = 0u; i < lh; ++i) {
+        const int64_t *lo = temp + i * rw;
+        const int64_t *hL = temp + (lh + (i > 0u ? i - 1u : 0u)) * rw;
+        const int64_t *hR = temp + (lh + (i < hh ? i : hh - 1u)) * rw;
+        int64_t *dst = data + (2u * i) * width;
+        for (c = 0u; c < rw; ++c)
+            dst[c] = lo[c] - jph_floor_div_pow2(hL[c] + hR[c] + 2, 2);
+    }
+    /* Phase 2: odd rows -> data[2i+1], reading even rows back from data. */
+    for (i = 0u; i < hh; ++i) {
+        const int64_t *hi = temp + (lh + i) * rw;
+        const int64_t *e0p = data + (2u * i) * width;
+        const int64_t *e1p = data + (2u * (i + 1u < lh ? i + 1u : i)) * width;
+        int64_t *dst = data + (2u * i + 1u) * width;
+        for (c = 0u; c < rw; ++c)
+            dst[c] = hi[c] + jph_floor_div_pow2(e0p[c] + e1p[c], 1);
+    }
+    return EXR_SUCCESS;
+}
+
 static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
                                         size_t width, size_t height,
                                         unsigned levels) {
     unsigned level;
+    int use_avx2 = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
+#if defined(EXR_X86)
+    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
 
     for (level = levels; level > 0; --level) {
         size_t rw = jph_ceil_div_pow2_size(width, level - 1u);
@@ -949,8 +988,8 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
         size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
         size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
-        int64_t *temp = NULL, *col_low = NULL, *col_high = NULL, *col_out = NULL;
-        size_t y, x;
+        int64_t *temp = NULL, *ev = NULL, *od = NULL;
+        size_t y;
         exr_result rc = EXR_SUCCESS;
 
         if (rw == 0 || rh == 0) return EXR_ERROR_CORRUPT;
@@ -962,35 +1001,39 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
             return EXR_ERROR_CORRUPT;
 
         temp = (int64_t *)exr_malloc(a, temp_bytes);
-        col_low = (int64_t *)exr_malloc(a, scratch_bytes);
-        col_high = (int64_t *)exr_malloc(a, scratch_bytes);
-        col_out = (int64_t *)exr_malloc(a, scratch_bytes);
-        if (!temp || !col_low || !col_high || !col_out) {
-            exr_free(a, temp);
-            exr_free(a, col_low);
-            exr_free(a, col_high);
-            exr_free(a, col_out);
+        if (use_avx2) {
+            ev = (int64_t *)exr_malloc(a, scratch_bytes);
+            od = (int64_t *)exr_malloc(a, scratch_bytes);
+        }
+        if (!temp || (use_avx2 && (!ev || !od))) {
+            exr_free(a, temp); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
 
+        /* Horizontal (row) pass: each row is contiguous low|high. */
         for (y = 0; y < rh; ++y) {
             const int64_t *row = data + y * width;
-            rc = jph_inverse_53_i64(row, lw, row + lw, hw, temp + y * rw, rw);
+#if defined(EXR_X86)
+            if (use_avx2)
+                rc = jph_inverse_53_i64_avx2(row, lw, row + lw, hw,
+                                             temp + y * rw, rw, ev, od);
+            else
+#endif
+                rc = jph_inverse_53_i64(row, lw, row + lw, hw, temp + y * rw, rw);
             if (rc != EXR_SUCCESS) goto done_level64;
         }
-        for (x = 0; x < rw; ++x) {
-            for (y = 0; y < lh; ++y) col_low[y] = temp[y * rw + x];
-            for (y = 0; y < hh; ++y) col_high[y] = temp[(lh + y) * rw + x];
-            rc = jph_inverse_53_i64(col_low, lh, col_high, hh, col_out, rh);
-            if (rc != EXR_SUCCESS) goto done_level64;
-            for (y = 0; y < rh; ++y) data[y * width + x] = col_out[y];
-        }
+        /* Vertical (column) pass, row-wise across all columns -- no gather. */
+#if defined(EXR_X86)
+        if (use_avx2)
+            rc = jph_inverse_53_vert_i64_avx2(temp, rw, lh, hh, data, width);
+        else
+#endif
+            rc = jph_inverse_53_vert_i64(temp, rw, lh, hh, data, width);
 
 done_level64:
         exr_free(a, temp);
-        exr_free(a, col_low);
-        exr_free(a, col_high);
-        exr_free(a, col_out);
+        exr_free(a, ev);
+        exr_free(a, od);
         if (rc != EXR_SUCCESS) return rc;
     }
     return EXR_SUCCESS;

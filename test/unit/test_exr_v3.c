@@ -2257,6 +2257,76 @@ static void jph_simd_check(void) {
         }
         free(data); free(ts); free(ta);
     }
+
+    /* int64 inverse 5/3 (float/32-bit decode): AVX2 1D and AVX2 vertical must
+     * match their scalar sources of truth, and the row-wise vertical must equal
+     * the per-column 1D path. Covers hh==0, even/odd rh, non-mult-of-4 rw. */
+    if (caps & EXR_SIMD_AVX2) {
+        const size_t RWMAX = 300u, RHMAX = 64u;
+        uint32_t rng = 0xfeed1234u;
+        int iok = 1, vok = 1;
+        size_t trial;
+        int64_t *low = (int64_t *)malloc(RWMAX * sizeof(int64_t));
+        int64_t *high = (int64_t *)malloc(RWMAX * sizeof(int64_t));
+        int64_t *o0 = (int64_t *)malloc(2u * RWMAX * sizeof(int64_t));
+        int64_t *o1 = (int64_t *)malloc(2u * RWMAX * sizeof(int64_t));
+        int64_t *ev = (int64_t *)malloc(RWMAX * sizeof(int64_t));
+        int64_t *od = (int64_t *)malloc(RWMAX * sizeof(int64_t));
+        int64_t *temp = (int64_t *)malloc(RWMAX * RHMAX * sizeof(int64_t));
+        int64_t *ds = (int64_t *)malloc(RWMAX * RHMAX * sizeof(int64_t));
+        int64_t *da = (int64_t *)malloc(RWMAX * RHMAX * sizeof(int64_t));
+        int64_t *ref = (int64_t *)malloc(RWMAX * RHMAX * sizeof(int64_t));
+        int64_t *cl = (int64_t *)malloc(RHMAX * sizeof(int64_t));
+        int64_t *ch = (int64_t *)malloc(RHMAX * sizeof(int64_t));
+        int64_t *co = (int64_t *)malloc(RHMAX * sizeof(int64_t));
+        if (low && high && o0 && o1 && ev && od && temp && ds && da && ref &&
+            cl && ch && co) {
+            for (trial = 0; trial < 4000 && (iok && vok); ++trial) {
+                size_t rw, rh, lh, hh, x, y, i, oc, lc, hc;
+                int shiftbits;
+                rng = rng * 1664525u + 1013904223u;
+                rw = 1u + (rng % RWMAX);
+                rng = rng * 1664525u + 1013904223u;
+                rh = 1u + (rng % RHMAX);
+                lh = (rh + 1u) / 2u; hh = rh / 2u;
+                shiftbits = (int)(trial % 40u);
+                /* --- 1D AVX2 == scalar --- */
+                oc = rw; lc = (oc + 1u) / 2u; hc = oc / 2u;
+                for (i = 0; i < lc; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    low[i] = (int64_t)(((uint64_t)rng << 32) | rng*2654435761u) >> shiftbits;
+                }
+                for (i = 0; i < hc; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    high[i] = (int64_t)(((uint64_t)rng << 32) | rng*2654435761u) >> shiftbits;
+                }
+                jph_inverse_53_i64(low, lc, high, hc, o0, oc);
+                jph_inverse_53_i64_avx2(low, lc, high, hc, o1, oc, ev, od);
+                if (memcmp(o0, o1, oc * sizeof(int64_t)) != 0) { iok = 0; break; }
+                /* --- vertical AVX2 == scalar == per-column --- */
+                for (i = 0; i < (lh + hh) * rw; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    temp[i] = (int64_t)(((uint64_t)rng << 32) | rng*2654435761u) >> shiftbits;
+                }
+                for (x = 0; x < rw; ++x) {
+                    for (y = 0; y < lh; ++y) cl[y] = temp[y * rw + x];
+                    for (y = 0; y < hh; ++y) ch[y] = temp[(lh + y) * rw + x];
+                    jph_inverse_53_i64(cl, lh, ch, hh, co, rh);
+                    for (y = 0; y < rh; ++y) ref[y * rw + x] = co[y];
+                }
+                jph_inverse_53_vert_i64(temp, rw, lh, hh, ds, rw);
+                jph_inverse_53_vert_i64_avx2(temp, rw, lh, hh, da, rw);
+                if (memcmp(ds, ref, rh * rw * sizeof(int64_t)) != 0) { vok = 0; break; }
+                if (memcmp(da, ds, rh * rw * sizeof(int64_t)) != 0) { vok = 0; break; }
+            }
+            CHECK(iok, "JPH inverse 5/3 1D i64 AVX2 == scalar");
+            if (iok) printf("  ok: JPH inverse 5/3 1D i64 AVX2 == scalar\n");
+            CHECK(vok, "JPH inverse 5/3 vertical i64 == per-column (+AVX2)");
+            if (vok) printf("  ok: JPH inverse 5/3 vertical i64 == per-column (+AVX2)\n");
+        }
+        free(low); free(high); free(o0); free(o1); free(ev); free(od);
+        free(temp); free(ds); free(da); free(ref); free(cl); free(ch); free(co);
+    }
 #endif
 }
 

@@ -213,6 +213,17 @@ exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
 exr_result jph_inverse_53_vert_i32_avx2(const int32_t *temp, size_t rw,
                                         size_t lh, size_t hh,
                                         int32_t *data, size_t width);
+/* AVX2 inverse reversible 5/3 1D (int64, float/32-bit decode path); bit-identical
+ * to jph_inverse_53_i64. ev/od are caller scratch (>= low/high counts). */
+exr_result jph_inverse_53_i64_avx2(const int64_t *low, size_t low_count,
+                                   const int64_t *high, size_t high_count,
+                                   int64_t *out, size_t out_count,
+                                   int64_t *ev, int64_t *od);
+/* AVX2 vertical (column) inverse 5/3 (int64), row-wise; bit-identical to
+ * jph_inverse_53_vert_i64. temp: lh low-rows, hh high-rows -> rh rows in data. */
+exr_result jph_inverse_53_vert_i64_avx2(const int64_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int64_t *data, size_t width);
 /* AVX2 sign-magnitude codeblock word -> signed int64 coefficient; bit-identical
  * to the scalar extraction loop in jph_decode_block. */
 void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
@@ -508,6 +519,14 @@ exr_result exr_jph_inverse_53_vert_i32(const int32_t *temp, size_t rw,
 exr_result jph_forward_53_vert_i64(const int64_t *data, size_t width,
                                    size_t rw, size_t lh, size_t hh,
                                    int64_t *temp);
+/* int64 inverse 5/3 1D + row-wise vertical scalar refs (sources of truth for
+ * the AVX2 variants). */
+exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
+                              const int64_t *high, size_t high_count,
+                              int64_t *out, size_t out_count);
+exr_result jph_inverse_53_vert_i64(const int64_t *temp, size_t rw,
+                                   size_t lh, size_t hh,
+                                   int64_t *data, size_t width);
 exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
                                      size_t width, size_t height,
                                      unsigned levels);
