@@ -202,6 +202,11 @@ exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
                                    const int32_t *high, size_t high_count,
                                    int32_t *out, size_t out_count,
                                    int64_t *ev, int64_t *od);
+/* Forward reversible 5/3 1D lifting (int64), bit-identical to the scalar
+ * jph_forward_53_i64; ev/od are caller scratch of >= ceil(n/2) int64 each. */
+exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
+                                   size_t low_count, int64_t *high,
+                                   size_t high_count, int64_t *ev, int64_t *od);
 #endif
 
 /* Scalar references for the JPH NLT type-3 involution (v<0 -> -v-bias). */

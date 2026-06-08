@@ -4397,14 +4397,34 @@ static exr_result jph_forward_53_i64(const int64_t *src, size_t n,
     return EXR_SUCCESS;
 }
 
+/* Forward 1D 5/3: AVX2 when available (bit-identical), else scalar. col_low
+ * doubles as the source for the column pass, so the SIMD kernel reads `src`
+ * which may alias the `low` output — pass a distinct source for that case. */
+static exr_result jph_forward_53_1d_i64(const int64_t *src, size_t n,
+                                        int64_t *low, size_t lc, int64_t *high,
+                                        size_t hc, int use_avx2, int64_t *ev,
+                                        int64_t *od) {
+#if defined(EXR_X86)
+    if (use_avx2)
+        return jph_forward_53_i64_avx2(src, n, low, lc, high, hc, ev, od);
+#else
+    (void)use_avx2; (void)ev; (void)od;
+#endif
+    return jph_forward_53_i64(src, n, low, lc, high, hc);
+}
+
 static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
                                         size_t width, size_t height,
                                         unsigned levels) {
     unsigned level;
+    int use_avx2 = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
+#if defined(EXR_X86)
+    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
 
     for (level = 1; level <= levels; ++level) {
         size_t rw = jph_ceil_div_pow2_size(width, level - 1u);
@@ -4412,7 +4432,8 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
         size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
-        int64_t *temp = NULL, *col_low = NULL, *col_high = NULL;
+        int64_t *temp = NULL, *col_src = NULL, *col_low = NULL, *col_high = NULL;
+        int64_t *ev = NULL, *od = NULL;
         size_t y, x;
         exr_result rc = EXR_SUCCESS;
 
@@ -4425,29 +4446,39 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
             return EXR_ERROR_CORRUPT;
 
         temp = (int64_t *)exr_malloc(a, temp_bytes);
+        col_src = (int64_t *)exr_malloc(a, scratch_bytes);
         col_low = (int64_t *)exr_malloc(a, scratch_bytes);
         col_high = (int64_t *)exr_malloc(a, scratch_bytes);
-        if (!temp || !col_low || !col_high) {
-            exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+        if (use_avx2) {
+            ev = (int64_t *)exr_malloc(a, scratch_bytes);
+            od = (int64_t *)exr_malloc(a, scratch_bytes);
+        }
+        if (!temp || !col_src || !col_low || !col_high ||
+            (use_avx2 && (!ev || !od))) {
+            exr_free(a, temp); exr_free(a, col_src); exr_free(a, col_low);
+            exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
 
         for (x = 0; x < rw; ++x) {
-            for (y = 0; y < rh; ++y) col_low[y] = data[y * width + x];
-            rc = jph_forward_53_i64(col_low, rh, col_low, lh, col_high, hh);
+            for (y = 0; y < rh; ++y) col_src[y] = data[y * width + x];
+            rc = jph_forward_53_1d_i64(col_src, rh, col_low, lh, col_high, hh,
+                                       use_avx2, ev, od);
             if (rc != EXR_SUCCESS) goto done_fwd64;
             for (y = 0; y < lh; ++y) temp[y * rw + x] = col_low[y];
             for (y = 0; y < hh; ++y) temp[(lh + y) * rw + x] = col_high[y];
         }
         for (y = 0; y < rh; ++y) {
-            rc = jph_forward_53_i64(temp + y * rw, rw, col_low, lw, col_high, hw);
+            rc = jph_forward_53_1d_i64(temp + y * rw, rw, col_low, lw, col_high,
+                                       hw, use_avx2, ev, od);
             if (rc != EXR_SUCCESS) goto done_fwd64;
             for (x = 0; x < lw; ++x) data[y * width + x] = col_low[x];
             for (x = 0; x < hw; ++x) data[y * width + lw + x] = col_high[x];
         }
 
 done_fwd64:
-        exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+        exr_free(a, temp); exr_free(a, col_src); exr_free(a, col_low);
+        exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
         if (rc != EXR_SUCCESS) return rc;
     }
     return EXR_SUCCESS;

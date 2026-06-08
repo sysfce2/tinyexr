@@ -274,4 +274,60 @@ exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
     return EXR_SUCCESS;
 }
 
+/* ---------------------------------------------------------------------------
+ * Forward reversible 5/3 1D lifting (int64). Mirrors the scalar
+ * jph_forward_53_i64 exactly: deinterleave src into even/odd (ev/od scratch),
+ * then predict (high) and update (low) with floor-div-by-2^s == arithmetic
+ * shift. Output low[]/high[] are separate contiguous arrays (no scatter).
+ * ------------------------------------------------------------------------- */
+EXR_TARGET("avx2")
+exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
+                                   size_t low_count, int64_t *high,
+                                   size_t high_count, int64_t *ev, int64_t *od) {
+    size_t nl = (n + 1u) / 2u, nh = n / 2u, i;
+    __m256i two = _mm256_set1_epi64x(2);
+
+    if (low_count != nl || high_count != nh) return EXR_ERROR_INVALID_ARGUMENT;
+    if (n == 0) return EXR_SUCCESS;
+
+    for (i = 0; i < nl; ++i) ev[i] = src[2u * i];
+    for (i = 0; i < nh; ++i) od[i] = src[2u * i + 1u];
+
+    /* predict: high[i] = od[i] - floor((ev[i] + ev[i+1]) / 2) */
+    i = 0;
+    for (; i + 4 <= nh && i + 4 < nl; i += 4) {
+        __m256i e0 = _mm256_loadu_si256((const __m256i *)(ev + i));
+        __m256i e1 = _mm256_loadu_si256((const __m256i *)(ev + i + 1));
+        __m256i o = _mm256_loadu_si256((const __m256i *)(od + i));
+        __m256i q = jph_sra64x4(_mm256_add_epi64(e0, e1), 1);
+        _mm256_storeu_si256((__m256i *)(high + i), _mm256_sub_epi64(o, q));
+    }
+    for (; i < nh; ++i) {
+        int64_t e0 = ev[i];
+        int64_t e1 = (i + 1u < nl) ? ev[i + 1] : e0;
+        high[i] = od[i] - jph_sra64_ref(e0 + e1, 1);
+    }
+
+    /* update: low[i] = ev[i] + floor((high[i-1] + high[i] + 2) / 4) */
+    if (nh == 0) {
+        for (i = 0; i < nl; ++i) low[i] = ev[i]; /* +floor(2/4)=+0 */
+        return EXR_SUCCESS;
+    }
+    low[0] = ev[0] + jph_sra64_ref((int64_t)high[0] + (int64_t)high[0] + 2, 2);
+    i = 1;
+    for (; i + 4 <= nh; i += 4) {
+        __m256i hl = _mm256_loadu_si256((const __m256i *)(high + i - 1));
+        __m256i hr = _mm256_loadu_si256((const __m256i *)(high + i));
+        __m256i ee = _mm256_loadu_si256((const __m256i *)(ev + i));
+        __m256i q = jph_sra64x4(_mm256_add_epi64(_mm256_add_epi64(hl, hr), two), 2);
+        _mm256_storeu_si256((__m256i *)(low + i), _mm256_add_epi64(ee, q));
+    }
+    for (; i < nl; ++i) {
+        int64_t dl = high[i - 1];
+        int64_t dr = (i < nh) ? high[i] : high[nh - 1];
+        low[i] = ev[i] + jph_sra64_ref(dl + dr + 2, 2);
+    }
+    return EXR_SUCCESS;
+}
+
 #endif /* EXR_X86 */
