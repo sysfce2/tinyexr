@@ -56,8 +56,12 @@ decode path then restructured the inverse 5/3 **column** pass into a
 column-parallel, gather/scatter-free AVX2 vertical lifting (mirroring OpenJPH —
 columns are the natural SIMD axis), and vectorized the sign-magnitude → signed
 coefficient extraction; together these cut decode wavelet+extraction time
-materially (~16% faster decode on the dev box). The remaining gap is OpenJPH's
-fully-SIMD entropy coder (cleanup VLC/MEL + MagSgn), which dominates the profile.
+materially (~16% faster all-HALF decode on the dev box). The same
+column-parallel restructuring was then applied to the **forward** 5/3 (encode,
+byte-identical output, ~7% faster htj2k256 encode) and to the **int64** inverse
+5/3 used for float/32-bit channels (AVX2 1D + vertical, ~18% faster float
+decode). The remaining gap is OpenJPH's fully-SIMD entropy coder (cleanup
+VLC/MEL + MagSgn + per-sample mag-bit encode), which dominates both profiles.
 
 ### Compression size
 
