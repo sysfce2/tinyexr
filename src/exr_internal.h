@@ -207,6 +207,16 @@ exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
 exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
                                    size_t low_count, int64_t *high,
                                    size_t high_count, int64_t *ev, int64_t *od);
+/* AVX2 vertical (column) inverse reversible 5/3 (int32), row-wise across all
+ * columns; bit-identical to exr_jph_inverse_53_vert_i32. temp: lh low-rows then
+ * hh high-rows (stride rw) -> rh interleaved rows in data (stride width). */
+exr_result jph_inverse_53_vert_i32_avx2(const int32_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int32_t *data, size_t width);
+/* AVX2 sign-magnitude codeblock word -> signed int64 coefficient; bit-identical
+ * to the scalar extraction loop in jph_decode_block. */
+void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
+                                         size_t n, unsigned shift);
 #endif
 
 /* Scalar references for the JPH NLT type-3 involution (v<0 -> -v-bias). */
@@ -484,6 +494,10 @@ exr_result exr_jph_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
 exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
                                   const int32_t *high, size_t high_count,
                                   int32_t *out, size_t out_count);
+/* Row-wise vertical inverse 5/3 (int32); source of truth for the AVX2 variant. */
+exr_result exr_jph_inverse_53_vert_i32(const int32_t *temp, size_t rw,
+                                       size_t lh, size_t hh,
+                                       int32_t *data, size_t width);
 exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
                                      size_t width, size_t height,
                                      unsigned levels);

@@ -275,6 +275,121 @@ exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
 }
 
 /* ---------------------------------------------------------------------------
+ * Vertical (column) inverse reversible 5/3, int32, row-wise across all columns.
+ * Bit-identical to the scalar exr_jph_inverse_53_vert_i32. `temp` holds lh
+ * contiguous low-rows then hh high-rows (stride rw); writes rh = lh+hh rows
+ * interleaved into `data` (stride width). Columns are the SIMD axis, so each
+ * lifting step is a contiguous 4-lane int64 vector op over the row -- no gather
+ * or scatter. Returns EXR_ERROR_CORRUPT iff any reconstructed sample leaves
+ * int32. temp and data are distinct buffers; even rows (2i) and odd rows (2i+1)
+ * are disjoint, so the phase-2 read-back of even rows is safe.
+ * ------------------------------------------------------------------------- */
+EXR_TARGET("avx2")
+exr_result jph_inverse_53_vert_i32_avx2(const int32_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int32_t *data, size_t width) {
+    size_t i, c;
+    __m256i two = _mm256_set1_epi64x(2);
+    __m256i imin = _mm256_set1_epi64x(INT32_MIN);
+    __m256i imax = _mm256_set1_epi64x(INT32_MAX);
+    __m256i ovf = _mm256_setzero_si256();
+    int tail_ovf = 0;
+
+    if (lh == 0u) return EXR_SUCCESS;
+    if (hh == 0u) { /* rh == 1: copy low row 0 verbatim */
+        for (c = 0u; c < rw; ++c) data[c] = temp[c];
+        return EXR_SUCCESS;
+    }
+
+    /* ---- Phase 1: even rows -> data[2i] ---- */
+    for (i = 0u; i < lh; ++i) {
+        const int32_t *lo = temp + i * rw;
+        const int32_t *hL = temp + (lh + (i > 0u ? i - 1u : 0u)) * rw;
+        const int32_t *hR = temp + (lh + (i < hh ? i : hh - 1u)) * rw;
+        int32_t *dst = data + (2u * i) * width;
+        for (c = 0u; c + 4u <= rw; c += 4u) {
+            __m256i dl = jph_widen_i32x4(hL + c);
+            __m256i dr = jph_widen_i32x4(hR + c);
+            __m256i lov = jph_widen_i32x4(lo + c);
+            __m256i q =
+                jph_sra64x4(_mm256_add_epi64(_mm256_add_epi64(dl, dr), two), 2);
+            __m256i e = _mm256_sub_epi64(lov, q);
+            ovf = _mm256_or_si256(ovf, _mm256_cmpgt_epi64(e, imax));
+            ovf = _mm256_or_si256(ovf, _mm256_cmpgt_epi64(imin, e));
+            _mm_storeu_si128((__m128i *)(dst + c), jph_narrow_i64x4(e));
+        }
+        for (; c < rw; ++c) {
+            int64_t e = (int64_t)lo[c] -
+                        jph_sra64_ref((int64_t)hL[c] + (int64_t)hR[c] + 2, 2);
+            if (e < INT32_MIN || e > INT32_MAX) tail_ovf = 1;
+            dst[c] = (int32_t)e;
+        }
+    }
+    /* Gate: all evens of the plane are range-checked before any odd is read. */
+    if (tail_ovf || !_mm256_testz_si256(ovf, ovf)) return EXR_ERROR_CORRUPT;
+
+    /* ---- Phase 2: odd rows -> data[2i+1], reading even rows back ---- */
+    ovf = _mm256_setzero_si256();
+    for (i = 0u; i < hh; ++i) {
+        const int32_t *hi = temp + (lh + i) * rw;
+        const int32_t *e0p = data + (2u * i) * width;
+        const int32_t *e1p = data + (2u * (i + 1u < lh ? i + 1u : i)) * width;
+        int32_t *dst = data + (2u * i + 1u) * width;
+        for (c = 0u; c + 4u <= rw; c += 4u) {
+            __m256i e0 = jph_widen_i32x4(e0p + c);
+            __m256i e1 = jph_widen_i32x4(e1p + c);
+            __m256i hv = jph_widen_i32x4(hi + c);
+            __m256i q = jph_sra64x4(_mm256_add_epi64(e0, e1), 1);
+            __m256i o = _mm256_add_epi64(hv, q);
+            ovf = _mm256_or_si256(ovf, _mm256_cmpgt_epi64(o, imax));
+            ovf = _mm256_or_si256(ovf, _mm256_cmpgt_epi64(imin, o));
+            _mm_storeu_si128((__m128i *)(dst + c), jph_narrow_i64x4(o));
+        }
+        for (; c < rw; ++c) {
+            int64_t o = (int64_t)hi[c] +
+                        jph_sra64_ref((int64_t)e0p[c] + (int64_t)e1p[c], 1);
+            if (o < INT32_MIN || o > INT32_MAX) tail_ovf = 1;
+            dst[c] = (int32_t)o;
+        }
+    }
+    if (tail_ovf || !_mm256_testz_si256(ovf, ovf)) return EXR_ERROR_CORRUPT;
+    return EXR_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
+ * Sign-magnitude -> signed int64. Converts a row of OpenJPH codeblock words
+ * (bit 31 = sign, bits 0..30 = magnitude) to signed reversible-transform
+ * coefficients: mag = (v & 0x7fffffff) >> shift; out = sign ? -mag : mag,
+ * sign-extended to int64. Bit-identical to the scalar loop in jph_decode_block.
+ * mag is always in [0, 2^31-1] so -mag never reaches INT32_MIN -- no overflow.
+ * ------------------------------------------------------------------------- */
+EXR_TARGET("avx2")
+void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
+                                         size_t n, unsigned shift) {
+    size_t i = 0;
+    const __m256i magmask = _mm256_set1_epi32(0x7fffffff);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m128i sh = _mm_cvtsi32_si128((int)shift);
+    for (; i + 8 <= n; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(buf + i));
+        __m256i mag = _mm256_srl_epi32(_mm256_and_si256(v, magmask), sh);
+        __m256i neg = _mm256_sub_epi32(zero, mag);
+        __m256i smask = _mm256_srai_epi32(v, 31); /* all-ones where sign set */
+        __m256i r = _mm256_blendv_epi8(mag, neg, smask); /* int32 result/lane */
+        /* widen 8x int32 -> 2x 4x int64 (sign-extend) and store */
+        _mm256_storeu_si256((__m256i *)(out + i),
+                            _mm256_cvtepi32_epi64(_mm256_castsi256_si128(r)));
+        _mm256_storeu_si256((__m256i *)(out + i + 4),
+                            _mm256_cvtepi32_epi64(_mm256_extracti128_si256(r, 1)));
+    }
+    for (; i < n; ++i) {
+        uint32_t v = buf[i];
+        int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
+        out[i] = (v & 0x80000000u) ? -mag : mag;
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Forward reversible 5/3 1D lifting (int64). Mirrors the scalar
  * jph_forward_53_i64 exactly: deinterleave src into even/odd (ev/od scratch),
  * then predict (high) and update (low) with floor-div-by-2^s == arithmetic

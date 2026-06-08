@@ -2117,6 +2117,105 @@ static void jph_simd_check(void) {
         }
         free(low); free(high); free(o0); free(o1); free(ev); free(od);
     }
+
+    /* vertical (column) inverse 5/3: the row-wise scalar must equal the trusted
+     * per-column 1D path, and the AVX2 variant must match the scalar -- output
+     * AND return code (incl. CORRUPT on out-of-int32 reconstruction). Covers
+     * hh==0 (rh==1), even rh (lh==hh), odd rh (lh==hh+1), non-mult-of-4 rw. */
+    {
+        const size_t RWMAX = 300u, RHMAX = 64u;
+        uint32_t rng = 0x13572468u;
+        int vok = 1, has_avx2 = (caps & EXR_SIMD_AVX2) != 0;
+        size_t trial;
+        int32_t *temp = (int32_t *)malloc(RWMAX * RHMAX * sizeof(int32_t));
+        int32_t *ds = (int32_t *)malloc(RWMAX * RHMAX * sizeof(int32_t));
+        int32_t *da = (int32_t *)malloc(RWMAX * RHMAX * sizeof(int32_t));
+        int32_t *ref = (int32_t *)malloc(RWMAX * RHMAX * sizeof(int32_t));
+        int32_t *cl = (int32_t *)malloc(RHMAX * sizeof(int32_t));
+        int32_t *ch = (int32_t *)malloc(RHMAX * sizeof(int32_t));
+        int32_t *co = (int32_t *)malloc(RHMAX * sizeof(int32_t));
+        if (temp && ds && da && ref && cl && ch && co) {
+            for (trial = 0; trial < 6000 && vok; ++trial) {
+                size_t rw, rh, lh, hh, x, y, i, n;
+                int shiftbits, ref_corrupt = 0;
+                exr_result rs, ra;
+                rng = rng * 1664525u + 1013904223u;
+                rw = 1u + (rng % RWMAX);
+                rng = rng * 1664525u + 1013904223u;
+                rh = 1u + (rng % RHMAX);
+                lh = (rh + 1u) / 2u;
+                hh = rh / 2u;
+                shiftbits = (int)(trial % 32u); /* magnitude: small ... full */
+                n = (lh + hh) * rw;
+                for (i = 0; i < n; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    temp[i] = (int32_t)((int32_t)rng >> shiftbits);
+                }
+                /* trusted reference: per-column gather -> 1D scalar -> scatter */
+                for (x = 0; x < rw && !ref_corrupt; ++x) {
+                    for (y = 0; y < lh; ++y) cl[y] = temp[y * rw + x];
+                    for (y = 0; y < hh; ++y) ch[y] = temp[(lh + y) * rw + x];
+                    if (exr_jph_inverse_53_i32(cl, lh, ch, hh, co, rh) !=
+                        EXR_SUCCESS) { ref_corrupt = 1; break; }
+                    for (y = 0; y < rh; ++y) ref[y * rw + x] = co[y];
+                }
+                memset(ds, 0x5a, RWMAX * RHMAX * sizeof(int32_t));
+                memset(da, 0x5a, RWMAX * RHMAX * sizeof(int32_t));
+                rs = exr_jph_inverse_53_vert_i32(temp, rw, lh, hh, ds, rw);
+                /* scalar-vert return code matches the per-column reference */
+                if ((rs == EXR_SUCCESS) == ref_corrupt) { vok = 0; break; }
+                if (rs == EXR_SUCCESS) {
+                    for (y = 0; y < rh && vok; ++y)
+                        if (memcmp(ds + y * rw, ref + y * rw,
+                                   rw * sizeof(int32_t)) != 0) vok = 0;
+                    if (!vok) break;
+                }
+                if (has_avx2) {
+                    ra = jph_inverse_53_vert_i32_avx2(temp, rw, lh, hh, da, rw);
+                    if (ra != rs) { vok = 0; break; }
+                    if (ra == EXR_SUCCESS &&
+                        memcmp(da, ds, (lh + hh) * rw * sizeof(int32_t)) != 0) {
+                        vok = 0; break;
+                    }
+                }
+            }
+            CHECK(vok, "JPH inverse 5/3 vertical == per-column (+AVX2)");
+            if (vok) printf("  ok: JPH inverse 5/3 vertical == per-column (+AVX2)\n");
+        }
+        free(temp); free(ds); free(da); free(ref); free(cl); free(ch); free(co);
+    }
+
+    /* sign-magnitude codeblock word -> signed int64: AVX2 == scalar over all
+     * shifts and the full uint32 range (incl. sign bit and max magnitude). */
+    if (caps & EXR_SIMD_AVX2) {
+        const size_t en = 1027u;
+        uint32_t *src = (uint32_t *)malloc(en * sizeof(uint32_t));
+        int64_t *r0 = (int64_t *)malloc(en * sizeof(int64_t));
+        int64_t *r1 = (int64_t *)malloc(en * sizeof(int64_t));
+        int eok = 1;
+        uint32_t rng = 0x2468aceu;
+        if (src && r0 && r1) {
+            unsigned shift;
+            for (shift = 0u; shift <= 30u && eok; ++shift) {
+                size_t i;
+                for (i = 0; i < en; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    src[i] = rng; /* full 32-bit incl. sign bit */
+                }
+                for (i = 0; i < en; ++i) {
+                    uint32_t v = src[i];
+                    int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
+                    r0[i] = (v & 0x80000000u) ? -mag : mag;
+                }
+                memset(r1, 0x5a, en * sizeof(int64_t));
+                jph_extract_signmag_i32_to_i64_avx2(r1, src, en, shift);
+                if (memcmp(r0, r1, en * sizeof(int64_t)) != 0) eok = 0;
+            }
+            CHECK(eok, "JPH sign-mag extract AVX2 == scalar");
+            if (eok) printf("  ok: JPH sign-mag extract AVX2 == scalar\n");
+        }
+        free(src); free(r0); free(r1);
+    }
 #endif
 }
 

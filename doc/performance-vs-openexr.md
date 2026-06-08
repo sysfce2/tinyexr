@@ -51,8 +51,13 @@ behind and **PXR24** ~1.8× — its in-tree, dependency-free LZ77 encoder is fas
 but not libdeflate-level. **HTJ2K** encode is the widest gap (~3×: the separate
 JPH/OpenJPH encoder). TinyEXR's HTJ2K paths recently gained an AVX2 forward 5/3
 wavelet, an unstuffed-buffer entropy reader, and a `clz`-builtin fast path in the
-per-sample prepare (encode +~39%, decode +~18% vs the pre-SIMD baseline); the
-remaining gap is OpenJPH's fully-SIMD entropy coder.
+per-sample prepare (encode +~39%, decode +~18% vs the pre-SIMD baseline). The
+decode path then restructured the inverse 5/3 **column** pass into a
+column-parallel, gather/scatter-free AVX2 vertical lifting (mirroring OpenJPH —
+columns are the natural SIMD axis), and vectorized the sign-magnitude → signed
+coefficient extraction; together these cut decode wavelet+extraction time
+materially (~16% faster decode on the dev box). The remaining gap is OpenJPH's
+fully-SIMD entropy coder (cleanup VLC/MEL + MagSgn), which dominates the profile.
 
 ### Compression size
 

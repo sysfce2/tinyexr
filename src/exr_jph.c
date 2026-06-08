@@ -770,6 +770,58 @@ exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
     return EXR_SUCCESS;
 }
 
+/* Row-wise (column-parallel) vertical inverse reversible 5/3, int32. This is the
+ * source of truth for the SIMD jph_inverse_53_vert_i32_avx2: it must stay
+ * bit-identical. `temp` holds `lh` contiguous low-rows [0..lh) then `hh`
+ * high-rows [lh..lh+hh), each `rw` wide (stride rw). The rh = lh+hh
+ * reconstructed rows are written interleaved into `data` (stride `width`): even
+ * output row 2i is the predict of low row i, odd output row 2i+1 the update of
+ * high row i. Per column this is exactly exr_jph_inverse_53_i32; running it
+ * row-wise over all columns avoids the strided gather/scatter (and the natural
+ * SIMD axis is the column, so it vectorizes cleanly). Returns EXR_ERROR_CORRUPT
+ * iff any reconstructed sample leaves int32 (matching the 1D kernel). */
+exr_result exr_jph_inverse_53_vert_i32(const int32_t *temp, size_t rw,
+                                       size_t lh, size_t hh,
+                                       int32_t *data, size_t width) {
+    size_t i, c;
+    if ((!temp || !data) && rw) return EXR_ERROR_INVALID_ARGUMENT;
+    if (lh == 0u) return EXR_SUCCESS; /* rh == 0; lh >= 1 whenever rh >= 1 */
+    if (hh == 0u) {                   /* rh == 1: copy low row 0 verbatim */
+        for (c = 0u; c < rw; ++c) data[c] = temp[c];
+        return EXR_SUCCESS;
+    }
+    /* Phase 1: even output rows -> data[2i]. */
+    for (i = 0u; i < lh; ++i) {
+        const int32_t *lo = temp + i * rw;
+        const int32_t *hL = temp + (lh + (i > 0u ? i - 1u : 0u)) * rw;
+        const int32_t *hR = temp + (lh + (i < hh ? i : hh - 1u)) * rw;
+        int32_t *dst = data + (2u * i) * width;
+        for (c = 0u; c < rw; ++c) {
+            int64_t e = (int64_t)lo[c] -
+                        jph_floor_div_pow2((int64_t)hL[c] + (int64_t)hR[c] + 2, 2);
+            exr_result rc = jph_i64_to_i32(e, &dst[c]);
+            if (rc != EXR_SUCCESS) return rc;
+        }
+    }
+    /* Phase 2: odd output rows -> data[2i+1], reading even rows back from data.
+     * Every even of the whole plane has passed the int32 range check above, so
+     * each read-back equals its exact int64 value -- bit-identical to the 1D
+     * kernel, which likewise reads narrowed evens back for the update. */
+    for (i = 0u; i < hh; ++i) {
+        const int32_t *hi = temp + (lh + i) * rw;
+        const int32_t *e0p = data + (2u * i) * width;
+        const int32_t *e1p = data + (2u * (i + 1u < lh ? i + 1u : i)) * width;
+        int32_t *dst = data + (2u * i + 1u) * width;
+        for (c = 0u; c < rw; ++c) {
+            int64_t o = (int64_t)hi[c] +
+                        jph_floor_div_pow2((int64_t)e0p[c] + (int64_t)e1p[c], 1);
+            exr_result rc = jph_i64_to_i32(o, &dst[c]);
+            if (rc != EXR_SUCCESS) return rc;
+        }
+    }
+    return EXR_SUCCESS;
+}
+
 static size_t jph_ceil_div_pow2_size(size_t v, unsigned shift) {
     while (shift--) v = (v + 1u) / 2u;
     return v;
@@ -793,10 +845,10 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         size_t rh = jph_ceil_div_pow2_size(height, level - 1u);
         size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
-        size_t temp_count, temp_bytes, scratch_len, scratch_bytes, sb64;
-        int32_t *temp = NULL, *col_low = NULL, *col_high = NULL, *col_out = NULL;
-        int64_t *ev = NULL, *od = NULL; /* AVX2 1D scratch */
-        size_t y, x;
+        size_t temp_count, temp_bytes, scratch_len, sb64;
+        int32_t *temp = NULL;
+        int64_t *ev = NULL, *od = NULL; /* AVX2 1D row-pass scratch */
+        size_t y;
         exr_result rc = EXR_SUCCESS;
 
         if (rw == 0 || rh == 0) return EXR_ERROR_CORRUPT;
@@ -804,25 +856,20 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
             exr_mul_ovf(temp_count, sizeof(int32_t), &temp_bytes))
             return EXR_ERROR_CORRUPT;
         scratch_len = rw > rh ? rw : rh;
-        if (exr_mul_ovf(scratch_len, sizeof(int32_t), &scratch_bytes) ||
-            exr_mul_ovf(scratch_len, sizeof(int64_t), &sb64))
+        if (exr_mul_ovf(scratch_len, sizeof(int64_t), &sb64))
             return EXR_ERROR_CORRUPT;
 
         temp = (int32_t *)exr_malloc(a, temp_bytes);
-        col_low = (int32_t *)exr_malloc(a, scratch_bytes);
-        col_high = (int32_t *)exr_malloc(a, scratch_bytes);
-        col_out = (int32_t *)exr_malloc(a, scratch_bytes);
         if (use_avx2) {
             ev = (int64_t *)exr_malloc(a, sb64);
             od = (int64_t *)exr_malloc(a, sb64);
         }
-        if (!temp || !col_low || !col_high || !col_out ||
-            (use_avx2 && (!ev || !od))) {
-            exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
-            exr_free(a, col_out); exr_free(a, ev); exr_free(a, od);
+        if (!temp || (use_avx2 && (!ev || !od))) {
+            exr_free(a, temp); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
 
+        /* Horizontal (row) pass: each row is contiguous low|high. */
         for (y = 0; y < rh; ++y) {
             const int32_t *row = data + y * width;
 #if defined(EXR_X86)
@@ -835,26 +882,17 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
                                             temp + y * rw, rw);
             if (rc != EXR_SUCCESS) goto done_level;
         }
-        for (x = 0; x < rw; ++x) {
-            for (y = 0; y < lh; ++y) col_low[y] = temp[y * rw + x];
-            for (y = 0; y < hh; ++y) col_high[y] = temp[(lh + y) * rw + x];
+        /* Vertical (column) pass, row-wise across all columns -- no gather/
+         * scatter. temp's lh low-rows / hh high-rows -> interleaved data rows. */
 #if defined(EXR_X86)
-            if (use_avx2)
-                rc = jph_inverse_53_i32_avx2(col_low, lh, col_high, hh, col_out,
-                                             rh, ev, od);
-            else
+        if (use_avx2)
+            rc = jph_inverse_53_vert_i32_avx2(temp, rw, lh, hh, data, width);
+        else
 #endif
-                rc = exr_jph_inverse_53_i32(col_low, lh, col_high, hh, col_out,
-                                            rh);
-            if (rc != EXR_SUCCESS) goto done_level;
-            for (y = 0; y < rh; ++y) data[y * width + x] = col_out[y];
-        }
+            rc = exr_jph_inverse_53_vert_i32(temp, rw, lh, hh, data, width);
 
 done_level:
         exr_free(a, temp);
-        exr_free(a, col_low);
-        exr_free(a, col_high);
-        exr_free(a, col_out);
         exr_free(a, ev);
         exr_free(a, od);
         if (rc != EXR_SUCCESS) return rc;
@@ -2392,20 +2430,64 @@ typedef struct {
 
 /* Unstuff `size` bytes of `data` into `out` (LSB-first); returns the bit count.
  * `out` must be zeroed and hold >= size/8 + 3 words. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+/* Is there a 0xFF byte in d[0..n)? Word-wise SWAR scan (endian-independent: it
+ * tests for a byte value). Returns at the first hit, so the slow path pays only
+ * up to the first 0xFF. Only the little-endian memcpy fast path uses it. */
+static int jph_mem_has_ff(const uint8_t *d, uint32_t n) {
+    uint32_t i = 0u;
+    for (; i + 8u <= n; i += 8u) {
+        uint64_t v, x;
+        memcpy(&v, d + i, 8u);
+        x = ~v; /* 0x00 in each lane that held 0xFF */
+        if ((x - UINT64_C(0x0101010101010101)) & ~x &
+            UINT64_C(0x8080808080808080))
+            return 1;
+    }
+    for (; i < n; ++i)
+        if (d[i] == 0xFFu) return 1;
+    return 0;
+}
+#endif
+
 static uint64_t jph_unstuff_bits(const uint8_t *data, uint32_t size,
                                  uint64_t *out) {
     uint64_t nbits = 0u;
     uint32_t idx, prevff = 0u;
-    for (idx = 0u; idx < size; ++idx) {
-        uint8_t b = data ? data[idx] : 0u;
-        uint32_t ub = prevff ? 7u : 8u;
-        uint64_t uv = (uint64_t)(b & (uint8_t)((1u << ub) - 1u));
-        uint64_t w = nbits >> 6u;
-        uint32_t off = (uint32_t)(nbits & 63u);
-        out[w] |= uv << off;
-        if (off + ub > 64u) out[w + 1u] |= uv >> (64u - off);
-        nbits += ub;
-        prevff = (b == 0xffu) ? 1u : 0u;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    /* Common-case fast path: with no 0xFF byte every byte contributes 8 bits at
+     * a byte-aligned offset, so the host-order bit buffer is byte-identical to
+     * the input -- a plain copy. The fetch side reads `out` in the same host
+     * order, and `out` (calloc'd, >= size/8+3 words) keeps its zero tail. */
+    if (data && !jph_mem_has_ff(data, size)) {
+        memcpy(out, data, size);
+        return (uint64_t)size * 8u;
+    }
+#endif
+    /* Slow path (stuffed stream): accumulate bits in a register and flush whole
+     * words, instead of a per-byte read-modify-write of out[] plus a split-store
+     * branch. `acc` holds the `accbits` not-yet-flushed low bits of word `w`. */
+    {
+        uint64_t acc = 0u;
+        uint32_t accbits = 0u;
+        size_t w = 0u;
+        for (idx = 0u; idx < size; ++idx) {
+            uint8_t b = data ? data[idx] : 0u;
+            uint32_t ub = prevff ? 7u : 8u;
+            uint64_t uv = (uint64_t)(b & (uint8_t)((1u << ub) - 1u));
+            uint32_t old = accbits;
+            acc |= uv << old;
+            accbits += ub;
+            nbits += ub;
+            if (accbits >= 64u) {
+                out[w++] = acc;
+                accbits -= 64u;
+                /* carry the bits of uv that didn't fit (shift is 1..8 here). */
+                acc = accbits ? (uv >> (64u - old)) : 0u;
+            }
+            prevff = (b == 0xffu) ? 1u : 0u;
+        }
+        if (accbits) out[w] = acc;
     }
     return nbits;
 }
@@ -3769,13 +3851,23 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     {
         uint32_t y;
         uint32_t shift = (kmax < 31u) ? 31u - kmax : 0u;
+#if defined(EXR_X86)
+        int use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
         for (y = 0u; y < height; ++y) {
+            const uint32_t *brow = buf + (size_t)y * sstr;
+            int64_t *orow = out + (size_t)y * out_stride;
             uint32_t x;
+#if defined(EXR_X86)
+            if (use_avx2) {
+                jph_extract_signmag_i32_to_i64_avx2(orow, brow, width, shift);
+                continue;
+            }
+#endif
             for (x = 0u; x < width; ++x) {
-                uint32_t v = buf[y * sstr + x];
+                uint32_t v = brow[x];
                 int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
-                out[y * out_stride + x] =
-                    (v & 0x80000000u) ? -mag : mag;
+                orow[x] = (v & 0x80000000u) ? -mag : mag;
             }
         }
     }
