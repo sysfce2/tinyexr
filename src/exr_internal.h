@@ -155,6 +155,14 @@ void exr_simd_force(int level);
  * tier. level: -1 restore real detection, 0 scalar, 1 sse4.1, 2 avx2. */
 void exr_cpu_caps_force(int level);
 
+/* Simple parallel-for over [0, njobs): runs fn(ctx, job) for each job, using up
+ * to `nthreads` workers (the calling thread participates). Always defined; when
+ * the library is built without EXR_USE_THREADS it runs serially. Jobs must be
+ * independent and report results through ctx (no aggregated return value).
+ * Defined in exr_thread.c. */
+typedef void (*exr_par_fn)(void *ctx, int job);
+void exr_parallel_for(int nthreads, int njobs, exr_par_fn fn, void *ctx);
+
 /* Scalar kernels (always built). */
 void exr_half_to_float_scalar(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half_scalar(const float *src, uint16_t *dst, size_t count);

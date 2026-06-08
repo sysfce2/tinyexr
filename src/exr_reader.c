@@ -629,6 +629,78 @@ static exr_result scatter_scanline_block(const exr_header *h, void **images,
     return EXR_SUCCESS;
 }
 
+#if defined(EXR_USE_THREADS)
+/* Decode a single scanline chunk into the (pre-allocated) output planes, using
+ * a private scratch buffer. Self-contained so it can run on any worker thread;
+ * chunks write disjoint output rows, so no locking is needed. */
+static exr_result decode_scanline_chunk(exr_reader *r, exr_int_part *p,
+                                        int32_t part_idx, exr_part *out,
+                                        uint32_t ci) {
+    const exr_allocator *a = &r->alloc;
+    const exr_header *h = &p->header;
+    int lpb = exr_lines_per_block(h->compression);
+    int ymin = h->data_window.min_y, ymax = h->data_window.max_y;
+    uint64_t off = p->offsets[ci];
+    const uint8_t *hdr, *cdata;
+    int32_t y0, data_size, nlines;
+    size_t hdr_size = r->is_multipart ? 12 : 8;
+    size_t want, dst_size;
+    exr_codec_ctx ctx;
+    uint8_t *block;
+    exr_result rc;
+
+    rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+    if (!EXR_OK(rc)) return rc;
+    if (r->is_multipart) {
+        if (exr_rd_i32(hdr) != part_idx) return EXR_ERROR_CORRUPT;
+        hdr += 4;
+    }
+    y0 = exr_rd_i32(hdr);
+    data_size = exr_rd_i32(hdr + 4);
+    if (data_size < 0 || y0 < ymin || y0 > ymax) return EXR_ERROR_CORRUPT;
+    nlines = lpb;
+    if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
+
+    rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                     h->data_window.min_x, y0, p->width, nlines,
+                                     &dst_size);
+    if (!EXR_OK(rc)) return rc;
+    if (exr_add_ovf((size_t)off, hdr_size, &want)) return EXR_ERROR_CORRUPT;
+    rc = exr_reader_fetch(r, want, (size_t)data_size, NULL, &cdata);
+    if (!EXR_OK(rc)) return rc;
+
+    block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+    if (!block) return EXR_ERROR_OUT_OF_MEMORY;
+    ctx.alloc = a;
+    ctx.compression = h->compression;
+    ctx.channels = h->channels;
+    ctx.num_channels = h->num_channels;
+    ctx.x = h->data_window.min_x;
+    ctx.y = y0;
+    ctx.width = p->width;
+    ctx.num_lines = nlines;
+    rc = exr_decompress_block(&ctx, cdata, (size_t)data_size, block, dst_size);
+    if (EXR_OK(rc))
+        rc = scatter_scanline_block(h, out->images, y0, nlines, block, dst_size);
+    exr_free(a, block);
+    return rc;
+}
+
+typedef struct {
+    exr_reader *r;
+    exr_int_part *p;
+    int32_t part_idx;
+    exr_part *out;
+    exr_result *rc; /* per-chunk results */
+} scanline_job_ctx;
+
+static void decode_scanline_job(void *vctx, int job) {
+    scanline_job_ctx *jc = (scanline_job_ctx *)vctx;
+    uint32_t ci = (uint32_t)job + 1u; /* chunk 0 is decoded inline first */
+    jc->rc[ci] = decode_scanline_chunk(jc->r, jc->p, jc->part_idx, jc->out, ci);
+}
+#endif /* EXR_USE_THREADS */
+
 static exr_result read_scanline_part(exr_reader *r, exr_int_part *p,
                                      int32_t part_idx, exr_part *out) {
     const exr_allocator *a = &r->alloc;
@@ -656,6 +728,36 @@ static exr_result read_scanline_part(exr_reader *r, exr_int_part *p,
         out->images[c] = exr_calloc(a, bytes ? bytes : 1, 1);
         if (!out->images[c]) return EXR_ERROR_OUT_OF_MEMORY;
     }
+
+#if defined(EXR_USE_THREADS)
+    /* Parallel path: only for fully-in-memory sources (concurrent fetch is a
+     * read-only pointer return) with more than one chunk. */
+    if (exr_get_num_threads() > 1 && p->num_chunks > 1 &&
+        r->kind == EXR_SRC_MEMORY) {
+        exr_result *rcs =
+            (exr_result *)exr_calloc(a, p->num_chunks, sizeof(exr_result));
+        if (rcs) {
+            uint32_t k;
+            exr_result first = EXR_SUCCESS;
+            /* Decode chunk 0 inline so lazy global inits (SIMD table, B44/JPH
+             * perceptual tables) are warmed by one thread before the fan-out. */
+            rcs[0] = decode_scanline_chunk(r, p, part_idx, out, 0);
+            if (EXR_OK(rcs[0])) {
+                scanline_job_ctx jc;
+                jc.r = r; jc.p = p; jc.part_idx = part_idx; jc.out = out;
+                jc.rc = rcs;
+                exr_parallel_for(exr_get_num_threads(),
+                                 (int)(p->num_chunks - 1), decode_scanline_job,
+                                 &jc);
+            }
+            for (k = 0; k < p->num_chunks; ++k)
+                if (!EXR_OK(rcs[k])) { first = rcs[k]; break; }
+            exr_free(a, rcs);
+            return first;
+        }
+        /* allocation failed -> fall through to the serial path */
+    }
+#endif
 
     for (ci = 0; ci < p->num_chunks; ++ci) {
         uint64_t off = p->offsets[ci];
@@ -762,6 +864,87 @@ static exr_result scatter_tile_block(const exr_header *h, void **images,
     return EXR_SUCCESS;
 }
 
+#if defined(EXR_USE_THREADS)
+/* Decode a single level-0 tile (chunk index idx, grid width nxt) into the
+ * output planes with a private scratch buffer; tiles write disjoint regions. */
+static exr_result decode_tile_chunk(exr_reader *r, exr_int_part *p,
+                                    int32_t part_idx, exr_part *out, int nxt,
+                                    uint32_t idx) {
+    const exr_allocator *a = &r->alloc;
+    const exr_header *h = &p->header;
+    int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
+    int txi = (int)(idx % (uint32_t)nxt);
+    int tyi = (int)(idx / (uint32_t)nxt);
+    uint64_t off = p->offsets[idx];
+    const uint8_t *hdr, *cdata;
+    size_t hdr_size = r->is_multipart ? 24 : 20;
+    int32_t htx, hty, hlx, hly, dsize;
+    int x0, y0, tile_w, tile_h, abs_x0, abs_y0;
+    size_t dst_size, want;
+    exr_codec_ctx ctx;
+    uint8_t *block;
+    exr_result rc;
+
+    rc = exr_reader_fetch(r, off, hdr_size, NULL, &hdr);
+    if (!EXR_OK(rc)) return rc;
+    if (r->is_multipart) {
+        if (exr_rd_i32(hdr) != part_idx) return EXR_ERROR_CORRUPT;
+        hdr += 4;
+    }
+    htx = exr_rd_i32(hdr);
+    hty = exr_rd_i32(hdr + 4);
+    hlx = exr_rd_i32(hdr + 8);
+    hly = exr_rd_i32(hdr + 12);
+    dsize = exr_rd_i32(hdr + 16);
+    if (hlx != 0 || hly != 0 || htx != txi || hty != tyi || dsize < 0)
+        return EXR_ERROR_CORRUPT;
+    x0 = txi * tx;
+    y0 = tyi * ty;
+    tile_w = (tx < p->width - x0) ? tx : (p->width - x0);
+    tile_h = (ty < p->height - y0) ? ty : (p->height - y0);
+    abs_x0 = h->data_window.min_x + x0;
+    abs_y0 = h->data_window.min_y + y0;
+    rc = exr_block_uncompressed_size(h->channels, h->num_channels, abs_x0,
+                                     abs_y0, tile_w, tile_h, &dst_size);
+    if (!EXR_OK(rc)) return rc;
+    if (exr_add_ovf((size_t)off, hdr_size, &want)) return EXR_ERROR_CORRUPT;
+    rc = exr_reader_fetch(r, want, (size_t)dsize, NULL, &cdata);
+    if (!EXR_OK(rc)) return rc;
+    block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+    if (!block) return EXR_ERROR_OUT_OF_MEMORY;
+    ctx.alloc = a;
+    ctx.compression = h->compression;
+    ctx.channels = h->channels;
+    ctx.num_channels = h->num_channels;
+    ctx.x = abs_x0;
+    ctx.y = abs_y0;
+    ctx.width = tile_w;
+    ctx.num_lines = tile_h;
+    rc = exr_decompress_block(&ctx, cdata, (size_t)dsize, block, dst_size);
+    if (EXR_OK(rc))
+        rc = scatter_tile_block(h, out->images, abs_x0, abs_y0, tile_w, tile_h,
+                                block, dst_size);
+    exr_free(a, block);
+    return rc;
+}
+
+typedef struct {
+    exr_reader *r;
+    exr_int_part *p;
+    int32_t part_idx;
+    exr_part *out;
+    int nxt;
+    exr_result *rc;
+} tile_job_ctx;
+
+static void decode_tile_job(void *vctx, int job) {
+    tile_job_ctx *jc = (tile_job_ctx *)vctx;
+    uint32_t idx = (uint32_t)job + 1u; /* tile 0 decoded inline first */
+    jc->rc[idx] =
+        decode_tile_chunk(jc->r, jc->p, jc->part_idx, jc->out, jc->nxt, idx);
+}
+#endif /* EXR_USE_THREADS */
+
 static exr_result read_tiled_part(exr_reader *r, exr_int_part *p,
                                   int32_t part_idx, exr_part *out) {
     const exr_allocator *a = &r->alloc;
@@ -790,6 +973,32 @@ static exr_result read_tiled_part(exr_reader *r, exr_int_part *p,
         out->images[c] = exr_calloc(a, bytes ? bytes : 1, 1);
         if (!out->images[c]) return EXR_ERROR_OUT_OF_MEMORY;
     }
+
+#if defined(EXR_USE_THREADS)
+    /* Parallel path for single-level tiled, fully-in-memory sources only. */
+    if (exr_get_num_threads() > 1 && p->num_chunks > 1 &&
+        r->kind == EXR_SRC_MEMORY &&
+        p->num_chunks == (uint32_t)nxt * (uint32_t)nyt) {
+        exr_result *rcs =
+            (exr_result *)exr_calloc(a, p->num_chunks, sizeof(exr_result));
+        if (rcs) {
+            uint32_t k;
+            exr_result first = EXR_SUCCESS;
+            rcs[0] = decode_tile_chunk(r, p, part_idx, out, nxt, 0); /* warm */
+            if (EXR_OK(rcs[0])) {
+                tile_job_ctx jc;
+                jc.r = r; jc.p = p; jc.part_idx = part_idx; jc.out = out;
+                jc.nxt = nxt; jc.rc = rcs;
+                exr_parallel_for(exr_get_num_threads(),
+                                 (int)(p->num_chunks - 1), decode_tile_job, &jc);
+            }
+            for (k = 0; k < p->num_chunks; ++k)
+                if (!EXR_OK(rcs[k])) { first = rcs[k]; break; }
+            exr_free(a, rcs);
+            return first;
+        }
+    }
+#endif
 
     for (tyi = 0; tyi < nyt; ++tyi) {
         for (txi = 0; txi < nxt; ++txi) {

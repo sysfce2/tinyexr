@@ -2120,6 +2120,91 @@ static void jph_simd_check(void) {
 #endif
 }
 
+#if defined(EXR_USE_THREADS)
+/* Multithreading: encode must be byte-deterministic and decode bit-identical
+ * regardless of thread count. Exercises scanline (all codecs) + single-level
+ * tiled, on the in-memory load/save paths the parallel code targets. */
+static void thread_save(exr_image *img, exr_compression comp, int nthreads,
+                        void **buf, size_t *sz) {
+    exr_set_num_threads(nthreads);
+    *buf = NULL;
+    *sz = 0;
+    (void)exr_save_to_memory(buf, sz, NULL, img, comp);
+}
+
+static void thread_tests(const char *path) {
+    static const exr_compression codecs[] = {
+        EXR_COMPRESSION_NONE, EXR_COMPRESSION_RLE, EXR_COMPRESSION_ZIPS,
+        EXR_COMPRESSION_ZIP,  EXR_COMPRESSION_PIZ, EXR_COMPRESSION_PXR24,
+        EXR_COMPRESSION_B44};
+    static const char *names[] = {"none", "rle", "zips", "zip",
+                                  "piz",  "pxr24", "b44"};
+    exr_image src;
+    size_t i;
+
+    memset(&src, 0, sizeof(src));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src))) {
+        g_fail++;
+        printf("  FAIL: %s load (threads)\n", path);
+        return;
+    }
+
+    for (i = 0; i < sizeof(codecs) / sizeof(codecs[0]); ++i) {
+        void *a = NULL, *b = NULL;
+        size_t na = 0, nb = 0;
+        exr_image d1, d4;
+        thread_save(&src, codecs[i], 1, &a, &na);
+        thread_save(&src, codecs[i], 4, &b, &nb);
+        CHECK(a && b && na == nb && memcmp(a, b, na) == 0, names[i]);
+        /* decode the (serial-encoded) bytes serially and with 4 workers */
+        memset(&d1, 0, sizeof(d1));
+        memset(&d4, 0, sizeof(d4));
+        exr_set_num_threads(1);
+        (void)exr_load_from_memory(a, na, NULL, &d1);
+        exr_set_num_threads(4);
+        (void)exr_load_from_memory(a, na, NULL, &d4);
+        CHECK(images_equal(&d1, &d4), names[i]);
+        printf("  ok: scanline %s  enc-deterministic + decode parity\n",
+               names[i]);
+        exr_image_free(&d1);
+        exr_image_free(&d4);
+        free(a);
+        free(b);
+    }
+
+    /* single-level tiled (77 tiles for 660x440 @ 64) */
+    src.parts[0].header.tiled = 1;
+    src.parts[0].header.part_type = EXR_PART_TILED;
+    src.parts[0].header.tile_x_size = 64;
+    src.parts[0].header.tile_y_size = 64;
+    src.parts[0].header.level_mode = EXR_TILE_ONE_LEVEL;
+    src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    {
+        void *a = NULL, *b = NULL;
+        size_t na = 0, nb = 0;
+        exr_image t1, t4;
+        thread_save(&src, EXR_COMPRESSION_ZIP, 1, &a, &na);
+        thread_save(&src, EXR_COMPRESSION_ZIP, 4, &b, &nb);
+        CHECK(a && b && na == nb && memcmp(a, b, na) == 0, "tiled zip enc");
+        memset(&t1, 0, sizeof(t1));
+        memset(&t4, 0, sizeof(t4));
+        exr_set_num_threads(1);
+        (void)exr_load_from_memory(a, na, NULL, &t1);
+        exr_set_num_threads(4);
+        (void)exr_load_from_memory(a, na, NULL, &t4);
+        CHECK(images_equal(&t1, &t4), "tiled zip decode parity");
+        printf("  ok: tiled zip  enc-deterministic + decode parity\n");
+        exr_image_free(&t1);
+        exr_image_free(&t4);
+        free(a);
+        free(b);
+    }
+
+    exr_set_num_threads(1);
+    exr_image_free(&src);
+}
+#endif /* EXR_USE_THREADS */
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -2293,6 +2378,11 @@ int main(void) {
                              "asakusa ZIP");
     stream_memory_bound_check("asakusa.exr", EXR_COMPRESSION_ZIP,
                               "asakusa ZIP");
+
+#if defined(EXR_USE_THREADS)
+    printf("== multithreading (serial vs parallel) ==\n");
+    thread_tests("asakusa.exr");
+#endif
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

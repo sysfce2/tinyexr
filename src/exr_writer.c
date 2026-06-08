@@ -330,6 +330,216 @@ static uint64_t *deep_prefix(const exr_allocator *a, const exr_part *pt) {
     return pfx;
 }
 
+/* ---- optional parallel block compression (phase 1 of two-phase encode) ---- */
+#if defined(EXR_USE_THREADS)
+/* Scanline: gather + compress chunk into payloads[ci]/sizes[ci]. */
+typedef struct {
+    const exr_allocator *a;
+    const exr_header *h;
+    const int *order;
+    const exr_channel *sorted;
+    void *const *images;
+    int xmin, ymin, ymax, width, lpb;
+    exr_compression comp;
+    uint8_t **payloads;
+    size_t *sizes;
+    exr_result *rc;
+} sl_enc_ctx;
+
+static exr_result encode_scanline_one(sl_enc_ctx *c, uint32_t ci) {
+    int y0 = c->ymin + (int)ci * c->lpb;
+    int nlines = (y0 + c->lpb - 1 > c->ymax) ? (c->ymax - y0 + 1) : c->lpb;
+    size_t blk_size;
+    uint8_t *block;
+    exr_codec_ctx cx;
+    exr_result rc = exr_block_uncompressed_size(c->h->channels,
+                                                c->h->num_channels, c->xmin, y0,
+                                                c->width, nlines, &blk_size);
+    if (!EXR_OK(rc)) return rc;
+    block = (uint8_t *)exr_malloc(c->a, blk_size ? blk_size : 1);
+    if (!block) return EXR_ERROR_OUT_OF_MEMORY;
+    gather_scanline_block(c->h, c->order, c->images, y0, nlines, block);
+    cx.alloc = c->a;
+    cx.compression = c->comp;
+    cx.channels = c->sorted;
+    cx.num_channels = c->h->num_channels;
+    cx.x = c->xmin;
+    cx.y = y0;
+    cx.width = c->width;
+    cx.num_lines = nlines;
+    rc = exr_compress_block(&cx, block, blk_size, &c->payloads[ci],
+                            &c->sizes[ci]);
+    exr_free(c->a, block);
+    return rc;
+}
+
+static void encode_scanline_job(void *vc, int job) {
+    sl_enc_ctx *c = (sl_enc_ctx *)vc;
+    uint32_t ci = (uint32_t)job + 1u; /* chunk 0 compressed inline first */
+    c->rc[ci] = encode_scanline_one(c, ci);
+}
+
+/* Simple single-level tiled: gather + compress tile idx. */
+typedef struct {
+    const exr_allocator *a;
+    const exr_header *h;
+    const int *order;
+    const exr_channel *sorted;
+    void *const *images;
+    int xmin, ymin, width, height, tx, ty, nxt;
+    exr_compression comp;
+    uint8_t **payloads;
+    size_t *sizes;
+    exr_result *rc;
+} tl_enc_ctx;
+
+static exr_result encode_tile_one(tl_enc_ctx *c, uint32_t idx) {
+    int txi = (int)(idx % (uint32_t)c->nxt);
+    int tyi = (int)(idx / (uint32_t)c->nxt);
+    int x0 = txi * c->tx, y0 = tyi * c->ty;
+    int tile_w = (c->tx < c->width - x0) ? c->tx : (c->width - x0);
+    int tile_h = (c->ty < c->height - y0) ? c->ty : (c->height - y0);
+    int abs_x0 = c->xmin + x0, abs_y0 = c->ymin + y0;
+    size_t blk_size;
+    uint8_t *block;
+    exr_codec_ctx cx;
+    exr_result rc = exr_block_uncompressed_size(c->h->channels,
+                                                c->h->num_channels, abs_x0,
+                                                abs_y0, tile_w, tile_h,
+                                                &blk_size);
+    if (!EXR_OK(rc)) return rc;
+    block = (uint8_t *)exr_malloc(c->a, blk_size ? blk_size : 1);
+    if (!block) return EXR_ERROR_OUT_OF_MEMORY;
+    gather_tile_block(c->h, c->order, c->images, abs_x0, abs_y0, tile_w, tile_h,
+                      block);
+    cx.alloc = c->a;
+    cx.compression = c->comp;
+    cx.channels = c->sorted;
+    cx.num_channels = c->h->num_channels;
+    cx.x = abs_x0;
+    cx.y = abs_y0;
+    cx.width = tile_w;
+    cx.num_lines = tile_h;
+    rc = exr_compress_block(&cx, block, blk_size, &c->payloads[idx],
+                            &c->sizes[idx]);
+    exr_free(c->a, block);
+    return rc;
+}
+
+static void encode_tile_job(void *vc, int job) {
+    tl_enc_ctx *c = (tl_enc_ctx *)vc;
+    uint32_t idx = (uint32_t)job + 1u; /* tile 0 compressed inline first */
+    c->rc[idx] = encode_tile_one(c, idx);
+}
+
+/* Two-phase scanline encode: compress all chunks in parallel into per-chunk
+ * buffers, then write them to `b` in order (identical bytes to the serial path).
+ * Sets *threaded=1 when the parallel path was taken (0 => caller runs serial). */
+static exr_result encode_parallel_scanline(
+    const exr_allocator *a, const exr_header *h, const int *order,
+    const exr_channel *sorted, const exr_part *pt, int xmin, int ymin, int ymax,
+    int lpb, exr_compression comp, obuf *b, uint64_t *offsets, uint32_t n,
+    int multipart, int p, int *threaded) {
+    uint8_t **payloads = (uint8_t **)exr_calloc(a, n, sizeof(uint8_t *));
+    size_t *sizes = (size_t *)exr_calloc(a, n, sizeof(size_t));
+    exr_result *rcs = (exr_result *)exr_calloc(a, n, sizeof(exr_result));
+    exr_result rc = EXR_SUCCESS;
+    uint32_t ci;
+    if (!payloads || !sizes || !rcs) {
+        exr_free(a, payloads);
+        exr_free(a, sizes);
+        exr_free(a, rcs);
+        *threaded = 0;
+        return EXR_SUCCESS; /* fall back to the serial path */
+    }
+    *threaded = 1;
+    {
+        sl_enc_ctx ec;
+        ec.a = a; ec.h = h; ec.order = order; ec.sorted = sorted;
+        ec.images = (void *const *)pt->images; ec.xmin = xmin; ec.ymin = ymin;
+        ec.ymax = ymax; ec.width = pt->width; ec.lpb = lpb; ec.comp = comp;
+        ec.payloads = payloads; ec.sizes = sizes; ec.rc = rcs;
+        rcs[0] = encode_scanline_one(&ec, 0); /* warm lazy inits */
+        if (EXR_OK(rcs[0]))
+            exr_parallel_for(exr_get_num_threads(), (int)(n - 1),
+                             encode_scanline_job, &ec);
+    }
+    for (ci = 0; ci < n; ++ci)
+        if (!EXR_OK(rcs[ci])) { rc = rcs[ci]; break; }
+    if (EXR_OK(rc)) {
+        for (ci = 0; ci < n; ++ci) {
+            int y0 = ymin + (int)ci * lpb;
+            offsets[ci] = (uint64_t)b->len;
+            if (multipart) ob_i32(b, p);
+            ob_i32(b, y0);
+            ob_i32(b, (int32_t)sizes[ci]);
+            ob_bytes(b, payloads[ci], sizes[ci]);
+            if (b->err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+        }
+    }
+    for (ci = 0; ci < n; ++ci) exr_free(a, payloads[ci]);
+    exr_free(a, payloads);
+    exr_free(a, sizes);
+    exr_free(a, rcs);
+    return rc;
+}
+
+/* Two-phase single-level tiled encode (mirror of the scanline driver). */
+static exr_result encode_parallel_tiled(
+    const exr_allocator *a, const exr_header *h, const int *order,
+    const exr_channel *sorted, const exr_part *pt, int xmin, int ymin, int tx,
+    int ty, int nxt, exr_compression comp, obuf *b, uint64_t *offsets,
+    uint32_t n, int multipart, int p, int *threaded) {
+    uint8_t **payloads = (uint8_t **)exr_calloc(a, n, sizeof(uint8_t *));
+    size_t *sizes = (size_t *)exr_calloc(a, n, sizeof(size_t));
+    exr_result *rcs = (exr_result *)exr_calloc(a, n, sizeof(exr_result));
+    exr_result rc = EXR_SUCCESS;
+    uint32_t idx;
+    if (!payloads || !sizes || !rcs) {
+        exr_free(a, payloads);
+        exr_free(a, sizes);
+        exr_free(a, rcs);
+        *threaded = 0;
+        return EXR_SUCCESS;
+    }
+    *threaded = 1;
+    {
+        tl_enc_ctx ec;
+        ec.a = a; ec.h = h; ec.order = order; ec.sorted = sorted;
+        ec.images = (void *const *)pt->images; ec.xmin = xmin; ec.ymin = ymin;
+        ec.width = pt->width; ec.height = pt->height; ec.tx = tx; ec.ty = ty;
+        ec.nxt = nxt; ec.comp = comp;
+        ec.payloads = payloads; ec.sizes = sizes; ec.rc = rcs;
+        rcs[0] = encode_tile_one(&ec, 0); /* warm lazy inits */
+        if (EXR_OK(rcs[0]))
+            exr_parallel_for(exr_get_num_threads(), (int)(n - 1),
+                             encode_tile_job, &ec);
+    }
+    for (idx = 0; idx < n; ++idx)
+        if (!EXR_OK(rcs[idx])) { rc = rcs[idx]; break; }
+    if (EXR_OK(rc)) {
+        for (idx = 0; idx < n; ++idx) {
+            int txi = (int)(idx % (uint32_t)nxt);
+            int tyi = (int)(idx / (uint32_t)nxt);
+            offsets[idx] = (uint64_t)b->len;
+            if (multipart) ob_i32(b, p);
+            ob_i32(b, txi);
+            ob_i32(b, tyi);
+            ob_i32(b, 0); /* level x */
+            ob_i32(b, 0); /* level y */
+            ob_i32(b, (int32_t)sizes[idx]);
+            ob_bytes(b, payloads[idx], sizes[idx]);
+            if (b->err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+        }
+    }
+    for (idx = 0; idx < n; ++idx) exr_free(a, payloads[idx]);
+    exr_free(a, payloads);
+    exr_free(a, sizes);
+    exr_free(a, rcs);
+    return rc;
+}
+#endif /* EXR_USE_THREADS */
+
 /* ---- serialize a set of parts -------------------------------------------- */
 
 static exr_result serialize(const exr_allocator *a, const exr_part *parts,
@@ -704,6 +914,18 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
             int nxt = (pt->width + tx - 1) / tx;
             int nyt = (pt->height + ty - 1) / ty;
             int txi, tyi;
+            int threaded = 0;
+#if defined(EXR_USE_THREADS)
+            if (exr_get_num_threads() > 1 && chunk_counts[p] > 1 &&
+                chunk_counts[p] == (uint32_t)nxt * (uint32_t)nyt) {
+                rc = encode_parallel_tiled(a, h, orders[p], sorted_chans[p], pt,
+                                           xmin, ymin, tx, ty, nxt, comp, &b,
+                                           offset_tables[p], chunk_counts[p],
+                                           multipart, p, &threaded);
+                if (threaded && !EXR_OK(rc)) goto done;
+            }
+#endif
+            if (!threaded)
             for (tyi = 0; tyi < nyt; ++tyi) {
                 for (txi = 0; txi < nxt; ++txi) {
                     uint32_t ci = (uint32_t)tyi * (uint32_t)nxt + (uint32_t)txi;
@@ -753,6 +975,18 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
         } else {
             int lpb = exr_lines_per_block(comp);
             uint32_t ci;
+            int threaded = 0;
+#if defined(EXR_USE_THREADS)
+            if (exr_get_num_threads() > 1 && chunk_counts[p] > 1) {
+                rc = encode_parallel_scanline(a, h, orders[p], sorted_chans[p],
+                                              pt, xmin, ymin, ymax, lpb, comp,
+                                              &b, offset_tables[p],
+                                              chunk_counts[p], multipart, p,
+                                              &threaded);
+                if (threaded && !EXR_OK(rc)) goto done;
+            }
+#endif
+            if (!threaded)
             for (ci = 0; ci < chunk_counts[p]; ++ci) {
                 int y0 = ymin + (int)ci * lpb;
                 int nlines = (y0 + lpb - 1 > ymax) ? (ymax - y0 + 1) : lpb;

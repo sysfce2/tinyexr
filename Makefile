@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke
 
 all: $(TARGET)
 
@@ -73,6 +73,17 @@ ifeq ($(LIBDEFLATE),1)
   LD_TEST_OBJ = $(patsubst deps/libdeflate/%.c,build/test-libdeflate/%.o,$(LD_SRC))
 endif
 
+# ---- optional C11-threads multithreading (default OFF; serial is the default)
+# Build any target with THREADS=1 to enable per-block parallel encode/decode
+# (src/exr_thread.c, uses <threads.h>). Default and freestanding builds stay
+# single-threaded. NOTE: run `make clean` when toggling THREADS.
+THREADS ?= 0
+THREAD_LIBS =
+ifeq ($(THREADS),1)
+  V3_DEFS    += -DEXR_USE_THREADS
+  THREAD_LIBS = -pthread          # C11 threads need pthreads on glibc < 2.34
+endif
+
 build:
 	@mkdir -p build
 
@@ -109,13 +120,27 @@ build/test-tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_INC) -O1 -g $(SAN) -w -c $< -o $@
 
 test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/unit/test_exr_v3.c | build
-	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) \
-	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) -lm -o build/test_exr_v3
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) \
+	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_v3
 	ASAN_OPTIONS=detect_leaks=0 ./build/test_exr_v3
+
+# Build + run the unit tests with multithreading enabled (parity + race checks).
+test-c-threads:
+	$(MAKE) test-c THREADS=1
+
+# Thread sanitizer over the threaded build (no ASan; proves no data races).
+# NOTE: requires a ThreadSanitizer that instruments C11 <threads.h>; some
+# glibc/TSan combos only intercept pthread_* and crash on thrd_create/mtx_*.
+# The threaded build also runs cleanly under ASan+UBSan via `make test-c-threads`.
+test-c-tsan: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_THREADS $(V3_INC) -O1 -g \
+	  -fsanitize=thread test/unit/test_exr_v3.c $(V3_SRC) $(ZSTD_SRC) \
+	  -pthread -lm -o build/test_exr_v3_tsan
+	./build/test_exr_v3_tsan
 
 bench: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) benchmark/bench.c | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O3 \
-	  benchmark/bench.c $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) -lm -o build/bench
+	  benchmark/bench.c $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(THREAD_LIBS) -lm -o build/bench
 	./build/bench
 
 # ---- tinyexr-vs-OpenEXR comparison (needs a built OpenEXR) -----------------
@@ -143,7 +168,7 @@ bench-compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/bench_
 	  echo "build OpenEXR first, or set OPENEXR_ROOT=/path/to/openexr"; exit 1; }
 	$(CXX) -std=c++14 -Wall -Ibenchmark $(OPENEXR_INC) -O3 \
 	  benchmark/bench_compare.cpp build/bench_tx.o $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) \
-	  $(OPENEXR_LIBS) -lm -o build/bench_compare
+	  $(OPENEXR_LIBS) $(THREAD_LIBS) -lm -o build/bench_compare
 	LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
 
 # Coverage-guided fuzzer (clang+libFuzzer over the whole library).
@@ -258,6 +283,8 @@ help:
 	@echo "make        - legacy v1 test (test_tinyexr)"
 	@echo "make lib    - pure-C11 v3 library (build/libtinyexr3.a)"
 	@echo "make test-c - run pure-C11 v3 reader unit test (ASan+UBSan)"
+	@echo "make test-c-threads - unit tests with multithreading (THREADS=1)"
+	@echo "make test-c-tsan - threaded unit tests under ThreadSanitizer"
 	@echo "make c11-gate - strict C11 -Werror compile of all src/*.c"
 	@echo "make bench  - codec/SIMD throughput benchmark (incl. HTJ2K SIMD tiers)"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
@@ -274,3 +301,5 @@ help:
 	@echo "Add LIBDEFLATE=1 to any target to use the optional vendored libdeflate"
 	@echo "  backend for ZIP/ZIPS/PXR24 (default: in-tree codec). Run 'make clean'"
 	@echo "  when toggling. e.g. make bench-compare LIBDEFLATE=1"
+	@echo "Add THREADS=1 to any target for C11-threads parallel encode/decode"
+	@echo "  (default: single-threaded). Set count via exr_set_num_threads()."

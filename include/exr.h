@@ -444,6 +444,18 @@ const char *exr_simd_info(void);
 void exr_half_to_float(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half(const float *src, uint16_t *dst, size_t count);
 
+/* Worker-thread count for per-block parallel encode/decode. 0 or 1 means
+ * single-threaded (the default). This is a no-op unless the library is built
+ * with thread support (-DEXR_USE_THREADS / `make ... THREADS=1`); without it
+ * encode/decode always run single-threaded regardless of this setting.
+ *
+ * Parallelism applies to the in-memory load/save paths for scanline and
+ * single-level tiled parts; deep, mipmap/ripmap, and the streaming reader/writer
+ * APIs remain single-threaded. When threads > 1, any custom exr_allocator passed
+ * to load/save must be thread-safe. The setting is process-global. */
+void exr_set_num_threads(int n);
+int exr_get_num_threads(void);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
