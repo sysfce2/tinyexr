@@ -445,4 +445,61 @@ exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
     return EXR_SUCCESS;
 }
 
+/* ---------------------------------------------------------------------------
+ * Vertical (column) forward reversible 5/3, int64, row-wise across all columns.
+ * Bit-identical to the scalar jph_forward_53_vert_i64. Reads data's interleaved
+ * rows (stride width) -> subband layout in temp (stride rw): lh low-rows then hh
+ * high-rows. Columns are the SIMD axis: each lifting step is a contiguous 4-lane
+ * int64 vector op over the row -- no gather/scatter. data and temp are distinct.
+ * ------------------------------------------------------------------------- */
+EXR_TARGET("avx2")
+exr_result jph_forward_53_vert_i64_avx2(const int64_t *data, size_t width,
+                                        size_t rw, size_t lh, size_t hh,
+                                        int64_t *temp) {
+    size_t i, c;
+    __m256i two = _mm256_set1_epi64x(2);
+
+    /* ---- Phase 1: high rows -> temp[(lh+i)*rw] ---- */
+    for (i = 0u; i < hh; ++i) {
+        const int64_t *e0 = data + (2u * i) * width;
+        const int64_t *e1 = data + (2u * (i + 1u < lh ? i + 1u : i)) * width;
+        const int64_t *od = data + (2u * i + 1u) * width;
+        int64_t *hd = temp + (lh + i) * rw;
+        for (c = 0u; c + 4u <= rw; c += 4u) {
+            __m256i a = _mm256_loadu_si256((const __m256i *)(e0 + c));
+            __m256i b = _mm256_loadu_si256((const __m256i *)(e1 + c));
+            __m256i o = _mm256_loadu_si256((const __m256i *)(od + c));
+            __m256i q = jph_sra64x4(_mm256_add_epi64(a, b), 1);
+            _mm256_storeu_si256((__m256i *)(hd + c), _mm256_sub_epi64(o, q));
+        }
+        for (; c < rw; ++c)
+            hd[c] = od[c] - jph_sra64_ref(e0[c] + e1[c], 1);
+    }
+
+    /* ---- Phase 2: low rows -> temp[i*rw] ---- */
+    for (i = 0u; i < lh; ++i) {
+        const int64_t *e0 = data + (2u * i) * width;
+        int64_t *ld = temp + i * rw;
+        if (hh == 0u) {
+            for (c = 0u; c < rw; ++c) ld[c] = e0[c];
+            continue;
+        }
+        {
+            const int64_t *hl = temp + (lh + (i > 0u ? i - 1u : 0u)) * rw;
+            const int64_t *hr = temp + (lh + (i < hh ? i : hh - 1u)) * rw;
+            for (c = 0u; c + 4u <= rw; c += 4u) {
+                __m256i a = _mm256_loadu_si256((const __m256i *)(e0 + c));
+                __m256i l = _mm256_loadu_si256((const __m256i *)(hl + c));
+                __m256i r = _mm256_loadu_si256((const __m256i *)(hr + c));
+                __m256i q =
+                    jph_sra64x4(_mm256_add_epi64(_mm256_add_epi64(l, r), two), 2);
+                _mm256_storeu_si256((__m256i *)(ld + c), _mm256_add_epi64(a, q));
+            }
+            for (; c < rw; ++c)
+                ld[c] = e0[c] + jph_sra64_ref(hl[c] + hr[c] + 2, 2);
+        }
+    }
+    return EXR_SUCCESS;
+}
+
 #endif /* EXR_X86 */

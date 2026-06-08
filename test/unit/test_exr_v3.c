@@ -2216,6 +2216,47 @@ static void jph_simd_check(void) {
         }
         free(src); free(r0); free(r1);
     }
+
+    /* vertical (column) forward 5/3 (int64, encode): AVX2 must match the scalar
+     * source of truth over random sizes incl. hh==0 (rh==1), even/odd rh, and
+     * non-mult-of-4 rw. (Codestream-level bit-exactness vs the prior per-column
+     * forward is additionally covered by the asakusa HTJ2K round-trip tests.) */
+    if (caps & EXR_SIMD_AVX2) {
+        const size_t RWMAX = 300u, RHMAX = 64u;
+        uint32_t rng = 0x0badf00du;
+        int fok = 1;
+        size_t trial;
+        int64_t *data = (int64_t *)malloc(RWMAX * RHMAX * sizeof(int64_t));
+        int64_t *ts = (int64_t *)malloc(RWMAX * RHMAX * sizeof(int64_t));
+        int64_t *ta = (int64_t *)malloc(RWMAX * RHMAX * sizeof(int64_t));
+        if (data && ts && ta) {
+            for (trial = 0; trial < 4000 && fok; ++trial) {
+                size_t rw, rh, lh, hh, i, n;
+                int shiftbits;
+                rng = rng * 1664525u + 1013904223u;
+                rw = 1u + (rng % RWMAX);
+                rng = rng * 1664525u + 1013904223u;
+                rh = 1u + (rng % RHMAX);
+                lh = (rh + 1u) / 2u;
+                hh = rh / 2u;
+                shiftbits = (int)(trial % 40u); /* up to ~full int64 range */
+                n = rh * rw; /* data uses stride rw here (width == rw) */
+                for (i = 0; i < n; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    data[i] = (int64_t)(((uint64_t)rng << 32) | (rng * 2654435761u));
+                    data[i] >>= shiftbits;
+                }
+                memset(ts, 0x5a, RWMAX * RHMAX * sizeof(int64_t));
+                memset(ta, 0x5a, RWMAX * RHMAX * sizeof(int64_t));
+                jph_forward_53_vert_i64(data, rw, rw, lh, hh, ts);
+                jph_forward_53_vert_i64_avx2(data, rw, rw, lh, hh, ta);
+                if (memcmp(ts, ta, rh * rw * sizeof(int64_t)) != 0) { fok = 0; break; }
+            }
+            CHECK(fok, "JPH forward 5/3 vertical AVX2 == scalar");
+            if (fok) printf("  ok: JPH forward 5/3 vertical AVX2 == scalar\n");
+        }
+        free(data); free(ts); free(ta);
+    }
 #endif
 }
 

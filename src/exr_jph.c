@@ -4521,6 +4521,44 @@ static exr_result jph_forward_53_1d_i64(const int64_t *src, size_t n,
     return jph_forward_53_i64(src, n, low, lc, high, hc);
 }
 
+/* Row-wise (column-parallel) forward reversible 5/3 vertical pass, int64. Source
+ * of truth for jph_forward_53_vert_i64_avx2 (must stay bit-identical). Reads the
+ * rh = lh+hh interleaved rows of `data` (stride `width`) -- even rows 2i, odd
+ * rows 2i+1 -- and writes the subband layout into `temp` (stride rw): lh low-rows
+ * [0..lh) then hh high-rows [lh..lh+hh). Per column this is exactly
+ * jph_forward_53_i64; doing it row-wise avoids the strided column gather/scatter
+ * (columns are the natural SIMD axis). `data` and `temp` are distinct buffers. */
+exr_result jph_forward_53_vert_i64(const int64_t *data, size_t width,
+                                   size_t rw, size_t lh, size_t hh,
+                                   int64_t *temp) {
+    size_t i, c;
+    /* Phase 1: high rows -> temp[(lh+i)*rw]. high[i] = odd[i] - floor((e0+e1)/2)
+     * where e1 (even[i+1]) clamps to even[i] at the bottom edge. */
+    for (i = 0u; i < hh; ++i) {
+        const int64_t *e0 = data + (2u * i) * width;
+        const int64_t *e1 = data + (2u * (i + 1u < lh ? i + 1u : i)) * width;
+        const int64_t *od = data + (2u * i + 1u) * width;
+        int64_t *hd = temp + (lh + i) * rw;
+        for (c = 0u; c < rw; ++c)
+            hd[c] = od[c] - jph_floor_div_pow2(e0[c] + e1[c], 1);
+    }
+    /* Phase 2: low rows -> temp[i*rw]. low[i] = even[i] + floor((dl+dr+2)/4),
+     * dl=high[i-1] (clamp 0), dr=high[i] (clamp hh-1). hh==0 -> low[i]=even[i]. */
+    for (i = 0u; i < lh; ++i) {
+        const int64_t *e0 = data + (2u * i) * width;
+        int64_t *ld = temp + i * rw;
+        if (hh == 0u) {
+            for (c = 0u; c < rw; ++c) ld[c] = e0[c];
+        } else {
+            const int64_t *hl = temp + (lh + (i > 0u ? i - 1u : 0u)) * rw;
+            const int64_t *hr = temp + (lh + (i < hh ? i : hh - 1u)) * rw;
+            for (c = 0u; c < rw; ++c)
+                ld[c] = e0[c] + jph_floor_div_pow2(hl[c] + hr[c] + 2, 2);
+        }
+    }
+    return EXR_SUCCESS;
+}
+
 static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
                                         size_t width, size_t height,
                                         unsigned levels) {
@@ -4540,7 +4578,7 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         size_t lw = (rw + 1u) / 2u, hw = rw / 2u;
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
         size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
-        int64_t *temp = NULL, *col_src = NULL, *col_low = NULL, *col_high = NULL;
+        int64_t *temp = NULL, *col_low = NULL, *col_high = NULL;
         int64_t *ev = NULL, *od = NULL;
         size_t y, x;
         exr_result rc = EXR_SUCCESS;
@@ -4554,28 +4592,29 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
             return EXR_ERROR_CORRUPT;
 
         temp = (int64_t *)exr_malloc(a, temp_bytes);
-        col_src = (int64_t *)exr_malloc(a, scratch_bytes);
         col_low = (int64_t *)exr_malloc(a, scratch_bytes);
         col_high = (int64_t *)exr_malloc(a, scratch_bytes);
         if (use_avx2) {
             ev = (int64_t *)exr_malloc(a, scratch_bytes);
             od = (int64_t *)exr_malloc(a, scratch_bytes);
         }
-        if (!temp || !col_src || !col_low || !col_high ||
+        if (!temp || !col_low || !col_high ||
             (use_avx2 && (!ev || !od))) {
-            exr_free(a, temp); exr_free(a, col_src); exr_free(a, col_low);
+            exr_free(a, temp); exr_free(a, col_low);
             exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
 
-        for (x = 0; x < rw; ++x) {
-            for (y = 0; y < rh; ++y) col_src[y] = data[y * width + x];
-            rc = jph_forward_53_1d_i64(col_src, rh, col_low, lh, col_high, hh,
-                                       use_avx2, ev, od);
-            if (rc != EXR_SUCCESS) goto done_fwd64;
-            for (y = 0; y < lh; ++y) temp[y * rw + x] = col_low[y];
-            for (y = 0; y < hh; ++y) temp[(lh + y) * rw + x] = col_high[y];
-        }
+        /* Vertical (column) analysis, row-wise across all columns -- no gather/
+         * scatter. data's interleaved rows -> temp's lh low-rows / hh high-rows. */
+#if defined(EXR_X86)
+        if (use_avx2)
+            rc = jph_forward_53_vert_i64_avx2(data, width, rw, lh, hh, temp);
+        else
+#endif
+            rc = jph_forward_53_vert_i64(data, width, rw, lh, hh, temp);
+        if (rc != EXR_SUCCESS) goto done_fwd64;
+        /* Horizontal (row) analysis: each temp row is contiguous. */
         for (y = 0; y < rh; ++y) {
             rc = jph_forward_53_1d_i64(temp + y * rw, rw, col_low, lw, col_high,
                                        hw, use_avx2, ev, od);
@@ -4585,7 +4624,7 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         }
 
 done_fwd64:
-        exr_free(a, temp); exr_free(a, col_src); exr_free(a, col_low);
+        exr_free(a, temp); exr_free(a, col_low);
         exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
         if (rc != EXR_SUCCESS) return rc;
     }
