@@ -41,16 +41,30 @@ compiler does the per-sample assembly cheaply; (2) the 128-bit (4-sample) kernel
 amortizes its gather/shift setup over only 4 lanes *and* reads both 64-bit window
 halves unconditionally, giving back the lazy-hi saving. So it was **reverted**.
 
-**Only remaining option with upside: 2-quad / 8-sample (256-bit) batching**
-(OpenJPH's `decode_two_quad32`), which amortizes setup over 8 lanes. Feasible —
-the `kappa` recurrence reads the *previous row's* `v_n` (`vp[]`), not the current
-row's left neighbour, so quads within a row are independent and 2-quad batching
-needs no dependency-breaking. But it is more complex (256-bit gather across the
-128-bit `pshufb` boundary, two quads' placement) and, given the 4-sample version
-is already break-even, its net ROI is uncertain. **Recommendation: stop here**
-unless a 256-bit batched kernel is specifically wanted; the scalar `JphQuadMs`
-(commit a4cb990) is the practical sweet spot for the entropy step. The design
-below stands as reference.
+**2-quad / 8-sample (256-bit) batching (OpenJPH `decode_two_quad32` style) —
+implemented, verified bit-exact, measured ~4% SLOWER, reverted.**
+`jph_decode_2quad_magsgn_i32_avx2` decoded two quads' 8 samples in a 256-bit
+register (per-128-lane prefix sum + `pshufb` gather from each quad's own window).
+It was wired into both step-2 loops for full quad pairs (`x+4<=width`), with the
+non-initial `kappa` for quad B correctly reading `vp[1]|vp[2]` (the scalar loop
+advances `vp` by one between quads). **Bit-exact** — 200k random parity trials,
+202 unit tests, 59 corpus files byte-identical — but a careful interleaved A/B
+(600 iters, min-of-7) measured **+4.1%** (slower) vs the scalar `JphQuadMs`.
+Reasons: (1) it computes the per-quad bit totals twice (scalar, to position the
+second window) duplicating the kernel's own `m_n`; (2) it fetches **two full
+128-bit windows** (4 reads) vs the scalar lazy path's ~2; (3) on Zen2, AVX2-256
+ops issue as 2×128-bit µops, so the nominal 2× width does not materialize while
+the extra setup does. Reverted.
+
+**Conclusion (entropy decode SIMD): not worth it on this workload/hardware.**
+Three data points — Stage 0 per-quad scalar (regressed, fixed into the shipped
+`JphQuadMs`), 1-quad AVX2 (break-even), 2-quad AVX2 (~4% slower) — all show the
+scalar `JphQuadMs` (commit a4cb990) is the sweet spot: it already minimizes
+fetches (lazy upper half) and the per-sample assembly is cheap, so per-quad SIMD
+setup + extra window reads cancel the parallelism. The MagSgn step would only
+favour SIMD on much denser / higher-bit-depth blocks or hardware with full-width
+256-bit execution. **The entropy-decode SIMD line is closed.** The design below
+remains as reference for any future revisit.
 
 ## Why
 
