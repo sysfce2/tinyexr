@@ -4,6 +4,31 @@ Status: **scoping / not yet implemented.** Target: `src/exr_jph.c`,
 `src/exr_jph_simd.c`. Reference: OpenJPH `ojph_block_decoder_avx2.cpp` /
 `_ssse3.cpp` in `~/work/openexr/external/OpenJPH/src/core/coding/`.
 
+## ⚠ Empirical finding (2026-06-09): Stage 0 regressed — premise needs revisiting
+
+Stage 0 (the scalar per-quad 128-bit-window refactor) was implemented and
+**measured ~4% SLOWER** on all-HALF htj2k256 decode (clean interleaved A/B,
+min-of-6: 5.09s → 5.30s), and was reverted. Root cause: the assumption that
+windowing "removes 3 of 4 fetches" is wrong for real data. HALF detail bands are
+**sparse** — most quads have 0–1 significant samples — and the current
+per-sample path does *zero* MagSgn work for insignificant samples. A per-quad
+window pays a fixed read + offset-bookkeeping cost on every quad (even fully
+insignificant ones; guarding the read by significance did not recover it).
+
+Implication for the SIMD stages: per-quad/2-quad vectorization pays the same
+fixed per-quad cost, so a net win requires enough significant samples per quad to
+amortize it. That holds for **dense, low-frequency (LL / coarse-resolution)**
+subbands but not the sparse high-frequency detail that dominates a typical HALF
+image. OpenJPH's measured step-2 speedups likely come from dense/high-bit-depth
+blocks plus its fully-SIMD surrounding pipeline, not this step on sparse data.
+
+**Revised recommendation:** treat decode entropy SIMD as **low priority / uncertain
+ROI** for the common all-HALF case. If pursued, gate it to dense quads (e.g.
+significant-sample count ≥ threshold, or only the coarse resolutions) and
+benchmark per-subband before committing. The wavelet/extraction SIMD already
+landed are the higher-confidence wins. The analysis below stands as the design
+if/when a dense-block path is wanted.
+
 ## Why
 
 After the wavelet/extraction/unstuff SIMD work, both decode profiles are
