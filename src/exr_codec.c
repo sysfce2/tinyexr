@@ -113,12 +113,17 @@ exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
  *   interleave: source is the even-byte half followed by the odd-byte half.
  * ------------------------------------------------------------------------- */
 
-void exr_predictor_decode(uint8_t *p, size_t n) {
+void exr_predictor_decode_scalar(uint8_t *p, size_t n) {
     size_t i;
     for (i = 1; i < n; ++i) {
         int d = (int)p[i - 1] + (int)p[i] - 128;
         p[i] = (uint8_t)d;
     }
+}
+
+void exr_predictor_decode(uint8_t *p, size_t n) {
+    exr_simd_init();
+    exr_simd.predictor_decode(p, n);
 }
 
 void exr_interleave_decode(const uint8_t *src, uint8_t *dst, size_t n) {
@@ -139,7 +144,7 @@ void exr_interleave_encode(const uint8_t *src, uint8_t *dst, size_t n) {
 
 /* Forward delta predictor: store (cur - prev + 128) per byte. Inverse of
  * exr_predictor_decode. */
-void exr_predictor_encode(uint8_t *p, size_t n) {
+void exr_predictor_encode_scalar(uint8_t *p, size_t n) {
     size_t i;
     int prev;
     if (n == 0) return;
@@ -149,4 +154,9 @@ void exr_predictor_encode(uint8_t *p, size_t n) {
         p[i] = (uint8_t)(cur - prev + (128 + 256));
         prev = cur;
     }
+}
+
+void exr_predictor_encode(uint8_t *p, size_t n) {
+    exr_simd_init();
+    exr_simd.predictor_encode(p, n);
 }

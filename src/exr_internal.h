@@ -141,6 +141,8 @@ typedef struct {
     void (*half_to_float)(const uint16_t *src, float *dst, size_t count);
     void (*float_to_half)(const float *src, uint16_t *dst, size_t count);
     void (*interleave)(const uint8_t *src, uint8_t *dst, size_t n); /* de-split */
+    void (*predictor_decode)(uint8_t *p, size_t n); /* delta -> prefix sum */
+    void (*predictor_encode)(uint8_t *p, size_t n); /* prefix sum -> delta */
 } exr_simd_vtbl;
 
 extern exr_simd_vtbl exr_simd;
@@ -148,15 +150,26 @@ void exr_simd_init(void);
 /* Force a kernel tier for benchmarking: 0=scalar, 1=sse2/neon, 2=avx2/f16c. */
 void exr_simd_force(int level);
 
+/* Benchmark-only: override the cached CPU caps so codec-internal dispatch that
+ * reads exr_cpu_caps() directly (e.g. the JPH/HTJ2K path) selects a specific
+ * tier. level: -1 restore real detection, 0 scalar, 1 sse4.1, 2 avx2. */
+void exr_cpu_caps_force(int level);
+
 /* Scalar kernels (always built). */
 void exr_half_to_float_scalar(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half_scalar(const float *src, uint16_t *dst, size_t count);
 void exr_interleave_scalar(const uint8_t *src, uint8_t *dst, size_t n);
+void exr_predictor_decode_scalar(uint8_t *p, size_t n);
+void exr_predictor_encode_scalar(uint8_t *p, size_t n);
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define EXR_X86 1
 void exr_interleave_sse2(const uint8_t *src, uint8_t *dst, size_t n);
 void exr_interleave_avx2(const uint8_t *src, uint8_t *dst, size_t n);
+/* SSE2 predictor: prefix-sum (decode) / delta (encode), bit-identical to the
+ * scalar reference. */
+void exr_predictor_decode_sse2(uint8_t *p, size_t n);
+void exr_predictor_encode_sse2(uint8_t *p, size_t n);
 void exr_half_to_float_f16c(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half_f16c(const float *src, uint16_t *dst, size_t count);
 
@@ -190,6 +203,10 @@ void jph_pack_i32_to_half_scalar(uint8_t *dst, const int32_t *src, size_t n);
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define EXR_NEON 1
 void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n);
+/* NEON predictor: prefix-sum (decode) / delta (encode), bit-identical to the
+ * scalar reference. */
+void exr_predictor_decode_neon(uint8_t *p, size_t n);
+void exr_predictor_encode_neon(uint8_t *p, size_t n);
 #endif
 
 /* ============================================================================
@@ -567,6 +584,22 @@ exr_result exr_deflate_zlib(const exr_allocator *a, const uint8_t *src,
 
 /* Adler-32 (zlib trailer). */
 uint32_t exr_adler32(const uint8_t *data, size_t n, uint32_t adler);
+
+/* Optional libdeflate backend for ZIP/ZIPS/PXR24 (gated by EXR_USE_LIBDEFLATE,
+ * default off). The in-tree encoder/inflate above stay the default and remain
+ * the only path for freestanding builds. ZIP/PXR24 call these via the
+ * EXR_DEFLATE_ZLIB / EXR_INFLATE_ZLIB macros so the choice is a build flag. */
+#ifdef EXR_USE_LIBDEFLATE
+exr_result exr_ld_deflate_zlib(const exr_allocator *a, const uint8_t *src,
+                               size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_ld_inflate_zlib(const uint8_t *src, size_t src_size, uint8_t *dst,
+                               size_t dst_cap, size_t *out_size);
+#define EXR_DEFLATE_ZLIB exr_ld_deflate_zlib
+#define EXR_INFLATE_ZLIB exr_ld_inflate_zlib
+#else
+#define EXR_DEFLATE_ZLIB exr_deflate_zlib
+#define EXR_INFLATE_ZLIB exr_inflate_zlib
+#endif
 
 /* fpnge-derived literal DEFLATE encoder with a PSHUFB Huffman-table lookup.
  * The PSHUFB-friendly table: symbols 0-15 and 240-255 are looked up by low

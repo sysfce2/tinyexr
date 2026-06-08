@@ -81,23 +81,44 @@ static uint32_t cpu_caps_cached(void) {
     return caps;
 }
 
-uint32_t exr_cpu_caps(void) { return cpu_caps_cached(); }
+/* Benchmark-only forced tier: -1 = use real detection (default). */
+static int g_caps_force = -1;
+
+uint32_t exr_cpu_caps(void) {
+    uint32_t real = cpu_caps_cached();
+    if (g_caps_force < 0) return real;
+    if (g_caps_force == 0) return 0; /* scalar */
+    {
+        uint32_t c = real & (EXR_SIMD_SSE2 | EXR_SIMD_SSE41);
+        if (g_caps_force >= 2) c |= real & (EXR_SIMD_AVX2 | CAP_F16C);
+        return c;
+    }
+}
+
+void exr_cpu_caps_force(int level) { g_caps_force = level; }
 
 /* The dispatch table (scalar by default; init upgrades it). */
-exr_simd_vtbl exr_simd = {0, 0, 0};
+exr_simd_vtbl exr_simd = {0, 0, 0, 0, 0};
 
 void exr_simd_init(void) {
     static int done = 0;
     uint32_t caps;
     if (done) return;
     caps = cpu_caps_cached();
+    (void)caps; /* unused on non-x86 (NEON/scalar set the table directly) */
 
     exr_simd.half_to_float = exr_half_to_float_scalar;
     exr_simd.float_to_half = exr_float_to_half_scalar;
     exr_simd.interleave = exr_interleave_scalar;
+    exr_simd.predictor_decode = exr_predictor_decode_scalar;
+    exr_simd.predictor_encode = exr_predictor_encode_scalar;
 
 #if defined(EXR_X86)
-    if (caps & EXR_SIMD_SSE2) exr_simd.interleave = exr_interleave_sse2;
+    if (caps & EXR_SIMD_SSE2) {
+        exr_simd.interleave = exr_interleave_sse2;
+        exr_simd.predictor_decode = exr_predictor_decode_sse2;
+        exr_simd.predictor_encode = exr_predictor_encode_sse2;
+    }
     if (caps & EXR_SIMD_AVX2) exr_simd.interleave = exr_interleave_avx2;
     if (caps & CAP_F16C) {
         exr_simd.half_to_float = exr_half_to_float_f16c;
@@ -106,6 +127,8 @@ void exr_simd_init(void) {
 #endif
 #if defined(EXR_NEON)
     exr_simd.interleave = exr_interleave_neon;
+    exr_simd.predictor_decode = exr_predictor_decode_neon;
+    exr_simd.predictor_encode = exr_predictor_encode_neon;
 #endif
     done = 1;
 }
@@ -114,11 +137,16 @@ void exr_simd_force(int level) {
     exr_simd.half_to_float = exr_half_to_float_scalar;
     exr_simd.float_to_half = exr_float_to_half_scalar;
     exr_simd.interleave = exr_interleave_scalar;
+    exr_simd.predictor_decode = exr_predictor_decode_scalar;
+    exr_simd.predictor_encode = exr_predictor_encode_scalar;
 #if defined(EXR_X86)
     {
         uint32_t caps = cpu_caps_cached();
-        if (level >= 1 && (caps & EXR_SIMD_SSE2))
+        if (level >= 1 && (caps & EXR_SIMD_SSE2)) {
             exr_simd.interleave = exr_interleave_sse2;
+            exr_simd.predictor_decode = exr_predictor_decode_sse2;
+            exr_simd.predictor_encode = exr_predictor_encode_sse2;
+        }
         if (level >= 2 && (caps & EXR_SIMD_AVX2))
             exr_simd.interleave = exr_interleave_avx2;
         if (level >= 2 && (caps & CAP_F16C)) {
@@ -127,7 +155,11 @@ void exr_simd_force(int level) {
         }
     }
 #elif defined(EXR_NEON)
-    if (level >= 1) exr_simd.interleave = exr_interleave_neon;
+    if (level >= 1) {
+        exr_simd.interleave = exr_interleave_neon;
+        exr_simd.predictor_decode = exr_predictor_decode_neon;
+        exr_simd.predictor_encode = exr_predictor_encode_neon;
+    }
 #else
     (void)level;
 #endif

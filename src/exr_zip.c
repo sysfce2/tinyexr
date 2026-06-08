@@ -16,7 +16,7 @@ exr_result exr_zip_decompress(const exr_allocator *a, const uint8_t *src,
     tmp = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
     if (!tmp) return EXR_ERROR_OUT_OF_MEMORY;
 
-    rc = exr_inflate_zlib(src, src_size, tmp, dst_size, &out_size);
+    rc = EXR_INFLATE_ZLIB(src, src_size, tmp, dst_size, &out_size);
     if (EXR_OK(rc)) {
         if (out_size != dst_size) {
             rc = EXR_ERROR_CORRUPT;
@@ -46,7 +46,7 @@ exr_result exr_zip_compress(const exr_allocator *a, const uint8_t *src, size_t n
     exr_interleave_encode(src, tmp, n);
     exr_predictor_encode(tmp, n);
 
-    rc = exr_deflate_zlib(a, tmp, n, &comp, &clen);
+    rc = EXR_DEFLATE_ZLIB(a, tmp, n, &comp, &clen);
     exr_free(a, tmp);
 
     if (!EXR_OK(rc) || clen >= n) { /* store original canonical block raw */

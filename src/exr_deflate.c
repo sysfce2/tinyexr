@@ -240,12 +240,23 @@ DFL_INLINE int decode_symbol(dfl_br *reader, const dfl_huff *table) {
 
 static void copy_match(uint8_t *dst, const uint8_t *src, int length,
                        int distance) {
+    (void)src;
     if (DFL_UNLIKELY(length <= 0)) return;
+    src = dst - distance;
     if (distance == 1) {
         memset(dst, *src, (size_t)length);
         return;
     }
-    src = dst - distance;
+    /* When distance >= 8 the 8-byte source window is fully written already, so
+     * even self-overlapping LZ copies can advance a word at a time. */
+    if (distance >= 8) {
+        while (length >= 8) {
+            memcpy(dst, src, 8);
+            dst += 8;
+            src += 8;
+            length -= 8;
+        }
+    }
     while (length-- > 0) *dst++ = *src++;
 }
 
@@ -736,7 +747,36 @@ static int start_dynamic_block(defl_huff *d, bitw *w) {
 #define ENC_MAX_MATCH 258
 #define ENC_WIN 32768
 #define ENC_HASH_SIZE (1 << 15)
-#define ENC_MAX_CHAIN 128
+/* Hash-chain probe depth and "good enough" match length. These trade ratio for
+ * speed; the values below target libdeflate level-4-ish throughput (the codec
+ * still emits valid DEFLATE, so correctness is unaffected). */
+#define ENC_MAX_CHAIN 16
+#define ENC_NICE_LEN 64
+
+/* Length of the common prefix of s1[0..maxlen) and s2[0..maxlen), compared a
+ * machine word at a time (the dominant cost of the LZ parse). */
+DFL_INLINE size_t enc_match_len(const uint8_t *s1, const uint8_t *s2,
+                                size_t maxlen) {
+    size_t l = 0;
+#if defined(__GNUC__) || defined(__clang__)
+    while (l + 8 <= maxlen) {
+        uint64_t a, b, z;
+        memcpy(&a, s1 + l, 8);
+        memcpy(&b, s2 + l, 8);
+        z = a ^ b;
+        if (z) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+            return l + (size_t)(__builtin_clzll(z) >> 3);
+#else
+            return l + (size_t)(__builtin_ctzll(z) >> 3);
+#endif
+        }
+        l += 8;
+    }
+#endif
+    while (l < maxlen && s1[l] == s2[l]) ++l;
+    return l;
+}
 
 static int len_code(int L) {
     int i;
@@ -754,8 +794,12 @@ typedef struct {
     uint16_t dist;
 } tok;
 
-static uint32_t enc_hash(const uint8_t *p) {
-    return (uint32_t)(((p[0] << 10) ^ (p[1] << 5) ^ p[2]) & (ENC_HASH_SIZE - 1));
+/* 4-byte multiplicative hash -> top `hbits` bits (Fibonacci hashing). Higher
+ * quality than the old 3-byte xor, so fewer chain probes are wasted. */
+DFL_INLINE uint32_t enc_hash(const uint8_t *p, int shift) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return (v * 2654435761u) >> shift;
 }
 
 /* Produce token list for src[0..n). Returns token count, or (size_t)-1. */
@@ -764,20 +808,28 @@ static size_t lz_parse(const exr_allocator *a, const uint8_t *src, size_t n,
     int32_t *head = NULL, *prev = NULL;
     size_t i = 0, ntok = 0;
     int32_t k;
+    /* Size the hash table to the block (avoids memset'ing 128 KB for the tiny
+     * blocks ZIPS produces). hbits in [10,15]; shift selects the top bits. */
+    int hbits = 10;
+    size_t hsize;
+    int shift;
+    while (hbits < 15 && ((size_t)1 << hbits) < n) ++hbits;
+    hsize = (size_t)1 << hbits;
+    shift = 32 - hbits;
 
-    head = (int32_t *)exr_malloc(a, sizeof(int32_t) * ENC_HASH_SIZE);
+    head = (int32_t *)exr_malloc(a, sizeof(int32_t) * hsize);
     prev = (int32_t *)exr_malloc(a, sizeof(int32_t) * (n ? n : 1));
     if (!head || !prev) {
         exr_free(a, head);
         exr_free(a, prev);
         return (size_t)-1;
     }
-    for (k = 0; k < ENC_HASH_SIZE; ++k) head[k] = -1;
+    for (k = 0; k < (int32_t)hsize; ++k) head[k] = -1;
 
     while (i < n) {
         size_t best_len = 0, best_dist = 0;
-        if (i + ENC_MIN_MATCH <= n) {
-            uint32_t h = enc_hash(src + i);
+        if (i + 4 <= n) {
+            uint32_t h = enc_hash(src + i, shift);
             int32_t cand = head[h];
             int chain = ENC_MAX_CHAIN;
             size_t maxlen = n - i;
@@ -785,13 +837,14 @@ static size_t lz_parse(const exr_allocator *a, const uint8_t *src, size_t n,
             while (cand >= 0 && chain-- > 0) {
                 size_t d = i - (size_t)cand;
                 if (d > ENC_WIN) break;
+                /* quick reject: only extend when the byte past the current best
+                 * match already agrees (cheap filter before the word compare). */
                 if (src[(size_t)cand + best_len] == src[i + best_len]) {
-                    size_t l = 0;
-                    while (l < maxlen && src[(size_t)cand + l] == src[i + l]) ++l;
+                    size_t l = enc_match_len(src + (size_t)cand, src + i, maxlen);
                     if (l > best_len) {
                         best_len = l;
                         best_dist = d;
-                        if (l >= maxlen) break;
+                        if (l >= maxlen || l >= ENC_NICE_LEN) break;
                     }
                 }
                 cand = prev[cand];
@@ -809,8 +862,8 @@ static size_t lz_parse(const exr_allocator *a, const uint8_t *src, size_t n,
             {
                 size_t j;
                 for (j = 1; j < best_len; ++j) {
-                    if (i + j + ENC_MIN_MATCH <= n) {
-                        uint32_t h2 = enc_hash(src + i + j);
+                    if (i + j + 4 <= n) {
+                        uint32_t h2 = enc_hash(src + i + j, shift);
                         prev[i + j] = head[h2];
                         head[h2] = (int32_t)(i + j);
                     }

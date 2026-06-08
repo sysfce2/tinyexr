@@ -120,7 +120,7 @@ static void bench_codecs(const char *path) {
             const char *lv[] = {"scalar", "sse2", "avx2"};
             dc.buf = buf;
             dc.buf_size = sz;
-            printf("  ZIP decode by forced SIMD tier (de-interleave dispatch):\n");
+            printf("  ZIP decode by forced SIMD tier (predictor + de-interleave):\n");
             for (lvl = 0; lvl <= 2; ++lvl) {
                 double td;
                 exr_simd_force(lvl);
@@ -128,6 +128,39 @@ static void bench_codecs(const char *path) {
                 printf("    %-7s %10.1f MP/s\n", lv[lvl], mpix / td);
             }
             exr_simd_init(); /* restore best */
+            free(buf);
+        }
+    }
+
+    /* end-to-end SIMD tier comparison on the HTJ2K (JPH) path. The JPH codec
+     * dispatches its SIMD kernels (NLT type-3, half pack, 5/3 inverse) off
+     * exr_cpu_caps() directly, so forcing the cap tier exercises the whole
+     * HTJ2K encode/decode pipeline, not just the de-interleave. */
+    {
+        void *buf = NULL;
+        size_t sz = 0;
+        if (EXR_OK(exr_save_to_memory(&buf, &sz, NULL, &src,
+                                      EXR_COMPRESSION_HTJ2K256))) {
+            struct codec_ctx dc, ec;
+            int lvl;
+            const char *lv[] = {"scalar", "sse4.1", "avx2"};
+            dc.buf = buf;
+            dc.buf_size = sz;
+            dc.comp = EXR_COMPRESSION_HTJ2K256;
+            ec.src = &src;
+            ec.comp = EXR_COMPRESSION_HTJ2K256;
+            printf("  HTJ2K256 by forced SIMD tier (JPH dispatch):\n");
+            printf("    %-7s %12s %12s\n", "tier", "encode MP/s", "decode MP/s");
+            for (lvl = 0; lvl <= 2; ++lvl) {
+                double te, td;
+                exr_cpu_caps_force(lvl); /* JPH path */
+                exr_simd_force(lvl);     /* interleave/half table, for parity */
+                te = timeit(do_encode, &ec, 0.3, NULL);
+                td = timeit(do_decode, &dc, 0.3, NULL);
+                printf("    %-7s %12.1f %12.1f\n", lv[lvl], mpix / te, mpix / td);
+            }
+            exr_cpu_caps_force(-1); /* restore real detection */
+            exr_simd_init();        /* restore best */
             free(buf);
         }
     }
