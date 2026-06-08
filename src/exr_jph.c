@@ -2485,6 +2485,8 @@ static uint64_t jph_decode_magsgn_sample64(JphMagSgn *magsgn, uint32_t inf,
     return val;
 }
 
+static int jph_clz64(uint64_t v); /* defined below; used in the magnitude pass */
+
 static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                                              const JphHtTables *htab,
                                              int64_t *out,
@@ -2789,16 +2791,12 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                 uint32_t u_q = sp[1];
                 uint32_t gamma = inf & 0xF0u;
                 uint64_t emax_src;
-                uint32_t lz = 0u, emax, kappa, u_q_eff;
+                uint32_t emax, kappa, u_q_eff;
                 uint64_t v_n;
                 exr_result sample_rc;
                 gamma &= gamma - 0x10u;
-                emax_src = vp[0] | vp[1] | 2u;
-                while ((emax_src & UINT64_C(0x8000000000000000)) == 0u) {
-                    ++lz;
-                    emax_src <<= 1u;
-                }
-                emax = 63u - lz;
+                emax_src = vp[0] | vp[1] | 2u; /* nonzero (| 2u) */
+                emax = 63u - (uint32_t)jph_clz64(emax_src);
                 kappa = gamma ? emax : 1u;
                 u_q_eff = u_q + kappa;
                 if (u_q_eff > mmsbp2) {
