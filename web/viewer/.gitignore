@@ -1,0 +1,7 @@
+# Emscripten / CMake build artifacts
+build/
+exr_viewer.mjs
+exr_viewer.wasm
+
+# Local test image fetched by the "Sample" button
+sample.exr
