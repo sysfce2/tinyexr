@@ -1,7 +1,12 @@
-# Emscripten / CMake build artifacts
+# Emscripten / CMake build directory
 build/
-exr_viewer.mjs
-exr_viewer.wasm
 
-# Local test image fetched by the "Sample" button
-sample.exr
+# The generated WASM module + ES6 glue and the demo sample image are committed
+# (see ../../.github/workflows/gh-pages.yml) so GitHub Pages can serve the
+# viewer as a static site without an Emscripten build in CI:
+#   exr_viewer.mjs
+#   exr_viewer.wasm
+#   sample.exr
+
+# Local generator binary
+gen_sample

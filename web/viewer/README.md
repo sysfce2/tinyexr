@@ -33,6 +33,18 @@ HTJ2K). Deep parts are detected and reported as unsupported by this viewer.
 > public v3 API with no iteration entry point, so the info panel shows the
 > structured header fields and channels only.
 
+## Live demo
+
+This viewer is deployed to GitHub Pages from the `release` branch by
+[`.github/workflows/gh-pages.yml`](../../.github/workflows/gh-pages.yml):
+
+➡️ <https://syoyo.github.io/tinyexr/>
+
+The deploy is a plain static-file upload — the generated `exr_viewer.mjs`,
+`exr_viewer.wasm`, and a small `sample.exr` are committed to the repo, so no
+Emscripten build runs in CI. After changing the C binding or UI, rebuild
+locally (below) and commit the regenerated `.mjs` / `.wasm`.
+
 ## Build
 
 Requires the [Emscripten SDK](https://emscripten.org/) on `PATH`
@@ -63,8 +75,16 @@ python3 -m http.server
 
 Then drag an `.exr` onto the window, or click **Open .exr**.
 
-The **Sample** button fetches `sample.exr` from this folder. To use the repo's
-test image:
+The **Sample** button fetches `sample.exr` from this folder. The committed
+`sample.exr` is a small HDR test pattern produced by `gen_sample.c`:
+
+```sh
+c++ -x c++ -DTINYEXR_USE_MINIZ=0 -DTINYEXR_USE_STB_ZLIB=0 -include zlib.h \
+    gen_sample.c -o gen_sample -lz -lm
+./gen_sample          # writes sample.exr
+```
+
+To use the repo's full-size test image instead:
 
 ```sh
 cp ../../asakusa.exr sample.exr
@@ -78,3 +98,5 @@ cp ../../asakusa.exr sample.exr
 | `CMakeLists.txt` | Emscripten build (MinSizeRel + `-Oz`), exports + ES6 module. |
 | `build.sh` | Convenience wrapper around `emcmake cmake` + copy. |
 | `index.html`, `style.css`, `viewer.js` | The WebGL2 viewer UI. |
+| `exr_viewer.mjs`, `exr_viewer.wasm` | Committed build outputs served by GitHub Pages. |
+| `gen_sample.c`, `sample.exr` | One-off HDR test-pattern generator and its output. |
