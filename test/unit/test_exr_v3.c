@@ -2339,6 +2339,12 @@ int main(void) {
     roundtrip("test/unit/regression/000-issue194.exr", EXR_COMPRESSION_PIZ, "PIZ-3ch");
     roundtrip("asakusa.exr", EXR_COMPRESSION_ZSTD, "ZSTD");
     roundtrip("test/unit/regression/flaga.exr", EXR_COMPRESSION_ZSTD, "ZSTD-8ch");
+    /* HTJ2K encode->decode on a real multi-channel HALF image. The htj2k32
+     * geometry (16-line res5 codeblocks) exposed a packet-header bit-stuffing
+     * bug: a header ending in 0xFF needs a trailing 0x00 stuffing byte, else the
+     * codeblock data desyncs by one byte (regression guard). */
+    roundtrip("asakusa.exr", EXR_COMPRESSION_HTJ2K256, "HTJ2K256");
+    roundtrip("asakusa.exr", EXR_COMPRESSION_HTJ2K32, "HTJ2K32");
     tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZIP, "ZIP");
     tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZSTD, "ZSTD");
     zstd_corruption_rejects("asakusa.exr");

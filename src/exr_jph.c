@@ -5713,6 +5713,17 @@ static exr_result jph_packet_writer_finish(JphPacketWriter *bw,
     exr_result rc = EXR_SUCCESS;
     if (!bw || !out_p) return EXR_ERROR_INVALID_ARGUMENT;
     if (bw->used) rc = jph_packet_writer_flush_byte(bw);
+    /* If the packet header ends on a 0xFF byte, JPEG2000 bit-stuffing requires
+     * a trailing 0x00: the decoder consumes a stuffing byte after every 0xFF,
+     * including at packet termination (jph_bitreader_terminate_packet reads one
+     * when prev_ff is set). Omitting it desyncs the following codeblock data by
+     * one byte whenever a header happens to end in 0xFF (data/geometry
+     * dependent). Matches OpenJPH's packet-header termination. */
+    if (rc == EXR_SUCCESS && bw->prev_ff) {
+        if (bw->p >= bw->end) return EXR_ERROR_CORRUPT;
+        *bw->p++ = 0x00u;
+        bw->prev_ff = 0u;
+    }
     if (rc == EXR_SUCCESS) *out_p = bw->p;
     return rc;
 }
