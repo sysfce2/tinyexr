@@ -178,6 +178,18 @@ fuzz: test/fuzzer/fuzz_v3.c | build
 	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_v3
 	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -max_total_time=60 test/unit/regression"
 
+# HTJ2K (JPH) encode+decode+round-trip fuzzer.
+#   ./build/fuzz_jph -max_total_time=600 test/fuzzer/corpus_jph
+fuzz-jph: test/fuzzer/fuzz_jph.c | build
+	clang $(V3_CSTD) $(V3_INC) -O1 -g -w -fsanitize=fuzzer,address,undefined \
+	  test/fuzzer/fuzz_jph.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_jph
+	@echo "built build/fuzz_jph"
+
+# Deterministic corpus replay for fuzz_jph (no libFuzzer needed).
+fuzz-jph-corpus: test/fuzzer/fuzz_jph.c | build
+	clang $(V3_CSTD) -Wall $(V3_INC) -O1 -g $(SAN) -DEXR_JPH_FUZZ_STANDALONE \
+	  test/fuzzer/fuzz_jph.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_jph_replay
+
 # Deterministic corpus replay under ASan+UBSan (no libFuzzer needed; CI gate).
 fuzz-corpus: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/fuzzer/fuzz_v3.c | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \

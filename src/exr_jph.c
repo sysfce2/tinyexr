@@ -2608,6 +2608,13 @@ static inline uint32_t jph_quad_ms_sample(JphQuadMs *q, const JphMagSgn *m,
         uint32_t o = q->off;
         uint32_t m_n = U_q - ((inf >> (12u + bit)) & 1u);
         uint32_t ms;
+        /* Caller must ensure U_q <= 31 so total consumed bits across all four
+         * samples stays <= 4*31 = 124 < 128 (the two-word window).  Guard here
+         * to prevent UB from a shift >= 64 if that invariant is ever violated. */
+        if (o + m_n > 127u) {
+            *v_n_out = 0u;
+            return 0u;
+        }
         if (o + m_n > 64u && !q->hi_loaded) {
             q->hi = jph_magsgn_fetch64_at(m, q->base + 64u);
             q->hi_loaded = 1;
@@ -3299,11 +3306,14 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     (void)i;
 
     if (!seg || !htab || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    /* Defense-in-depth: HT codeblocks are at most 128x32 (callers/validation
+     * enforce this).  Re-check locally so the fixed-size scratch math below
+     * cannot be driven OOB if a future caller skips the guard. */
     if (width == 0u || height == 0u) return EXR_ERROR_INVALID_ARGUMENT;
     if (width > 128u || height > 32u) return EXR_ERROR_CORRUPT;
 
     if (num_passes > 1u && lengths2 == 0u) num_passes = 1u;
-    if (num_passes > 3u) return EXR_ERROR_UNSUPPORTED;
+    if (num_passes < 1u || num_passes > 3u) return EXR_ERROR_UNSUPPORTED;
 
     if (missing_msbs >= 30u || kmax > 30u) {
         return jph_decode_block64_cleanup(seg, htab, out, out_stride, kmax);
