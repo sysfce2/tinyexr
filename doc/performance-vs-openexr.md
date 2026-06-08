@@ -60,8 +60,15 @@ materially (~16% faster all-HALF decode on the dev box). The same
 column-parallel restructuring was then applied to the **forward** 5/3 (encode,
 byte-identical output, ~7% faster htj2k256 encode) and to the **int64** inverse
 5/3 used for float/32-bit channels (AVX2 1D + vertical, ~18% faster float
-decode). The remaining gap is OpenJPH's fully-SIMD entropy coder (cleanup
-VLC/MEL + MagSgn + per-sample mag-bit encode), which dominates both profiles.
+decode). The cleanup-pass entropy decoder's MagSgn reconstruction was then
+restructured to a per-quad reader (`JphQuadMs`): one bit-window read per quad
+(lazy upper half) replacing four per-sample stream fetches, ~4% faster all-HALF
+decode. The remaining gap is OpenJPH's fully-SIMD entropy coder (cleanup VLC/MEL
++ MagSgn + per-sample mag-bit encode), which dominates both profiles; SIMD-ing
+the decode MagSgn step beyond the scalar per-quad reader was tried (1- and
+2-quad AVX2 kernels) and did not pay off on this hardware — the per-quad scalar
+path already minimizes the bit-I/O the SIMD would amortize (see
+`doc/htj2k-entropy-simd-scope.md`).
 
 ### Compression size
 
