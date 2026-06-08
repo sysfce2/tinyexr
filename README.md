@@ -564,6 +564,34 @@ Highlights:
 
 Build: `make lib` (`build/libtinyexr3.a`), `make test-c`, `make c11-gate`.
 
+### Performance vs OpenEXR
+
+Benchmarked against the reference **OpenEXR** library (4.0-dev) on an idle AMD
+Ryzen 9 3950X (Zen2), `asakusa.exr` 660×440, fully in-memory, both pinned to the
+same thread count. Throughput in megapixels/s. Full writeup + charts:
+[`doc/performance-vs-openexr.md`](doc/performance-vs-openexr.md).
+
+- **Single thread, default (dependency-free) decode:** TinyEXR is faster on the
+  cheap codecs — **uncompressed ~3.4×** (2699 vs 789) and **RLE ~2.5×**
+  (230 vs 93). OpenEXR leads the compressed codecs (ZIP ~1.2×, PXR24 ~1.8×,
+  ZIPS ~2.1×, PIZ ~2.7×, HTJ2K ~2.5–3×), thanks to its libdeflate / tuned
+  PIZ / OpenJPH backends.
+- **Single-thread encode:** ties/wins on RLE/PIZ/B44; OpenEXR is ~1.5× on
+  ZIP/ZIPS, ~1.8× on PXR24, ~4× on HTJ2K.
+- **Optional libdeflate backend** (`make … LIBDEFLATE=1`, off by default): with
+  the same backend TinyEXR **matches or beats** OpenEXR on the deflate family —
+  e.g. ZIP decode **1.37×** (80.8 vs 58.8), sizes byte-identical.
+- **Multi-threaded** (opt-in C11 threads, `make … THREADS=1` +
+  `exr_set_num_threads(n)`): per-block parallel encode/decode scales **~5×
+  (ZIP) to ~8.8× (ZIPS)** to 16 threads. At 16 threads TinyEXR **out-decodes
+  OpenEXR on RLE/ZIP/ZIPS/B44** (in-tree), and leads the whole deflate family
+  decisively with libdeflate (ZIP decode 339.6 vs 226.6, ZIPS 358.5 vs 151.1).
+
+Compressed sizes are essentially identical (the formats interoperate). Net:
+TinyEXR is the fast, dependency-free choice for read latency and cheap codecs;
+enabling libdeflate and/or threads puts it ahead of OpenEXR on the deflate family
+too.
+
 ### Streaming block I/O (bounded working memory)
 
 The pure-C11 v3 API (`include/exr.h`) can decode and encode an EXR one block at
