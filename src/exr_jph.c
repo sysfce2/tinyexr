@@ -2551,19 +2551,23 @@ static exr_result jph_magsgn_init(JphMagSgn *m, const uint8_t *data,
     return jph_forward_bits_init(m, data, size, 0xffu, bitbuf);
 }
 
-static uint64_t jph_magsgn_fetch64(JphMagSgn *m) {
-    uint64_t c, v, avail;
+/* Read 64 unstuffed bits at an arbitrary absolute bit position (no cursor move),
+ * with the same fill semantics as jph_magsgn_fetch64. */
+static uint64_t jph_magsgn_fetch64_at(const JphMagSgn *m, uint64_t c) {
+    uint64_t v, avail;
     uint32_t off;
-    if (!m) return 0u;
-    c = m->cursor;
     if (c >= m->real_bits) return m->fill_word;
     off = (uint32_t)(c & 63u);
     v = m->buf[c >> 6u] >> off;
     if (off) v |= m->buf[(c >> 6u) + 1u] << (64u - off);
     avail = m->real_bits - c;
-    /* bits beyond real_bits are already 0 in `buf`; for a 1-fill stream set them */
     if (avail < 64u && m->fill_word) v |= ~UINT64_C(0) << avail;
     return v;
+}
+
+static uint64_t jph_magsgn_fetch64(JphMagSgn *m) {
+    if (!m) return 0u;
+    return jph_magsgn_fetch64_at(m, m->cursor);
 }
 
 static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
@@ -2572,6 +2576,57 @@ static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
 
 static void jph_magsgn_advance(JphMagSgn *m, uint32_t n) {
     if (m) m->cursor += n;
+}
+
+/* Per-quad MagSgn reader for the int32 path. A whole HT quad of this path
+ * consumes <= 4*31 = 124 bits, so one 128-bit window at the quad's start cursor
+ * covers it and the 4 samples are extracted at running bit offsets -- replacing
+ * the 4 per-sample fetch+advance with (usually) a single 64-bit read. The upper
+ * 64 bits are fetched lazily, only when a sample actually crosses bit 64 (rare
+ * for HALF data, whose quad magnitudes are small). Bit-identical to the
+ * per-sample core of jph_decode_block. */
+typedef struct {
+    uint64_t lo, hi, base;
+    uint32_t off;
+    int hi_loaded;
+} JphQuadMs;
+
+static inline void jph_quad_ms_begin(JphQuadMs *q, const JphMagSgn *m) {
+    q->base = m->cursor;
+    q->lo = jph_magsgn_fetch64_at(m, q->base);
+    q->hi = 0u;
+    q->off = 0u;
+    q->hi_loaded = 0;
+}
+
+static inline uint32_t jph_quad_ms_sample(JphQuadMs *q, const JphMagSgn *m,
+                                          uint32_t inf, uint32_t bit,
+                                          uint32_t U_q, uint32_t p,
+                                          uint32_t *v_n_out) {
+    uint32_t val = 0u, v_n = 0u;
+    if (inf & (1u << (4u + bit))) {
+        uint32_t o = q->off;
+        uint32_t m_n = U_q - ((inf >> (12u + bit)) & 1u);
+        uint32_t ms;
+        if (o + m_n > 64u && !q->hi_loaded) {
+            q->hi = jph_magsgn_fetch64_at(m, q->base + 64u);
+            q->hi_loaded = 1;
+        }
+        ms = (o < 64u) ? (uint32_t)((q->lo >> o) | (o ? (q->hi << (64u - o)) : 0u))
+                       : (uint32_t)(q->hi >> (o - 64u));
+        val = ms << 31;
+        v_n = ms & jph_mask32(m_n);
+        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
+        v_n |= 1u;
+        val |= (v_n + 2u) << (p - 1u);
+        q->off = o + m_n;
+    }
+    *v_n_out = v_n;
+    return val;
+}
+
+static inline void jph_quad_ms_end(JphQuadMs *q, JphMagSgn *m) {
+    m->cursor = q->base + q->off;
 }
 
 /* uint64 words needed for jph_unstuff_bits over `size` bytes (+ fetch slack). */
@@ -3476,79 +3531,36 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
         while (x < width) {
             uint32_t inf = sp[0];
             uint32_t U_q = sp[1];
-            uint32_t bit, m_n;
-            uint32_t v_n = 0, val = 0;
+            uint32_t v_n = 0u, ignore;
+            JphQuadMs q;
 
             if (U_q > mmsbp2) {
                 rc = EXR_ERROR_CORRUPT;
                 goto done;
             }
-            bit = 0u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
-            }
-            dp[0] = val;
-            v_n = 0u;
-            val = 0u;
-            bit = 1u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
-            }
-            if (1u < height) {
-                dp[sstr] = val;
+            jph_quad_ms_begin(&q, &magsgn);
+            dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 0u, U_q, p, &ignore);
+            {
+                uint32_t val =
+                    jph_quad_ms_sample(&q, &magsgn, inf, 1u, U_q, p, &v_n);
+                if (1u < height) dp[sstr] = val;
             }
             vp[0] = (uint32_t)(prev_v_n | v_n);
             prev_v_n = 0;
             ++dp;
             ++x;
             if (x >= width) {
+                jph_quad_ms_end(&q, &magsgn);
                 ++vp;
                 break;
             }
-            v_n = 0u;
-            val = 0u;
-            bit = 2u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
+            dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 2u, U_q, p, &ignore);
+            {
+                uint32_t val =
+                    jph_quad_ms_sample(&q, &magsgn, inf, 3u, U_q, p, &v_n);
+                if (1u < height) dp[sstr] = val;
             }
-            dp[0] = val;
-            v_n = 0u;
-            val = 0u;
-            bit = 3u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
-            }
-            if (1u < height) {
-                dp[sstr] = val;
-            }
+            jph_quad_ms_end(&q, &magsgn);
             prev_v_n = v_n;
             ++dp;
             ++x;
@@ -3604,72 +3616,33 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 }
 
                 {
-                    uint32_t bit = 0u, m_n, v_n, val = 0u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
-                    }
-                    dp[0] = val;
-                    v_n = 0u;
-                    val = 0u;
-                    bit = 1u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
-                    }
-                    if (y + 1u < height) {
-                        dp[sstr] = val;
+                    uint32_t v_n = 0u, ignore;
+                    JphQuadMs q;
+                    jph_quad_ms_begin(&q, &magsgn);
+                    dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 0u, U_q, p,
+                                               &ignore);
+                    {
+                        uint32_t val = jph_quad_ms_sample(&q, &magsgn, inf, 1u,
+                                                          U_q, p, &v_n);
+                        if (y + 1u < height) dp[sstr] = val;
                     }
                     vp[0] = (uint32_t)(prev_v_n | v_n);
                     prev_v_n = 0;
                     ++dp;
                     ++x;
                     if (x >= width) {
+                        jph_quad_ms_end(&q, &magsgn);
                         ++vp;
                         break;
                     }
-                    v_n = 0u;
-                    val = 0u;
-                    bit = 2u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
+                    dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 2u, U_q, p,
+                                               &ignore);
+                    {
+                        uint32_t val = jph_quad_ms_sample(&q, &magsgn, inf, 3u,
+                                                          U_q, p, &v_n);
+                        if (y + 1u < height) dp[sstr] = val;
                     }
-                    dp[0] = val;
-                    v_n = 0u;
-                    val = 0u;
-                    bit = 3u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
-                    }
-                    if (y + 1u < height) {
-                        dp[sstr] = val;
-                    }
+                    jph_quad_ms_end(&q, &magsgn);
                     prev_v_n = v_n;
                     ++dp;
                     ++x;
