@@ -4838,15 +4838,21 @@ static exr_result jph_mel_vlc_terminate(JphMelEnc *m, JphVlcEnc *v) {
 }
 
 static int jph_clz64(uint64_t v) {
-    int n = 0;
     if (!v) return 64;
-    if (!(v & UINT64_C(0xFFFFFFFF00000000))) { n += 32; v <<= 32; }
-    if (!(v & UINT64_C(0xFFFF000000000000))) { n += 16; v <<= 16; }
-    if (!(v & UINT64_C(0xFF00000000000000))) { n += 8;  v <<= 8;  }
-    if (!(v & UINT64_C(0xF000000000000000))) { n += 4;  v <<= 4;  }
-    if (!(v & UINT64_C(0xC000000000000000))) { n += 2;  v <<= 2;  }
-    if (!(v & UINT64_C(0x8000000000000000))) { n += 1;  }
-    return n;
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_clzll(v); /* single lzcnt/bsr on x86; v != 0 guaranteed */
+#else
+    {
+        int n = 0;
+        if (!(v & UINT64_C(0xFFFFFFFF00000000))) { n += 32; v <<= 32; }
+        if (!(v & UINT64_C(0xFFFF000000000000))) { n += 16; v <<= 16; }
+        if (!(v & UINT64_C(0xFF00000000000000))) { n += 8;  v <<= 8;  }
+        if (!(v & UINT64_C(0xF000000000000000))) { n += 4;  v <<= 4;  }
+        if (!(v & UINT64_C(0xC000000000000000))) { n += 2;  v <<= 2;  }
+        if (!(v & UINT64_C(0x8000000000000000))) { n += 1;  }
+        return n;
+    }
+#endif
 }
 
 /* abs() of a coefficient that may exceed int32 (32-bit-precision components). */
