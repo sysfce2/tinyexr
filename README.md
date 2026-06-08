@@ -673,6 +673,20 @@ the core plus the pure-C binding `examples/wasm/exr_wasm.c`
 (`exrw_decode_rgba` / `exrw_encode_rgba` / `exrw_free`), with `FILESYSTEM=0`.
 See `examples/wasm/README.md` and the `node examples/wasm/test.mjs` smoke test.
 
+**Browser viewer** (`web/viewer/`, needs `emcc` + CMake): a self-contained
+WebGL2 EXR viewer built on the v3 streaming block API — drag-and-drop / upload,
+load progress, exposure / gamma / channel controls, zoom / pan, data/display
+window + region overlays, a pixel picker, and a header/info panel with part and
+mip selectors. Build it with the Emscripten CMake toolchain (MinSizeRel + `-Oz`):
+
+```sh
+cd web/viewer
+./build.sh          # emcmake cmake -S . -B build -DCMAKE_BUILD_TYPE=MinSizeRel && cmake --build build
+python3 -m http.server   # then open http://localhost:8000/
+```
+
+See `web/viewer/README.md` for details.
+
 ## Unit tests
 
 See `test/unit` directory.

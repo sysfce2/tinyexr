@@ -1,0 +1,50 @@
+name: Deploy WASM viewer to GitHub Pages
+
+# Publishes web/viewer (the pure-C11 v3 WASM EXR viewer) as a static site.
+# The generated exr_viewer.mjs / exr_viewer.wasm and a small sample.exr are
+# committed to the repo, so no Emscripten build runs here — we just upload the
+# directory as the Pages artifact.
+
+on:
+  # Deploy on every push to the release branch that touches the viewer.
+  push:
+    branches: ["release"]
+    paths:
+      - "web/viewer/**"
+      - ".github/workflows/gh-pages.yml"
+  # Allow manual deploys from the Actions tab.
+  workflow_dispatch:
+
+# Least-privilege token for Pages deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment; don't cancel an in-progress one so a
+# running publish always finishes.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload viewer as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/viewer
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
