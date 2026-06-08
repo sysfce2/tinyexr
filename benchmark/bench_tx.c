@@ -104,3 +104,5 @@ void bench_tx_unload(void) {
 }
 
 const char *bench_tx_simd_info(void) { return exr_simd_info(); }
+
+void bench_tx_set_threads(int n) { exr_set_num_threads(n); }

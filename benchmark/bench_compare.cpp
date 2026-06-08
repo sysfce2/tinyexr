@@ -253,12 +253,15 @@ int main(int argc, char **argv) {
         if (threads < 0) threads = 0;
     }
     IMF::setGlobalThreadCount(threads);
+    /* Match tinyexr's worker count to OpenEXR's (no-op unless built THREADS=1).
+     * 0 -> single-threaded on both sides. */
+    bench_tx_set_threads(threads);
 
     printf("TinyEXR v3 vs OpenEXR benchmark  |  tinyexr SIMD: %s\n",
            bench_tx_simd_info());
-    printf("OpenEXR worker threads: %d (%s; set EXR_THREADS=N to change)\n",
-           threads,
-           threads == 0 ? "single-threaded, calling thread only" : "pool");
+    printf("worker threads: %d (both libraries; EXR_THREADS=N to change; "
+           "tinyexr needs a THREADS=1 build to use them)\n",
+           threads);
     printf("(in-memory; each library loads the same source independently)\n");
 
     if (argc > 1) {

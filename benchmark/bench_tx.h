@@ -39,6 +39,9 @@ bench_tx_result bench_tx_run(int i, double mpix);
 void bench_tx_unload(void);
 const char *bench_tx_simd_info(void);
 
+/* Set tinyexr's worker-thread count (no-op unless built with THREADS=1). */
+void bench_tx_set_threads(int n);
+
 #ifdef __cplusplus
 }
 #endif

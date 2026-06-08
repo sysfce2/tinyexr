@@ -16,7 +16,7 @@ It reports:
    PXR24/B44/DWA files on the command line to time those decoders too).
 
 2. **ZIP decode by forced SIMD tier** — the same ZIP decode run with the
-   byte de-interleave kernel forced to scalar / SSE2 / AVX2 (via
+   predictor + byte de-interleave kernels forced to scalar / SSE2 / AVX2 (via
    `exr_simd_force`), showing the end-to-end effect of that dispatch.
 
 3. **HTJ2K256 by forced SIMD tier** — end-to-end HTJ2K encode *and* decode at
@@ -89,136 +89,65 @@ an opt-in/benchmark encoder — the default ZIP codec keeps the fpng LZ77 path.
 
 ## Measured results
 
-Machine: **AMD Ryzen 9 3950X (Zen2)**, single-threaded. SIMD reported as
-`avx2+f16c` (caps `0x7` = SSE2 | SSE4.1 | AVX2). Source: `asakusa.exr`
-(660×440, 4 ch). Numbers vary run-to-run by a few percent.
+Machine: **AMD Ryzen 9 3950X (Zen2)**, idle. SIMD reported as `avx2+f16c`
+(caps `0x7` = SSE2 | SSE4.1 | AVX2). Source: `asakusa.exr` (660×440, 4 ch).
+Numbers vary run-to-run by a few percent.
+
+> The full **tinyexr vs OpenEXR** comparison (single-thread + multi-thread,
+> in-tree + libdeflate, with charts) lives in
+> [`doc/performance-vs-openexr.md`](../doc/performance-vs-openexr.md). This
+> section covers the bench's own SIMD-tier / micro-kernel numbers.
 
 ### SIMD tiers (`make bench`)
 
-End-to-end decode by forced de-interleave tier, and HTJ2K256 (JPH) by forced
-tier:
+End-to-end decode by forced tier (the ZIP tier covers the SIMD predictor +
+de-interleave; HTJ2K256 the JPH dispatch):
 
 | path                  | scalar | SSE2/SSE4.1 | AVX2 |
 |-----------------------|-------:|------------:|-----:|
-| ZIP decode (MP/s)     | 29.2   | **37.0** (SSE2) | 36.2 |
-| HTJ2K256 encode (MP/s)| 5.2    | 5.5 (SSE4.1)| 5.4  |
-| HTJ2K256 decode (MP/s)| 10.1   | 10.2 (SSE4.1)| **13.3** |
-
-(ZIP decode tier now covers both the SIMD predictor and the de-interleave;
-SSE2 lifts it ~1.27×.)
+| ZIP decode (MP/s)     | 36.6   | **47.5** (SSE2) | 47.6 |
+| HTJ2K256 encode (MP/s)| 7.5    | 7.5 (SSE4.1)| 7.6  |
+| HTJ2K256 decode (MP/s)| 13.7   | 14.3 (SSE4.1)| **19.6** |
 
 SIMD micro-kernels (throughput, speedup vs scalar):
 
 | kernel                  | scalar    | SSE2/SSE4.1     | AVX2            |
 |-------------------------|----------:|----------------:|----------------:|
-| byte de-interleave      | 2.03 GB/s | 4.02 GB/s (1.98×, SSE2) | 3.52 GB/s (1.74×) |
-| half→float              | 2.31 GB/s | —               | 6.60 GB/s (2.85×, F16C) |
-| fpnge PSHUFB lookup     | 0.36 GB/s | 1.53 GB/s (4.28×, SSE4.1) | 1.64 GB/s (4.58×) |
-| JPH `nlt3` (NLT type-3) | 238.7 M/s | 563.1 M/s (2.36×, SSE2) | 601.9 M/s (2.52×) |
-| JPH `pack` (i32→half)   | 914.9 M/s | 1105.5 M/s (1.21×, SSE4.1) | 1148.7 M/s (1.26×) |
-| predictor decode (delta)| 0.95 GB/s | **3.3 GB/s** (3.4×, SSE2)  | (SSE2)          |
+| byte de-interleave      | 3.04 GB/s | 7.93 GB/s (2.61×, SSE2) | 6.81 GB/s (2.24×) |
+| half→float              | 3.21 GB/s | —               | 14.70 GB/s (4.57×, F16C) |
+| fpnge PSHUFB lookup     | 0.50 GB/s | 2.71 GB/s (5.44×, SSE4.1) | 3.21 GB/s (6.44×) |
+| JPH `nlt3` (NLT type-3) | 305.6 M/s | 1204.3 M/s (3.94×, SSE2) | 1190.4 M/s (3.89×) |
+| JPH `pack` (i32→half)   | 1617.6 M/s | 2197.6 M/s (1.36×, SSE4.1) | 2415.8 M/s (1.49×) |
+| predictor decode (delta)| 1.35 GB/s | **4.78 GB/s** (3.54×, SSE2) | (SSE2) |
 
 The predictor (delta) decode is a serial byte prefix-sum; the SSE2 version
 builds the prefix sum with log₂(16) lane shifts and carries the running total
-across chunks, ~3.4× over scalar. It runs on every ZIP/ZIPS/PXR24/RLE decode.
+across chunks (~3.5× over scalar). It runs on every ZIP/ZIPS/PXR24/RLE decode.
 
 De-interleave and `pack` are memory-bandwidth-bound, so AVX2 does not beat SSE
-much (and de-interleave's SSE2 path is actually fastest here). The compute-bound
-kernels — F16C half→float, PSHUFB Huffman lookup, JPH NLT — get the biggest
-wins, and AVX2 lifts HTJ2K256 decode by ~1.35×.
+much. The compute-bound kernels — F16C half→float, PSHUFB Huffman lookup, JPH
+NLT — get the biggest wins, and AVX2 lifts HTJ2K256 decode by ~1.4×.
 
-### tinyexr vs OpenEXR (`make bench-compare`)
+### tinyexr vs OpenEXR
 
-OpenEXR 4.0-dev. **Both single-threaded** — the harness calls
-`Imf::setGlobalThreadCount(0)` (calling thread only) by default; set
-`EXR_THREADS=N` to give OpenEXR a worker pool (see "Threading" below). Both
-fully in-memory.
+The codec-by-codec comparison (encode/decode throughput and size), the optional
+`LIBDEFLATE=1` backend results, and the multi-threaded scaling + 16-thread
+comparison — all on a clean idle machine, with charts — are written up in
+[`doc/performance-vs-openexr.md`](../doc/performance-vs-openexr.md).
 
-| codec    | tx enc | exr enc | tx dec | exr dec | tx KB | exr KB |
-|----------|-------:|--------:|-------:|--------:|------:|-------:|
-| none     | 57.5   | 47.3    | **1892** | 309  | 2276 | 2276 |
-| rle      | 38.0   | 32.9    | **120.3** | 58.4 | 1644 | 1644 |
-| zips     | 8.1    | 10.9    | 17.2   | 34.9    | 1205  | 1212   |
-| zip      | 7.4    | 10.8    | 36.2   | 44.4    | 1155  | **1070** |
-| piz      | 16.5   | 17.9    | 18.7   | 46.1    | 742   | 742    |
-| pxr24    | 7.1    | 12.2    | 36.1   | 58.5    | 1158  | 1163   |
-| b44      | 24.1   | 23.9    | 81.9   | 108.9   | 993   | 993    |
-| htj2k256 | 5.0    | 21.7    | 13.0   | 34.5    | 1132  | **1016** |
-| htj2k32  | 6.2    | 22.1    | 17.9   | 36.6    | 1160  | **1042** |
-
-(enc/dec in MP/s; KB = compressed size. Numbers vary a few % run-to-run.)
-
-**Short summary.** Compressed-output sizes are essentially identical for
-NONE/RLE/PIZ/PXR24/B44/ZIPS (codecs interoperate — a tinyexr-written ZIP decodes
-correctly in OpenEXR and vice-versa); the only notable size gaps are ZIP/HTJ2K,
-from different deflate/JPH encoder tuning. On throughput, single-threaded:
-
-- **tinyexr wins** on uncompressed decode (~**6×**, 1892 vs 309 MP/s — no thread
-  setup or framebuffer copy) and on **RLE decode** (~2×, 120 vs 58), and ties on
-  RLE encode, PIZ, and B44.
-- **ZIP/PXR24 are now close:** decode is within **~1.2×** (zip 36 vs 44, pxr24 36
-  vs 59) and encode within **~1.5×** (was ~3.6×). The residual gap is the
-  backend — OpenEXR uses **libdeflate** (level 4), the fastest deflate in
-  existence; tinyexr keeps an in-tree, dependency-free fpng-derived LZ77 encoder
-  + compact inflate. HTJ2K encode (~3–4× behind) is the separate JPH encoder.
-  *For full deflate parity, build with `LIBDEFLATE=1` — see the next section.*
-
-> **In-tree codec tuning (this branch), no new dependencies.**
-> - **Deflate encoder ~2.3×** (ZIP encode 3.1 → 7.4 MP/s, PXR24 3.2 → 7.1, ZIPS
->   5.3 → 8.1) with *no* ratio loss: word-at-a-time match scan, `nice_length`
->   early-out, shorter hash chain (128 → 16), and a 4-byte multiplicative hash
->   with a block-sized table (no 128 KB memset per tiny ZIPS block).
-> - **SIMD predictor (SSE2)** — the serial delta/prefix-sum is now ~3.4× faster
->   (0.95 → 3.3 GB/s), lifting **ZIP decode 31 → 36** and **RLE decode 73 → 120**
->   MP/s. Bit-identical to the scalar reference (verified) and fuzz-clean.
-> - **Inflate** `copy_match` advances 8 bytes at a time when `distance ≥ 8`.
->
-> Decode time for a ZIP block is now ~95 % inflate (predictor went from 28 % of
-> the cost to ~8 %); closing the last bit would mean a libdeflate-class inflate.
-
-### Optional libdeflate backend (`LIBDEFLATE=1`)
-
-OpenEXR's deflate speed comes from **libdeflate**. TinyEXR vendors libdeflate
-1.25 (MIT, `deps/libdeflate/COPYING`) as an **optional, off-by-default** backend
-for ZIP/ZIPS/PXR24 — the in-tree pure-C codec stays the default and remains the
-only path for freestanding builds. Enable it on any target:
+Quick reproduce:
 
 ```sh
-make bench-compare LIBDEFLATE=1     # run 'make clean' when toggling the flag
+make bench-compare                         # single-thread, in-tree codec
+make bench-compare LIBDEFLATE=1            # + vendored libdeflate backend
+make bench-compare THREADS=1               # build with C11-threads support
+EXR_THREADS=16 ./build/bench_compare       # 16 threads, both libraries
 ```
 
-The flag defines `EXR_USE_LIBDEFLATE`; ZIP/PXR24 then route their zlib
-compress/decompress through libdeflate (level 4, matching OpenEXR; override with
-`-DEXR_LIBDEFLATE_LEVEL=N`). Only the zlib path is compiled (no crc32/gzip).
-With it on, the same machine, single-threaded:
-
-| codec | tx enc | exr enc | tx dec | exr dec | tx KB | exr KB |
-|-------|-------:|--------:|-------:|--------:|------:|-------:|
-| zip   | **11.6** | 10.6  | **60.9** | 43.5 | 1070 | 1070 |
-| zips  | **12.6** | 11.6  | **45.0** | 35.4 | 1212 | 1212 |
-| pxr24 | **12.8** | 10.1  | 59.7   | 60.8    | 1163 | 1163 |
-
-Sizes become identical (same libdeflate level), and tinyexr **matches or beats**
-OpenEXR: both use libdeflate's inflate, but tinyexr's decode adds the fast SSE2
-predictor with less per-block framework overhead, so **ZIP decode runs ~1.4×
-OpenEXR** (61 vs 44 MP/s). This is the route to true deflate parity when a small
-extra dependency is acceptable; otherwise the in-tree codec (above) stays within
-~1.2–1.5× with zero dependencies.
-
-### Threading (answering "is OpenEXR single-threaded?")
-
-The table above is single-threaded on both sides. OpenEXR's scanline API
-parallelizes per-block, so with a worker pool it pulls far ahead — which is why
-the fair comparison pins it to one thread. For contrast, `EXR_THREADS=16` on the
-same machine:
-
-| codec | exr enc 1T → 16T | exr dec 1T → 16T |
-|-------|-----------------:|-----------------:|
-| zip   | 11.0 → **27.7**  | 44.1 → **107.0** |
-| zips  | 11.2 → 24.8      | 35.2 → 81.6      |
-| pxr24 | 12.0 → 36.3      | 59.5 → 114.4     |
-| piz   | 17.7 → 34.6      | 45.7 → 89.5      |
-| rle   | 32.4 → 73.2      | 56.5 → 76.4      |
-
-tinyexr is single-threaded everywhere, so for a like-for-like core-vs-core
-comparison use the default (`EXR_THREADS=0`).
+Headlines (asakusa.exr, single thread): tinyexr decodes uncompressed ~3.4× and
+RLE ~2.5× faster than OpenEXR; OpenEXR leads the deflate family / PIZ / HTJ2K
+(its libdeflate / tuned PIZ / OpenJPH backends). With `LIBDEFLATE=1` tinyexr
+matches or beats OpenEXR on the deflate family (ZIP decode ~1.4×). With
+`THREADS=1` tinyexr's per-block parallel path scales ~5–9× to 16 threads and, at
+16 threads, out-decodes OpenEXR on RLE/ZIP/ZIPS/B44 (and the whole deflate family
+when libdeflate is also enabled).
