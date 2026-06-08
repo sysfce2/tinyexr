@@ -26,12 +26,31 @@ helpers. Result: **~4% faster** all-HALF htj2k256 decode (clean interleaved A/B,
 min-of-6: 5.13s → 4.91s), byte-identical across the corpus. **Landed — scalar,
 no SIMD.**
 
-**Implication for the SIMD stages:** Stage 1 (AVX2, extract a quad's 4 — or two
-quads' 8 — samples in parallel) now builds on the `JphQuadMs` window layout and
-is justified by the density data. The lazy-window scalar win captured the
-fetch-reduction part; the remaining upside is parallelizing the per-sample
-mask/shift/assemble. Still medium-risk (intricate `pshufb`/`srlv` gather), now
-**higher-confidence** given dense data. The design below stands.
+**Stage 1 (AVX2 4-sample MagSgn kernel) implemented, verified, measured
+break-even — not shipped.** `jph_decode_quad_magsgn_i32_avx2` decodes a quad's 4
+samples in parallel from the pre-filled 128-bit window: per-lane `m_n`, inclusive
+prefix-sum for bit offsets, `pshufb` byte-gather (`d0`/`d1`) + AVX2 `srlv`/`sllv`
+variable shift to extract each sample, then the `v_n`/sign/`val` assembly, with
+insignificant lanes masked to 0. It was wired into both step-2 loops as a
+full-quad fast path (half-quads/non-AVX2 keep scalar `JphQuadMs`) and is
+**bit-exact** — 200k random parity trials vs a scalar reference, 202 unit tests,
+59 single-part corpus files byte-identical. But a careful interleaved A/B (800
+iters, min-of-8) measured **+0.0%** vs the committed scalar `JphQuadMs`. Reasons:
+(1) the scalar path already cut fetches to ~1/quad (lazy upper half) and the
+compiler does the per-sample assembly cheaply; (2) the 128-bit (4-sample) kernel
+amortizes its gather/shift setup over only 4 lanes *and* reads both 64-bit window
+halves unconditionally, giving back the lazy-hi saving. So it was **reverted**.
+
+**Only remaining option with upside: 2-quad / 8-sample (256-bit) batching**
+(OpenJPH's `decode_two_quad32`), which amortizes setup over 8 lanes. Feasible —
+the `kappa` recurrence reads the *previous row's* `v_n` (`vp[]`), not the current
+row's left neighbour, so quads within a row are independent and 2-quad batching
+needs no dependency-breaking. But it is more complex (256-bit gather across the
+128-bit `pshufb` boundary, two quads' placement) and, given the 4-sample version
+is already break-even, its net ROI is uncertain. **Recommendation: stop here**
+unless a 256-bit batched kernel is specifically wanted; the scalar `JphQuadMs`
+(commit a4cb990) is the practical sweet spot for the entropy step. The design
+below stands as reference.
 
 ## Why
 
