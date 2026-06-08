@@ -22,6 +22,13 @@ static size_t pixel_size(exr_pixel_type t) {
     return t == EXR_PIXEL_HALF ? 2u : 4u;
 }
 
+/* floor(a / b) for b > 0 (a may be negative), matching exr_core's num_samples. */
+static long floordivc(long a, long b) {
+    long q = a / b, r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) --q;
+    return q;
+}
+
 /* Interpret one sample as a double for diff reporting. */
 static double sample_to_double(const void *base, size_t i, exr_pixel_type t) {
     if (t == EXR_PIXEL_HALF) {
@@ -61,9 +68,18 @@ int main(int argc, char **argv) {
             mismatch = 1;
             continue;
         }
-        size_t npix = (size_t)pa->width * pa->height;
         for (int ca = 0; ca < pa->header.num_channels; ++ca) {
             const exr_channel *cha = &pa->header.channels[ca];
+            /* per-channel sample count honours x/y subsampling (e.g. RY/BY in
+             * luminance-chroma images are sampling 2 2 -> a quarter-size plane).
+             * num_samples(lo,hi,s) = floor(hi/s) - floor((lo-1)/s). */
+            int xs = cha->x_sampling <= 0 ? 1 : cha->x_sampling;
+            int ys = cha->y_sampling <= 0 ? 1 : cha->y_sampling;
+            int lo_x = pa->header.data_window.min_x, hi_x = pa->header.data_window.max_x;
+            int lo_y = pa->header.data_window.min_y, hi_y = pa->header.data_window.max_y;
+            long cw = (long)floordivc(hi_x, xs) - floordivc((long)lo_x - 1, xs);
+            long chh = (long)floordivc(hi_y, ys) - floordivc((long)lo_y - 1, ys);
+            size_t npix = (size_t)(cw > 0 ? cw : 0) * (size_t)(chh > 0 ? chh : 0);
             /* find same-named channel in b */
             int cb = -1;
             for (int j = 0; j < pb->header.num_channels; ++j)
