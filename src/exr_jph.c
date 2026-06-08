@@ -2372,91 +2372,85 @@ static uint64_t jph_mask64(uint32_t nbits) {
     return nbits >= 64u ? UINT64_MAX : ((UINT64_C(1) << nbits) - 1u);
 }
 
-/* ----- MagSgn forward reader (feeds the `fill` pattern when exhausted) -----
+/* ----- MagSgn forward reader (unstuffed contiguous bit buffer) -------------
  *
- * Bits are delivered LSB-first with JPEG2000 bit-unstuffing: a 0xff byte is
- * followed by a 7-bit byte (its MSB is the stuffed bit and dropped). A 128-bit
- * little-endian accumulator (acc_lo/acc_hi) buffers >= 64 decoded bits so that
- * fetch/fetch64 are a single mask and advance is a double-shift + refill, rather
- * than re-walking the stream bit-by-bit per sample. */
+ * The whole segment is unstuffed once, up front, into a caller-provided bit
+ * buffer (LSB-first; a 0xff byte is followed by a 7-bit byte whose MSB is the
+ * stuffed bit and dropped). Reads are then pure shifts at a bit cursor, with no
+ * per-fetch refill branch -- faster than the old lazy accumulator and, crucially,
+ * a contiguous random-accessible layout the SIMD magnitude/sign path will gather
+ * from. Past the real bits the stream yields the `fill` pattern (1s for MagSgn,
+ * 0s for SigProp), matching the original feed-on-exhaustion behaviour.
+ *
+ * The buffer must be zero-initialised and hold >= size/8 + 3 uint64 words. */
 typedef struct {
-    const uint8_t *start;
-    uint32_t total_size;
-    uint8_t fill;
-    uint64_t acc_lo, acc_hi; /* buffered bits, next bit at acc_lo bit 0 */
-    uint32_t nbits;          /* number of valid buffered bits (kept >= 64) */
-    uint32_t rd_idx;         /* next source byte to consume */
-    uint32_t rd_prevff;      /* previous source byte was 0xff (=> 7-bit unit) */
+    const uint64_t *buf; /* unstuffed bits; bit k = buf[k>>6] >> (k&63) */
+    uint64_t real_bits;  /* count of valid unstuffed bits */
+    uint64_t cursor;     /* current bit position */
+    uint64_t fill_word;  /* bits beyond real_bits: ~0 (MagSgn) or 0 (SigProp) */
 } JphMagSgn;
 
-static uint8_t jph_magsgn_byte(const JphMagSgn *m, uint32_t idx) {
-    return (idx < m->total_size && m->start) ? m->start[idx] : m->fill;
-}
-
-/* Top up the accumulator to > 64 buffered bits (so a 64-bit fetch is always
- * serviceable). The `fill` pattern provides an unbounded tail past the stream
- * end, matching the original feed-on-exhaustion behaviour. */
-static void jph_magsgn_refill(JphMagSgn *m) {
-    while (m->nbits <= 64u) {
-        uint8_t b = jph_magsgn_byte(m, m->rd_idx);
-        uint32_t ub = m->rd_prevff ? 7u : 8u;
+/* Unstuff `size` bytes of `data` into `out` (LSB-first); returns the bit count.
+ * `out` must be zeroed and hold >= size/8 + 3 words. */
+static uint64_t jph_unstuff_bits(const uint8_t *data, uint32_t size,
+                                 uint64_t *out) {
+    uint64_t nbits = 0u;
+    uint32_t idx, prevff = 0u;
+    for (idx = 0u; idx < size; ++idx) {
+        uint8_t b = data ? data[idx] : 0u;
+        uint32_t ub = prevff ? 7u : 8u;
         uint64_t uv = (uint64_t)(b & (uint8_t)((1u << ub) - 1u));
-        if (m->nbits < 64u) {
-            m->acc_lo |= uv << m->nbits;
-            if (m->nbits + ub > 64u) m->acc_hi |= uv >> (64u - m->nbits);
-        } else {
-            m->acc_hi |= uv << (m->nbits - 64u);
-        }
-        m->nbits += ub;
-        m->rd_prevff = (b == 0xffu) ? 1u : 0u;
-        m->rd_idx++;
+        uint64_t w = nbits >> 6u;
+        uint32_t off = (uint32_t)(nbits & 63u);
+        out[w] |= uv << off;
+        if (off + ub > 64u) out[w + 1u] |= uv >> (64u - off);
+        nbits += ub;
+        prevff = (b == 0xffu) ? 1u : 0u;
     }
+    return nbits;
 }
 
 static exr_result jph_forward_bits_init(JphMagSgn *m, const uint8_t *data,
-                                        uint32_t size, uint8_t fill) {
-    if (!m) return EXR_ERROR_INVALID_ARGUMENT;
-    memset(m, 0, sizeof(*m));
-    m->start = data;
-    m->total_size = size;
-    m->fill = fill;
+                                        uint32_t size, uint8_t fill,
+                                        uint64_t *bitbuf) {
+    if (!m || !bitbuf) return EXR_ERROR_INVALID_ARGUMENT;
+    m->buf = bitbuf;
+    m->cursor = 0u;
+    m->fill_word = fill ? ~UINT64_C(0) : UINT64_C(0);
+    m->real_bits = jph_unstuff_bits(data, size, bitbuf);
     return EXR_SUCCESS;
 }
 
 static exr_result jph_magsgn_init(JphMagSgn *m, const uint8_t *data,
-                                  uint32_t size) {
-    return jph_forward_bits_init(m, data, size, 0xffu);
-}
-
-static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
-    if (!m) return 0u;
-    jph_magsgn_refill(m);
-    return (uint32_t)m->acc_lo; /* low 32 buffered bits */
+                                  uint32_t size, uint64_t *bitbuf) {
+    return jph_forward_bits_init(m, data, size, 0xffu, bitbuf);
 }
 
 static uint64_t jph_magsgn_fetch64(JphMagSgn *m) {
+    uint64_t c, v, avail;
+    uint32_t off;
     if (!m) return 0u;
-    jph_magsgn_refill(m);
-    return m->acc_lo; /* low 64 buffered bits */
+    c = m->cursor;
+    if (c >= m->real_bits) return m->fill_word;
+    off = (uint32_t)(c & 63u);
+    v = m->buf[c >> 6u] >> off;
+    if (off) v |= m->buf[(c >> 6u) + 1u] << (64u - off);
+    avail = m->real_bits - c;
+    /* bits beyond real_bits are already 0 in `buf`; for a 1-fill stream set them */
+    if (avail < 64u && m->fill_word) v |= ~UINT64_C(0) << avail;
+    return v;
+}
+
+static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
+    return (uint32_t)jph_magsgn_fetch64(m);
 }
 
 static void jph_magsgn_advance(JphMagSgn *m, uint32_t n) {
-    if (!m || n == 0u) return;
-    if (n >= 128u) {
-        m->acc_lo = 0u;
-        m->acc_hi = 0u;
-        m->nbits = 0u;
-    } else if (n >= 64u) {
-        m->acc_lo = m->acc_hi >> (n - 64u);
-        m->acc_hi = 0u;
-        m->nbits = (m->nbits > n) ? m->nbits - n : 0u;
-    } else {
-        m->acc_lo = (m->acc_lo >> n) | (m->acc_hi << (64u - n));
-        m->acc_hi >>= n;
-        m->nbits = (m->nbits > n) ? m->nbits - n : 0u;
-    }
-    jph_magsgn_refill(m);
+    if (m) m->cursor += n;
 }
+
+/* uint64 words needed for jph_unstuff_bits over `size` bytes (+ fetch slack). */
+static size_t jph_magsgn_words(uint32_t size) { return (size_t)size / 8u + 3u; }
 
 
 static uint64_t jph_decode_magsgn_sample64(JphMagSgn *magsgn, uint32_t inf,
@@ -2504,6 +2498,8 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
     uint16_t *scratch = NULL;
     uint64_t *v_n_scratch = NULL;
     uint64_t *buf = NULL;
+    uint64_t *magsgn_bits = NULL;
+    uint64_t *sigprop_bits = NULL;
     size_t scratch_count, v_n_count, buf_count;
     exr_jph_mel_reader mel;
     JphVlcRev vlc;
@@ -2547,7 +2543,13 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                                          sizeof(uint64_t));
     buf = (uint64_t *)exr_calloc(exr_default_allocator(),
                                  buf_count ? buf_count : 1u, sizeof(uint64_t));
-    if (!scratch || !v_n_scratch || !buf) {
+    magsgn_bits = (uint64_t *)exr_calloc(exr_default_allocator(),
+                                         jph_magsgn_words(lcup - scup),
+                                         sizeof(uint64_t));
+    sigprop_bits = (uint64_t *)exr_calloc(exr_default_allocator(),
+                                          jph_magsgn_words(lengths2),
+                                          sizeof(uint64_t));
+    if (!scratch || !v_n_scratch || !buf || !magsgn_bits || !sigprop_bits) {
         rc = EXR_ERROR_OUT_OF_MEMORY;
         goto done;
     }
@@ -2555,7 +2557,7 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
     exr_jph_mel_init(&mel, seg->data + lcup - scup, (size_t)scup - 1u);
     rc = jph_vlc_rev_init(&vlc, seg->data, lcup, scup);
     if (rc != EXR_SUCCESS) goto done;
-    rc = jph_magsgn_init(&magsgn, seg->data, lcup - scup);
+    rc = jph_magsgn_init(&magsgn, seg->data, lcup - scup, magsgn_bits);
     if (rc != EXR_SUCCESS) goto done;
 
     if (exr_jph_mel_get_run(&mel, &run, &i) != EXR_SUCCESS) i = 0;
@@ -2887,7 +2889,8 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
         }
 
         memset(prev_row_sig, 0, sizeof(prev_row_sig));
-        rc = jph_forward_bits_init(&sigprop, seg->data + lengths1, lengths2, 0u);
+        rc = jph_forward_bits_init(&sigprop, seg->data + lengths1, lengths2, 0u,
+                                   sigprop_bits);
         if (rc != EXR_SUCCESS) goto done;
 
         {
@@ -3077,6 +3080,8 @@ done:
     exr_free(exr_default_allocator(), scratch);
     exr_free(exr_default_allocator(), v_n_scratch);
     exr_free(exr_default_allocator(), buf);
+    exr_free(exr_default_allocator(), magsgn_bits);
+    exr_free(exr_default_allocator(), sigprop_bits);
     return rc;
 }
 
@@ -3099,6 +3104,8 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     uint16_t *scratch = NULL;
     uint32_t *v_n_scratch = NULL;
     uint32_t *buf = NULL;
+    uint64_t *magsgn_bits = NULL;
+    uint64_t *sigprop_bits = NULL;
     size_t scratch_count, v_n_count, buf_count;
     exr_jph_mel_reader mel;
     JphVlcRev vlc;
@@ -3148,17 +3155,25 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                                          sizeof(uint32_t));
     buf = (uint32_t *)exr_calloc(exr_default_allocator(),
                                  buf_count ? buf_count : 1u, sizeof(uint32_t));
-    if (!scratch || !v_n_scratch || !buf) {
+    magsgn_bits = (uint64_t *)exr_calloc(exr_default_allocator(),
+                                         jph_magsgn_words(lcup - scup),
+                                         sizeof(uint64_t));
+    sigprop_bits = (uint64_t *)exr_calloc(exr_default_allocator(),
+                                          jph_magsgn_words(lengths2),
+                                          sizeof(uint64_t));
+    if (!scratch || !v_n_scratch || !buf || !magsgn_bits || !sigprop_bits) {
         exr_free(exr_default_allocator(), scratch);
         exr_free(exr_default_allocator(), v_n_scratch);
         exr_free(exr_default_allocator(), buf);
+        exr_free(exr_default_allocator(), magsgn_bits);
+        exr_free(exr_default_allocator(), sigprop_bits);
         return EXR_ERROR_OUT_OF_MEMORY;
     }
 
     exr_jph_mel_init(&mel, seg->data + lcup - scup, (size_t)scup - 1u);
     rc = jph_vlc_rev_init(&vlc, seg->data, lcup, scup);
     if (rc != EXR_SUCCESS) goto done;
-    rc = jph_magsgn_init(&magsgn, seg->data, lcup - scup);
+    rc = jph_magsgn_init(&magsgn, seg->data, lcup - scup, magsgn_bits);
     if (rc != EXR_SUCCESS) goto done;
 
     if (exr_jph_mel_get_run(&mel, &run, &i) != EXR_SUCCESS) i = 0;
@@ -3582,7 +3597,8 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
         }
 
         memset(prev_row_sig, 0, sizeof(prev_row_sig));
-        rc = jph_forward_bits_init(&sigprop, seg->data + lengths1, lengths2, 0u);
+        rc = jph_forward_bits_init(&sigprop, seg->data + lengths1, lengths2, 0u,
+                                   sigprop_bits);
         if (rc != EXR_SUCCESS) goto done;
 
         {
@@ -3770,6 +3786,8 @@ done:
     exr_free(exr_default_allocator(), scratch);
     exr_free(exr_default_allocator(), v_n_scratch);
     exr_free(exr_default_allocator(), buf);
+    exr_free(exr_default_allocator(), magsgn_bits);
+    exr_free(exr_default_allocator(), sigprop_bits);
     return rc;
 }
 
