@@ -22,7 +22,7 @@ multi-threaded.
   leads (≈1.2× ZIP, ≈1.8× PXR24, ≈2–2.7× ZIPS/PIZ/HTJ2K) because of its
   **libdeflate** backend and tuned PIZ/JPH.
 - **Single-thread encode:** TinyEXR ties or wins on RLE/PIZ/B44; OpenEXR is
-  ≈1.5× on ZIP/ZIPS, ≈1.8× on PXR24, and ≈3.5× on HTJ2K.
+  ≈1.5× on ZIP/ZIPS, ≈1.8× on PXR24, and ≈3× on HTJ2K.
 - **libdeflate (opt-in):** with the same backend, TinyEXR **matches or beats**
   OpenEXR on the deflate family — e.g. **ZIP decode 1.4×** single-thread.
 - **Multi-threaded:** TinyEXR's opt-in parallel path scales ~5–9× to 16 threads;
@@ -48,10 +48,11 @@ inflate; the predictor and de-interleave passes are already vectorized.
 
 TinyEXR ties or beats OpenEXR on **RLE / PIZ / B44**. On **ZIP/ZIPS** it is ~1.5×
 behind and **PXR24** ~1.8× — its in-tree, dependency-free LZ77 encoder is fast
-but not libdeflate-level. **HTJ2K** encode is the widest gap (~3.5×: the separate
+but not libdeflate-level. **HTJ2K** encode is the widest gap (~3×: the separate
 JPH/OpenJPH encoder). TinyEXR's HTJ2K paths recently gained an AVX2 forward 5/3
-wavelet and an unstuffed-buffer entropy reader (encode +~16%, decode +~18% vs the
-pre-SIMD baseline); the remaining gap is OpenJPH's fully-SIMD entropy coder.
+wavelet, an unstuffed-buffer entropy reader, and a `clz`-builtin fast path in the
+per-sample prepare (encode +~39%, decode +~18% vs the pre-SIMD baseline); the
+remaining gap is OpenJPH's fully-SIMD entropy coder.
 
 ### Compression size
 
@@ -98,8 +99,8 @@ In-tree default:
 | piz   | 23.6 | 25.4 | 24.6 | 67.5 |
 | pxr24 | 9.2  | 16.4 | 48.0 | 88.0 |
 | b44   | 31.7 | 34.8 | 145  | 178 |
-| htj2k256 | 9.3 | 33.1 | 24.6 | 59.7 |
-| htj2k32  | 9.8 | 31.8 | 27.7 | 55.0 |
+| htj2k256 | 11.0 | 33.2 | 24.0 | 59.6 |
+| htj2k32  | 11.6 | 31.6 | 27.1 | 55.0 |
 
 `LIBDEFLATE=1` (deflate family): zip 15.3/14.0/80.8/58.8, zips 16.2/14.8/61.4/46.4,
 pxr24 16.4/15.8/83.6/83.8 (tx enc / exr enc / tx dec / exr dec).
