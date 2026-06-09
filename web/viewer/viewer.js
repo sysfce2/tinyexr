@@ -812,17 +812,20 @@ function setupInput() {
     selectAndDecode(sel.part, sel.lx, sel.ly, false, parseInt(e.target.value, 10));
   });
 
-  // deep (3D) sample image, fetched over HTTP from the tinyexr repo
-  const DEEP_URL =
-    "https://raw.githubusercontent.com/syoyo/tinyexr/release/deepscanline.exr";
-  document.getElementById("btnDeep").addEventListener("click", async () => {
+  // deep (3D) sample images, fetched over HTTP from the tinyexr repo
+  const DEEP_BASE = "https://raw.githubusercontent.com/syoyo/tinyexr/release/data/";
+  const loadDeepSample = async (file) => {
     try {
-      loadBytes(await fetchUrlWithProgress(DEEP_URL, "deepscanline.exr"), "deepscanline.exr");
+      loadBytes(await fetchUrlWithProgress(DEEP_BASE + file, file), file);
     } catch (err) {
       setProgress(-1);
-      showError("Could not fetch deepscanline.exr (" + err.message + ").");
+      showError("Could not fetch " + file + " (" + err.message + ").");
     }
-  });
+  };
+  document.getElementById("btnDeep").addEventListener("click",
+    () => loadDeepSample("deepscanline.exr"));
+  document.getElementById("btnDeepTiled").addEventListener("click",
+    () => loadDeepSample("deep_tiled_sample.exr"));
 
   // deep 3D controls
   const pt = document.getElementById("ptSize");

@@ -460,7 +460,7 @@ Reading deep image EXR file.
 See `example/deepview` for actual usage.
 
 ```cpp
-  const char* input = "deepscanline.exr";
+  const char* input = "data/deepscanline.exr";
   const char* err = NULL; // or nullptr
   DeepImage deepImage;
 
@@ -487,7 +487,7 @@ See `example/deepview` for actual usage.
 
 ### deepview
 
-`examples/deepview` is simple deep image viewer in OpenGL. It can be tested with `deepscanline.exr`.
+`examples/deepview` is simple deep image viewer in OpenGL. It can be tested with `data/deepscanline.exr`.
 
 ![DeepViewExample](https://github.com/syoyo/tinyexr/blob/release/examples/deepview/deepview_screencast.gif?raw=true)
 

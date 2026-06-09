@@ -1702,13 +1702,18 @@ static void deep_tiled_oob_rejects(void) {
     memset(&back, 0, sizeof(back));
     if (EXR_OK(exr_load_from_memory(buf, sz, NULL, &back))) exr_image_free(&back);
 
-    /* offset table stored verbatim = cumulative int32 LE [1,2,3,4]; corrupt to
-     * decreasing [4,3,2,1] so pixel 1 yields a negative count. */
-    for (i = 0; i < 4; ++i) {
-        pat[i * 4 + 0] = (uint8_t)(i + 1); pat[i * 4 + 1] = 0;
-        pat[i * 4 + 2] = 0; pat[i * 4 + 3] = 0;
-        rep[i * 4 + 0] = (uint8_t)(4 - i); rep[i * 4 + 1] = 0;
-        rep[i * 4 + 2] = 0; rep[i * 4 + 3] = 0;
+    /* offset table stored verbatim = cumulative-per-row int32 LE [1,2,1,2]
+     * (each tile row restarts); corrupt row 0 to decreasing [2,1,2,1] so pixel
+     * (0,1) yields a negative count. */
+    {
+        static const uint8_t patv[4] = {1, 2, 1, 2};
+        static const uint8_t repv[4] = {2, 1, 2, 1};
+        for (i = 0; i < 4; ++i) {
+            pat[i * 4 + 0] = patv[i]; pat[i * 4 + 1] = 0;
+            pat[i * 4 + 2] = 0; pat[i * 4 + 3] = 0;
+            rep[i * 4 + 0] = repv[i]; rep[i * 4 + 1] = 0;
+            rep[i * 4 + 2] = 0; rep[i * 4 + 3] = 0;
+        }
     }
     for (i = 0; sz >= 16 && i + 16 <= sz; ++i) {
         if (memcmp((uint8_t *)buf + i, pat, 16) == 0) {
@@ -2588,8 +2593,22 @@ int main(void) {
 
     printf("== streaming deep + suspend/resume + memory bound ==\n");
     deep_tiled_oob_rejects();
-    stream_deep_check("deepscanline.exr", EXR_COMPRESSION_ZIPS,
+    stream_deep_check("data/deepscanline.exr", EXR_COMPRESSION_ZIPS,
                       "deep scanline ZIPS");
+    /* Regression: an OpenEXR-authored deep-tiled file (per-row cumulative
+     * offset tables) decodes via the high-level loader. */
+    {
+        exr_image di;
+        memset(&di, 0, sizeof(di));
+        if (EXR_OK(exr_load_from_file("data/deep_tiled_sample.exr", NULL, &di))) {
+            CHECK(di.num_parts == 1 && di.parts[0].is_deep &&
+                  di.parts[0].deep_total_samples > 0,
+                  "deep-tiled sample loads (data/deep_tiled_sample.exr)");
+            exr_image_free(&di);
+        } else {
+            CHECK(0, "deep-tiled sample loads (data/deep_tiled_sample.exr)");
+        }
+    }
     stream_would_block_check("asakusa.exr", EXR_COMPRESSION_ZIP,
                              "asakusa ZIP");
     stream_memory_bound_check("asakusa.exr", EXR_COMPRESSION_ZIP,

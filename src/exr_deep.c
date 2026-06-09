@@ -209,7 +209,6 @@ exr_result exr_deep_decode_counts(exr_reader *r, exr_int_part *p,
     const uint8_t *hdr, *packed;
     size_t hsz, need, i;
     int32_t *otab;
-    int64_t prev = 0;
     exr_result rc;
 
     if (idx >= p->num_chunks) return EXR_ERROR_INVALID_ARGUMENT;
@@ -232,11 +231,18 @@ exr_result exr_deep_decode_counts(exr_reader *r, exr_int_part *p,
     rc = deep_decompress(a, h->compression, packed, (size_t)pots,
                          (uint8_t *)otab, need * sizeof(int32_t));
     if (!EXR_OK(rc)) { exr_free(a, otab); return rc; }
-    for (i = 0; i < need; ++i) {
-        int64_t cum = otab[i], cnt = cum - prev;
-        if (cnt < 0) { exr_free(a, otab); return EXR_ERROR_CORRUPT; }
-        counts[i] = (int32_t)cnt;
-        prev = cum;
+    /* Offset table is cumulative per row (resets each row); for scanline blocks
+     * bh == 1 so this is identical to a flat cumulative scan. */
+    for (i = 0; i < (size_t)bh; ++i) {
+        int64_t rp = 0;
+        size_t x;
+        for (x = 0; x < (size_t)bw; ++x) {
+            size_t k = i * (size_t)bw + x;
+            int64_t cum = otab[k], cnt = cum - rp;
+            if (cnt < 0) { exr_free(a, otab); return EXR_ERROR_CORRUPT; }
+            counts[k] = (int32_t)cnt;
+            rp = cum;
+        }
     }
     exr_free(a, otab);
     return EXR_SUCCESS;
@@ -277,7 +283,8 @@ exr_result exr_deep_decode_samples(exr_reader *r, exr_int_part *p,
         usds = exr_rd_u64(hdr + 20);
     }
 
-    /* the offset table's last cumulative entry is the block's total sample count */
+    /* The offset table is cumulative per row, so the block's total sample count
+     * is the sum of each row's last cumulative entry (not the table's last). */
     need = (size_t)bw * (size_t)bh;
     otab = (int32_t *)exr_malloc(a, (need ? need : 1) * sizeof(int32_t));
     if (!otab) return EXR_ERROR_OUT_OF_MEMORY;
@@ -286,9 +293,13 @@ exr_result exr_deep_decode_samples(exr_reader *r, exr_int_part *p,
     rc = deep_decompress(a, h->compression, packed, (size_t)pots,
                          (uint8_t *)otab, need * sizeof(int32_t));
     if (!EXR_OK(rc)) goto done;
-    if (need > 0) {
-        if (otab[need - 1] < 0) { rc = EXR_ERROR_CORRUPT; goto done; }
-        total = (uint64_t)otab[need - 1];
+    if (bw > 0) {
+        int row;
+        for (row = 0; row < bh; ++row) {
+            int32_t last = otab[(size_t)row * (size_t)bw + (size_t)(bw - 1)];
+            if (last < 0) { rc = EXR_ERROR_CORRUPT; goto done; }
+            total += (uint64_t)last;
+        }
     }
     if (usds != total * sample_size) { rc = EXR_ERROR_CORRUPT; goto done; }
 
@@ -448,7 +459,7 @@ exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
     for (tyi = 0; tyi < nyt; ++tyi) {
         for (txi = 0; txi < nxt; ++txi) {
             uint32_t idx = (uint32_t)tyi * nxt + txi;
-            uint64_t off, pots, psds, usds, prev = 0;
+            uint64_t off, pots, psds, usds;
             const uint8_t *hdr, *packed;
             size_t hsz = r->is_multipart ? 44 : 40;
             int tw = (tx < width - txi * tx) ? tx : (width - txi * tx);
@@ -491,20 +502,23 @@ exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
             rc = deep_decompress(a, h->compression, packed, (size_t)pots,
                                  (uint8_t *)otab, need * sizeof(int32_t));
             if (!EXR_OK(rc)) goto done;
+            /* The sample-count table is cumulative per scanline row (it resets
+             * at the start of each row of the tile), matching OpenEXR. */
             for (rr = 0; rr < th; ++rr) {
+                uint64_t prev = 0;
                 for (x = 0; x < tw; ++x) {
                     int32_t cum = otab[rr * tw + x];
                     int64_t cnt = (int64_t)cum - (int64_t)prev;
                     size_t pix = (size_t)(tyi * ty + rr) * width + (txi * tx + x);
                     /* The offset table is attacker-controlled (stored verbatim
-                     * for NONE); a non-monotonic table would yield negative
+                     * for NONE); a non-monotonic row would yield negative
                      * counts -> wrapped prefix sums and heap OOB in pass 2. */
                     if (cnt < 0) { rc = EXR_ERROR_CORRUPT; goto done; }
                     out->deep_sample_counts[pix] = (int32_t)cnt;
                     prev = (uint64_t)cum;
                 }
+                total += prev;
             }
-            total += prev;
         }
     }
 
@@ -600,11 +614,18 @@ exr_result exr_deep_encode_tile(const exr_allocator *a, exr_compression comp,
     notab = (size_t)tile_w * tile_h;
     otab = (int32_t *)exr_malloc(a, notab * sizeof(int32_t));
     if (!otab) return EXR_ERROR_OUT_OF_MEMORY;
-    for (rr = 0; rr < tile_h; ++rr)
+    /* Offset table is cumulative per scanline row (resets each row), matching
+     * OpenEXR; `cum` separately tracks the tile's grand total for the sample
+     * buffer size below. */
+    for (rr = 0; rr < tile_h; ++rr) {
+        uint64_t rowcum = 0;
         for (x = 0; x < tile_w; ++x) {
-            cum += (uint64_t)part->deep_sample_counts[(size_t)(y0 + rr) * width + (x0 + x)];
-            otab[rr * tile_w + x] = (int32_t)cum;
+            uint64_t cnt = (uint64_t)part->deep_sample_counts[(size_t)(y0 + rr) * width + (x0 + x)];
+            rowcum += cnt;
+            cum += cnt;
+            otab[rr * tile_w + x] = (int32_t)rowcum;
         }
+    }
     *unpacked_off_size = notab * sizeof(int32_t);
     rc = deep_compress(a, comp, (uint8_t *)otab, notab * sizeof(int32_t),
                        packed_off, packed_off_size);

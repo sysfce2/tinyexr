@@ -42,9 +42,10 @@ the legacy v1 embind sample in `experimental/js/`.
   **3D point cloud**: every deep sample is placed at its pixel (x, y) and its `Z`
   (depth), colored by depth (viridis) or by RGB. Orbit (drag), zoom (wheel), pan
   (shift-/right-drag); point size, exposure, and a reset-view control. The
-  **Deep (3D)** button loads the repo's `deepscanline.exr` over HTTP. (Decoded
+  **Deep scanline (3D)** and **Deep tiled (3D)** buttons load the repo's
+  `data/deepscanline.exr` and `data/deep_tiled_sample.exr` over HTTP. (Decoded
   via the v3 high-level `exr_load_from_memory`, which fills the per-part deep
-  sample arrays.)
+  sample arrays; deep scanline and deep tiled are both supported.)
 - **Part / mip / channel-view selectors** — switch parts in a multipart EXR,
   mip/ripmap levels in a tiled EXR, and the **channel view** (auto RGB(A), named
   layers like `diffuse.{R,G,B}`, or any single channel as grayscale) for parts
