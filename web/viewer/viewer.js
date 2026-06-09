@@ -626,8 +626,138 @@ function setupInput() {
 }
 
 /* -------------------------------------------------------------------- boot */
+/* ----------------------------------------------- openexr-images browser ---- */
+// Browse the official OpenEXR sample-image library and load any image over HTTP.
+// One GitHub tree API call lists every .exr; images are fetched from raw.*.
+const OEXR_REPO = "AcademySoftwareFoundation/openexr-images";
+const OEXR_TREE_API =
+  "https://api.github.com/repos/" + OEXR_REPO + "/git/trees/main?recursive=1";
+const OEXR_RAW_BASE = "https://raw.githubusercontent.com/" + OEXR_REPO + "/main/";
+
+function humanSize(b) {
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return Math.round(b / 1024) + " KB";
+  return (b / 1048576).toFixed(1) + " MB";
+}
+
+function setupBrowser() {
+  const modal = document.getElementById("browser");
+  const treeEl = document.getElementById("browserTree");
+  const filterEl = document.getElementById("browserFilter");
+  let allFiles = null; // cached [{path, name, size}] after first load
+
+  const msg = (text, err) => {
+    const d = document.createElement("div");
+    d.className = "msg" + (err ? " err" : "");
+    d.textContent = text;
+    treeEl.replaceChildren(d);
+  };
+
+  const close = () => modal.classList.add("hidden");
+  const open = () => {
+    modal.classList.remove("hidden");
+    if (allFiles === null) load();
+    filterEl.focus();
+  };
+
+  // Build a nested {dirs:Map, files:[]} tree from flat paths.
+  function buildTree(files) {
+    const root = { dirs: new Map(), files: [] };
+    for (const f of files) {
+      const parts = f.path.split("/");
+      let node = root;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (!node.dirs.has(parts[i]))
+          node.dirs.set(parts[i], { dirs: new Map(), files: [] });
+        node = node.dirs.get(parts[i]);
+      }
+      node.files.push(f);
+    }
+    return root;
+  }
+  const countFiles = (n) =>
+    n.files.length + [...n.dirs.values()].reduce((s, c) => s + countFiles(c), 0);
+
+  async function loadRepoFile(f) {
+    close();
+    try {
+      const url = OEXR_RAW_BASE + f.path.split("/").map(encodeURIComponent).join("/");
+      loadBytes(await fetchUrlWithProgress(url, f.name));
+    } catch (err) {
+      setProgress(-1);
+      showError("Could not fetch " + f.name + " (" + err.message + ").");
+    }
+  }
+
+  function renderNode(node, openAll) {
+    const frag = document.createDocumentFragment();
+    for (const [name, child] of [...node.dirs.entries()].sort((a, b) =>
+      a[0].localeCompare(b[0]))) {
+      const det = document.createElement("details");
+      det.open = openAll;
+      const sum = document.createElement("summary");
+      sum.textContent = name;
+      const cnt = document.createElement("span");
+      cnt.className = "count";
+      cnt.textContent = countFiles(child) + (countFiles(child) === 1 ? " file" : " files");
+      sum.appendChild(cnt);
+      const kids = document.createElement("div");
+      kids.className = "children";
+      kids.appendChild(renderNode(child, openAll));
+      det.append(sum, kids);
+      frag.appendChild(det);
+    }
+    for (const f of [...node.files].sort((a, b) => a.name.localeCompare(b.name))) {
+      const btn = document.createElement("button");
+      btn.className = "tree-file";
+      btn.title = "Load " + f.path;
+      const nm = document.createElement("span");
+      nm.textContent = f.name;
+      const sz = document.createElement("span");
+      sz.className = "sz";
+      sz.textContent = humanSize(f.size);
+      btn.append(nm, sz);
+      btn.addEventListener("click", () => loadRepoFile(f));
+      frag.appendChild(btn);
+    }
+    return frag;
+  }
+
+  function rerender() {
+    const q = filterEl.value.trim().toLowerCase();
+    const files = q ? allFiles.filter((f) => f.path.toLowerCase().includes(q)) : allFiles;
+    if (!files.length) { msg("No matching .exr files."); return; }
+    treeEl.replaceChildren(renderNode(buildTree(files), !!q));
+  }
+
+  async function load() {
+    msg("Loading image list…");
+    try {
+      const resp = await fetch(OEXR_TREE_API);
+      if (!resp.ok) throw new Error(resp.status + " " + resp.statusText);
+      const data = await resp.json();
+      allFiles = data.tree
+        .filter((b) => b.type === "blob" && b.path.toLowerCase().endsWith(".exr"))
+        .map((b) => ({ path: b.path, name: b.path.split("/").pop(), size: b.size || 0 }));
+      rerender();
+    } catch (err) {
+      allFiles = null;
+      msg("Failed to load list (" + err.message + "). The GitHub API may be rate-limited; try again later.", true);
+    }
+  }
+
+  document.getElementById("btnBrowse").addEventListener("click", open);
+  document.getElementById("browserClose").addEventListener("click", close);
+  modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.classList.contains("hidden")) close();
+  });
+  filterEl.addEventListener("input", () => { if (allFiles) rerender(); });
+}
+
 (async function main() {
   setupInput();
+  setupBrowser();
   document.getElementById("gamma").disabled = ctl.srgb;
   try {
     M = await createModule();

@@ -173,6 +173,56 @@ select { width: 100%; }
 .chan-table td:last-child { color: var(--muted); text-align: right; }
 .subhead { color: var(--muted); margin: 10px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
 
+/* --------------------------------------------------- openexr-images browser */
+#browser {
+  position: fixed; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(8,9,12,.62);
+}
+.browser-box {
+  width: min(560px, 92vw); max-height: 82vh;
+  display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 18px 60px rgba(0,0,0,.5);
+  overflow: hidden;
+}
+.browser-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--line);
+}
+.browser-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+#browserClose { padding: 2px 9px; line-height: 1.2; }
+.browser-sub {
+  padding: 10px 14px; border-bottom: 1px solid var(--line);
+  color: var(--muted); font-size: 12px; line-height: 1.5;
+}
+.browser-sub a { color: var(--accent); }
+#browserFilter {
+  display: block; width: 100%; margin-top: 8px;
+  font: inherit; color: var(--fg);
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 7px; padding: 6px 9px;
+}
+.browser-tree { padding: 8px 10px; overflow-y: auto; }
+.browser-tree details { margin: 1px 0; }
+.browser-tree summary {
+  cursor: pointer; padding: 4px 6px; border-radius: 6px;
+  color: var(--fg); list-style-position: inside; user-select: none;
+}
+.browser-tree summary:hover { background: var(--panel2); }
+.browser-tree summary .count { color: var(--muted); font-size: 11px; margin-left: 6px; }
+.browser-tree .children { margin-left: 14px; border-left: 1px solid var(--line); padding-left: 6px; }
+.tree-file {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  width: 100%; text-align: left; background: none; border: none;
+  border-radius: 6px; padding: 4px 6px; color: var(--fg);
+}
+.tree-file:hover { background: var(--accent2); border-color: var(--accent); }
+.tree-file .sz { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+.tree-file:hover .sz { color: #cfe0ff; }
+.browser-tree .msg { color: var(--muted); padding: 14px 6px; font-size: 12px; }
+.browser-tree .msg.err { color: var(--danger); }
+
 footer { padding: 12px 16px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .ghrow { margin-top: 10px; }
 #ghLink {
