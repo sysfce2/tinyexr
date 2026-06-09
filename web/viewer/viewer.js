@@ -272,6 +272,30 @@ function readFileWithProgress(file) {
   });
 }
 
+// Fetch a URL into a Uint8Array, streaming download progress when the server
+// reports a Content-Length (e.g. the remote asakusa.exr).
+async function fetchUrlWithProgress(url, what) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(resp.status + " " + resp.statusText);
+  const total = +resp.headers.get("content-length");
+  if (!resp.body || !total) {
+    setProgress(0, "Fetching " + what + "…");
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+  const reader = resp.body.getReader();
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf.set(value, off);
+    off += value.length;
+    setProgress((off / total) * 100,
+      "Fetching " + what + "… " + Math.round((off / total) * 100) + "%");
+  }
+  return off === total ? buf : buf.subarray(0, off);
+}
+
 async function loadBytes(bytes) {
   hideError();
   if (handle) { M._exrv_close(handle); handle = 0; img = null; }
@@ -460,6 +484,18 @@ function setupInput() {
     } catch (err) {
       setProgress(-1);
       showError("Place an EXR named sample.exr next to index.html (see README).");
+    }
+  });
+
+  // asakusa — fetched over HTTP from the tinyexr repo (release branch)
+  const ASAKUSA_URL =
+    "https://raw.githubusercontent.com/syoyo/tinyexr/release/asakusa.exr";
+  document.getElementById("btnAsakusa").addEventListener("click", async () => {
+    try {
+      loadBytes(await fetchUrlWithProgress(ASAKUSA_URL, "asakusa.exr"));
+    } catch (err) {
+      setProgress(-1);
+      showError("Could not fetch asakusa.exr (" + err.message + ").");
     }
   });
 

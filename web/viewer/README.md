@@ -75,8 +75,11 @@ python3 -m http.server
 
 Then drag an `.exr` onto the window, or click **Open .exr**.
 
-The **Sample** button fetches `sample.exr` from this folder. The committed
-`sample.exr` is a small HDR test pattern produced by `gen_sample.c`:
+The **Sample** button fetches `sample.exr` from this folder; the **Asakusa**
+button fetches the repo's `asakusa.exr` over HTTP from
+`raw.githubusercontent.com` (a demo of loading from a remote URL, with download
+progress). The committed `sample.exr` is a small HDR test pattern produced by
+`gen_sample.c`:
 
 ```sh
 c++ -x c++ -DTINYEXR_USE_MINIZ=0 -DTINYEXR_USE_STB_ZLIB=0 -include zlib.h \

@@ -2,13 +2,51 @@
 
 ![Example](https://github.com/syoyo/tinyexr/blob/release/asakusa.png?raw=true)
 
-[![AppVeyor build status](https://ci.appveyor.com/api/projects/status/k07ftfe4ph057qau/branch/release?svg=true)](https://ci.appveyor.com/project/syoyo/tinyexr/branch/release)
+[![CI](https://github.com/syoyo/tinyexr/actions/workflows/ci.yml/badge.svg?branch=release)](https://github.com/syoyo/tinyexr/actions/workflows/ci.yml)
 
-[![Coverity Scan Build Status](https://scan.coverity.com/projects/5827/badge.svg)](https://scan.coverity.com/projects/5827)
+> 🌐 **Live demo:** [**TinyEXR v3 WASM viewer**](https://syoyo.github.io/tinyexr/) — decode and view `.exr`
+> entirely in the browser (drag-and-drop; all v3 codecs: ZIP / PIZ / PXR24 / B44 / ZSTD / HTJ2K).
 
-`tinyexr` is a small, single header-only library to load and save OpenEXR (.exr) images.
-`tinyexr` is written in portable C++ (no library dependency except for STL), thus `tinyexr` is good to embed into your application.
-To use `tinyexr`, simply copy `tinyexr.h`, `miniz.c` and `miniz.h`(for zlib. You can use system-installed zlib instead of miniz, or the zlib implementation included in `stb_image[_write].h`. Controlled with `TINYEXR_USE_MINIZ` and `TINYEXR_USE_STB_ZLIB` compile flags) into your project.
+`tinyexr` is a small library to load and save OpenEXR (.exr) images, good to
+embed into your application. It now comes in two flavours:
+
+- **v3 — pure-C11 rewrite (main).** The current main development line; the
+  recommended version going forward (see below).
+- **v1 — single-header C++ (old, stable).** The original `tinyexr.h`; still a
+  solid, battle-tested choice today.
+
+## v3 — pure-C11 rewrite (main)
+
+TinyEXR's main development line is a ground-up rewrite as a **pure-C11** library
+(`include/exr.h` + `src/*.c`) — the **v3 C API**. It is the recommended version
+going forward and will be the next major release.
+
+Highlights:
+
+- **Pure C11 core** — no C++ in the library; the public header is C++-safe.
+- **Full codec coverage** — read **and** write for NONE / RLE / ZIP / ZIPS / PIZ
+  / PXR24 / B44 / B44A, plus ZSTD and HTJ2K; scanline and tiled
+  (ONE_LEVEL / MIPMAP / RIPMAP), multipart, and deep images. (DWAA/DWAB are
+  intentionally unsupported.)
+- **Streaming block I/O** for bounded working memory (see below).
+- **Freestanding-capable core** with callback file I/O and an Emscripten WASM
+  build (see below) — this is what powers the [live viewer demo](https://syoyo.github.io/tinyexr/).
+- Optional **allocator hook**, runtime **SIMD** dispatch (SSE2/SSE4.1/AVX2/F16C,
+  NEON), and a fuzzed, sanitizer-clean test suite.
+
+Build: `make lib` (`build/libtinyexr3.a`), `make test-c`, `make c11-gate`. See
+[v3 C API details](#v3-c-api-details) below for performance, the streaming block
+API, and the freestanding / WASM build.
+
+## v1 — single-header C++ (old, stable)
+
+The original single-header C++ API (`tinyexr.h`) is the **old but stable**
+version. It is written in portable C++ (no dependency except STL), so it is easy
+to embed into your application. To use it, simply copy `tinyexr.h`, `miniz.c` and
+`miniz.h` (for zlib. You can use system-installed zlib instead of miniz, or the
+zlib implementation included in `stb_image[_write].h`. Controlled with
+`TINYEXR_USE_MINIZ` and `TINYEXR_USE_STB_ZLIB` compile flags) into your project.
+The rest of this README (Features, Usage, Examples, …) documents the v1 API.
 
 # Security
 
@@ -541,28 +579,11 @@ int EXRGetWavelengths(const EXRHeader* header, float* wavelengths, int max);
 
 See `examples/spectral/` for a complete read/write example.
 
-## v3 C API (experimental)
+## v3 C API details
 
-The next major release of TinyEXR is a ground-up rewrite as a **pure-C11**
-library (`include/exr.h` + `src/*.c`) — the **v3 C API**. It is **experimental**
-today and will become the main release in the next major version. Until then the
-stable v1 single-header API (`tinyexr.h`) remains the recommended choice for
-production.
-
-Highlights:
-
-- **Pure C11 core** — no C++ in the library; the public header is C++-safe.
-- **Full codec coverage** — read **and** write for NONE / RLE / ZIP / ZIPS / PIZ
-  / PXR24 / B44 / B44A, plus ZSTD and HTJ2K; scanline and tiled
-  (ONE_LEVEL / MIPMAP / RIPMAP), multipart, and deep images. (DWAA/DWAB are
-  intentionally unsupported.)
-- **Streaming block I/O** for bounded working memory (see below).
-- **Freestanding-capable core** with callback file I/O and an Emscripten WASM
-  build (see below).
-- Optional **allocator hook**, runtime **SIMD** dispatch (SSE2/SSE4.1/AVX2/F16C,
-  NEON), and a fuzzed, sanitizer-clean test suite.
-
-Build: `make lib` (`build/libtinyexr3.a`), `make test-c`, `make c11-gate`.
+This section expands on the [v3 overview](#v3--pure-c11-rewrite-main) at the top
+— performance vs OpenEXR, the streaming block API, and the freestanding / WASM
+build.
 
 ### Performance vs OpenEXR
 
