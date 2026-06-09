@@ -155,25 +155,6 @@ Current status of `tinyexr` is:
 
 * C++ compiler(C++11 recommended. C++03 may work)
 
-# Use case
-
-## New TinyEXR (v0.9.5+)
-
-* Godot. Multi-platform 2D and 3D game engine https://godotengine.org/
-* Filament. PBR engine(used in a converter tool). https://github.com/google/filament
-* PyEXR. Loading OpenEXR (.exr) images using Python. https://github.com/ialhashim/PyEXR
-* The-Forge. The Forge Cross-Platform Rendering Framework PC, Linux, Ray Tracing, macOS / iOS, Android, XBOX, PS4 https://github.com/ConfettiFX/The-Forge
-* psdr-cuda. Path-space differentiable renderer. https://github.com/uci-rendering/psdr-cuda
-* Studying Microfacets BSDFs https://virtualgonio.pages.xlim.fr/
-* Your project here!
-
-## Older TinyEXR (v0.9.0)
-
-* mallie https://github.com/lighttransport/mallie
-* Cinder 0.9.0 https://libcinder.org/notes/v0.9.0
-* Piccante (develop branch) http://piccantelib.net/
-* Your project here!
-
 ## Examples
 
 * [examples/deepview/](examples/deepview) Deep image view
