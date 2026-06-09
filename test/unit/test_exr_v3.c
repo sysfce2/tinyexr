@@ -2420,6 +2420,80 @@ static void thread_tests(const char *path) {
 }
 #endif /* EXR_USE_THREADS */
 
+/* Spectral: channel-name helpers, emissive cube round-trip, custom-attribute
+ * round-trip through the writer. */
+static void spectral_tests(void) {
+    char nm[64];
+    float wl;
+
+    /* name format + parse (comma decimal, 6 fractional digits) */
+    exr_spectral_channel_name(nm, sizeof(nm), EXR_SPECTRUM_EMISSIVE, 0, 550.0f);
+    CHECK(strcmp(nm, "S0.550,000000nm") == 0, "spectral emissive name format");
+    exr_spectral_channel_name(nm, sizeof(nm), EXR_SPECTRUM_REFLECTIVE, 0, 700.0f);
+    CHECK(strcmp(nm, "T.700,000000nm") == 0, "spectral reflective name format");
+    wl = exr_spectral_channel_wavelength("S0.550,000000nm");
+    CHECK(wl > 549.9f && wl < 550.1f, "spectral wavelength parse");
+    CHECK(exr_spectral_channel_stokes("S2.480,000000nm") == 2, "stokes parse");
+    CHECK(exr_spectral_channel_stokes("T.480,000000nm") == -1, "reflective stokes -1");
+    CHECK(exr_is_spectral_channel("S0.480,000000nm") == 1, "is-spectral-channel");
+    CHECK(exr_is_spectral_channel("R") == 0, "non-spectral channel");
+
+    /* build a 3x2 emissive image with 4 wavelengths, save, reload, compare */
+    {
+        const int W = 3, H = 2, NWL = 4;
+        float wls[4] = {480.0f, 550.0f, 620.0f, 700.0f};
+        float *samples = (float *)malloc((size_t)NWL * W * H * sizeof(float));
+        exr_image img;
+        void *blob = NULL;
+        size_t blob_size = 0;
+        exr_spectral_image spec;
+        int k, p, ok = 1;
+
+        for (k = 0; k < NWL; ++k)
+            for (p = 0; p < W * H; ++p)
+                samples[(size_t)k * W * H + p] = (float)(k * 100 + p) * 0.5f;
+
+        memset(&img, 0, sizeof(img));
+        CHECK(EXR_OK(exr_spectral_setup_emissive(NULL, W, H, NWL, wls, samples,
+                                                 "W.m^-2.sr^-1", &img)),
+              "spectral setup emissive");
+        CHECK(EXR_OK(exr_save_to_memory(&blob, &blob_size, NULL, &img,
+                                        EXR_COMPRESSION_ZIP)),
+              "spectral save to memory");
+        exr_image_free(&img);
+
+        memset(&spec, 0, sizeof(spec));
+        CHECK(EXR_OK(exr_spectral_load_from_memory(blob, blob_size, NULL, &spec)),
+              "spectral load from memory");
+        CHECK(spec.type == EXR_SPECTRUM_EMISSIVE, "reloaded spectrum type emissive");
+        CHECK(spec.num_wavelengths == NWL && spec.width == W && spec.height == H,
+              "reloaded spectral dimensions");
+        CHECK(strcmp(spec.units, "W.m^-2.sr^-1") == 0, "reloaded spectral units");
+        for (k = 0; k < spec.num_wavelengths; ++k)
+            if (spec.wavelengths[k] < wls[k] - 0.5f ||
+                spec.wavelengths[k] > wls[k] + 0.5f)
+                ok = 0;
+        CHECK(ok, "reloaded wavelengths sorted + correct");
+        ok = 1;
+        for (k = 0; k < NWL; ++k)
+            for (p = 0; p < W * H; ++p) {
+                float got = exr_spectral_sample(&spec, 0, k, p % W, p / W);
+                float want = (float)(k * 100 + p) * 0.5f;
+                if (got < want - 0.01f || got > want + 0.01f) ok = 0;
+            }
+        CHECK(ok, "reloaded spectral samples match");
+        {
+            float ps[4];
+            int n = exr_spectral_pixel(&spec, 0, 1, 0, ps); /* pixel index p=1 */
+            CHECK(n == NWL && ps[0] == 0.5f && ps[1] == 50.5f,
+                  "per-pixel spectrum extract");
+        }
+        exr_spectral_image_free(&spec);
+        free(samples);
+        free(blob);
+    }
+}
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -2618,6 +2692,9 @@ int main(void) {
     printf("== multithreading (serial vs parallel) ==\n");
     thread_tests("asakusa.exr");
 #endif
+
+    printf("== spectral (JCGT layout) ==\n");
+    spectral_tests();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

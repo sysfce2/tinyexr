@@ -291,6 +291,13 @@ struct exr_attr_list {
 void exr_attr_list_free(const exr_allocator *a, exr_attr_list *list);
 const exr_attr *exr_attr_find(const exr_attr_list *list, const char *name);
 
+/* Append a copy of (name,type,data) to the list, growing it as needed. Used by
+ * the header parser and by exr_header_set_attribute. */
+exr_result exr_attr_list_append(const exr_allocator *a, exr_attr_list *list,
+                                const char *name, size_t name_len,
+                                const char *type, size_t type_len,
+                                const uint8_t *data, uint32_t size);
+
 /* Parse one channel-list ("chlist") attribute into a freshly allocated channel
  * array. Returns EXR_SUCCESS and sets *out_channels / *out_count. */
 exr_result exr_parse_chlist(const exr_allocator *a, const uint8_t *data,

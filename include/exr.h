@@ -205,6 +205,63 @@ void exr_image_free(exr_image *img);
 void exr_part_free(const exr_allocator *a, exr_part *part);
 
 /* ============================================================================
+ * Custom header attributes (exr_header.attrs is otherwise opaque)
+ *
+ * Read access lets callers inspect any parsed attribute (standard or custom);
+ * write access lets callers attach custom attributes that round-trip through
+ * exr_save_* / exr_writer_*. The standard attributes the writer emits itself
+ * (channels, compression, dataWindow, displayWindow, lineOrder,
+ * pixelAspectRatio, screenWindowCenter, screenWindowWidth, tiles, name, type,
+ * chunkCount, version, maxSamplesPerPixel) are skipped on write to avoid
+ * duplicates.
+ * ========================================================================== */
+
+/* A read-only view onto one parsed attribute. `data` points into storage owned
+ * by the exr_image/reader and is valid for its lifetime. It is the raw on-disk
+ * payload and is NOT guaranteed NUL-terminated (OpenEXR "string" attributes are
+ * strlen bytes with no NUL) — use exr_header_get_string_attribute for strings. */
+typedef struct exr_attribute {
+    const char *name;      /* attribute name (NUL-terminated) */
+    const char *type_name; /* OpenEXR type, e.g. "string", "int", "float" */
+    const void *data;      /* raw payload, `size` bytes */
+    uint32_t size;
+} exr_attribute;
+
+/* Number of parsed attributes on a header (0 if header->attrs is NULL). */
+int32_t exr_header_num_attributes(const exr_header *hdr);
+
+/* Fill *out with attribute `index` (0..num-1). EXR_ERROR_INVALID_ARGUMENT if
+ * out is NULL or index is out of range. */
+exr_result exr_header_get_attribute(const exr_header *hdr, int32_t index,
+                                    exr_attribute *out);
+
+/* Find an attribute by name. EXR_SUCCESS and fills *out, or
+ * EXR_ERROR_INVALID_ARGUMENT if not found / bad args. */
+exr_result exr_header_find_attribute(const exr_header *hdr, const char *name,
+                                     exr_attribute *out);
+
+/* Copy a "string"-typed attribute's value into `buf` (always NUL-terminated
+ * when buf_size > 0; truncated to fit). EXR_SUCCESS if the attribute exists
+ * (regardless of truncation), else EXR_ERROR_INVALID_ARGUMENT. out_len
+ * (optional) receives the full untruncated length. */
+exr_result exr_header_get_string_attribute(const exr_header *hdr,
+                                           const char *name, char *buf,
+                                           size_t buf_size, size_t *out_len);
+
+/* Set (or replace) a custom attribute so it round-trips through save/write.
+ * `type_name` is the OpenEXR type string (e.g. "string", "int"); data/size is
+ * the raw payload (for "string", strlen bytes, NO trailing NUL). Allocates
+ * header->attrs on first use with `alloc` (NULL = default). */
+exr_result exr_header_set_attribute(const exr_allocator *alloc, exr_header *hdr,
+                                    const char *name, const char *type_name,
+                                    const void *data, uint32_t size);
+
+/* Convenience for "string"-typed attributes (writes strlen(value) bytes). */
+exr_result exr_header_set_string_attribute(const exr_allocator *alloc,
+                                           exr_header *hdr, const char *name,
+                                           const char *value);
+
+/* ============================================================================
  * High-level load / save
  * ========================================================================== */
 
@@ -420,6 +477,131 @@ exr_result exr_writer_write_deep_tile(exr_writer *w, int32_t part,
 /* Backpatch every offset table (seek + write) and flush. For the file-backed
  * sink this also closes the file. */
 exr_result exr_writer_end_stream(exr_writer *w);
+
+/* ============================================================================
+ * Spectral images (JCGT 2021 "An OpenEXR Layout for Spectral Images";
+ * afichet/spectral-exr)
+ *
+ * Spectral data is stored as ordinary EXR channels named by wavelength, with a
+ * comma decimal separator and an "nm" suffix:
+ *   - emissive Stokes component n (0..3): "S{n}.{wavelength}nm" (e.g.
+ *     "S0.550,000000nm"); S0 is intensity, S1..S3 the polarisation state.
+ *   - reflective:                         "T.{wavelength}nm".
+ * A "spectralLayoutVersion" string attribute (value "1.0") marks the file as
+ * spectral; units live in "ROOT/units" (reflective) or "emissiveUnits"
+ * (emissive/polarised), with optional "polarisationHandedness".
+ * ========================================================================== */
+
+typedef enum exr_spectrum_type {
+    EXR_SPECTRUM_NONE = 0,   /* not a spectral image */
+    EXR_SPECTRUM_REFLECTIVE, /* T.{wl}nm channels */
+    EXR_SPECTRUM_EMISSIVE,   /* S0.{wl}nm only */
+    EXR_SPECTRUM_POLARISED   /* S0..S3.{wl}nm */
+} exr_spectrum_type;
+
+#define EXR_SPECTRAL_LAYOUT_VERSION "1.0"
+
+/* True if the header carries a "spectralLayoutVersion" attribute. */
+int exr_is_spectral(const exr_header *hdr);
+
+/* Classify by channel naming (REFLECTIVE / EMISSIVE / POLARISED), else NONE. */
+exr_spectrum_type exr_spectrum_type_of(const exr_header *hdr);
+
+/* Parse the wavelength (nm) from a spectral channel name; < 0 if not spectral.
+ * Locale-independent; accepts the comma decimal separator. */
+float exr_spectral_channel_wavelength(const char *channel_name);
+
+/* Stokes component 0..3 for "S{n}." channels, or -1 (incl. all "T." channels). */
+int exr_spectral_channel_stokes(const char *channel_name);
+
+/* 1 if the name matches S{n}.{wl}nm or T.{wl}nm with a valid wavelength. */
+int exr_is_spectral_channel(const char *channel_name);
+
+/* Collect the sorted, unique wavelengths (ascending) into `out` (capacity
+ * `max`). Returns the count written; if out is NULL returns the count that
+ * would be written (query). Wavelengths within 0.01 nm are merged. NOTE: the
+ * header channel order is lexicographic on the formatted wavelength string, so
+ * it does NOT equal ascending wavelength — always rely on this sort. */
+int32_t exr_spectral_wavelengths(const exr_header *hdr, float *out, int32_t max);
+
+/* Copy the spectral units string ("ROOT/units" for reflective, else
+ * "emissiveUnits") into buf (NUL-terminated). EXR_SUCCESS if present, else
+ * EXR_ERROR_INVALID_ARGUMENT. */
+exr_result exr_spectral_units(const exr_header *hdr, char *buf, size_t buf_size);
+
+/* Build a channel name into buf (>= 32 bytes). EMISSIVE/POLARISED use stokes
+ * 0..3; REFLECTIVE ignores stokes. Format "S{n}.{wl}nm" / "T.{wl}nm" with a
+ * comma decimal separator and 6 fractional digits. */
+void exr_spectral_channel_name(char *buf, size_t buf_size,
+                               exr_spectrum_type type, int stokes,
+                               float wavelength_nm);
+
+/* Attach spectralLayoutVersion + units (+ polarisationHandedness for POLARISED)
+ * to a header so it round-trips through save. `units` may be NULL. */
+exr_result exr_spectral_set_attributes(const exr_allocator *alloc,
+                                       exr_header *hdr, exr_spectrum_type type,
+                                       const char *units);
+
+/* A decoded spectral cube (part 0 only; all planes float). */
+typedef struct exr_spectral_image {
+    int32_t width, height;
+    exr_spectrum_type type;
+
+    int32_t num_wavelengths;
+    float *wavelengths; /* [num_wavelengths] ascending, owned */
+
+    /* Stokes planes. stokes[0] is always present (S0 emissive, or T reflective);
+     * stokes[1..3] hold S1..S3 for POLARISED, else NULL. Each non-NULL plane is
+     * num_wavelengths * width * height floats, laid out [wavelength][y*width+x]
+     * (num_wavelengths contiguous width*height planes). */
+    float *stokes[4];
+
+    char units[64];      /* "" if none */
+    char handedness[8];  /* "left"/"right"/"" (polarised only) */
+    exr_allocator alloc; /* owns the buffers above */
+} exr_spectral_image;
+
+/* Load + verify spectral + gather wavelengths + fill the float cube. On success
+ * *out is filled and must be released with exr_spectral_image_free().
+ * EXR_ERROR_UNSUPPORTED if the file is not spectral (or uses subsampled
+ * spectral channels, or is multipart-only-spectral past part 0). */
+exr_result exr_spectral_load_from_file(const char *path,
+                                       const exr_allocator *alloc,
+                                       exr_spectral_image *out);
+exr_result exr_spectral_load_from_memory(const void *data, size_t size,
+                                         const exr_allocator *alloc,
+                                         exr_spectral_image *out);
+
+void exr_spectral_image_free(exr_spectral_image *img);
+
+/* Sample at (wavelength_index, x, y) of Stokes plane `s` (0 for non-polarised).
+ * Returns 0 on out-of-range. */
+float exr_spectral_sample(const exr_spectral_image *img, int32_t s,
+                          int32_t wavelength_index, int32_t x, int32_t y);
+
+/* Copy the full per-pixel spectrum of plane `s` at (x,y) into out_spectrum
+ * (>= num_wavelengths floats). Returns the count written, 0 on bad args. */
+int32_t exr_spectral_pixel(const exr_spectral_image *img, int32_t s, int32_t x,
+                           int32_t y, float *out_spectrum);
+
+const float *exr_spectral_wavelength_array(const exr_spectral_image *img,
+                                           int32_t *out_count);
+
+/* Build a single-part exr_image (channels named per the convention, FLOAT
+ * pixels) plus the spectral attributes, ready for exr_save_to_file/memory.
+ * `samples` is [wavelength][y*width+x]. `units` may be NULL. On success *out_img
+ * is filled and owned by the caller (free with exr_image_free). */
+exr_result exr_spectral_setup_emissive(const exr_allocator *alloc, int32_t width,
+                                       int32_t height, int32_t num_wavelengths,
+                                       const float *wavelengths,
+                                       const float *samples, const char *units,
+                                       exr_image *out_img);
+exr_result exr_spectral_setup_reflective(const exr_allocator *alloc,
+                                         int32_t width, int32_t height,
+                                         int32_t num_wavelengths,
+                                         const float *wavelengths,
+                                         const float *samples, const char *units,
+                                         exr_image *out_img);
 
 /* ============================================================================
  * Utilities

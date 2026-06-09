@@ -12,6 +12,7 @@
  */
 
 import createModule from "./exr_viewer.mjs";
+import { unzipSync } from "./fflate.module.js";
 
 /* ------------------------------------------------------------------ globals */
 let M = null;             // emscripten module
@@ -20,7 +21,13 @@ let header = null;        // parsed header JSON
 let sel = { part: 0, lx: 0, ly: 0, view: 0 };
 let views = [];           // channel-view options for the current part
 
-let mode = "2d";          // "2d" flat image, or "3d" deep point cloud
+let mode = "2d";          // "2d" flat image, "3d" deep cloud, or "spectral"
+// spectral state (mode === "spectral"): the WASM side holds the wavelength cube
+let specWl = null;        // Float32Array of wavelengths (nm), ascending
+let specNwl = 0;          // number of wavelength bands
+let specWi = 0;           // current wavelength index
+let specDims = { w: 0, h: 0 };
+let lastSpecPixel = null; // { x, y, spec: Float32Array } last hovered pixel
 // deep 3D state
 let prog3d = null, uni3d = null, vbo3d = null, deepN = 0, deepBounds = null;
 let cam = { az: 0.5, el: -0.32, dist: 2.2, panX: 0, panY: 0 };
@@ -392,6 +399,7 @@ async function loadBytes(bytes, name) {
   buildPartSelector();
   views = [];                 // force a fresh channel-view list for the new file
   if (header.parts[0] && header.parts[0].deep) await enterDeepMode(0);
+  else if (header.parts[0] && header.parts[0].spectral) await enterSpectralMode(0);
   else await selectAndDecode(0, 0, 0, true);
 }
 
@@ -467,8 +475,13 @@ function updatePixel(sx, sy) {
   const ax = ix + dwMin.x, ay = iy + dwMin.y;
   const f = (x) => (Math.abs(x) >= 1e4 || (Math.abs(x) < 1e-4 && x !== 0))
     ? x.toExponential(3) : x.toFixed(4);
-  el.textContent =
-    `x ${ax}  y ${ay}\nR ${f(r)}\nG ${f(g)}\nB ${f(b)}\nA ${f(a)}`;
+  if (mode === "spectral") {
+    el.textContent = `x ${ax}  y ${ay}\n${specWl[specWi].toFixed(1)} nm  ${f(r)}`;
+    updateSpecPixel(ix, iy);
+  } else {
+    el.textContent =
+      `x ${ax}  y ${ay}\nR ${f(r)}\nG ${f(g)}\nB ${f(b)}\nA ${f(a)}`;
+  }
   el.classList.remove("hidden");
 }
 
@@ -637,6 +650,19 @@ function setupInput() {
     }
   });
 
+  // bundled spectral sample (16-band emissive), next to index.html
+  document.getElementById("btnSpectralSample").addEventListener("click", async () => {
+    try {
+      setProgress(0, "Fetching spectral_sample.exr…");
+      const resp = await fetch("spectral_sample.exr");
+      if (!resp.ok) throw new Error("spectral_sample.exr not found");
+      loadBytes(new Uint8Array(await resp.arrayBuffer()), "spectral_sample.exr");
+    } catch (err) {
+      setProgress(-1);
+      showError("Could not load spectral_sample.exr (" + err.message + ").");
+    }
+  });
+
   // asakusa — fetched over HTTP from the tinyexr repo (release branch)
   const ASAKUSA_URL =
     "https://raw.githubusercontent.com/syoyo/tinyexr/release/asakusa.exr";
@@ -802,7 +828,14 @@ function setupInput() {
   document.getElementById("partSel").addEventListener("change", (e) => {
     const part = parseInt(e.target.value, 10);
     if (header.parts[part] && header.parts[part].deep) enterDeepMode(part);
+    else if (part === 0 && header.parts[part] && header.parts[part].spectral)
+      enterSpectralMode(part);
     else selectAndDecode(part, 0, 0, true);
+  });
+
+  // wavelength scrubber (spectral mode)
+  document.getElementById("wavelength").addEventListener("input", (e) => {
+    showWavelength(parseInt(e.target.value, 10), false);
   });
   document.getElementById("levelSel").addEventListener("change", (e) => {
     const [lx, ly] = e.target.value.split(",").map(Number);
@@ -1117,6 +1150,8 @@ function set2DMode() {
   mode = "2d";
   document.getElementById("ctrls").classList.remove("hidden");
   document.getElementById("deepCtrls").classList.add("hidden");
+  document.getElementById("spectralCtrls").classList.add("hidden");
+  document.getElementById("channelView").style.display = "";
   document.getElementById("overlay").style.display = "";
 }
 
@@ -1165,6 +1200,7 @@ async function enterDeepMode(part) {
   document.getElementById("dropzone").classList.add("hidden");
   document.getElementById("ctrls").classList.add("hidden");
   document.getElementById("deepCtrls").classList.remove("hidden");
+  document.getElementById("spectralCtrls").classList.add("hidden");
   document.getElementById("info").classList.remove("hidden");
   document.getElementById("viewbar").classList.add("hidden");
   document.getElementById("pixel").classList.add("hidden");
@@ -1176,9 +1212,275 @@ async function enterDeepMode(part) {
   render3d();
 }
 
+/* ========================================================== spectral view */
+function spectrumLabel(ph) {
+  switch (ph.spectrumType) {
+    case "reflective": return "Reflective";
+    case "emissive": return "Emissive";
+    case "polarised": return "Polarised (S0)";
+    default: return "Spectral";
+  }
+}
+
+// Decode all wavelength planes of a spectral part and switch to spectral mode:
+// a grayscale view of one wavelength at a time (scrubbed with the slider) plus
+// a per-pixel spectrum plot. Uses the flat 2D render path (exposure/gamma apply).
+async function enterSpectralMode(part) {
+  setProgress(0, "Decoding spectral planes…");
+  await raf();
+  const nwl = M._exrv_spectral_open(handle);
+  if (nwl <= 0) {
+    setProgress(-1);
+    showError("Could not decode this spectral image.");
+    return;
+  }
+  const w = M._exrv_spectral_width(handle), h = M._exrv_spectral_height(handle);
+  specDims = { w, h };
+  specNwl = nwl;
+  const wp = M._exrv_spectral_wavelengths(handle);
+  specWl = M.HEAPF32.slice(wp >> 2, (wp >> 2) + nwl); // copy out of the heap
+  specWi = 0;
+  setProgress(100);
+
+  mode = "spectral";
+  sel = { part, lx: 0, ly: 0, view: 0 };
+  roi = null;
+  const ph = header.parts[part];
+  dwMin = { x: 0, y: 0 };
+  dispWin = ph.displayWindow;
+
+  document.getElementById("dropzone").classList.add("hidden");
+  document.getElementById("ctrls").classList.remove("hidden");
+  document.getElementById("deepCtrls").classList.add("hidden");
+  document.getElementById("spectralCtrls").classList.remove("hidden");
+  document.getElementById("channelView").style.display = "none";
+  document.getElementById("info").classList.remove("hidden");
+  document.getElementById("viewbar").classList.remove("hidden");
+  document.getElementById("overlay").style.display = "";
+
+  const slider = document.getElementById("wavelength");
+  slider.min = "0";
+  slider.max = String(nwl - 1);
+  slider.step = "1";
+  slider.value = "0";
+
+  document.getElementById("spectralInfo").textContent =
+    `${spectrumLabel(ph)} · ${w}×${h} · ${nwl} bands · ` +
+    `${specWl[0].toFixed(1)}–${specWl[nwl - 1].toFixed(1)} nm`;
+
+  lastSpecPixel = null;
+  clearSpecPlot();
+  document.getElementById("specPixelPos").textContent = "—";
+  showWavelength(0, true);
+  renderInfo();
+}
+
+// Upload the grayscale plane for wavelength index `wi` and refresh the view.
+function showWavelength(wi, doFit) {
+  if (mode !== "spectral") return;
+  wi = clamp(wi | 0, 0, specNwl - 1);
+  specWi = wi;
+  if (M._exrv_spectral_show(handle, wi) < 0) {
+    showError("Wavelength decode failed.");
+    return;
+  }
+  const ptr = M._exrv_rgba(handle);
+  const w = specDims.w, h = specDims.h;
+  const data = M.HEAPF32.slice(ptr >> 2, (ptr >> 2) + w * h * 4);
+  img = { w, h, data };
+  uploadTexture();
+  document.getElementById("wlVal").textContent = specWl[wi].toFixed(1) + " nm";
+  document.getElementById("wavelength").value = String(wi);
+  if (doFit) fitView(); else render();
+  redrawSpecPlot();
+}
+
+// Read a pixel's full spectrum from WASM and draw it.
+function updateSpecPixel(ix, iy) {
+  const ptr = M._exrv_spectral_pixel(handle, ix, iy);
+  if (!ptr) return;
+  const spec = M.HEAPF32.slice(ptr >> 2, (ptr >> 2) + specNwl);
+  lastSpecPixel = { x: ix, y: iy, spec };
+  document.getElementById("specPixelPos").textContent = `x ${ix}  y ${iy}`;
+  drawSpecPlot(spec);
+}
+
+function clearSpecPlot() {
+  const cv = document.getElementById("specPlot");
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#0d1117";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+}
+function redrawSpecPlot() {
+  if (lastSpecPixel) drawSpecPlot(lastSpecPixel.spec);
+  else clearSpecPlot();
+}
+
+// Plot value-vs-wavelength for the hovered pixel, with a marker at the current
+// wavelength. Y axis auto-scales to the pixel's peak.
+function drawSpecPlot(spec) {
+  const cv = document.getElementById("specPlot");
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  ctx.fillStyle = "#0d1117";
+  ctx.fillRect(0, 0, W, H);
+  if (!spec || !specNwl) return;
+
+  const padL = 38, padR = 8, padT = 8, padB = 18;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  let vmax = 0;
+  for (let i = 0; i < spec.length; i++) if (spec[i] > vmax) vmax = spec[i];
+  if (!(vmax > 0)) vmax = 1;
+  const wl0 = specWl[0], wl1 = specWl[specNwl - 1];
+  const wlr = (wl1 > wl0) ? (wl1 - wl0) : 1;
+  const xOf = (wl) => padL + ((wl - wl0) / wlr) * plotW;
+  const yOf = (v) => padT + plotH - (Math.max(v, 0) / vmax) * plotH;
+
+  ctx.strokeStyle = "#30363d";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + plotH);
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.stroke();
+
+  // current-wavelength marker
+  ctx.strokeStyle = "#4c9aff";
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  const xm = xOf(specWl[specWi]);
+  ctx.moveTo(xm, padT);
+  ctx.lineTo(xm, padT + plotH);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // spectrum polyline + points
+  ctx.strokeStyle = "#ffd24c";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < specNwl; i++) {
+    const x = xOf(specWl[i]), y = yOf(spec[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = "#ffd24c";
+  for (let i = 0; i < specNwl; i++) {
+    ctx.beginPath();
+    ctx.arc(xOf(specWl[i]), yOf(spec[i]), 1.6, 0, 6.283);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = "#8b949e";
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(wl0.toFixed(0) + " nm", padL, H - 5);
+  ctx.fillText(wl1.toFixed(0), padL + plotW, H - 5);
+  ctx.textAlign = "right";
+  ctx.fillText(vmax >= 1e4 || vmax < 1e-2 ? vmax.toExponential(1)
+                                          : vmax.toFixed(2), padL - 3, padT + 8);
+  ctx.fillText("0", padL - 3, padT + plotH);
+}
+
+/* ------------------------------------- JCGT spectral sample-image browser -- */
+const JCGT_ZIP = "https://jcgt.org/published/0010/03/01/sample-images.zip";
+// jcgt.org likely sends no CORS headers, so try direct first then public
+// proxies. Proxies can be slow or rate-limited; this is best-effort.
+const CORS_PROXIES = [
+  (u) => u,
+  (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
+  (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+];
+
+function setupSpecBrowser() {
+  const modal = document.getElementById("specBrowser");
+  const treeEl = document.getElementById("specBrowserTree");
+  const filterEl = document.getElementById("specBrowserFilter");
+  let entries = null; // { name -> Uint8Array } of .exr files, cached
+
+  const msg = (text, err) => {
+    const d = document.createElement("div");
+    d.className = "msg" + (err ? " err" : "");
+    d.textContent = text;
+    treeEl.replaceChildren(d);
+  };
+  const close = () => modal.classList.add("hidden");
+  const open = () => {
+    modal.classList.remove("hidden");
+    if (entries === null) load();
+    filterEl.focus();
+  };
+
+  async function fetchZip() {
+    let lastErr;
+    for (const mk of CORS_PROXIES) {
+      try {
+        return await fetchUrlWithProgress(mk(JCGT_ZIP), "sample-images.zip");
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error("fetch failed");
+  }
+
+  async function load() {
+    msg("Fetching + unzipping sample-images.zip…");
+    try {
+      const zip = await fetchZip();
+      setProgress(100);
+      const files = unzipSync(zip);
+      entries = {};
+      for (const name of Object.keys(files))
+        if (/\.exr$/i.test(name) && files[name].length) entries[name] = files[name];
+      if (!Object.keys(entries).length) { msg("No .exr files in the archive.", true); return; }
+      rerender();
+    } catch (err) {
+      entries = null;
+      setProgress(-1);
+      msg("Could not fetch/unzip the archive (" + err.message +
+          "). jcgt.org may block cross-origin requests and the proxies may be " +
+          "rate-limited; try again later or download the zip and drag a file in.",
+          true);
+    }
+  }
+
+  function rerender() {
+    const q = filterEl.value.trim().toLowerCase();
+    const names = Object.keys(entries)
+      .filter((n) => !q || n.toLowerCase().includes(q))
+      .sort((a, b) => a.localeCompare(b));
+    if (!names.length) { msg("No matching .exr files."); return; }
+    const frag = document.createDocumentFragment();
+    for (const name of names) {
+      const btn = document.createElement("button");
+      btn.className = "tree-file";
+      btn.title = "Load " + name;
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = name;
+      const sz = document.createElement("span");
+      sz.className = "sz";
+      sz.textContent = humanSize(entries[name].length);
+      btn.append(nm, sz);
+      btn.addEventListener("click", () => {
+        close();
+        loadBytes(entries[name].slice(), name.split("/").pop());
+      });
+      frag.appendChild(btn);
+    }
+    treeEl.replaceChildren(frag);
+  }
+
+  document.getElementById("btnSpectral").addEventListener("click", open);
+  document.getElementById("specBrowserClose").addEventListener("click", close);
+  modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.classList.contains("hidden")) close();
+  });
+  filterEl.addEventListener("input", () => { if (entries) rerender(); });
+}
+
 (async function main() {
   setupInput();
   setupBrowser();
+  setupSpecBrowser();
   initLegendGradient();
   document.getElementById("gamma").disabled = ctl.srgb;
   try {

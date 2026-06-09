@@ -57,6 +57,11 @@ typedef struct exrv_session {
     /* deep point cloud: 6 floats per sample (x, y, z, r, g, b) */
     float *deep_pts;
     int deep_n;
+
+    /* spectral image (loaded lazily for the spectral viewer mode) */
+    exr_spectral_image spec;
+    int spec_loaded;
+    float *spec_pixel; /* num_wavelengths scratch for the per-pixel spectrum */
 } exrv_session;
 
 #define EXRV_MAX_SESSIONS 16
@@ -244,6 +249,20 @@ static const char *levelmode_name(exr_tile_level_mode m) {
     return "unknown";
 }
 
+static const char *spectrum_type_name(exr_spectrum_type t) {
+    switch (t) {
+    case EXR_SPECTRUM_NONE:
+        return "none";
+    case EXR_SPECTRUM_REFLECTIVE:
+        return "reflective";
+    case EXR_SPECTRUM_EMISSIVE:
+        return "emissive";
+    case EXR_SPECTRUM_POLARISED:
+        return "polarised";
+    }
+    return "unknown";
+}
+
 /* ------------------------------------------------------------------- exports */
 
 EXRV_EXPORT int exrv_open(const uint8_t *data, int size) {
@@ -291,6 +310,8 @@ EXRV_EXPORT void exrv_close(int h) {
     if (!s) return;
     session_reset_selection(s);
     free(s->deep_pts);
+    free(s->spec_pixel);
+    if (s->spec_loaded) exr_spectral_image_free(&s->spec);
     if (s->r) exr_reader_close(s->r);
     free(s->data);
     free(s);
@@ -434,6 +455,17 @@ EXRV_EXPORT char *exrv_header_json(int h) {
             sb_puts(&b, "}");
         }
         sb_puts(&b, "]");
+
+        /* Spectral metadata (JCGT layout) so the UI can offer spectral mode. */
+        sb_puts(&b, ",");
+        sb_kv_int(&b, "spectral", exr_is_spectral(hd) ? 1 : 0);
+        if (exr_is_spectral(hd)) {
+            sb_puts(&b, ",\"spectrumType\":");
+            sb_json_str(&b, spectrum_type_name(exr_spectrum_type_of(hd)));
+            sb_puts(&b, ",");
+            sb_kv_int(&b, "numWavelengths",
+                      exr_spectral_wavelengths(hd, NULL, 0));
+        }
 
         sb_puts(&b, "}");
     }
@@ -756,6 +788,100 @@ EXRV_EXPORT float *exrv_deep_points(int h) {
 EXRV_EXPORT int exrv_deep_count(int h) {
     exrv_session *s = session_from_handle(h);
     return s ? s->deep_n : 0;
+}
+
+/* ----------------------------------------------------- spectral viewer ---- */
+
+EXRV_EXPORT int exrv_is_spectral(int h, int part) {
+    exrv_session *s = session_from_handle(h);
+    const exr_header *hd;
+    if (!s) return 0;
+    if (part < 0 || part >= s->num_parts) return 0;
+    hd = exr_reader_part_header(s->r, part);
+    return (hd && exr_is_spectral(hd)) ? 1 : 0;
+}
+
+/* Load all wavelength planes of the (single) spectral part into a float cube,
+ * (re)allocate the shared RGBA buffer sized to the image, and a per-pixel
+ * spectrum scratch. Returns the number of wavelengths (> 0) or -1. The cube
+ * keeps the spectral channels in memory so wavelength scrubbing and per-pixel
+ * spectra are allocation-free afterwards. */
+EXRV_EXPORT int exrv_spectral_open(int h) {
+    exrv_session *s = session_from_handle(h);
+    size_t npix;
+    if (!s) return -1;
+
+    session_reset_selection(s); /* frees any 2D rgba buffer + selection */
+    if (s->spec_loaded) {
+        exr_spectral_image_free(&s->spec);
+        s->spec_loaded = 0;
+    }
+    free(s->spec_pixel);
+    s->spec_pixel = NULL;
+
+    if (!EXR_OK(exr_spectral_load_from_memory(s->data, s->size, NULL, &s->spec)))
+        return -1;
+    s->spec_loaded = 1;
+    s->lw = s->spec.width;
+    s->lh = s->spec.height;
+    s->dw_min_x = 0;
+    s->dw_min_y = 0;
+
+    npix = (size_t)s->lw * (size_t)s->lh;
+    s->rgba = (float *)malloc((npix ? npix : 1) * 4 * sizeof(float));
+    s->spec_pixel = (float *)malloc(
+        (s->spec.num_wavelengths ? (size_t)s->spec.num_wavelengths : 1) *
+        sizeof(float));
+    if (!s->rgba || !s->spec_pixel) return -1;
+    return s->spec.num_wavelengths;
+}
+
+EXRV_EXPORT int exrv_spectral_width(int h) {
+    exrv_session *s = session_from_handle(h);
+    return (s && s->spec_loaded) ? s->spec.width : 0;
+}
+EXRV_EXPORT int exrv_spectral_height(int h) {
+    exrv_session *s = session_from_handle(h);
+    return (s && s->spec_loaded) ? s->spec.height : 0;
+}
+
+/* Pointer to the sorted wavelength array (num_wavelengths floats) for JS. */
+EXRV_EXPORT float *exrv_spectral_wavelengths(int h) {
+    exrv_session *s = session_from_handle(h);
+    return (s && s->spec_loaded) ? s->spec.wavelengths : NULL;
+}
+
+/* Fill the shared RGBA buffer with the grayscale plane for wavelength `wi`
+ * (R=G=B=value, A=1), reusing the existing 2D upload + tone-map path. Returns
+ * 1 on success, -1 otherwise. */
+EXRV_EXPORT int exrv_spectral_show(int h, int wi) {
+    exrv_session *s = session_from_handle(h);
+    size_t npix, p;
+    const float *plane;
+    if (!s || !s->spec_loaded || !s->rgba) return -1;
+    if (wi < 0 || wi >= s->spec.num_wavelengths || !s->spec.stokes[0]) return -1;
+    npix = (size_t)s->spec.width * (size_t)s->spec.height;
+    plane = s->spec.stokes[0] + (size_t)wi * npix;
+    for (p = 0; p < npix; ++p) {
+        float v = plane[p];
+        s->rgba[p * 4 + 0] = v;
+        s->rgba[p * 4 + 1] = v;
+        s->rgba[p * 4 + 2] = v;
+        s->rgba[p * 4 + 3] = 1.0f;
+    }
+    return 1;
+}
+
+/* Fill the per-pixel spectrum scratch (num_wavelengths floats) for (x,y) of the
+ * primary Stokes plane and return it (zeros on out-of-range). */
+EXRV_EXPORT float *exrv_spectral_pixel(int h, int x, int y) {
+    exrv_session *s = session_from_handle(h);
+    if (!s || !s->spec_loaded || !s->spec_pixel) return NULL;
+    if (exr_spectral_pixel(&s->spec, 0, x, y, s->spec_pixel) <= 0) {
+        int i;
+        for (i = 0; i < s->spec.num_wavelengths; ++i) s->spec_pixel[i] = 0.0f;
+    }
+    return s->spec_pixel;
 }
 
 EXRV_EXPORT void exrv_free(void *p) { free(p); }

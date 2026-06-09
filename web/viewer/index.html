@@ -66,6 +66,10 @@
         <button id="btnDeep" title="Load the repo's deepscanline.exr as a 3D point cloud">Deep scanline (3D)</button>
         <button id="btnDeepTiled" title="Load the repo's deep_tiled_sample.exr as a 3D point cloud">Deep tiled (3D)</button>
       </div>
+      <div class="row">
+        <button id="btnSpectralSample" title="Load the bundled spectral_sample.exr (16-band emissive)">Spectral sample</button>
+        <button id="btnSpectral" title="Fetch + unzip the JCGT spectral sample images and pick one">Spectral samples…</button>
+      </div>
     </header>
 
     <section id="ctrls" class="hidden">
@@ -143,14 +147,30 @@
       <footer style="padding:10px 0 0">Drag to orbit · wheel to zoom · shift-drag (or right-drag) to pan</footer>
     </section>
 
+    <section id="spectralCtrls" class="hidden">
+      <h2>Spectral</h2>
+      <div id="spectralInfo" class="mono"></div>
+      <div class="ctrl">
+        <div class="ctrl-head"><span>Wavelength</span><span id="wlVal">—</span></div>
+        <input id="wavelength" type="range" min="0" max="0" step="1" value="0" />
+      </div>
+      <div class="ctrl">
+        <div class="ctrl-head"><span>Pixel spectrum</span><span id="specPixelPos">—</span></div>
+        <canvas id="specPlot" width="280" height="150"></canvas>
+        <div class="specplot-hint">Hover the image to read a pixel's spectrum.</div>
+      </div>
+      <footer style="padding:10px 0 0">Each plane is shown as grayscale; exposure
+        and gamma above still apply. Polarised images show S0.</footer>
+    </section>
+
     <section id="info" class="hidden">
       <h2>Header / Info</h2>
       <div id="infoBody"></div>
     </section>
 
     <footer>
-      Built on the v3 streaming block API. Custom attributes are opaque in the
-      public API, so only structured header fields are shown.
+      Built on the v3 streaming block API. Spectral EXRs (JCGT layout) open in a
+      grayscale wavelength scrubber with a per-pixel spectrum plot.
       <div class="ghrow">
         <a id="ghLink" href="https://github.com/syoyo/tinyexr" target="_blank"
            rel="noopener noreferrer" title="TinyEXR on GitHub">
@@ -184,6 +204,26 @@
         <input id="browserFilter" type="search" placeholder="filter…" />
       </div>
       <div id="browserTree" class="browser-tree"></div>
+    </div>
+  </div>
+
+  <!-- JCGT spectral sample-image browser ------------------------------- -->
+  <div id="specBrowser" class="hidden">
+    <div class="browser-box">
+      <header class="browser-head">
+        <h2>Spectral sample images</h2>
+        <button id="specBrowserClose" title="Close (Esc)">✕</button>
+      </header>
+      <div class="browser-sub">
+        From the JCGT 2021 paper
+        <a href="https://jcgt.org/published/0010/03/01/" target="_blank"
+           rel="noopener noreferrer">“An OpenEXR Layout for Spectral Images”</a>
+        (<code>sample-images.zip</code>), fetched + unzipped in the browser. The
+        archive is on jcgt.org which may block cross-origin requests; a CORS
+        proxy is used as a fallback. Click a file to load it.
+        <input id="specBrowserFilter" type="search" placeholder="filter…" />
+      </div>
+      <div id="specBrowserTree" class="browser-tree"></div>
     </div>
   </div>
 </div>

@@ -106,6 +106,21 @@ static void write_box2i(obuf *b, const char *name, const exr_box2i *w) {
     ob_attr(b, name, "box2i", t, 16);
 }
 
+/* Standard attributes the writer emits itself; custom-attribute round-trip
+ * skips these so they are never duplicated. */
+static int is_reserved_attr_name(const char *name) {
+    static const char *const reserved[] = {
+        "channels",         "compression",      "dataWindow",
+        "displayWindow",    "lineOrder",        "pixelAspectRatio",
+        "screenWindowCenter", "screenWindowWidth", "tiles",
+        "name",             "type",             "chunkCount",
+        "version",          "maxSamplesPerPixel"};
+    size_t i;
+    for (i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
+        if (strcmp(name, reserved[i]) == 0) return 1;
+    return 0;
+}
+
 static void write_header(obuf *b, const exr_header *h, const int *order,
                          exr_compression comp, int multipart,
                          uint32_t chunk_count, int32_t max_samples) {
@@ -191,6 +206,16 @@ static void write_header(obuf *b, const exr_header *h, const int *order,
         ob_attr(b, "version", "int", t, 4); /* deep data version */
         exr_wr_i32(t, max_samples);
         ob_attr(b, "maxSamplesPerPixel", "int", t, 4);
+    }
+    /* Emit any custom attributes attached by the caller (e.g. spectral
+     * metadata), skipping the standard ones written above. */
+    if (h->attrs) {
+        uint32_t i;
+        for (i = 0; i < h->attrs->count; ++i) {
+            const exr_attr *at = &h->attrs->items[i];
+            if (is_reserved_attr_name(at->name)) continue;
+            ob_attr(b, at->name, at->type_name, at->data, at->size);
+        }
     }
     ob_u8(b, 0); /* end of header */
 }

@@ -29,6 +29,16 @@ Highlights:
   (ONE_LEVEL / MIPMAP / RIPMAP), multipart, and deep images. (DWAA/DWAB are
   intentionally unsupported.)
 - **Streaming block I/O** for bounded working memory (see below).
+- **Custom header attributes** — read (`exr_header_num_attributes` /
+  `_get_attribute` / `_find_attribute` / `_get_string_attribute`) and write
+  (`exr_header_set_attribute` / `_set_string_attribute`) arbitrary attributes
+  that round-trip through save.
+- **Spectral images** (JCGT 2021 layout / afichet `spectral-exr`) — detect and
+  parse emissive / reflective / polarised spectra, list wavelengths, and load a
+  wavelength cube (`exr_spectral_load_from_file/memory`,
+  `exr_spectral_setup_emissive/reflective`). The [live viewer](https://syoyo.github.io/tinyexr/)
+  opens a spectral EXR as a grayscale **wavelength scrubber** with a per-pixel
+  **spectrum plot**, and can fetch + unzip the JCGT sample-image archive in-browser.
 - **Freestanding-capable core** with callback file I/O and an Emscripten WASM
   build (see below) — this is what powers the [live viewer demo](https://syoyo.github.io/tinyexr/).
 - Optional **allocator hook**, runtime **SIMD** dispatch (SSE2/SSE4.1/AVX2/F16C,

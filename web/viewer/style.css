@@ -189,7 +189,7 @@ select { width: 100%; }
 .subhead { color: var(--muted); margin: 10px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
 
 /* --------------------------------------------------- openexr-images browser */
-#browser {
+#browser, #specBrowser {
   position: fixed; inset: 0; z-index: 20;
   display: flex; align-items: center; justify-content: center;
   background: rgba(8,9,12,.62);
@@ -206,18 +206,25 @@ select { width: 100%; }
   padding: 12px 14px; border-bottom: 1px solid var(--line);
 }
 .browser-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
-#browserClose { padding: 2px 9px; line-height: 1.2; }
+#browserClose, #specBrowserClose { padding: 2px 9px; line-height: 1.2; }
 .browser-sub {
   padding: 10px 14px; border-bottom: 1px solid var(--line);
   color: var(--muted); font-size: 12px; line-height: 1.5;
 }
 .browser-sub a { color: var(--accent); }
-#browserFilter {
+#browserFilter, #specBrowserFilter {
   display: block; width: 100%; margin-top: 8px;
   font: inherit; color: var(--fg);
   background: var(--panel2); border: 1px solid var(--line);
   border-radius: 7px; padding: 6px 9px;
 }
+
+/* spectral plot + hint */
+#specPlot {
+  display: block; width: 100%; height: auto; margin-top: 6px;
+  background: #0d1117; border: 1px solid var(--line); border-radius: 7px;
+}
+.specplot-hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
 .browser-tree { padding: 8px 10px; overflow-y: auto; }
 .browser-tree details { margin: 1px 0; }
 .browser-tree summary {

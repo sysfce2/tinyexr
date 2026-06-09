@@ -41,9 +41,9 @@ V3_WARN  = -Wall -Wextra -Werror
 V3_DEFS  =
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
-# Freestanding core: everything except the optional stdio layer and the
-# (freestanding-only) mem/str implementations.
-V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c,$(V3_SRC))
+# Freestanding core: everything except the optional stdio layer, the spectral
+# helpers (hosted-only convenience), and the (freestanding-only) mem/str impls.
+V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c,$(V3_SRC))
 ZSTD_SRC = deps/zstd/tinyexr_zstd.c
 ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
