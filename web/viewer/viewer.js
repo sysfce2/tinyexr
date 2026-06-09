@@ -19,6 +19,12 @@ let handle = 0;           // current exrv session handle
 let header = null;        // parsed header JSON
 let sel = { part: 0, lx: 0, ly: 0, view: 0 };
 let views = [];           // channel-view options for the current part
+
+let mode = "2d";          // "2d" flat image, or "3d" deep point cloud
+// deep 3D state
+let prog3d = null, uni3d = null, vbo3d = null, deepN = 0, deepBounds = null;
+let cam = { az: 0.5, el: -0.32, dist: 2.2, panX: 0, panY: 0 };
+let deepCtl = { pointSize: 2, rgb: false, exposure: 0 };
 let img = null;           // { w, h, data: Float32Array(rgba) }
 let fileName = null;      // name of the currently loaded file (for info panel)
 let dwMin = { x: 0, y: 0 };
@@ -150,6 +156,7 @@ function syncCanvasSize() {
 
 function render() {
   if (!gl) return;
+  if (mode === "3d") return render3d();
   syncCanvasSize();
   const W = gl.canvas.width, H = gl.canvas.height;
   gl.viewport(0, 0, W, H);
@@ -384,12 +391,14 @@ async function loadBytes(bytes, name) {
 
   buildPartSelector();
   views = [];                 // force a fresh channel-view list for the new file
-  await selectAndDecode(0, 0, 0, true);
+  if (header.parts[0] && header.parts[0].deep) await enterDeepMode(0);
+  else await selectAndDecode(0, 0, 0, true);
 }
 
 async function selectAndDecode(part, lx, ly, doFit, viewIdx) {
   // Clear the canvas immediately so a part/view switch doesn't leave the old
   // image (or a partially-decoded frame) on screen while the new one decodes.
+  set2DMode();
   img = null; render();
 
   roi = null;
@@ -715,6 +724,35 @@ function setupInput() {
   glc.addEventListener("mouseleave", () =>
     document.getElementById("pixel").classList.add("hidden"));
 
+  // --- 3D orbit controls (active only in deep/3D mode) ---
+  glc.addEventListener("wheel", (e) => {
+    if (mode !== "3d") return;
+    e.preventDefault();
+    cam.dist = clamp(cam.dist * Math.exp(e.deltaY * 0.0015), 0.2, 50);
+    render3d();
+  }, { passive: false });
+  let d3 = null;
+  glc.addEventListener("mousedown", (e) => {
+    if (mode !== "3d") return;
+    e.preventDefault();
+    d3 = { x: e.clientX, y: e.clientY, az: cam.az, el: cam.el,
+           panX: cam.panX, panY: cam.panY, pan: e.shiftKey || e.button === 2 };
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!d3) return;
+    const dx = e.clientX - d3.x, dy = e.clientY - d3.y;
+    if (d3.pan) {
+      cam.panX = d3.panX + dx * 0.0025 * cam.dist;
+      cam.panY = d3.panY - dy * 0.0025 * cam.dist;
+    } else {
+      cam.az = d3.az + dx * 0.01;
+      cam.el = clamp(d3.el + dy * 0.01, -1.55, 1.55);
+    }
+    render3d();
+  });
+  window.addEventListener("mouseup", () => { d3 = null; });
+  glc.addEventListener("contextmenu", (e) => { if (mode === "3d") e.preventDefault(); });
+
   // view buttons
   document.getElementById("btnFit").addEventListener("click", fitView);
   document.getElementById("btn11").addEventListener("click", oneToOne);
@@ -762,7 +800,9 @@ function setupInput() {
     ctl.cropDisp = e.target.checked; render();
   });
   document.getElementById("partSel").addEventListener("change", (e) => {
-    selectAndDecode(parseInt(e.target.value, 10), 0, 0, true);
+    const part = parseInt(e.target.value, 10);
+    if (header.parts[part] && header.parts[part].deep) enterDeepMode(part);
+    else selectAndDecode(part, 0, 0, true);
   });
   document.getElementById("levelSel").addEventListener("change", (e) => {
     const [lx, ly] = e.target.value.split(",").map(Number);
@@ -770,6 +810,40 @@ function setupInput() {
   });
   document.getElementById("channelSel").addEventListener("change", (e) => {
     selectAndDecode(sel.part, sel.lx, sel.ly, false, parseInt(e.target.value, 10));
+  });
+
+  // deep (3D) sample image, fetched over HTTP from the tinyexr repo
+  const DEEP_URL =
+    "https://raw.githubusercontent.com/syoyo/tinyexr/release/deepscanline.exr";
+  document.getElementById("btnDeep").addEventListener("click", async () => {
+    try {
+      loadBytes(await fetchUrlWithProgress(DEEP_URL, "deepscanline.exr"), "deepscanline.exr");
+    } catch (err) {
+      setProgress(-1);
+      showError("Could not fetch deepscanline.exr (" + err.message + ").");
+    }
+  });
+
+  // deep 3D controls
+  const pt = document.getElementById("ptSize");
+  pt.addEventListener("input", () => {
+    deepCtl.pointSize = parseFloat(pt.value);
+    document.getElementById("ptVal").textContent = deepCtl.pointSize.toFixed(1);
+    if (mode === "3d") render3d();
+  });
+  const dexp = document.getElementById("deepExposure");
+  dexp.addEventListener("input", () => {
+    deepCtl.exposure = parseFloat(dexp.value);
+    document.getElementById("deepExpVal").textContent =
+      (deepCtl.exposure >= 0 ? "+" : "") + deepCtl.exposure.toFixed(1) + " EV";
+    if (mode === "3d") render3d();
+  });
+  document.getElementById("deepColorMode").addEventListener("change", (e) => {
+    deepCtl.rgb = e.target.checked;
+    if (mode === "3d") render3d();
+  });
+  document.getElementById("resetView").addEventListener("click", () => {
+    resetCam(); render3d();
   });
 
   window.addEventListener("resize", () => { syncCanvasSize(); render(); });
@@ -934,6 +1008,169 @@ function setupBrowser() {
     if (e.key === "Escape" && !modal.classList.contains("hidden")) close();
   });
   filterEl.addEventListener("input", () => { if (allFiles) rerender(); });
+}
+
+/* ============================================================ deep 3D view */
+const VS3D = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aCol;
+layout(location=2) in float aT;
+uniform mat4 uMVP; uniform float uPointSize, uExposure; uniform int uRGB;
+out vec3 vCol;
+vec3 toSRGB(vec3 c){ c=clamp(c,0.0,1.0);
+  return mix(12.92*c, 1.055*pow(c,vec3(1.0/2.4))-0.055, step(0.0031308,c)); }
+vec3 viridis(float t){ t=clamp(t,0.0,1.0);
+  const vec3 c0=vec3(0.2777273272234177,0.005407344544966578,0.3340998053353061);
+  const vec3 c1=vec3(0.1050930431085774,1.404613529898575,1.384590162594685);
+  const vec3 c2=vec3(-0.3308618287255563,0.214847559468213,0.09509516302823659);
+  const vec3 c3=vec3(-4.634230498983486,-5.799100973351585,-19.33244095627987);
+  const vec3 c4=vec3(6.228269936347081,14.17993336680509,56.69055260068105);
+  const vec3 c5=vec3(4.776384997670288,-13.74514537774601,-65.35303263337234);
+  const vec3 c6=vec3(-5.435455855934631,4.645852612178535,26.3124352495832);
+  return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6))))); }
+void main(){
+  gl_Position = uMVP * vec4(aPos, 1.0);
+  gl_PointSize = uPointSize;
+  if (uRGB == 1) vCol = toSRGB(max(aCol * uExposure, 0.0));
+  else           vCol = viridis(aT);
+}`;
+const FS3D = `#version 300 es
+precision highp float;
+in vec3 vCol; out vec4 frag;
+void main(){ vec2 d = gl_PointCoord*2.0-1.0; if (dot(d,d) > 1.0) discard; frag = vec4(vCol, 1.0); }`;
+
+// --- minimal column-major mat4 helpers ---
+function m4ident() { const o = new Float32Array(16); o[0]=o[5]=o[10]=o[15]=1; return o; }
+function m4mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k*4+r] * b[c*4+k];
+    o[c*4+r] = s;
+  }
+  return o;
+}
+function m4persp(fovy, asp, n, f) {
+  const t = 1/Math.tan(fovy/2), o = new Float32Array(16);
+  o[0]=t/asp; o[5]=t; o[10]=(f+n)/(n-f); o[11]=-1; o[14]=2*f*n/(n-f); return o;
+}
+function m4trans(x, y, z) { const o = m4ident(); o[12]=x; o[13]=y; o[14]=z; return o; }
+function m4rotX(a) { const c=Math.cos(a), s=Math.sin(a), o=m4ident(); o[5]=c; o[6]=s; o[9]=-s; o[10]=c; return o; }
+function m4rotY(a) { const c=Math.cos(a), s=Math.sin(a), o=m4ident(); o[0]=c; o[2]=-s; o[8]=s; o[10]=c; return o; }
+
+function initGL3D() {
+  prog3d = gl.createProgram();
+  gl.attachShader(prog3d, compile(gl.VERTEX_SHADER, VS3D));
+  gl.attachShader(prog3d, compile(gl.FRAGMENT_SHADER, FS3D));
+  gl.linkProgram(prog3d);
+  if (!gl.getProgramParameter(prog3d, gl.LINK_STATUS))
+    throw new Error("link3d: " + gl.getProgramInfoLog(prog3d));
+  uni3d = {
+    mvp: gl.getUniformLocation(prog3d, "uMVP"),
+    pointSize: gl.getUniformLocation(prog3d, "uPointSize"),
+    exposure: gl.getUniformLocation(prog3d, "uExposure"),
+    rgb: gl.getUniformLocation(prog3d, "uRGB"),
+  };
+  vbo3d = gl.createBuffer();
+}
+
+function resetCam() { cam = { az: 0.5, el: -0.32, dist: 2.2, panX: 0, panY: 0 }; }
+
+function render3d() {
+  if (!gl || !prog3d) return;
+  syncCanvasSize();
+  const W = gl.canvas.width, H = gl.canvas.height;
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0.05, 0.06, 0.07, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+
+  const proj = m4persp(45 * Math.PI / 180, W / H, 0.01, 100);
+  const view = m4mul(m4trans(cam.panX, cam.panY, -cam.dist),
+                     m4mul(m4rotX(cam.el), m4rotY(cam.az)));
+  const mvp = m4mul(proj, view);
+
+  gl.useProgram(prog3d);
+  gl.uniformMatrix4fv(uni3d.mvp, false, mvp);
+  gl.uniform1f(uni3d.pointSize, deepCtl.pointSize * dpr());
+  gl.uniform1f(uni3d.exposure, Math.pow(2, deepCtl.exposure));
+  gl.uniform1i(uni3d.rgb, deepCtl.rgb ? 1 : 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo3d);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 12);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 28, 24);
+  gl.drawArrays(gl.POINTS, 0, deepN);
+
+  gl.disableVertexAttribArray(2);
+  gl.disable(gl.DEPTH_TEST);
+  updateZoomLabel3d();
+}
+
+function updateZoomLabel3d() { /* viewbar hidden in 3D; nothing to do */ }
+
+// Switch the panel/HUD back to flat-image mode.
+function set2DMode() {
+  mode = "2d";
+  document.getElementById("ctrls").classList.remove("hidden");
+  document.getElementById("deepCtrls").classList.add("hidden");
+  document.getElementById("overlay").style.display = "";
+}
+
+// Decode a deep part into a point cloud and show it in the 3D view.
+async function enterDeepMode(part) {
+  setProgress(0, "Decoding deep samples…");
+  await raf();
+  const n = M._exrv_deep_load(handle, part);
+  if (n <= 0) {
+    setProgress(-1);
+    showError("Could not decode this deep part (needs a Z channel).");
+    return;
+  }
+  const ptr = M._exrv_deep_points(handle);
+  const src = M.HEAPF32.subarray(ptr >> 2, (ptr >> 2) + n * 6);
+
+  const ph = header.parts[part];
+  const W = ph.width, Hh = ph.height;
+  let zmin = Infinity, zmax = -Infinity;
+  for (let i = 0; i < n; i++) { const z = src[i*6+2]; if (z < zmin) zmin = z; if (z > zmax) zmax = z; }
+  if (!(zmax > zmin)) zmax = zmin + 1;
+  const maxXY = Math.max(W, Hh), zr = zmax - zmin;
+
+  // Interleave normalized [x, y, z, r, g, b, depthT(0..1)]; center + scale to ~unit.
+  const arr = new Float32Array(n * 7);
+  for (let i = 0; i < n; i++) {
+    const x = src[i*6], y = src[i*6+1], t = (src[i*6+2] - zmin) / zr;
+    arr[i*7+0] = (x - W/2) / maxXY;
+    arr[i*7+1] = -(y - Hh/2) / maxXY;
+    arr[i*7+2] = -(t - 0.5) * 0.8;
+    arr[i*7+3] = src[i*6+3];
+    arr[i*7+4] = src[i*6+4];
+    arr[i*7+5] = src[i*6+5];
+    arr[i*7+6] = t;
+  }
+  if (!prog3d) initGL3D();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo3d);
+  gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
+  deepN = n; deepBounds = { w: W, h: Hh, zmin, zmax };
+  setProgress(100);
+
+  mode = "3d";
+  sel = { part, lx: 0, ly: 0, view: 0 };
+  img = null; roi = null;
+  dwMin = { x: ph.dataWindow.minX, y: ph.dataWindow.minY };
+  document.getElementById("dropzone").classList.add("hidden");
+  document.getElementById("ctrls").classList.add("hidden");
+  document.getElementById("deepCtrls").classList.remove("hidden");
+  document.getElementById("info").classList.remove("hidden");
+  document.getElementById("viewbar").classList.add("hidden");
+  document.getElementById("pixel").classList.add("hidden");
+  document.getElementById("overlay").style.display = "none";
+  document.getElementById("deepInfo").textContent =
+    `${n.toLocaleString()} samples · ${W}×${Hh} · Z ${zmin.toFixed(2)}–${zmax.toFixed(2)}`;
+  resetCam();
+  renderInfo();
+  render3d();
 }
 
 (async function main() {

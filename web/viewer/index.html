@@ -63,6 +63,7 @@
       </div>
       <div class="row">
         <button id="btnBrowse" title="Browse the OpenEXR sample image library">Browse OpenEXR images…</button>
+        <button id="btnDeep" title="Load the repo's deepscanline.exr as a 3D point cloud">Deep (3D)</button>
       </div>
     </header>
 
@@ -121,6 +122,24 @@
         <div class="ctrl-head"><span>Region (shift-drag)</span><button id="clearRoi" class="link">clear</button></div>
         <div id="roiText" class="mono"></div>
       </div>
+    </section>
+
+    <section id="deepCtrls" class="hidden">
+      <h2>Deep 3D point cloud</h2>
+      <div id="deepInfo" class="mono"></div>
+      <div class="ctrl">
+        <div class="ctrl-head"><span>Point size</span><span id="ptVal">2.0</span></div>
+        <input id="ptSize" type="range" min="1" max="10" step="0.5" value="2" />
+      </div>
+      <div class="ctrl">
+        <div class="ctrl-head"><span>Exposure</span><span id="deepExpVal">0.0 EV</span></div>
+        <input id="deepExposure" type="range" min="-8" max="8" step="0.1" value="0" />
+      </div>
+      <label class="chk"><input id="deepColorMode" type="checkbox" /> Color by RGB (default: depth)</label>
+      <div class="row" style="margin-top:10px">
+        <button id="resetView">Reset view</button>
+      </div>
+      <footer style="padding:10px 0 0">Drag to orbit · wheel to zoom · shift-drag (or right-drag) to pan</footer>
     </section>
 
     <section id="info" class="hidden">

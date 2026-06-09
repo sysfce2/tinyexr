@@ -53,6 +53,10 @@ typedef struct exrv_session {
     int nblocks;
     int rmap[4]; /* header channel index for R,G,B,A or -1 */
     float *rgba; /* lw*lh*4 accumulation buffer (RGBA float) */
+
+    /* deep point cloud: 6 floats per sample (x, y, z, r, g, b) */
+    float *deep_pts;
+    int deep_n;
 } exrv_session;
 
 #define EXRV_MAX_SESSIONS 16
@@ -286,6 +290,7 @@ EXRV_EXPORT void exrv_close(int h) {
     exrv_session *s = session_from_handle(h);
     if (!s) return;
     session_reset_selection(s);
+    free(s->deep_pts);
     if (s->r) exr_reader_close(s->r);
     free(s->data);
     free(s);
@@ -667,6 +672,90 @@ done:
 EXRV_EXPORT float *exrv_rgba(int h) {
     exrv_session *s = session_from_handle(h);
     return s ? s->rgba : NULL;
+}
+
+/* ------------------------------------------------------------ deep (3D) ---- */
+
+/* Read deep sample `idx` of channel `c` as float (0 if c < 0). */
+static float deep_sample_f(const exr_part *p, int c, uint64_t idx) {
+    const void *buf;
+    if (c < 0) return 0.0f;
+    buf = p->deep_images[c];
+    switch (p->header.channels[c].pixel_type) {
+    case EXR_PIXEL_HALF: { float f; exr_half_to_float((const uint16_t *)buf + idx, &f, 1); return f; }
+    case EXR_PIXEL_FLOAT: return ((const float *)buf)[idx];
+    case EXR_PIXEL_UINT:  return (float)((const uint32_t *)buf)[idx];
+    default: return 0.0f;
+    }
+}
+
+/* Decode a deep part into a point cloud: 6 floats per sample (x, y, z, r, g, b),
+ * x/y in data-window pixel coords, z = the Z (depth) channel. Returns the sample
+ * count (>= 0) or -1 (not deep / no Z / error). Buffer via exrv_deep_points. */
+EXRV_EXPORT int exrv_deep_load(int h, int part) {
+    exrv_session *s = session_from_handle(h);
+    exr_image img;
+    exr_part *p;
+    int zc = -1, rc = -1, gc = -1, bc = -1, c, x, y, w;
+    uint64_t N, off, o;
+    if (!s) return -1;
+    if (part < 0 || part >= s->num_parts) return -1;
+
+    free(s->deep_pts);
+    s->deep_pts = NULL;
+    s->deep_n = 0;
+
+    memset(&img, 0, sizeof img);
+    if (!EXR_OK(exr_load_from_memory(s->data, s->size, NULL, &img))) return -1;
+    if (part >= img.num_parts) { exr_image_free(&img); return -1; }
+    p = &img.parts[part];
+    if (!p->is_deep || !p->deep_sample_counts || !p->deep_images) {
+        exr_image_free(&img);
+        return -1;
+    }
+    for (c = 0; c < p->header.num_channels; ++c) {
+        const char *nm = p->header.channels[c].name;
+        if (!strcmp(nm, "Z")) zc = c;
+        else if (!strcmp(nm, "R")) rc = c;
+        else if (!strcmp(nm, "G")) gc = c;
+        else if (!strcmp(nm, "B")) bc = c;
+    }
+    N = p->deep_total_samples;
+    if (N == 0 || zc < 0) { exr_image_free(&img); return -1; } /* need depth */
+
+    s->deep_pts = (float *)malloc((size_t)N * 6 * sizeof(float));
+    if (!s->deep_pts) { exr_image_free(&img); return -1; }
+
+    w = p->width;
+    off = 0; o = 0;
+    for (y = 0; y < p->height; ++y) {
+        for (x = 0; x < w; ++x) {
+            int cnt = p->deep_sample_counts[(size_t)y * w + x], sps;
+            for (sps = 0; sps < cnt; ++sps) {
+                uint64_t i = off + (uint64_t)sps;
+                s->deep_pts[o++] = (float)x;
+                s->deep_pts[o++] = (float)y;
+                s->deep_pts[o++] = deep_sample_f(p, zc, i);
+                s->deep_pts[o++] = deep_sample_f(p, rc, i);
+                s->deep_pts[o++] = deep_sample_f(p, gc, i);
+                s->deep_pts[o++] = deep_sample_f(p, bc, i);
+            }
+            off += (uint64_t)cnt;
+        }
+    }
+    s->deep_n = (int)N;
+    exr_image_free(&img);
+    return s->deep_n;
+}
+
+EXRV_EXPORT float *exrv_deep_points(int h) {
+    exrv_session *s = session_from_handle(h);
+    return s ? s->deep_pts : NULL;
+}
+
+EXRV_EXPORT int exrv_deep_count(int h) {
+    exrv_session *s = session_from_handle(h);
+    return s ? s->deep_n : 0;
 }
 
 EXRV_EXPORT void exrv_free(void *p) { free(p); }
