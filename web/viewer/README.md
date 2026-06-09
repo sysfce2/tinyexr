@@ -22,15 +22,19 @@ the legacy v1 embind sample in `experimental/js/`.
   reflects blocks decoded.
 - **WebGL2 rendering** with GPU tone-mapping — **exposure** (EV), **gamma /
   sRGB** curve, and **channel isolation** (RGB / R / G / B / A / luminance) are
-  all instant (no re-decode).
+  all instant (no re-decode). A single isolated channel can be shown as a
+  **false-color** (viridis) heatmap.
+- **Luminance (Y) images** — EXRs with a `Y` channel and no R/G/B (multiview,
+  luminance-chroma) render as grayscale instead of black. (Subsampled chroma
+  `RY`/`BY` is not reconstructed.)
 - **Zoom / pan** — wheel zooms to the cursor; drag pans; *Fit* / *1:1* buttons.
 - **Region windows** — the **display window** is drawn as an overlay over the
   **data window**, with a *crop to display window* toggle; **shift-drag** marks a
   region of interest (coordinates shown, *Zoom region* button).
 - **Pixel picker** — hover to read the raw float R/G/B/A at a pixel (and its
   absolute data-window coordinates).
-- **Header / info panel** — part type, compression, line order, data/display
-  windows, pixel aspect, and the channel list.
+- **Header / info panel** — file name, part type, compression, line order,
+  data/display windows, pixel aspect, and the channel list.
 - **Part / mip selectors** — switch parts in a multipart EXR and mip/ripmap
   levels in a tiled EXR.
 

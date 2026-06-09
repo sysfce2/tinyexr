@@ -469,6 +469,15 @@ EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
     s->dw_min_y = hd->data_window.min_y;
     for (k = 0; k < 4; ++k) s->rmap[k] = find_channel(hd, names[k]);
 
+    /* Luminance fallback: images with no R/G/B but a Y (luminance) channel —
+     * e.g. multiview (Fog.exr) and luminance-chroma EXRs — map Y onto R, G and
+     * B so they render as grayscale instead of black. Subsampled chroma (RY/BY)
+     * is not reconstructed; the result is luminance-only. */
+    if (s->rmap[0] < 0 && s->rmap[1] < 0 && s->rmap[2] < 0) {
+        int y = find_channel(hd, "Y");
+        if (y >= 0) s->rmap[0] = s->rmap[1] = s->rmap[2] = y;
+    }
+
     if (!EXR_OK(exr_reader_num_blocks(s->r, part, &nb))) return -1;
 
     s->blocks = (uint32_t *)malloc((nb ? nb : 1) * sizeof(uint32_t));

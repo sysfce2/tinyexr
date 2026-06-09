@@ -19,6 +19,7 @@ let handle = 0;           // current exrv session handle
 let header = null;        // parsed header JSON
 let sel = { part: 0, lx: 0, ly: 0 };
 let img = null;           // { w, h, data: Float32Array(rgba) }
+let fileName = null;      // name of the currently loaded file (for info panel)
 let dwMin = { x: 0, y: 0 };
 let dispWin = null;       // {minX,minY,maxX,maxY} of selected part
 
@@ -27,7 +28,7 @@ let view = { zoom: 1, panX: 0, panY: 0 };
 
 // display controls
 let ctl = { exposure: 0, gamma: 2.2, srgb: true, channel: 0,
-            showDisp: true, cropDisp: false };
+            falseColor: false, showDisp: true, cropDisp: false };
 
 // region of interest, in image pixels (level space), or null
 let roi = null;
@@ -48,25 +49,45 @@ precision highp float;
 in vec2 vUV; out vec4 frag;
 uniform sampler2D uTex;
 uniform float uExposure, uGamma;
-uniform int uSRGB, uChannel;
+uniform int uSRGB, uChannel, uFalse;
 vec3 toSRGB(vec3 c){
   c = clamp(c, 0.0, 1.0);
   return mix(12.92*c, 1.055*pow(c, vec3(1.0/2.4)) - 0.055, step(0.0031308, c));
 }
+// Perceptually-uniform viridis colormap (polynomial approximation).
+vec3 viridis(float t){
+  t = clamp(t, 0.0, 1.0);
+  const vec3 c0 = vec3(0.2777273272234177, 0.005407344544966578, 0.3340998053353061);
+  const vec3 c1 = vec3(0.1050930431085774, 1.404613529898575, 1.384590162594685);
+  const vec3 c2 = vec3(-0.3308618287255563, 0.214847559468213, 0.09509516302823659);
+  const vec3 c3 = vec3(-4.634230498983486, -5.799100973351585, -19.33244095627987);
+  const vec3 c4 = vec3(6.228269936347081, 14.17993336680509, 56.69055260068105);
+  const vec3 c5 = vec3(4.776384997670288, -13.74514537774601, -65.35303263337234);
+  const vec3 c6 = vec3(-5.435455855934631, 4.645852612178535, 26.3124352495832);
+  return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));
+}
+// Tone-map a scalar to display [0,1] using the same curve as the RGB path.
+float tone(float s){
+  s = max(s, 0.0);
+  return (uSRGB == 1) ? toSRGB(vec3(s)).r : pow(clamp(s, 0.0, 1.0), 1.0 / uGamma);
+}
 void main(){
   vec4 t = texture(uTex, vUV);
-  vec3 c;
   float e = uExposure;
-  if      (uChannel == 1) c = vec3(t.r * e);
-  else if (uChannel == 2) c = vec3(t.g * e);
-  else if (uChannel == 3) c = vec3(t.b * e);
-  else if (uChannel == 4) c = vec3(t.a);           // alpha shown raw
-  else if (uChannel == 5) c = vec3(dot(t.rgb, vec3(0.2126,0.7152,0.0722)) * e);
-  else                    c = t.rgb * e;
-  c = max(c, 0.0);
-  if (uSRGB == 1) c = toSRGB(c);
-  else            c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / uGamma));
-  frag = vec4(c, 1.0);
+  if (uChannel == 0) {                               // RGB
+    vec3 c = max(t.rgb * e, 0.0);
+    c = (uSRGB == 1) ? toSRGB(c) : pow(clamp(c, 0.0, 1.0), vec3(1.0 / uGamma));
+    frag = vec4(c, 1.0);
+    return;
+  }
+  float s;                                           // single scalar channel
+  if      (uChannel == 1) s = t.r * e;
+  else if (uChannel == 2) s = t.g * e;
+  else if (uChannel == 3) s = t.b * e;
+  else if (uChannel == 4) s = t.a;                   // alpha: no exposure
+  else                    s = dot(t.rgb, vec3(0.2126,0.7152,0.0722)) * e;
+  float d = tone(s);
+  frag = (uFalse == 1) ? vec4(viridis(d), 1.0) : vec4(vec3(d), 1.0);
 }`;
 
 function compile(type, src) {
@@ -98,6 +119,7 @@ function initGL() {
     gamma: gl.getUniformLocation(prog, "uGamma"),
     srgb: gl.getUniformLocation(prog, "uSRGB"),
     channel: gl.getUniformLocation(prog, "uChannel"),
+    falseColor: gl.getUniformLocation(prog, "uFalse"),
   };
 
   vbo = gl.createBuffer();
@@ -161,6 +183,7 @@ function render() {
   gl.uniform1f(uni.gamma, ctl.gamma);
   gl.uniform1i(uni.srgb, ctl.srgb ? 1 : 0);
   gl.uniform1i(uni.channel, ctl.channel);
+  gl.uniform1i(uni.falseColor, (ctl.falseColor && ctl.channel !== 0) ? 1 : 0);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
   drawOverlay();
@@ -296,8 +319,9 @@ async function fetchUrlWithProgress(url, what) {
   return off === total ? buf : buf.subarray(0, off);
 }
 
-async function loadBytes(bytes) {
+async function loadBytes(bytes, name) {
   hideError();
+  fileName = name || null;
   if (handle) { M._exrv_close(handle); handle = 0; img = null; }
 
   const p = M._malloc(bytes.length);
@@ -411,6 +435,10 @@ function buildLevelSelector() {
   levelSel.parentElement.style.display = levels.length > 1 ? "" : "none";
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
 function kv(k, v) { return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
 function box(b) { return `[${b.minX}, ${b.minY}] → [${b.maxX}, ${b.maxY}]`; }
 
@@ -418,6 +446,7 @@ function renderInfo() {
   const p = header.parts[sel.part];
   const body = document.getElementById("infoBody");
   let h = "";
+  if (fileName) h += kv("File", esc(fileName));
   h += kv("Parts", header.numParts);
   h += kv("Type", p.type + (p.tiled ? ` (${p.tileXSize}×${p.tileYSize} tiles, ${p.levelMode})` : ""));
   h += kv("Compression", p.compression);
@@ -471,7 +500,7 @@ function setupInput() {
   // file picker
   document.getElementById("file").addEventListener("change", async (e) => {
     const f = e.target.files[0];
-    if (f) loadBytes(await readFileWithProgress(f));
+    if (f) loadBytes(await readFileWithProgress(f), f.name);
   });
 
   // sample
@@ -480,7 +509,7 @@ function setupInput() {
       setProgress(0, "Fetching sample.exr…");
       const resp = await fetch("sample.exr");
       if (!resp.ok) throw new Error("sample.exr not found");
-      loadBytes(new Uint8Array(await resp.arrayBuffer()));
+      loadBytes(new Uint8Array(await resp.arrayBuffer()), "sample.exr");
     } catch (err) {
       setProgress(-1);
       showError("Place an EXR named sample.exr next to index.html (see README).");
@@ -492,7 +521,7 @@ function setupInput() {
     "https://raw.githubusercontent.com/syoyo/tinyexr/release/asakusa.exr";
   document.getElementById("btnAsakusa").addEventListener("click", async () => {
     try {
-      loadBytes(await fetchUrlWithProgress(ASAKUSA_URL, "asakusa.exr"));
+      loadBytes(await fetchUrlWithProgress(ASAKUSA_URL, "asakusa.exr"), "asakusa.exr");
     } catch (err) {
       setProgress(-1);
       showError("Could not fetch asakusa.exr (" + err.message + ").");
@@ -515,7 +544,7 @@ function setupInput() {
     }));
   stage.addEventListener("drop", async (e) => {
     const f = e.dataTransfer.files[0];
-    if (f) loadBytes(await readFileWithProgress(f));
+    if (f) loadBytes(await readFileWithProgress(f), f.name);
   });
 
   // wheel zoom (to cursor)
@@ -606,6 +635,12 @@ function setupInput() {
     if (!b) return;
     ctl.channel = parseInt(b.dataset.ch, 10);
     for (const x of e.currentTarget.children) x.classList.toggle("active", x === b);
+    // False color only applies to a single scalar channel (not RGB).
+    document.getElementById("falseColor").disabled = ctl.channel === 0;
+    render();
+  });
+  document.getElementById("falseColor").addEventListener("change", (e) => {
+    ctl.falseColor = e.target.checked;
     render();
   });
   document.getElementById("showDisp").addEventListener("change", (e) => {
@@ -682,7 +717,7 @@ function setupBrowser() {
     close();
     try {
       const url = OEXR_RAW_BASE + f.path.split("/").map(encodeURIComponent).join("/");
-      loadBytes(await fetchUrlWithProgress(url, f.name));
+      loadBytes(await fetchUrlWithProgress(url, f.name), f.path);
     } catch (err) {
       setProgress(-1);
       showError("Could not fetch " + f.name + " (" + err.message + ").");
