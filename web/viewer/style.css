@@ -75,6 +75,21 @@ body {
 }
 #pixel { top: 12px; left: 12px; }
 
+#legend { top: 12px; right: 12px; width: 168px; white-space: normal; }
+.legend-top {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 5px;
+}
+.legend-top .legend-cm { color: var(--muted); font-size: 11px; }
+.legend-bar {
+  height: 10px; border-radius: 3px; border: 1px solid var(--line);
+  /* background (viridis gradient) is set from JS to match the shader */
+}
+.legend-ends {
+  display: flex; justify-content: space-between;
+  color: var(--muted); font-size: 11px; margin-top: 3px;
+}
+
 #viewbar {
   position: absolute; left: 12px; bottom: 12px;
   display: flex; align-items: center; gap: 6px;

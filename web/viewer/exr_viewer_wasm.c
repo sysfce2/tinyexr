@@ -469,13 +469,25 @@ EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
     s->dw_min_y = hd->data_window.min_y;
     for (k = 0; k < 4; ++k) s->rmap[k] = find_channel(hd, names[k]);
 
-    /* Luminance fallback: images with no R/G/B but a Y (luminance) channel —
-     * e.g. multiview (Fog.exr) and luminance-chroma EXRs — map Y onto R, G and
-     * B so they render as grayscale instead of black. Subsampled chroma (RY/BY)
-     * is not reconstructed; the result is luminance-only. */
+    /* Fallbacks for parts without conventional R/G/B so they render instead of
+     * showing black — common in multipart EXRs (depth Z, motion vectors,
+     * disparity, masks) and luminance/multiview images. */
     if (s->rmap[0] < 0 && s->rmap[1] < 0 && s->rmap[2] < 0) {
         int y = find_channel(hd, "Y");
-        if (y >= 0) s->rmap[0] = s->rmap[1] = s->rmap[2] = y;
+        if (y >= 0) {
+            /* Luminance (multiview Fog.exr, luminance-chroma): Y -> grayscale.
+             * Subsampled chroma (RY/BY) is not reconstructed. */
+            s->rmap[0] = s->rmap[1] = s->rmap[2] = y;
+        } else if (hd->num_channels == 1) {
+            /* Single data channel (depth Z, mask): replicate to grayscale. */
+            s->rmap[0] = s->rmap[1] = s->rmap[2] = 0;
+        } else if (hd->num_channels >= 2) {
+            /* Multi-channel data (motion vectors forward.u/v, disparity .x/.y):
+             * map the leading channels to R, G and (if present) B. */
+            s->rmap[0] = 0;
+            s->rmap[1] = 1;
+            s->rmap[2] = (hd->num_channels >= 3) ? 2 : -1;
+        }
     }
 
     if (!EXR_OK(exr_reader_num_blocks(s->r, part, &nb))) return -1;

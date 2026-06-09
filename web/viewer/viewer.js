@@ -188,6 +188,48 @@ function render() {
 
   drawOverlay();
   updateZoomLabel();
+  updateLegend();
+}
+
+// Channel labels for the false-color legend (index matches the channel buttons).
+const CHANNEL_NAMES = ["RGB", "R", "G", "B", "A", "Lum"];
+
+// Viridis colormap in JS — must match the shader's viridis() so the legend is
+// an accurate key for the rendered false-color image.
+function viridisRGB(t) {
+  t = Math.min(Math.max(t, 0), 1);
+  const c0 = [0.2777273272234177, 0.005407344544966578, 0.3340998053353061];
+  const c1 = [0.1050930431085774, 1.404613529898575, 1.384590162594685];
+  const c2 = [-0.3308618287255563, 0.214847559468213, 0.09509516302823659];
+  const c3 = [-4.634230498983486, -5.799100973351585, -19.33244095627987];
+  const c4 = [6.228269936347081, 14.17993336680509, 56.69055260068105];
+  const c5 = [4.776384997670288, -13.74514537774601, -65.35303263337234];
+  const c6 = [-5.435455855934631, 4.645852612178535, 26.3124352495832];
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const v = c0[i] + t * (c1[i] + t * (c2[i] + t * (c3[i] + t * (c4[i] + t * (c5[i] + t * c6[i])))));
+    out.push(Math.round(Math.min(Math.max(v, 0), 1) * 255));
+  }
+  return out;
+}
+
+function initLegendGradient() {
+  const stops = [];
+  for (let i = 0; i <= 16; i++) {
+    const t = i / 16;
+    const [r, g, b] = viridisRGB(t);
+    stops.push(`rgb(${r},${g},${b}) ${(t * 100).toFixed(1)}%`);
+  }
+  document.getElementById("legendBar").style.background =
+    `linear-gradient(90deg, ${stops.join(", ")})`;
+}
+
+function updateLegend() {
+  const legend = document.getElementById("legend");
+  const show = !!img && ctl.falseColor && ctl.channel !== 0;
+  legend.classList.toggle("hidden", !show);
+  if (show)
+    document.getElementById("legendChan").textContent = CHANNEL_NAMES[ctl.channel] || "";
 }
 
 /* image-pixel (level space) -> device-pixel screen coords */
@@ -824,6 +866,7 @@ function setupBrowser() {
 (async function main() {
   setupInput();
   setupBrowser();
+  initLegendGradient();
   document.getElementById("gamma").disabled = ctl.srgb;
   try {
     M = await createModule();

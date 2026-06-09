@@ -23,10 +23,13 @@ the legacy v1 embind sample in `experimental/js/`.
 - **WebGL2 rendering** with GPU tone-mapping — **exposure** (EV), **gamma /
   sRGB** curve, and **channel isolation** (RGB / R / G / B / A / luminance) are
   all instant (no re-decode). A single isolated channel can be shown as a
-  **false-color** (viridis) heatmap.
-- **Luminance (Y) images** — EXRs with a `Y` channel and no R/G/B (multiview,
-  luminance-chroma) render as grayscale instead of black. (Subsampled chroma
-  `RY`/`BY` is not reconstructed.)
+  **false-color** (viridis) heatmap, with a colormap legend.
+- **Non-RGB parts** — parts/images without conventional `R`/`G`/`B` still render
+  instead of showing black: a `Y` (luminance) channel maps to grayscale
+  (multiview / luminance-chroma; subsampled `RY`/`BY` chroma is not
+  reconstructed), a single data channel (depth `Z`, mask) is replicated to
+  grayscale, and multi-channel data (motion vectors, disparity) maps its leading
+  channels to R/G/B. Pair with **false color** to read depth/data parts.
 - **Zoom / pan** — wheel zooms to the cursor; drag pans; *Fit* / *1:1* buttons.
 - **Region windows** — the **display window** is drawn as an overlay over the
   **data window**, with a *crop to display window* toggle; **shift-drag** marks a
