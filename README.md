@@ -1,4 +1,4 @@
-# Tiny OpenEXR image library.
+# Tiny EXR image library.
 
 ![Example](https://github.com/syoyo/tinyexr/blob/release/asakusa.png?raw=true)
 
