@@ -11,10 +11,11 @@ the legacy v1 embind sample in `experimental/js/`.
 - **OpenEXR sample-image browser** — the *Browse OpenEXR images…* button opens a
   collapsible tree of the official
   [openexr-images](https://github.com/AcademySoftwareFoundation/openexr-images)
-  library (one GitHub tree-API call lists all ~100 `.exr`; type to filter). Click
-  any image to fetch it over HTTP (from `raw.githubusercontent.com`, with
-  download progress) and decode it — a quick way to exercise every codec, tiling
-  mode, multipart, and multiview file.
+  library (one GitHub tree-API call lists all ~100 `.exr`; type to filter). Each
+  row shows a **thumbnail** (the repo's sibling `.jpg` preview, lazy-loaded on
+  expand). Click any image to fetch it over HTTP (from `raw.githubusercontent.com`,
+  with download progress) and decode it — a quick way to exercise every codec,
+  tiling mode, multipart, and multiview file.
 - **Load progress** driven by the v3 *streaming block API*
   (`exr_reader_num_blocks` / `exr_reader_block_info` / `exr_reader_decode_block`):
   the file is decoded one scanline-block / tile at a time and the progress bar

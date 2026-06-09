@@ -711,12 +711,31 @@ function setupBrowser() {
       const btn = document.createElement("button");
       btn.className = "tree-file";
       btn.title = "Load " + f.path;
+      let thumb;
+      if (f.thumb) {
+        thumb = document.createElement("img");
+        thumb.className = "thumb";
+        thumb.loading = "lazy";
+        thumb.decoding = "async";
+        thumb.alt = "";
+        thumb.width = 46; thumb.height = 30;
+        thumb.src = f.thumb;
+        // Fall back to the checker placeholder if the preview fails to load.
+        thumb.addEventListener("error", () => {
+          thumb.removeAttribute("src");
+          thumb.classList.add("noimg");
+        });
+      } else {
+        thumb = document.createElement("span");
+        thumb.className = "thumb noimg";
+      }
       const nm = document.createElement("span");
+      nm.className = "nm";
       nm.textContent = f.name;
       const sz = document.createElement("span");
       sz.className = "sz";
       sz.textContent = humanSize(f.size);
-      btn.append(nm, sz);
+      btn.append(thumb, nm, sz);
       btn.addEventListener("click", () => loadRepoFile(f));
       frag.appendChild(btn);
     }
@@ -736,9 +755,21 @@ function setupBrowser() {
       const resp = await fetch(OEXR_TREE_API);
       if (!resp.ok) throw new Error(resp.status + " " + resp.statusText);
       const data = await resp.json();
+      // Each .exr in this repo has a sibling full-res .jpg preview; use it as a
+      // browser-native thumbnail (lazy-loaded). Note which siblings exist.
+      const blobs = new Set(data.tree.filter((b) => b.type === "blob").map((b) => b.path));
+      const rawUrl = (p) => OEXR_RAW_BASE + p.split("/").map(encodeURIComponent).join("/");
       allFiles = data.tree
         .filter((b) => b.type === "blob" && b.path.toLowerCase().endsWith(".exr"))
-        .map((b) => ({ path: b.path, name: b.path.split("/").pop(), size: b.size || 0 }));
+        .map((b) => {
+          const jpg = b.path.replace(/\.exr$/i, ".jpg");
+          return {
+            path: b.path,
+            name: b.path.split("/").pop(),
+            size: b.size || 0,
+            thumb: blobs.has(jpg) ? rawUrl(jpg) : null,
+          };
+        });
       rerender();
     } catch (err) {
       allFiles = null;

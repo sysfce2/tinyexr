@@ -213,11 +213,25 @@ select { width: 100%; }
 .browser-tree summary .count { color: var(--muted); font-size: 11px; margin-left: 6px; }
 .browser-tree .children { margin-left: 14px; border-left: 1px solid var(--line); padding-left: 6px; }
 .tree-file {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  display: flex; align-items: center; gap: 10px;
   width: 100%; text-align: left; background: none; border: none;
   border-radius: 6px; padding: 4px 6px; color: var(--fg);
 }
 .tree-file:hover { background: var(--accent2); border-color: var(--accent); }
+.tree-file .thumb {
+  flex: 0 0 auto; width: 46px; height: 30px;
+  object-fit: cover; border-radius: 4px;
+  background: var(--panel2); border: 1px solid var(--line);
+}
+/* placeholder when no sibling .jpg exists or it failed to load */
+.tree-file .thumb.noimg {
+  background:
+    repeating-conic-gradient(#1a1d22 0% 25%, #262a31 0% 50%) 50% / 10px 10px;
+}
+.tree-file .nm {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .tree-file .sz { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
 .tree-file:hover .sz { color: #cfe0ff; }
 .browser-tree .msg { color: var(--muted); padding: 14px 6px; font-size: 12px; }
