@@ -34,6 +34,18 @@ Highlights:
 - Optional **allocator hook**, runtime **SIMD** dispatch (SSE2/SSE4.1/AVX2/F16C,
   NEON), and a fuzzed, sanitizer-clean test suite.
 
+**Performance** — single-thread decode throughput vs the reference OpenEXR
+library, with the optional **libdeflate** backend on/off (and HTJ2K, which has no
+deflate path). With the same backend TinyEXR meets or beats OpenEXR on the
+deflate family:
+
+![Decode throughput: tinyexr libdeflate on/off vs OpenEXR](doc/perf-libdeflate-htj2k-decode.png)
+
+![Encode throughput: tinyexr libdeflate on/off vs OpenEXR](doc/perf-libdeflate-htj2k-encode.png)
+
+See [TinyEXR vs OpenEXR — performance](doc/performance-vs-openexr.md) for the
+full codec-by-codec encode/decode and multi-threaded numbers.
+
 Build: `make lib` (`build/libtinyexr3.a`), `make test-c`, `make c11-gate`. See
 [v3 C API details](#v3-c-api-details) below for performance, the streaming block
 API, and the freestanding / WASM build.

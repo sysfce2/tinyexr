@@ -102,6 +102,20 @@ parity. Encode reaches parity too (ZIP 15.3 vs 14.0, PXR24 16.4 vs 15.8). Both
 call libdeflate's inflate; TinyEXR's edge is its SSE2/AVX2 predictor and lower
 per-block overhead.
 
+The two charts below put **libdeflate on/off vs OpenEXR** side by side across the
+deflate family **and HTJ2K** (which has no deflate path, so only the in-tree and
+OpenEXR bars apply). The in-tree TinyEXR bars are the freestanding default; the
+green bars are the same `-DEXR_USE_LIBDEFLATE` build:
+
+![Decode: tinyexr libdeflate on/off vs OpenEXR, incl. htj2k](perf-libdeflate-htj2k-decode.png)
+
+![Encode: tinyexr libdeflate on/off vs OpenEXR, incl. htj2k](perf-libdeflate-htj2k-encode.png)
+
+On decode, libdeflate flips the deflate family in TinyEXR's favour (ZIP/ZIPS) and
+brings PXR24 to parity; HTJ2K stays OpenEXR's (its tuned JPH decoder). On encode,
+libdeflate lifts the deflate family to parity-or-better, while OpenEXR keeps a
+wide HTJ2K lead from its SIMD JPH entropy encoder.
+
 ### Full single-thread numbers
 
 In-tree default:
@@ -180,5 +194,6 @@ benchmarked here); sweep larger images and channel counts.
 ---
 
 *Charts: `doc/perf-decode.svg`, `perf-encode.svg`, `perf-libdeflate-decode.svg`,
+`perf-libdeflate-htj2k-decode.png`, `perf-libdeflate-htj2k-encode.png`,
 `perf-mt-scaling.svg`, `perf-mt-compare.svg`. Harness:
 `benchmark/bench_compare.cpp` (`make bench-compare [THREADS=1] [LIBDEFLATE=1]`).*
