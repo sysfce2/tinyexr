@@ -9787,6 +9787,7 @@ int LoadDeepEXR(DeepImage *deep_image, const char *filename, const char **err) {
   int num_scanline_blocks = 1;  // 16 for ZIP compression.
   int compression_type = -1;
   int num_channels = -1;
+  bool is_tiled = false;  // deep *tiled* parts are not supported here
   std::vector<tinyexr::ChannelInfo> channels;
 
   // Read attributes
@@ -9873,7 +9874,20 @@ int LoadDeepEXR(DeepImage *deep_image, const char *filename, const char **err) {
       tinyexr::swap4(&y);
       tinyexr::swap4(&w);
       tinyexr::swap4(&h);
+    } else if (attr_name.compare("tiles") == 0 ||
+               (attr_name.compare("type") == 0 && data.size() >= 8 &&
+                memcmp(&data[0], "deeptile", 8) == 0)) {
+      // Deep *tiled* parts use a tile-based chunk layout that this scanline
+      // reader cannot parse; flag it and reject below instead of mis-reading
+      // (and crashing on) tile chunks as scanlines.
+      is_tiled = true;
     }
+  }
+
+  if (is_tiled) {
+    tinyexr::SetErrorMessage(
+        "Deep tiled images are not supported by LoadDeepEXR", err);
+    return TINYEXR_ERROR_UNSUPPORTED_FORMAT;
   }
 
   TINYEXR_CHECK_AND_RETURN_C(dx >= 0, TINYEXR_ERROR_INVALID_DATA);
