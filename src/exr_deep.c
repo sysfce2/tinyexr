@@ -310,12 +310,26 @@ exr_result exr_deep_decode_samples(exr_reader *r, exr_int_part *p,
     rc = deep_decompress(a, h->compression, packed, (size_t)psds, sbuf,
                          (size_t)usds);
     if (!EXR_OK(rc)) goto done;
+    /* Sample data is channel-planar per scanline row (each row of the block is
+     * an independent deep scanline). Scatter row by row so the per-channel
+     * output stays in pixel row-major order. For scanline blocks bh == 1. */
     soff = 0;
-    for (c = 0; c < nch; ++c) {
-        size_t ps = exr_pixel_size(h->channels[c].pixel_type);
-        size_t cb = (size_t)total * ps;
-        if (chan_dst[c] && cb) memcpy(chan_dst[c], sbuf + soff, cb);
-        soff += cb;
+    {
+        int row;
+        uint64_t dest = 0; /* output sample offset (shared across channels) */
+        for (row = 0; row < bh; ++row) {
+            uint64_t rt = (bw > 0)
+                ? (uint64_t)otab[(size_t)row * (size_t)bw + (size_t)(bw - 1)]
+                : 0;
+            for (c = 0; c < nch; ++c) {
+                size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+                size_t cb = (size_t)rt * ps;
+                if (chan_dst[c] && cb)
+                    memcpy((uint8_t *)chan_dst[c] + dest * ps, sbuf + soff, cb);
+                soff += cb;
+            }
+            dest += rt;
+        }
     }
 
 done:
@@ -541,7 +555,7 @@ exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
             uint32_t idx = (uint32_t)tyi * nxt + txi;
             uint64_t off, pots, psds, usds, tile_total = 0;
             const uint8_t *hdr, *packed;
-            size_t hsz = r->is_multipart ? 44 : 40, base = 0;
+            size_t hsz = r->is_multipart ? 44 : 40;
             int tw = (tx < width - txi * tx) ? tx : (width - txi * tx);
             int th = (ty < height - tyi * ty) ? ty : (height - tyi * ty);
             int rr, x;
@@ -567,18 +581,25 @@ exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
             if (!EXR_OK(rc)) goto done;
             rc = deep_decompress(a, h->compression, packed, (size_t)psds, sbuf, (size_t)usds);
             if (!EXR_OK(rc)) goto done;
-            for (c = 0; c < nch; ++c) {
-                size_t ps = exr_pixel_size(h->channels[c].pixel_type), local = 0;
+            /* Sample data is stored one tile-row at a time, each row
+             * channel-planar (the tile is a stack of th deep scanlines of width
+             * tw), matching the per-row offset table. */
+            {
+                size_t soff = 0; /* byte offset within sbuf */
                 for (rr = 0; rr < th; ++rr) {
-                    for (x = 0; x < tw; ++x) {
-                        size_t pix = (size_t)(tyi * ty + rr) * width + (txi * tx + x);
-                        int cnt = out->deep_sample_counts[pix];
-                        memcpy((uint8_t *)out->deep_images[c] + prefix[pix] * ps,
-                               sbuf + base + local * ps, (size_t)cnt * ps);
-                        local += (size_t)cnt;
+                    for (c = 0; c < nch; ++c) {
+                        size_t ps = exr_pixel_size(h->channels[c].pixel_type);
+                        size_t local = 0;
+                        for (x = 0; x < tw; ++x) {
+                            size_t pix = (size_t)(tyi * ty + rr) * width + (txi * tx + x);
+                            int cnt = out->deep_sample_counts[pix];
+                            memcpy((uint8_t *)out->deep_images[c] + prefix[pix] * ps,
+                                   sbuf + soff + local * ps, (size_t)cnt * ps);
+                            local += (size_t)cnt;
+                        }
+                        soff += local * ps;
                     }
                 }
-                base += tile_total * ps;
             }
         }
     }
