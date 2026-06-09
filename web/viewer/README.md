@@ -38,8 +38,11 @@ the legacy v1 embind sample in `experimental/js/`.
   absolute data-window coordinates).
 - **Header / info panel** — file name, part type, compression, line order,
   data/display windows, pixel aspect, and the channel list.
-- **Part / mip selectors** — switch parts in a multipart EXR and mip/ripmap
-  levels in a tiled EXR.
+- **Part / mip / channel-view selectors** — switch parts in a multipart EXR,
+  mip/ripmap levels in a tiled EXR, and the **channel view** (auto RGB(A), named
+  layers like `diffuse.{R,G,B}`, or any single channel as grayscale) for parts
+  with non-standard channel layouts. Switching any selector clears the canvas
+  immediately so the previous image never lingers during the new decode.
 
 All v3 decode codecs are supported (ZIP/ZIPS, RLE, PIZ, PXR24, B44/B44A, ZSTD,
 HTJ2K). Deep parts are detected and reported as unsupported by this viewer.

@@ -448,50 +448,22 @@ EXRV_EXPORT char *exrv_header_json(int h) {
  * Returns the number of blocks to decode (>= 0), or -1 on error / unsupported
  * (e.g. a deep part).
  */
-EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
-    exrv_session *s = session_from_handle(h);
+/* Common tail of the select* entry points: validate the part, enumerate the
+ * blocks of (part, level), compute the level dimensions, and allocate a cleared
+ * RGBA buffer. Caller has already filled s->rmap / s->ycc. Returns block count
+ * (>= 0) or -1. */
+static int finish_selection(exrv_session *s, int part, int level_x, int level_y) {
     const exr_header *hd;
     uint32_t nb = 0, i;
-    int lw = 0, lh = 0, count = 0, k;
-    static const char *names[4] = {"R", "G", "B", "A"};
-    if (!s) return -1;
-    if (part < 0 || part >= s->num_parts) return -1;
+    int lw = 0, lh = 0, count = 0;
 
     hd = exr_reader_part_header(s->r, part);
     if (!hd) return -1;
-    if (hd->part_type == EXR_PART_DEEP_SCANLINE ||
-        hd->part_type == EXR_PART_DEEP_TILED)
-        return -1; /* deep not supported by this viewer */
-
-    session_reset_selection(s);
     s->sel_part = part;
     s->dw_min_x = hd->data_window.min_x;
     s->dw_min_y = hd->data_window.min_y;
-    for (k = 0; k < 4; ++k) s->rmap[k] = find_channel(hd, names[k]);
-
-    /* Fallbacks for parts without conventional R/G/B so they render instead of
-     * showing black — common in multipart EXRs (depth Z, motion vectors,
-     * disparity, masks) and luminance/multiview images. */
-    if (s->rmap[0] < 0 && s->rmap[1] < 0 && s->rmap[2] < 0) {
-        int y = find_channel(hd, "Y");
-        if (y >= 0) {
-            /* Luminance (multiview Fog.exr, luminance-chroma): Y -> grayscale.
-             * Subsampled chroma (RY/BY) is not reconstructed. */
-            s->rmap[0] = s->rmap[1] = s->rmap[2] = y;
-        } else if (hd->num_channels == 1) {
-            /* Single data channel (depth Z, mask): replicate to grayscale. */
-            s->rmap[0] = s->rmap[1] = s->rmap[2] = 0;
-        } else if (hd->num_channels >= 2) {
-            /* Multi-channel data (motion vectors forward.u/v, disparity .x/.y):
-             * map the leading channels to R, G and (if present) B. */
-            s->rmap[0] = 0;
-            s->rmap[1] = 1;
-            s->rmap[2] = (hd->num_channels >= 3) ? 2 : -1;
-        }
-    }
 
     if (!EXR_OK(exr_reader_num_blocks(s->r, part, &nb))) return -1;
-
     s->blocks = (uint32_t *)malloc((nb ? nb : 1) * sizeof(uint32_t));
     if (!s->blocks) return -1;
 
@@ -509,18 +481,10 @@ EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
     s->nblocks = count;
     s->lw = lw;
     s->lh = lh;
-
-    if (lw <= 0 || lh <= 0) {
-        session_reset_selection(s);
-        s->sel_part = part;
-        return -1;
-    }
+    if (lw <= 0 || lh <= 0) { session_reset_selection(s); s->sel_part = part; return -1; }
 
     s->rgba = (float *)malloc((size_t)lw * (size_t)lh * 4 * sizeof(float));
-    if (!s->rgba) {
-        session_reset_selection(s);
-        return -1;
-    }
+    if (!s->rgba) { session_reset_selection(s); return -1; }
     /* default RGB = 0, A = 1 (so images lacking an alpha channel are opaque) */
     {
         size_t n = (size_t)lw * (size_t)lh, p;
@@ -532,6 +496,65 @@ EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
         }
     }
     return count;
+}
+
+/* Auto-detect a sensible channel mapping for a part (conventional R/G/B/A,
+ * luminance-chroma Y/RY/BY, or a generic fallback) and select it. */
+EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
+    exrv_session *s = session_from_handle(h);
+    const exr_header *hd;
+    static const char *names[4] = {"R", "G", "B", "A"};
+    int k;
+    if (!s) return -1;
+    if (part < 0 || part >= s->num_parts) return -1;
+    hd = exr_reader_part_header(s->r, part);
+    if (!hd) return -1;
+    if (hd->part_type == EXR_PART_DEEP_SCANLINE ||
+        hd->part_type == EXR_PART_DEEP_TILED)
+        return -1; /* deep not supported by this viewer */
+
+    session_reset_selection(s);
+    for (k = 0; k < 4; ++k) s->rmap[k] = find_channel(hd, names[k]);
+
+    /* Fallbacks for parts without conventional R/G/B so they render instead of
+     * showing black — luminance, multiview, depth, motion vectors, etc.
+     * NOTE: luminance-chroma (Y + subsampled RY/BY, e.g. CrissyField.exr) is
+     * shown as grayscale Y only; full-color YCbCr reconstruction is blocked by
+     * the v3 core mis-decoding subsampled channels (RY/BY come back wrong). */
+    if (s->rmap[0] < 0 && s->rmap[1] < 0 && s->rmap[2] < 0) {
+        int y = find_channel(hd, "Y");
+        if (y >= 0) {
+            s->rmap[0] = s->rmap[1] = s->rmap[2] = y; /* luminance -> grayscale */
+        } else if (hd->num_channels == 1) {
+            s->rmap[0] = s->rmap[1] = s->rmap[2] = 0; /* single data channel */
+        } else if (hd->num_channels >= 2) {
+            /* Multi-channel data (motion vectors, disparity): leading -> R,G,B. */
+            s->rmap[0] = 0;
+            s->rmap[1] = 1;
+            s->rmap[2] = (hd->num_channels >= 3) ? 2 : -1;
+        }
+    }
+    return finish_selection(s, part, level_x, level_y);
+}
+
+/* Explicit channel selection from the UI's channel-view combo: (c0,c1,c2,c3)
+ * map directly to (R,G,B,A); -1 leaves the default (RGB 0 / A 1). Use the same
+ * index for c0/c1/c2 to display one channel as grayscale. */
+EXRV_EXPORT int exrv_select_channels(int h, int part, int level_x, int level_y,
+                                     int c0, int c1, int c2, int c3) {
+    exrv_session *s = session_from_handle(h);
+    const exr_header *hd;
+    if (!s) return -1;
+    if (part < 0 || part >= s->num_parts) return -1;
+    hd = exr_reader_part_header(s->r, part);
+    if (!hd) return -1;
+    if (hd->part_type == EXR_PART_DEEP_SCANLINE ||
+        hd->part_type == EXR_PART_DEEP_TILED)
+        return -1;
+
+    session_reset_selection(s);
+    s->rmap[0] = c0; s->rmap[1] = c1; s->rmap[2] = c2; s->rmap[3] = c3;
+    return finish_selection(s, part, level_x, level_y);
 }
 
 EXRV_EXPORT int exrv_level_width(int h) {

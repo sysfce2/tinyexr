@@ -17,7 +17,8 @@ import createModule from "./exr_viewer.mjs";
 let M = null;             // emscripten module
 let handle = 0;           // current exrv session handle
 let header = null;        // parsed header JSON
-let sel = { part: 0, lx: 0, ly: 0 };
+let sel = { part: 0, lx: 0, ly: 0, view: 0 };
+let views = [];           // channel-view options for the current part
 let img = null;           // { w, h, data: Float32Array(rgba) }
 let fileName = null;      // name of the currently loaded file (for info panel)
 let dwMin = { x: 0, y: 0 };
@@ -382,18 +383,32 @@ async function loadBytes(bytes, name) {
   document.getElementById("viewbar").classList.remove("hidden");
 
   buildPartSelector();
+  views = [];                 // force a fresh channel-view list for the new file
   await selectAndDecode(0, 0, 0, true);
 }
 
-async function selectAndDecode(part, lx, ly, doFit) {
+async function selectAndDecode(part, lx, ly, doFit, viewIdx) {
+  // Clear the canvas immediately so a part/view switch doesn't leave the old
+  // image (or a partially-decoded frame) on screen while the new one decodes.
+  img = null; render();
+
   roi = null;
   updateRoiUI();
   const ph = header.parts[part];
   dwMin = { x: ph.dataWindow.minX, y: ph.dataWindow.minY };
   dispWin = ph.displayWindow;
-  sel = { part, lx, ly };
 
-  const total = M._exrv_select(handle, part, lx, ly);
+  // Rebuild the channel-view list when the part changes; otherwise keep it.
+  const partChanged = sel.part !== part || views.length === 0;
+  if (partChanged) { views = buildViews(ph); buildChannelSelector(); }
+  if (viewIdx === undefined) viewIdx = partChanged ? 0 : (sel.view || 0);
+  if (viewIdx < 0 || viewIdx >= views.length) viewIdx = 0;
+  sel = { part, lx, ly, view: viewIdx };
+  document.getElementById("channelSel").value = String(viewIdx);
+
+  const v = views[viewIdx];
+  const total = M._exrv_select_channels(handle, part, lx, ly,
+    v.c[0], v.c[1], v.c[2], v.c[3]);
   if (total < 0) {
     setProgress(-1);
     img = null; render();
@@ -460,6 +475,61 @@ function buildPartSelector() {
   });
   partSel.value = "0";
   partSel.parentElement.style.display = header.numParts > 1 ? "" : "none";
+}
+
+// Derive the selectable channel "views" for a part: conventional RGB(A),
+// luminance-chroma (Y/RY/BY → color), named layers (prefix.R/G/B), a generic
+// leading-channels-to-RGB for data parts, and every channel as grayscale.
+// View.c holds header channel indices (matching p.channels order); -1 = unused.
+function buildViews(p) {
+  const ch = p.channels;
+  const idx = (name) => ch.findIndex((c) => c.name === name);
+  const primary = [];
+  const R = idx("R"), G = idx("G"), B = idx("B"), A = idx("A");
+  if (R >= 0 && G >= 0 && B >= 0)
+    primary.push({ label: A >= 0 ? "RGBA" : "RGB", c: [R, G, B, A] });
+  const Y = idx("Y");
+  // Luminance-chroma (Y + RY/BY) is shown as grayscale Y; full-color YCbCr
+  // reconstruction is pending a v3-core fix for subsampled-channel decode.
+
+  // Named layers: group channels by the prefix before the last '.'.
+  const layers = new Map();
+  ch.forEach((c, i) => {
+    const dot = c.name.lastIndexOf(".");
+    if (dot > 0) {
+      const pre = c.name.slice(0, dot), suf = c.name.slice(dot + 1);
+      if (!layers.has(pre)) layers.set(pre, {});
+      layers.get(pre)[suf] = i;
+    }
+  });
+  for (const [pre, m] of layers) {
+    if (m.R !== undefined && m.G !== undefined && m.B !== undefined)
+      primary.push({ label: `${pre} (RGB)`,
+        c: [m.R, m.G, m.B, m.A !== undefined ? m.A : -1] });
+  }
+
+  if (!primary.length) {
+    if (Y >= 0) primary.push({ label: "Y (luminance)", c: [Y, Y, Y, -1] });
+    else if (ch.length >= 2) // motion vectors / disparity / generic data
+      primary.push({ label: "Channels → RGB", c: [0, 1, ch.length >= 3 ? 2 : -1, -1] });
+  }
+
+  const individual = ch.map((c, i) => ({ label: `${c.name} (gray)`, c: [i, i, i, -1] }));
+  return [...primary, ...individual];
+}
+
+function buildChannelSelector() {
+  const channelSel = document.getElementById("channelSel");
+  channelSel.innerHTML = "";
+  views.forEach((v, i) => {
+    const opt = document.createElement("option");
+    opt.value = i;
+    opt.textContent = v.label;
+    channelSel.appendChild(opt);
+  });
+  channelSel.value = "0";
+  // Hide the combo when there's only one trivial view (e.g. a plain RGB image).
+  document.getElementById("channelView").style.display = views.length > 1 ? "" : "none";
 }
 
 function buildLevelSelector() {
@@ -697,6 +767,9 @@ function setupInput() {
   document.getElementById("levelSel").addEventListener("change", (e) => {
     const [lx, ly] = e.target.value.split(",").map(Number);
     selectAndDecode(sel.part, lx, ly, true);
+  });
+  document.getElementById("channelSel").addEventListener("change", (e) => {
+    selectAndDecode(sel.part, sel.lx, sel.ly, false, parseInt(e.target.value, 10));
   });
 
   window.addEventListener("resize", () => { syncCanvasSize(); render(); });
