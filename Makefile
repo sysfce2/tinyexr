@@ -288,6 +288,75 @@ freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
 	./build/fs_smoke
 	@echo "freestanding gate: OK"
 
+# ---- tocio (sandbox: tiny OpenColorIO config engine + codegen) ------------
+# Pure-C11, freestanding, no external deps. Lives outside src/ so it has its own
+# build/gate targets. Mirrors the v3 freestanding discipline.
+TOC_INC      = -Isandbox/tocio/include -Isandbox/tocio/src
+TOC_SRC      = $(wildcard sandbox/tocio/src/*.c)
+TOC_OBJ      = $(patsubst sandbox/tocio/src/%.c,build/toc-%.o,$(TOC_SRC))
+TOC_HDRS     = sandbox/tocio/include/tocio.h sandbox/tocio/src/toc_internal.h
+# Freestanding core: everything except the optional hosted stdio loader.
+TOC_CORE_SRC = $(filter-out sandbox/tocio/src/toc_stdio.c,$(TOC_SRC))
+TOC_FS_OBJ   = $(patsubst sandbox/tocio/src/%.c,build/toc-fs-%.o,$(TOC_CORE_SRC))
+TOC_FS_FORBIDDEN = $(FS_FORBIDDEN)
+
+.PHONY: tocio-lib tocio-c11-gate tocio-freestanding-gate tocio-test
+
+build/toc-%.o: sandbox/tocio/src/%.c $(TOC_HDRS) | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 -g $(SAN) -c $< -o $@
+
+tocio-lib: $(TOC_OBJ)
+	$(AR) rcs build/libtocio.a $(TOC_OBJ)
+	@echo "built build/libtocio.a"
+
+tocio-c11-gate: | build
+	@for f in $(TOC_SRC); do \
+	  echo "  C11  $$f"; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	@echo "tocio pure-C11 gate: OK"
+
+build/toc-fs-%.o: sandbox/tocio/src/%.c $(TOC_HDRS) | build
+	$(CC) -DTOC_FREESTANDING -ffreestanding -fno-builtin -fno-stack-protector \
+	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O2 -g -c $< -o $@
+
+tocio-freestanding-gate: $(TOC_FS_OBJ) sandbox/tocio/tests/toc_fs_smoke.c | build
+	@echo "  scan: only toc_stdio.c may include <stdio.h>"
+	@bad=`grep -rl '<stdio.h>' sandbox/tocio/src/ | grep -v 'toc_stdio.c' || true`; \
+	  if [ -n "$$bad" ]; then echo "  FAIL: stdio leaked into: $$bad"; exit 1; fi
+	@echo "  scan: no forbidden libc symbols in the freestanding core"
+	@for o in $(TOC_FS_OBJ); do \
+	  hit=`nm -u $$o 2>/dev/null | awk '{print $$NF}' | grep -wE '$(TOC_FS_FORBIDDEN)' || true`; \
+	  if [ -n "$$hit" ]; then echo "  FAIL: $$o references:" $$hit; exit 1; fi; \
+	done
+	@echo "  run: freestanding-compiled core + custom-allocator round-trip"
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 \
+	  sandbox/tocio/tests/toc_fs_smoke.c $(TOC_FS_OBJ) -o build/toc_fs_smoke
+	./build/toc_fs_smoke
+	@echo "tocio freestanding gate: OK"
+
+tocio-test: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O1 -g $(SAN) \
+	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -ldl -o build/toc_test
+	ASAN_OPTIONS=detect_leaks=0 ./build/toc_test
+
+# ---- tocio WASM (Emscripten ES6 module for the web viewer) -----------------
+TOCW_EXPORTS = ['_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_malloc','_free']
+TOCW_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','UTF8ToString','stringToUTF8','lengthBytesUTF8']
+.PHONY: wasm-tocio wasm-tocio-test
+wasm-tocio: | build
+	$(EMCC) -O3 $(TOC_INC) -w \
+	  $(TOC_CORE_SRC) sandbox/tocio/wasm/toc_wasm.c \
+	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
+	  -s "EXPORTED_FUNCTIONS=$(TOCW_EXPORTS)" \
+	  -s "EXPORTED_RUNTIME_METHODS=$(TOCW_RUNTIME)" \
+	  -o build/tocio.mjs
+	@echo "built build/tocio.mjs + build/tocio.wasm"
+
+wasm-tocio-test: wasm-tocio
+	node sandbox/tocio/wasm/test.mjs
+
 clean:
 	rm -rf $(TARGET) miniz.o build $(PARSE_HARNESS)
 
