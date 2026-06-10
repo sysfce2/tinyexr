@@ -295,8 +295,9 @@ TOC_INC      = -Isandbox/tocio/include -Isandbox/tocio/src
 TOC_SRC      = $(wildcard sandbox/tocio/src/*.c)
 TOC_OBJ      = $(patsubst sandbox/tocio/src/%.c,build/toc-%.o,$(TOC_SRC))
 TOC_HDRS     = sandbox/tocio/include/tocio.h sandbox/tocio/src/toc_internal.h
-# Freestanding core: everything except the optional hosted stdio loader.
-TOC_CORE_SRC = $(filter-out sandbox/tocio/src/toc_stdio.c,$(TOC_SRC))
+# Freestanding core: everything except the optional hosted stdio loader and the
+# hosted JIT (needs OS executable memory).
+TOC_CORE_SRC = $(filter-out sandbox/tocio/src/toc_stdio.c sandbox/tocio/src/toc_jit.c,$(TOC_SRC))
 TOC_FS_OBJ   = $(patsubst sandbox/tocio/src/%.c,build/toc-fs-%.o,$(TOC_CORE_SRC))
 TOC_FS_FORBIDDEN = $(FS_FORBIDDEN)
 

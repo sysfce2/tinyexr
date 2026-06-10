@@ -206,6 +206,25 @@ void toc_simd_init(void) {
     done = 1;
 }
 
+/* Apply one op to a single pixel (the JIT calls this for ops it does not
+ * inline; also the per-pixel fallback for the batch path). */
+void toc_apply_op_pixel(const toc_op *op, float *px, int ch) {
+    switch (op->kind) {
+        case TOC_OP_MATRIX: k_matrix(op, px, ch); break;
+        case TOC_OP_RANGE: k_range(op, px, ch); break;
+        case TOC_OP_EXPONENT: k_exponent(op, px, ch); break;
+        case TOC_OP_EXP_LINEAR: k_exp_linear(op, px, ch); break;
+        case TOC_OP_LOG: k_log(op, px, ch); break;
+        case TOC_OP_LOG_CAMERA: k_logcam(op, px, ch); break;
+        case TOC_OP_CDL: k_cdl(op, px, ch); break;
+        case TOC_OP_LUT1D: toc_lut1d_apply_pixel(op, px, ch); break;
+        case TOC_OP_LUT3D: toc_lut3d_apply_pixel(op, px, ch); break;
+        case TOC_OP_FIXEDFUNC: toc_fixedfunc_apply_pixel(op, px, ch); break;
+        case TOC_OP_NOOP:
+        default: break;
+    }
+}
+
 /* Apply one op to the whole buffer (op-major; enables SIMD batch kernels). */
 static void batch_op(const toc_op *op, float *rgba, size_t npix, int ch) {
     size_t i;

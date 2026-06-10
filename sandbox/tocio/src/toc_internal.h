@@ -162,6 +162,9 @@ void toc_simd_init(void);
 /* Force a tier for parity tests: 0 scalar, 1 SSE2, 2 AVX2. */
 void toc_simd_force(int level);
 
+/* Apply a single op to one pixel (used by the batch fallback + the JIT). */
+void toc_apply_op_pixel(const toc_op *op, float *px, int ch);
+
 void toc_matrix_batch_scalar(const float *m, const float *off, float *rgba,
                              size_t npix, int ch);
 void toc_range_batch_scalar(const float *scale, const float *offset,

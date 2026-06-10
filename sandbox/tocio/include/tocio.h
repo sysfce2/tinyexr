@@ -267,6 +267,23 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                          const toc_allocator *a, toc_shader *out);
 void toc_shader_free(toc_shader *sh);
 
+/* ============================================================================
+ * Backend 4: x64 JIT (emit machine code to executable memory, run directly)
+ *
+ * Hosted-only (needs OS executable memory); x86-64 + SSE2. matrix/range are
+ * inlined as SSE; transcendental/LUT ops call the C interpreter kernel. The
+ * compiled function borrows the op list, which must outlive the jit. Returns
+ * TOC_ERROR_UNSUPPORTED on non-x86-64 or if exec memory cannot be obtained.
+ * ========================================================================== */
+typedef struct toc_jit toc_jit;
+typedef void (*toc_jit_fn)(float *rgba, size_t pixel_count);
+
+/* `channels` (3 or 4) is baked into the compiled code. */
+toc_result toc_jit_compile(const toc_op_list *ops, int channels,
+                           const toc_allocator *a, toc_jit **out);
+toc_jit_fn toc_jit_func(const toc_jit *j);
+void toc_jit_destroy(toc_jit *j);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

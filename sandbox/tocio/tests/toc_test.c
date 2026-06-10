@@ -697,6 +697,89 @@ static void test_builtins(void) {
     toc_config_free(cfg);
 }
 
+/* ---- x64 JIT: emitted machine code == interpreter ------------------------ */
+static void test_jit(void) {
+    toc_op_list *l = newlist();
+    toc_jit *j = NULL;
+    toc_result rc;
+    int i, ok = 1;
+    build_pipeline(l); /* matrix + exponent + range */
+    rc = toc_jit_compile(l, 4, NULL, &j);
+    if (rc == TOC_ERROR_UNSUPPORTED) {
+        printf("  note: JIT unsupported on this target; skipping\n");
+        toc_op_list_free(l);
+        return;
+    }
+    CHECK(TOC_OK(rc) && j, "jit compile");
+    if (TOC_OK(rc)) {
+        toc_jit_fn fn = toc_jit_func(j);
+        CHECK(fn != NULL, "jit func ptr");
+        if (fn) {
+            for (i = 0; i < 64; ++i) {
+                float a[4], b[4];
+                int c;
+                for (c = 0; c < 4; ++c) {
+                    float v = (float)((i * 53 + c * 17) % 200 - 50) / 100.0f;
+                    a[c] = b[c] = v;
+                }
+                toc_apply(l, a, 1, 4); /* interpreter */
+                fn(b, 1);              /* native code */
+                for (c = 0; c < 4; ++c)
+                    if (!approx(a[c], b[c], 1e-6f)) ok = 0;
+            }
+            CHECK(ok, "JIT == interpreter (64 pixels, matrix+exp+range)");
+            /* multi-pixel run exercises the loop */
+            {
+                static float buf[16 * 4], ref[16 * 4];
+                int n;
+                for (n = 0; n < 16 * 4; ++n)
+                    buf[n] = ref[n] = (float)(n % 7) * 0.1f;
+                toc_apply(l, ref, 16, 4);
+                fn(buf, 16);
+                ok = 1;
+                for (n = 0; n < 16 * 4; ++n)
+                    if (!approx(buf[n], ref[n], 1e-6f)) ok = 0;
+                CHECK(ok, "JIT loop over 16 pixels == interpreter");
+            }
+        }
+        toc_jit_destroy(j);
+    }
+    /* a LUT op (helper-call path) also runs through the JIT */
+    {
+        toc_op_list *l2 = newlist();
+        toc_op *m = toc_op_list_push(l2, TOC_OP_MATRIX);
+        toc_op *lut = toc_op_list_push(l2, TOC_OP_LUT3D);
+        static float cube[2 * 2 * 2 * 3];
+        int ir, ig, ib, n;
+        toc_jit *j2 = NULL;
+        for (ib = 0; ib < 2; ++ib)
+            for (ig = 0; ig < 2; ++ig)
+                for (ir = 0; ir < 2; ++ir) {
+                    size_t idx = (((size_t)ib * 2 + ig) * 2 + ir) * 3;
+                    cube[idx + 0] = (float)ir; cube[idx + 1] = (float)ig;
+                    cube[idx + 2] = (float)ib;
+                }
+        for (n = 0; n < 4; ++n) m->u.matrix.m[n * 4 + n] = 1.0f; /* identity */
+        lut->u.lut3d.size = 2; lut->u.lut3d.data = cube;
+        lut->u.lut3d.domain_max[0] = lut->u.lut3d.domain_max[1] =
+            lut->u.lut3d.domain_max[2] = 1.0f;
+        lut->u.lut3d.interp = TOC_INTERP_TETRAHEDRAL;
+        if (TOC_OK(toc_jit_compile(l2, 4, NULL, &j2)) && j2) {
+            float a[4] = {0.2f, 0.6f, 0.9f, 1.0f}, b[4];
+            int c;
+            memcpy(b, a, sizeof(a));
+            toc_apply(l2, a, 1, 4);
+            toc_jit_func(j2)(b, 1);
+            ok = 1;
+            for (c = 0; c < 4; ++c) if (!approx(a[c], b[c], 1e-6f)) ok = 0;
+            CHECK(ok, "JIT with LUT3D (helper call) == interpreter");
+            toc_jit_destroy(j2);
+        }
+        toc_op_list_free(l2);
+    }
+    toc_op_list_free(l);
+}
+
 int main(void) {
     printf("== tocio math ==\n");
     test_math();
@@ -722,6 +805,8 @@ int main(void) {
     test_simd_parity();
     printf("== tocio builtins + fixedfunc ==\n");
     test_builtins();
+    printf("== tocio x64 JIT ==\n");
+    test_jit();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
