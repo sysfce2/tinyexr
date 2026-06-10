@@ -184,12 +184,43 @@ void toc_range_batch_scalar(const float *scale, const float *offset,
     for (i = 0; i < npix; ++i) k_range(&tmp, rgba + i * (size_t)ch, ch);
 }
 
+/* Scalar batch references for the transcendental ops: the bit-exact source of
+ * truth the NEON tier must reproduce. Each just walks the buffer per pixel. */
+void toc_exponent_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch) {
+    size_t i;
+    for (i = 0; i < npix; ++i) k_exponent(op, rgba + i * (size_t)ch, ch);
+}
+void toc_log_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch) {
+    size_t i;
+    for (i = 0; i < npix; ++i) k_log(op, rgba + i * (size_t)ch, ch);
+}
+void toc_logcam_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch) {
+    size_t i;
+    for (i = 0; i < npix; ++i) k_logcam(op, rgba + i * (size_t)ch, ch);
+}
+void toc_explin_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch) {
+    size_t i;
+    for (i = 0; i < npix; ++i) k_exp_linear(op, rgba + i * (size_t)ch, ch);
+}
+void toc_cdl_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch) {
+    size_t i;
+    for (i = 0; i < npix; ++i) k_cdl(op, rgba + i * (size_t)ch, ch);
+}
+
 /* ---- SIMD dispatch table ------------------------------------------------- */
-toc_simd_vtbl toc_simd = {toc_matrix_batch_scalar, toc_range_batch_scalar};
+toc_simd_vtbl toc_simd = {toc_matrix_batch_scalar, toc_range_batch_scalar,
+                          toc_exponent_batch_scalar, toc_log_batch_scalar,
+                          toc_logcam_batch_scalar,   toc_explin_batch_scalar,
+                          toc_cdl_batch_scalar};
 
 void toc_simd_force(int level) {
     toc_simd.matrix = toc_matrix_batch_scalar;
     toc_simd.range = toc_range_batch_scalar;
+    toc_simd.exponent = toc_exponent_batch_scalar;
+    toc_simd.log_ = toc_log_batch_scalar;
+    toc_simd.log_camera = toc_logcam_batch_scalar;
+    toc_simd.exp_linear = toc_explin_batch_scalar;
+    toc_simd.cdl = toc_cdl_batch_scalar;
 #if defined(TOC_X86)
     if (level >= 1) {
         toc_simd.matrix = toc_matrix_batch_sse2;
@@ -200,6 +231,11 @@ void toc_simd_force(int level) {
     if (level >= 1) {
         toc_simd.matrix = toc_matrix_batch_neon;
         toc_simd.range = toc_range_batch_neon;
+        toc_simd.exponent = toc_exponent_batch_neon;
+        toc_simd.log_ = toc_log_batch_neon;
+        toc_simd.log_camera = toc_logcam_batch_neon;
+        toc_simd.exp_linear = toc_explin_batch_neon;
+        toc_simd.cdl = toc_cdl_batch_neon;
     }
 #else
     (void)level;
@@ -216,6 +252,11 @@ void toc_simd_init(void) {
 #elif defined(TOC_NEON)
     toc_simd.matrix = toc_matrix_batch_neon; /* NEON is baseline on aarch64 */
     toc_simd.range = toc_range_batch_neon;
+    toc_simd.exponent = toc_exponent_batch_neon;
+    toc_simd.log_ = toc_log_batch_neon;
+    toc_simd.log_camera = toc_logcam_batch_neon;
+    toc_simd.exp_linear = toc_explin_batch_neon;
+    toc_simd.cdl = toc_cdl_batch_neon;
 #endif
     done = 1;
 }
@@ -252,16 +293,16 @@ static void batch_op(const toc_op *op, float *rgba, size_t npix, int ch) {
                            op->u.range.clamp_lo, op->u.range.clamp_hi, rgba,
                            npix, ch);
             return;
+        case TOC_OP_EXPONENT: toc_simd.exponent(op, rgba, npix, ch); return;
+        case TOC_OP_LOG: toc_simd.log_(op, rgba, npix, ch); return;
+        case TOC_OP_LOG_CAMERA: toc_simd.log_camera(op, rgba, npix, ch); return;
+        case TOC_OP_EXP_LINEAR: toc_simd.exp_linear(op, rgba, npix, ch); return;
+        case TOC_OP_CDL: toc_simd.cdl(op, rgba, npix, ch); return;
         default: break;
     }
     for (i = 0; i < npix; ++i) {
         float *px = rgba + i * (size_t)ch;
         switch (op->kind) {
-            case TOC_OP_EXPONENT: k_exponent(op, px, ch); break;
-            case TOC_OP_EXP_LINEAR: k_exp_linear(op, px, ch); break;
-            case TOC_OP_LOG: k_log(op, px, ch); break;
-            case TOC_OP_LOG_CAMERA: k_logcam(op, px, ch); break;
-            case TOC_OP_CDL: k_cdl(op, px, ch); break;
             case TOC_OP_LUT1D: toc_lut1d_apply_pixel(op, px, ch); break;
             case TOC_OP_LUT3D: toc_lut3d_apply_pixel(op, px, ch); break;
             case TOC_OP_FIXEDFUNC: toc_fixedfunc_apply_pixel(op, px, ch); break;

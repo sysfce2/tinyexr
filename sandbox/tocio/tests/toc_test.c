@@ -1227,6 +1227,90 @@ static void test_simd_parity(void) {
     toc_op_list_free(l);
 }
 
+/* Per-op SIMD parity for the transcendental kernels: scalar vs the NEON tier
+ * (force level 1), bit-exact over an input range that crosses op breakpoints.
+ * memcmp keeps it NaN-bit-safe. On x86 these ops stay scalar, so it is a no-op
+ * pass there; the bit-exactness it locks is the aarch64 NEON path. */
+static void parity_check(toc_op_list *l, const char *name) {
+    enum { NP = 257 };
+    static float base[NP * 4], a[NP * 4], b[NP * 4];
+    int i, ok = 1;
+    for (i = 0; i < NP * 4; ++i)
+        base[i] = (float)((i * 37) % 300 - 80) / 100.0f; /* [-0.80, 2.19] */
+    memcpy(a, base, sizeof(base));
+    memcpy(b, base, sizeof(base));
+    toc_simd_force(0);
+    toc_apply(l, a, NP, 4);
+    toc_simd_force(1);
+    toc_apply(l, b, NP, 4);
+    for (i = 0; i < NP * 4; ++i)
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) ok = 0;
+    CHECK(ok, name);
+    toc_op_list_free(l);
+}
+
+static void test_simd_parity_transcendentals(void) {
+    int c, k;
+    { /* exponent */
+        toc_op_list *l = newlist();
+        toc_op *o = toc_op_list_push(l, TOC_OP_EXPONENT);
+        for (c = 0; c < 4; ++c) o->u.exponent.e[c] = (c < 3) ? 0.45f : 1.0f;
+        parity_check(l, "NEON exponent == scalar");
+    }
+    for (k = 0; k < 2; ++k) { /* log forward + inverse */
+        toc_op_list *l = newlist();
+        toc_op *o = toc_op_list_push(l, TOC_OP_LOG);
+        o->u.log.base = 10.0f;
+        o->u.log.inverse = k;
+        for (c = 0; c < 3; ++c) {
+            o->u.log.lin_slope[c] = 0.9f; o->u.log.lin_offset[c] = 0.1f;
+            o->u.log.log_slope[c] = 0.3f; o->u.log.log_offset[c] = 0.6f;
+        }
+        parity_check(l, k ? "NEON log inverse == scalar"
+                          : "NEON log forward == scalar");
+    }
+    for (k = 0; k < 2; ++k) { /* log_camera forward + inverse */
+        toc_op_list *l = newlist();
+        toc_op *o = toc_op_list_push(l, TOC_OP_LOG_CAMERA);
+        o->u.logcam.base = 10.0f;
+        o->u.logcam.inverse = k;
+        for (c = 0; c < 3; ++c) {
+            o->u.logcam.lin_slope[c] = 0.9f; o->u.logcam.lin_offset[c] = 0.1f;
+            o->u.logcam.log_slope[c] = 0.3f; o->u.logcam.log_offset[c] = 0.6f;
+            o->u.logcam.lin_break[c] = 0.15f;
+            o->u.logcam.linear_slope[c] = 1.1f;
+            o->u.logcam.linear_offset[c] = 0.0f;
+        }
+        parity_check(l, k ? "NEON log_camera inverse == scalar"
+                          : "NEON log_camera forward == scalar");
+    }
+    for (k = 0; k < 2; ++k) { /* exp_linear (MonCurve) forward + inverse */
+        toc_op_list *l = newlist();
+        toc_op *o = toc_op_list_push(l, TOC_OP_EXP_LINEAR);
+        o->u.exp_linear.inverse = k;
+        for (c = 0; c < 4; ++c) {
+            o->u.exp_linear.scale[c] = 0.95f; o->u.exp_linear.offset[c] = 0.05f;
+            o->u.exp_linear.gamma[c] = 2.4f;  o->u.exp_linear.breakpoint[c] = 0.04f;
+            o->u.exp_linear.slope[c] = 0.077f;
+        }
+        parity_check(l, k ? "NEON exp_linear inverse == scalar"
+                          : "NEON exp_linear forward == scalar");
+    }
+    for (k = 0; k < 2; ++k) { /* cdl with and without clamp */
+        toc_op_list *l = newlist();
+        toc_op *o = toc_op_list_push(l, TOC_OP_CDL);
+        o->u.cdl.saturation = 1.2f;
+        o->u.cdl.clamp = k;
+        for (c = 0; c < 3; ++c) {
+            o->u.cdl.slope[c] = 1.1f; o->u.cdl.offset[c] = 0.02f;
+            o->u.cdl.power[c] = 0.9f; o->u.cdl.luma[c] = 0.0f;
+        }
+        parity_check(l, k ? "NEON cdl (clamp) == scalar"
+                          : "NEON cdl (no clamp) == scalar");
+    }
+    toc_simd_force(2);
+}
+
 /* ---- builtins + fixedfunc + logcamera ------------------------------------ */
 static const char *g_builtin_cfg =
     "ocio_profile_version: 2\n"
@@ -1548,6 +1632,7 @@ int main(void) {
     test_codegen_glsl();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
+    test_simd_parity_transcendentals();
     printf("== tocio builtins + fixedfunc ==\n");
     test_builtins();
     printf("== tocio fixedfunc styles ==\n");

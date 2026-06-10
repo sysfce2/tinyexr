@@ -341,6 +341,13 @@ tocio-test: | build
 	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -ldl -o build/toc_test
 	ASAN_OPTIONS=detect_leaks=0 ./build/toc_test
 
+# Interpreter throughput benchmark (scalar vs SIMD per op). -O2, no sanitizers.
+.PHONY: tocio-bench
+tocio-bench: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 \
+	  sandbox/tocio/tests/toc_bench.c $(TOC_SRC) -lm -ldl -o build/toc_bench
+	./build/toc_bench
+
 # ---- tocio ARM64 (aarch64 NEON) cross build + qemu test ---------------------
 # Cross-compile the full tocio test suite and run under qemu-aarch64.
 # toc_jit.c has a native AArch64/NEON backend (emits A64 code to executable

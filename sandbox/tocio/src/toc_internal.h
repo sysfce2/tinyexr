@@ -150,12 +150,22 @@ const char *toc_node_scalar(const toc_node *n);
  * via a batch kernel. matrix/range have SSE2/AVX2 variants; the scalar batch is
  * the bit-exact reference. Dispatched once via CPUID.
  * ========================================================================== */
+/* Transcendental ops (exponent/log/log_camera/exp_linear/cdl) batch over the
+ * whole buffer; the NEON tier vectorizes their pow/log/exp math 4 lanes per
+ * pixel (one RGBA pixel per iteration) and is bit-exact with the scalar batch. */
+typedef void (*toc_op_batch_fn)(const toc_op *op, float *rgba, size_t npix,
+                                int ch);
 typedef struct {
     void (*matrix)(const float *m, const float *off, float *rgba, size_t npix,
                    int ch);
     void (*range)(const float *scale, const float *offset, const float *vmin,
                   const float *vmax, int clamp_lo, int clamp_hi, float *rgba,
                   size_t npix, int ch);
+    toc_op_batch_fn exponent;
+    toc_op_batch_fn log_;
+    toc_op_batch_fn log_camera;
+    toc_op_batch_fn exp_linear;
+    toc_op_batch_fn cdl;
 } toc_simd_vtbl;
 extern toc_simd_vtbl toc_simd;
 void toc_simd_init(void);
@@ -170,6 +180,12 @@ void toc_matrix_batch_scalar(const float *m, const float *off, float *rgba,
 void toc_range_batch_scalar(const float *scale, const float *offset,
                             const float *vmin, const float *vmax, int clamp_lo,
                             int clamp_hi, float *rgba, size_t npix, int ch);
+/* Scalar batch references for the transcendental ops (vtbl defaults). */
+void toc_exponent_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_log_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_logcam_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_explin_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_cdl_batch_scalar(const toc_op *op, float *rgba, size_t npix, int ch);
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
     defined(_M_IX86)
@@ -192,6 +208,12 @@ void toc_matrix_batch_neon(const float *m, const float *off, float *rgba,
 void toc_range_batch_neon(const float *scale, const float *offset,
                           const float *vmin, const float *vmax, int clamp_lo,
                           int clamp_hi, float *rgba, size_t npix, int ch);
+/* NEON transcendental batch kernels (bit-exact with the *_scalar references). */
+void toc_exponent_batch_neon(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_log_batch_neon(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_logcam_batch_neon(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_explin_batch_neon(const toc_op *op, float *rgba, size_t npix, int ch);
+void toc_cdl_batch_neon(const toc_op *op, float *rgba, size_t npix, int ch);
 #endif
 
 /* ============================================================================
