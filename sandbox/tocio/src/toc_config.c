@@ -88,6 +88,30 @@ const toc_node *toc_cfg_find_colorspace(const toc_config *cfg, const char *name)
     return find_in_seq(cs_seq(cfg, "display_colorspaces"), name);
 }
 
+/* ---- look introspection (public API) ------------------------------------- */
+int toc_config_num_looks(const toc_config *cfg) {
+    const toc_node *s = cfg ? cs_seq(cfg, "looks") : NULL;
+    return (s && s->kind == TOC_NODE_SEQ) ? (int)s->n_items : 0;
+}
+const char *toc_config_look_name(const toc_config *cfg, int index) {
+    const toc_node *s = cfg ? cs_seq(cfg, "looks") : NULL;
+    if (!s || s->kind != TOC_NODE_SEQ || index < 0 ||
+        (size_t)index >= s->n_items)
+        return NULL;
+    return toc_node_scalar(toc_node_map_get(s->items[index], "name"));
+}
+int toc_config_num_view_transforms(const toc_config *cfg) {
+    const toc_node *s = cfg ? cs_seq(cfg, "view_transform") : NULL;
+    return (s && s->kind == TOC_NODE_SEQ) ? (int)s->n_items : 0;
+}
+const char *toc_config_view_transform_name(const toc_config *cfg, int index) {
+    const toc_node *s = cfg ? cs_seq(cfg, "view_transform") : NULL;
+    if (!s || s->kind != TOC_NODE_SEQ || index < 0 ||
+        (size_t)index >= s->n_items)
+        return NULL;
+    return toc_node_scalar(toc_node_map_get(s->items[index], "name"));
+}
+
 const char *toc_cfg_resolve_role(const toc_config *cfg, const char *name) {
     const toc_node *roles, *r;
     if (!cfg || !name) return name;
@@ -156,6 +180,61 @@ int toc_config_num_views(const toc_config *cfg, const char *display) {
     const toc_node *v = d ? toc_node_map_get(d, display) : NULL;
     return (v && v->kind == TOC_NODE_SEQ) ? (int)v->n_items : 0;
 }
+/* ---- view transform lookup ------------------------------------------------ */
+const toc_node *toc_cfg_find_view_transform(const toc_config *cfg,
+                                            const char *name) {
+    return find_in_seq(cs_seq(cfg, "view_transform"), name);
+}
+
+/* ---- look lookup --------------------------------------------------------- */
+const toc_node *toc_cfg_find_look(const toc_config *cfg, const char *name) {
+    return find_in_seq(cs_seq(cfg, "looks"), name);
+}
+int toc_cfg_view_looks(const toc_node *vnode, const char **names, int max) {
+    const toc_node *lk = toc_node_map_get(vnode, "looks");
+    const char *s;
+    int n = 0;
+    if (!lk || lk->kind != TOC_NODE_SCALAR) return 0;
+    s = toc_node_scalar(lk);
+    while (*s && n < max) {
+        while (*s == ' ' || *s == ',') ++s;
+        if (!*s) break;
+        names[n++] = s;
+        while (*s && *s != ',') ++s;
+        if (*s) { *((char *)s) = '\0'; ++s; } /* mutate in place (owned by arena) */
+    }
+    return n;
+}
+
+/* ---- active displays/views ------------------------------------------------ */
+int toc_config_num_active_displays(const toc_config *cfg) {
+    const toc_node *a = cfg ? toc_node_map_get(cfg->root, "active_displays") : NULL;
+    if (!a) return -1; /* not set = all active */
+    if (a->kind == TOC_NODE_SEQ) return (int)a->n_items;
+    return 0;
+}
+const char *toc_config_active_display_name(const toc_config *cfg, int index) {
+    const toc_node *a = cfg ? toc_node_map_get(cfg->root, "active_displays") : NULL;
+    if (!a || a->kind != TOC_NODE_SEQ || index < 0 ||
+        (size_t)index >= a->n_items)
+        return NULL;
+    return toc_node_scalar(a->items[index]);
+}
+
+int toc_config_num_active_views(const toc_config *cfg) {
+    const toc_node *a = cfg ? toc_node_map_get(cfg->root, "active_views") : NULL;
+    if (!a) return -1; /* not set = all active */
+    if (a->kind == TOC_NODE_SEQ) return (int)a->n_items;
+    return 0;
+}
+const char *toc_config_active_view_name(const toc_config *cfg, int index) {
+    const toc_node *a = cfg ? toc_node_map_get(cfg->root, "active_views") : NULL;
+    if (!a || a->kind != TOC_NODE_SEQ || index < 0 ||
+        (size_t)index >= a->n_items)
+        return NULL;
+    return toc_node_scalar(a->items[index]);
+}
+
 const char *toc_config_view_name(const toc_config *cfg, const char *display,
                                  int index) {
     const toc_node *d = cfg ? toc_node_map_get(cfg->root, "displays") : NULL;

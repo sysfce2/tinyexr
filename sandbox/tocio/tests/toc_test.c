@@ -370,6 +370,213 @@ static void test_processor(void) {
     toc_config_free(cfg);
 }
 
+/* ---- CDL inverse round-trip ---------------------------------------------- */
+static void test_cdl_inverse(void) {
+    /* Build a config with a CDL color space to test inverse */
+    static const char *cdl_cfg =
+        "ocio_profile_version: 2\n"
+        "colorspaces:\n"
+        "  - !<ColorSpace>\n"
+        "    name: lin\n"
+        "    isdata: false\n"
+        "  - !<ColorSpace>\n"
+        "    name: cdlin\n"
+        "    isdata: false\n"
+        "    to_reference: !<CDLTransform> {slope: [1.5, 1.0, 0.8], "
+        "offset: [0.05, 0.0, -0.02], power: [0.9, 1.1, 1.0], sat: 0.85}\n";
+    toc_config *cfg = NULL;
+    toc_op_list *fwd = NULL, *rev = NULL;
+    float px[3] = {0.18f, 0.35f, 0.09f}, orig[3];
+    toc_result rc;
+    memcpy(orig, px, sizeof(px));
+    rc = toc_config_parse(cdl_cfg, strlen(cdl_cfg), NULL, &cfg);
+    CHECK(TOC_OK(rc), "CDL config parse");
+    if (!TOC_OK(rc)) return;
+    /* forward lin -> cdlin (inverse of cdlin's to_reference) */
+    rc = toc_processor_from_colorspaces(cfg, "lin", "cdlin", NULL, &fwd);
+    CHECK(TOC_OK(rc) && fwd, "CDL forward build");
+    /* but cdlin's to_reference is CDL, so lin->cdlin is the inverse path */
+    /* Actually: cdlin's to_reference is CDL, so cdlin->lin is forward CDL.
+     * lin->cdlin is inverse CDL. Let me test both. */
+    /* test 1: cdlin -> lin (forward CDL, 1 op), then lin -> cdlin (inverse CDL, 3 ops) */
+    rc = toc_processor_from_colorspaces(cfg, "cdlin", "lin", NULL, &fwd);
+    CHECK(TOC_OK(rc) && fwd && fwd->count == 1,
+          "CDL forward -> 1 op");
+    if (TOC_OK(rc)) {
+        rc = toc_processor_from_colorspaces(cfg, "lin", "cdlin", NULL, &rev);
+        CHECK(TOC_OK(rc) && rev && rev->count == 3,
+              "CDL inverse -> 3 ops (matrix+exponent+range)");
+        if (TOC_OK(rc)) {
+            toc_apply(fwd, px, 1, 3);
+            toc_apply(rev, px, 1, 3);
+            CHECK(approx(px[0], orig[0], 2e-3f) &&
+                  approx(px[1], orig[1], 2e-3f) &&
+                  approx(px[2], orig[2], 2e-3f),
+                  "CDL forward+inverse round-trip");
+            toc_op_list_free(rev);
+        }
+        toc_op_list_free(fwd);
+    }
+    toc_config_free(cfg);
+}
+
+/* ---- looks + active_displays --------------------------------------------- */
+static const char *g_look_cfg =
+    "ocio_profile_version: 2\n"
+    "roles:\n"
+    "  scene_linear: lin\n"
+    "colorspaces:\n"
+    "  - !<ColorSpace>\n"
+    "    name: lin\n"
+    "    isdata: false\n"
+    "  - !<ColorSpace>\n"
+    "    name: srgb\n"
+    "    isdata: false\n"
+    "    from_reference: !<ExponentTransform> {value: [0.45, 0.45, 0.45, 1]}\n"
+    "looks:\n"
+    "  - !<Look>\n"
+    "    name: darken\n"
+    "    process_space: lin\n"
+    "    transform: !<ExponentTransform> {value: [0.5, 0.5, 0.5, 1]}\n"
+    "active_displays: [sRGB]\n"
+    "active_views: [Raw]\n"
+    "displays:\n"
+    "  sRGB:\n"
+    "    - !<View> {name: Raw, colorspace: srgb}\n"
+    "    - !<View> {name: Dark, colorspace: srgb, looks: darken}\n";
+
+static void test_looks(void) {
+    toc_config *cfg = NULL;
+    toc_result rc =
+        toc_config_parse(g_look_cfg, strlen(g_look_cfg), NULL, &cfg);
+    CHECK(TOC_OK(rc), "looks config parse");
+    if (!TOC_OK(rc)) return;
+    /* introspection */
+    CHECK(toc_config_num_looks(cfg) == 1, "num_looks == 1");
+    {
+        const char *n = toc_config_look_name(cfg, 0);
+        CHECK(n && strcmp(n, "darken") == 0, "look name");
+    }
+    {
+        int na = toc_config_num_active_displays(cfg);
+        CHECK(na == 1, "active_displays count");
+        if (na > 0) {
+            const char *d = toc_config_active_display_name(cfg, 0);
+            CHECK(d && strcmp(d, "sRGB") == 0, "active display name");
+        }
+    }
+    {
+        int na = toc_config_num_active_views(cfg);
+        CHECK(na == 1, "active_views count");
+        if (na > 0) {
+            const char *v = toc_config_active_view_name(cfg, 0);
+            CHECK(v && strcmp(v, "Raw") == 0, "active view name");
+        }
+    }
+    /* simple view (no look): src -> srgb */
+    {
+        toc_op_list *ops = NULL;
+        float px[3] = {0.3f, 0.3f, 0.3f};
+        rc = toc_processor_from_display_view(cfg, "lin", "sRGB", "Raw",
+                                             NULL, &ops);
+        CHECK(TOC_OK(rc) && ops && ops->count == 1, "Raw no-look view");
+        if (TOC_OK(rc)) {
+            toc_apply(ops, px, 1, 3);
+            CHECK(approx(px[0], powf(0.3f, 0.45f), 1e-3f),
+                  "Raw view (srgb ^0.45)");
+            toc_op_list_free(ops);
+        }
+    }
+    /* view with look: src -> reference -> process_space lin -> ^0.5 -> reference -> srgb */
+    {
+        toc_op_list *ops = NULL;
+        float px[3] = {0.3f, 0.3f, 0.3f};
+        rc = toc_processor_from_display_view(cfg, "lin", "sRGB", "Dark",
+                                             NULL, &ops);
+        CHECK(TOC_OK(rc) && ops, "Dark look view");
+        if (TOC_OK(rc)) {
+            /* pipeline: 0.3 (lin) -> to ref (identity) -> lin process space (no-op)
+             * -> ^0.5 -> to ref (identity) -> srgb ^0.45
+             * result: pow(pow(0.3, 0.5), 0.45) = pow(0.3, 0.225) = 0.763 */
+            toc_apply(ops, px, 1, 3);
+            CHECK(approx(px[0], powf(0.3f, 0.225f), 1e-3f),
+                  "Dark view (^0.5 then ^0.45)");
+            toc_op_list_free(ops);
+        }
+    }
+    toc_config_free(cfg);
+}
+
+/* ---- view_transform display path ----------------------------------------- */
+static const char *g_vt_cfg =
+    "ocio_profile_version: 2\n"
+    "roles:\n"
+    "  scene_linear: lin\n"
+    "colorspaces:\n"
+    "  - !<ColorSpace>\n"
+    "    name: lin\n"
+    "    isdata: false\n"
+    "  - !<ColorSpace>\n"
+    "    name: srgb\n"
+    "    isdata: false\n"
+    "    from_reference: !<ExponentTransform> {value: [0.45, 0.45, 0.45, 1]}\n"
+    "view_transform:\n"
+    "  - !<ViewTransform>\n"
+    "    name: test_vt\n"
+    "    from_reference: !<MatrixTransform> {matrix: [2,0,0,0, 0,2,0,0, "
+    "0,0,2,0, 0,0,0,1]}\n"
+    "displays:\n"
+    "  sRGB:\n"
+    "    - !<View> {name: Raw, colorspace: srgb}\n"
+    "    - !<View> {name: Log, view_transform: test_vt, display_colorspace: srgb}\n";
+
+static void test_display_view(void) {
+    toc_config *cfg = NULL;
+    toc_result rc =
+        toc_config_parse(g_vt_cfg, strlen(g_vt_cfg), NULL, &cfg);
+    CHECK(TOC_OK(rc), "view_transform config parse");
+    if (!TOC_OK(rc)) return;
+    /* introspection */
+    CHECK(toc_config_num_view_transforms(cfg) == 1,
+          "num_view_transforms == 1");
+    {
+        const char *n = toc_config_view_transform_name(cfg, 0);
+        CHECK(n && strcmp(n, "test_vt") == 0, "view_transform name");
+    }
+    /* simple view: src -> srgb via colorspace */
+    {
+        toc_op_list *ops = NULL;
+        rc = toc_processor_from_display_view(cfg, "lin", "sRGB", "Raw",
+                                             NULL, &ops);
+        CHECK(TOC_OK(rc) && ops && ops->count == 1, "Raw simple view -> 1 op");
+        if (TOC_OK(rc)) {
+            float px[3] = {0.3f, 0.3f, 0.3f};
+            toc_apply(ops, px, 1, 3);
+            /* srgb from_reference is ^0.45 on 0.3 = pow(0.3, 0.45) = 0.589 */
+            CHECK(approx(px[0], powf(0.3f, 0.45f), 1e-3f), "Raw view value");
+            toc_op_list_free(ops);
+        }
+    }
+    /* view_transform view: src -> reference -> vt *2 -> srgb ^0.45 */
+    {
+        toc_op_list *ops = NULL;
+        rc = toc_processor_from_display_view(cfg, "lin", "sRGB", "Log",
+                                             NULL, &ops);
+        CHECK(TOC_OK(rc) && ops && ops->count == 2,
+              "Log view_transform view -> 2 ops");
+        if (TOC_OK(rc)) {
+            float px[3] = {0.3f, 0.3f, 0.3f};
+            /* pipeline: 0.3 (lin) -> identity to ref -> *2 (vt from_ref)
+             * -> pow(0.6, 0.45) = 0.796 (srgb from_ref) */
+            toc_apply(ops, px, 1, 3);
+            CHECK(approx(px[0], powf(0.6f, 0.45f), 1e-3f),
+                  "Log view_transform view value");
+            toc_op_list_free(ops);
+        }
+    }
+    toc_config_free(cfg);
+}
+
 /* ---- file LUTs ----------------------------------------------------------- */
 static void load_and_check(const char *name, const char *txt, float in,
                            float expect, const char *msg) {
@@ -409,6 +616,241 @@ static void test_lutfile(void) {
                    "Version 1\nFrom 0.0 1.0\nLength 3\nComponents 1\n{\n0.0\n"
                    "0.5\n1.0\n}\n",
                    0.25f, 0.25f, ".spi1d ramp midpoint");
+    /* ---- CLF (Common LUT Format) ----------------------------------------- */
+    load_and_check(
+        "id.clf",
+        "<?xml version=\"1.0\"?>\n"
+        "<ProcessList compCLFversion=\"3\" id=\"id\">\n"
+        "  <LUT1D>\n"
+        "    <Array dim=\"3 4\">\n"
+        "      0 0 0\n"
+        "      0.3333 0.3333 0.3333\n"
+        "      0.6667 0.6667 0.6667\n"
+        "      1 1 1\n"
+        "    </Array>\n"
+        "  </LUT1D>\n"
+        "</ProcessList>\n",
+        0.5f, 0.5f, ".clf 1D identity via LUT");
+    load_and_check(
+        "id3.clf",
+        "<ProcessList compCLFversion=\"3\" id=\"id3\">\n"
+        "  <LUT3D>\n"
+        "    <Array dim=\"3 2 2 2\">\n"
+        "      0 0 0\n"
+        "      1 0 0\n"
+        "      0 1 0\n"
+        "      1 1 0\n"
+        "      0 0 1\n"
+        "      1 0 1\n"
+        "      0 1 1\n"
+        "      1 1 1\n"
+        "    </Array>\n"
+        "  </LUT3D>\n"
+        "</ProcessList>\n",
+        0.4f, 0.4f, ".clf 3D identity");
+    /* Matrix doubling brightness */
+    {
+        static const char *clf =
+            "<?xml version=\"1.0\"?>\n"
+            "<ProcessList>\n"
+            "  <Matrix>\n"
+            "    <Array dim=\"3 3\">\n"
+            "      2 0 0\n"
+            "      0 2 0\n"
+            "      0 0 2\n"
+            "    </Array>\n"
+            "  </Matrix>\n"
+            "</ProcessList>\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "x2.clf", clf, strlen(clf), 0);
+        CHECK(TOC_OK(rc) && l->count == 1 && l->ops[0].kind == TOC_OP_MATRIX,
+              ".clf Matrix 2x brightness");
+        if (TOC_OK(rc)) {
+            float px[3] = {0.3f, 0.3f, 0.3f};
+            toc_apply(l, px, 1, 3);
+            CHECK(approx(px[0], 0.6f, 1e-4f), ".clf Matrix 2x value");
+        }
+        toc_op_list_free(l);
+    }
+    /* Range CLA */
+    {
+        static const char *clf =
+            "<ProcessList>\n"
+            "  <Range>\n"
+            "    <minInValue>0.0</minInValue>\n"
+            "    <maxInValue>1.0</maxInValue>\n"
+            "    <minOutValue>0.1</minOutValue>\n"
+            "    <maxOutValue>0.9</maxOutValue>\n"
+            "  </Range>\n"
+            "</ProcessList>\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "cla.clf", clf, strlen(clf), 0);
+        CHECK(TOC_OK(rc) && l->count == 1 && l->ops[0].kind == TOC_OP_RANGE,
+              ".clf Range");
+        if (TOC_OK(rc)) {
+            float p1[3] = {0.0f, 0.0f, 0.0f};
+            float p2[3] = {0.5f, 0.5f, 0.5f};
+            float p3[3] = {1.0f, 1.0f, 1.0f};
+            toc_apply(l, p1, 1, 3);
+            toc_apply(l, p2, 1, 3);
+            toc_apply(l, p3, 1, 3);
+            CHECK(approx(p1[0], 0.1f, 1e-4f), ".clf Range lo clamp");
+            CHECK(approx(p2[0], 0.5f, 1e-4f), ".clf Range mid");
+            CHECK(approx(p3[0], 0.9f, 1e-4f), ".clf Range hi clamp");
+        }
+        toc_op_list_free(l);
+    }
+    /* Exponent */
+    {
+        static const char *clf =
+            "<ProcessList>\n"
+            "  <Exponent>\n"
+            "    <ExponentParams style=\"basicFwd\">2.2 2.2 2.2</ExponentParams>\n"
+            "  </Exponent>\n"
+            "</ProcessList>\n";
+        load_and_check("gamma.clf", clf, 0.5f, powf(0.5f, 2.2f), ".clf Exponent");
+    }
+    /* Multi-op: Matrix + Range */
+    {
+        static const char *clf =
+            "<?xml version=\"1.0\"?>\n"
+            "<ProcessList>\n"
+            "  <Matrix>\n"
+            "    <Array dim=\"3 3\">\n"
+            "      1 0 0\n"
+            "      0 1 0\n"
+            "      0 0 1\n"
+            "    </Array>\n"
+            "  </Matrix>\n"
+            "  <Range>\n"
+            "    <minInValue>0.0</minInValue>\n"
+            "    <maxInValue>1.0</maxInValue>\n"
+            "    <minOutValue>0.0</minOutValue>\n"
+            "    <maxOutValue>1.0</maxOutValue>\n"
+            "  </Range>\n"
+            "</ProcessList>\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "multi.clf", clf, strlen(clf), 0);
+        CHECK(TOC_OK(rc) && l->count == 2, ".clf multi-op count");
+        CHECK(TOC_OK(rc) && l->count >= 2 &&
+                  l->ops[0].kind == TOC_OP_MATRIX &&
+                  l->ops[1].kind == TOC_OP_RANGE,
+              ".clf multi-op types");
+        if (TOC_OK(rc)) {
+            float px[3] = {0.42f, 0.42f, 0.42f};
+            toc_apply(l, px, 1, 3);
+            CHECK(approx(px[0], 0.42f, 1e-4f), ".clf multi-op identity");
+        }
+        toc_op_list_free(l);
+    }
+    /* sniff by content (no name hint): <?xml triggers CLF parser */
+    load_and_check(NULL,
+                   "<?xml version=\"1.0\"?>\n<ProcessList>\n"
+                   "  <LUT1D>\n"
+                   "    <Array dim=\"3 2\">0 0 0 1 1 1</Array>\n"
+                   "  </LUT1D>\n"
+                   "</ProcessList>\n",
+                   0.5f, 0.5f, ".clf sniff by <?xml");
+    /* sniff by content: <ProcessList directly */
+    load_and_check(NULL,
+                   "<ProcessList>\n"
+                   "  <LUT1D>\n"
+                   "    <Array dim=\"3 2\">0 0 0 1 1 1</Array>\n"
+                   "  </LUT1D>\n"
+                   "</ProcessList>\n",
+                   0.5f, 0.5f, ".clf sniff by <ProcessList");
+    /* ---- CSP (ColorSpace Process) ----------------------------------------- */
+    /* 3D mesh identity N=2 */
+    load_and_check(
+        "id.csp",
+        "CSPLUTV1.0\n"
+        "3DMESH 2\n"
+        "3D\n"
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+        "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        0.4f, 0.4f, ".csp 3D identity");
+    /* PRE_1D + 3D identity */
+    load_and_check(
+        "pre.csp",
+        "CSPLUTV1.0\n"
+        "PRE_1D 2\n"
+        "0 0 0\n1 1 1\n"
+        "3DMESH 2\n"
+        "3D\n"
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+        "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        0.3f, 0.3f, ".csp PRE_1D + 3D identity");
+    /* POST_1D + 3D identity */
+    load_and_check(
+        "post.csp",
+        "CSPLUTV1.0\n"
+        "3DMESH 2\n"
+        "3D\n"
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+        "0 0 1\n1 0 1\n0 1 1\n1 1 1\n"
+        "POST_1D 2\n"
+        "0 0 0\n1 1 1\n",
+        0.3f, 0.3f, ".csp 3D + POST_1D identity");
+    /* full pipeline: PRE_1D + 3D + POST_1D */
+    load_and_check(
+        "full.csp",
+        "CSPLUTV1.0\n"
+        "POST_1D 2\n"
+        "0 0 0\n1 1 1\n"
+        "3DMESH 2 2 2\n"
+        "PRE_1D 2\n"
+        "0 0 0\n1 1 1\n"
+        "3D\n"
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+        "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        0.3f, 0.3f, ".csp full pipeline identity");
+    /* CSPLUT0001 header */
+    load_and_check(
+        "alt.csp",
+        "CSPLUT0001\n"
+        "3DMESH 2\n"
+        "3D\n"
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+        "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        0.4f, 0.4f, ".csp CSPLUT0001 header");
+    /* content sniffing (no extension) */
+    load_and_check(NULL,
+                   "CSPLUTV1.0\n"
+                   "3DMESH 2\n"
+                   "3D\n"
+                   "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+                   "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+                   0.4f, 0.4f, ".csp sniff by content");
+    /* multi-op count check for full pipeline */
+    {
+        static const char *csp =
+            "CSPLUTV1.0\n"
+            "PRE_1D 2\n0 0 0\n0.5 0.5 0.5\n"
+            "3DMESH 2\n"
+            "3D\n"
+            "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+            "0 0 1\n1 0 1\n0 1 1\n1 1 1\n"
+            "POST_1D 2\n0 0 0\n1 1 1\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "full.csp", csp, strlen(csp), 0);
+        CHECK(TOC_OK(rc) && l->count == 3, ".csp 3-op pipeline");
+        CHECK(TOC_OK(rc) && l->count >= 3 &&
+                  l->ops[0].kind == TOC_OP_LUT1D &&
+                  l->ops[1].kind == TOC_OP_LUT3D &&
+                  l->ops[2].kind == TOC_OP_LUT1D,
+              ".csp 3-op types (LUT1D->LUT3D->LUT1D)");
+        toc_op_list_free(l);
+    }
+    /* non-identity PRE_1D: scales by 0.5 */
+    load_and_check(
+        "scale.csp",
+        "CSPLUTV1.0\n"
+        "PRE_1D 2\n0 0 0\n0.5 0.5 0.5\n"
+        "3DMESH 2\n"
+        "3D\n"
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+        "0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        0.4f, 0.2f, ".csp PRE_1D scale 0.5");
 }
 
 /* file reader returning a baked identity .spi1d for any name */
@@ -479,6 +921,158 @@ static void build_pipeline(toc_op_list *l) {
         r->u.range.max[c] = 1.0f;
     }
     r->u.range.clamp_lo = r->u.range.clamp_hi = 1;
+}
+
+/* ---- edge-case hardening ------------------------------------------------ */
+static void test_edge_cases(void) {
+    /* ---- CLF edge cases ---- */
+    /* truncated: no closing tags (use strlen for correct length) */
+    {
+        const char *s = "<ProcessList>\n<Matrix>\n<Array dim=\"3 3\">\n"
+                        "1 0 0\n0 1 0\n0 0 1\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "bad.clf", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".clf truncated");
+        toc_op_list_free(l);
+    }
+    /* empty input */
+    {
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "empty.clf", "", 0, 0);
+        CHECK(!TOC_OK(rc), ".clf empty");
+        toc_op_list_free(l);
+    }
+    /* unknown process nodes silently skipped */
+    {
+        const char *s =
+            "<ProcessList>\n<UnknownNode/>\n<Garbage></Garbage>\n"
+            "<LUT1D>\n<Array dim=\"3 2\">0 0 0 1 1 1</Array>\n</LUT1D>\n"
+            "</ProcessList>\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "skip.clf", s, strlen(s), 0);
+        CHECK(TOC_OK(rc) && l->count == 1 && l->ops[0].kind == TOC_OP_LUT1D,
+              ".clf unknown nodes skipped");
+        toc_op_list_free(l);
+    }
+    /* insane LUT dimensions rejected */
+    {
+        const char *s =
+            "<ProcessList>\n<LUT3D>\n<Array dim=\"3 9999 9999 9999\">\n"
+            "0 0 0</Array>\n</LUT3D>\n</ProcessList>\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "big.clf", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".clf insane size rejected");
+        toc_op_list_free(l);
+    }
+    /* CLF with only comments and whitespace */
+    {
+        const char *s = "<?xml version=\"1.0\"?>\n<!-- just a comment -->\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "ws.clf", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".clf only comments");
+        toc_op_list_free(l);
+    }
+    /* CLF: Range with no child elements (should produce identity range) */
+    {
+        const char *s =
+            "<ProcessList>\n<Range>\n</Range>\n</ProcessList>\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "rnge.clf", s, strlen(s), 0);
+        CHECK(TOC_OK(rc) && l->count == 1 && l->ops[0].kind == TOC_OP_RANGE,
+              ".clf empty Range");
+        if (TOC_OK(rc)) {
+            float px[3] = {2.0f, 2.0f, 2.0f};
+            toc_apply(l, px, 1, 3);
+            CHECK(approx(px[0], 2.0f, 1e-4f), ".clf empty Range identity");
+        }
+        toc_op_list_free(l);
+    }
+    /* ---- CSP edge cases ---- */
+    /* missing 3D section */
+    {
+        const char *s = "CSPLUTV1.0\n3DMESH 2\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "bad.csp", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".csp missing 3D");
+        toc_op_list_free(l);
+    }
+    /* truncated 3D data */
+    {
+        const char *s = "CSPLUTV1.0\n3DMESH 2\n3D\n0 0 0\n1 0 0\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "trunc.csp", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".csp truncated 3D");
+        toc_op_list_free(l);
+    }
+    /* malformed header (not CSP, not CLF, not cube — falls through to cube parser) */
+    {
+        const char *s =
+            "NOTCSP\n3DMESH 2\n3D\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+            "0 0 1\n1 1 1\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "bad.csp", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".csp bad header");
+        toc_op_list_free(l);
+    }
+    /* insane mesh size */
+    {
+        const char *s = "CSPLUTV1.0\n3DMESH 9999\n3D\n0 0 0\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "huge.csp", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".csp insane size");
+        toc_op_list_free(l);
+    }
+    /* PRE_1D with missing data */
+    {
+        const char *s = "CSPLUTV1.0\nPRE_1D 10\n0 0 0\n1 1 1\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "badpre.csp", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), ".csp PRE_1D truncated");
+        toc_op_list_free(l);
+    }
+    /* ---- general edge cases ---- */
+    /* empty input */
+    {
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "empty", "", 0, 0);
+        CHECK(!TOC_OK(rc), "empty input all parsers");
+        toc_op_list_free(l);
+    }
+    /* all whitespace */
+    {
+        const char *s = "   \n\t\n   \n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "ws", s, strlen(s), 0);
+        CHECK(!TOC_OK(rc), "whitespace-only input");
+        toc_op_list_free(l);
+    }
+    /* invert should return NONINVERTIBLE for all LUT types */
+    {
+        const char *cube = "LUT_1D_SIZE 2\n0 0 0\n1 1 1\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "inv.cube", cube, strlen(cube), 1);
+        CHECK(rc == TOC_ERROR_NONINVERTIBLE, "invert cube -> NONINVERTIBLE");
+        toc_op_list_free(l);
+    }
+    {
+        const char *csp =
+            "CSPLUTV1.0\n3DMESH 2\n3D\n"
+            "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+            "0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "inv.csp", csp, strlen(csp), 1);
+        CHECK(rc == TOC_ERROR_NONINVERTIBLE, "invert CSP -> NONINVERTIBLE");
+        toc_op_list_free(l);
+    }
+    {
+        const char *clf =
+            "<ProcessList>\n<LUT1D>\n<Array dim=\"3 2\">0 0 0 1 1 1</Array>\n"
+            "</LUT1D>\n</ProcessList>\n";
+        toc_op_list *l = newlist();
+        toc_result rc = toc_load_lutfile(l, "inv.clf", clf, strlen(clf), 1);
+        CHECK(rc == TOC_ERROR_NONINVERTIBLE, "invert CLF -> NONINVERTIBLE");
+        toc_op_list_free(l);
+    }
 }
 
 static void test_codegen_c(void) {
@@ -697,6 +1291,82 @@ static void test_builtins(void) {
     toc_config_free(cfg);
 }
 
+/* ---- FixedFunction styles (round-trip for all invert pairs) -------------- */
+static void push_fixedfunc(toc_op_list *l, int style, const float *params,
+                            int nparams) {
+    toc_op *op = toc_op_list_push(l, TOC_OP_FIXEDFUNC);
+    int i;
+    op->u.fixedfunc.style = style;
+    for (i = 0; i < nparams; ++i) op->u.fixedfunc.params[i] = params[i];
+    op->u.fixedfunc.nparams = nparams;
+}
+
+static void test_fixedfunc_styles(void) {
+    struct { int fwd, inv; const char *name; float pixel[3]; float params[8];
+             int nparams; float eps; } styles[] = {
+        {TOC_FF_ACES_GLOW03, TOC_FF_ACES_GLOW03_INV, "Glow03",
+         {0.02f,0.03f,0.01f}, {0.075f,0.1f}, 2, 5e-3f},
+        {TOC_FF_ACES_GLOW10, TOC_FF_ACES_GLOW10_INV, "Glow10",
+         {0.02f,0.03f,0.01f}, {0.05f,0.08f}, 2, 5e-3f},
+        {TOC_FF_ACES_DARKTODIM10, TOC_FF_ACES_DARKTODIM10_INV, "DarkToDim10",
+         {0.18f,0.35f,0.09f}, {0.9811f}, 1, 2e-3f},
+        {TOC_FF_ACES_RED_MOD_03, TOC_FF_ACES_RED_MOD_03_INV, "RedMod03",
+         {0.8f,0.3f,0.2f}, {0}, 0, 2e-3f},
+        {TOC_FF_ACES_RED_MOD_10, TOC_FF_ACES_RED_MOD_10_INV, "RedMod10",
+         {0.8f,0.3f,0.2f}, {0}, 0, 2e-3f},
+        {TOC_FF_ACES_GAMUTCOMP13, TOC_FF_ACES_GAMUTCOMP13_INV, "GamutComp13",
+         {0.8f,0.3f,0.2f}, {0.5f,0.5f,0.5f,0.1f,0.1f,0.1f,0.7f}, 7, 5e-3f},
+        {TOC_FF_RGB_TO_HSV, TOC_FF_HSV_TO_RGB, "RGB->HSV",
+         {0.8f,0.3f,0.5f}, {0}, 0, 1e-4f},
+        {TOC_FF_XYZ_TO_xyY, TOC_FF_xyY_TO_XYZ, "XYZ<->xyY",
+         {0.3f,0.3f,0.3f}, {0}, 0, 1e-4f},
+        {TOC_FF_XYZ_TO_uvY, TOC_FF_uvY_TO_XYZ, "XYZ<->uvY",
+         {0.3f,0.3f,0.3f}, {0}, 0, 1e-4f},
+        {TOC_FF_XYZ_TO_LUV, TOC_FF_LUV_TO_XYZ, "XYZ<->LUV",
+         {0.3f,0.3f,0.3f}, {0}, 0, 5e-3f},
+    };
+    int i;
+    for (i = 0; i < (int)(sizeof(styles)/sizeof(styles[0])); ++i) {
+        toc_op_list *l = newlist();
+        float px[3], orig[3];
+        int c;
+        memcpy(orig, styles[i].pixel, sizeof(orig));
+        memcpy(px, orig, sizeof(px));
+        push_fixedfunc(l, styles[i].fwd, styles[i].params, styles[i].nparams);
+        toc_apply(l, px, 1, 3);
+        /* verify forward changed pixel */
+        {
+            int changed = 0;
+            for (c = 0; c < 3; ++c)
+                if (!approx(px[c], orig[c], 1e-6f)) changed = 1;
+            CHECK(changed, styles[i].name);
+        }
+        toc_op_list_free(l);
+        /* round-trip */
+        {
+            toc_op_list *rt = newlist();
+            memcpy(px, orig, sizeof(px));
+            push_fixedfunc(rt, styles[i].fwd, styles[i].params, styles[i].nparams);
+            push_fixedfunc(rt, styles[i].inv, styles[i].params, styles[i].nparams);
+            toc_apply(rt, px, 1, 3);
+            CHECK(approx(px[0], orig[0], styles[i].eps) &&
+                  approx(px[1], orig[1], styles[i].eps) &&
+                  approx(px[2], orig[2], styles[i].eps), styles[i].name);
+            toc_op_list_free(rt);
+        }
+    }
+    /* Direct style value check for HSV_TO_RGB: hue=60°(h*6=1), sat=0.625, val=0.8 */
+    {
+        toc_op_list *l = newlist();
+        float px[3] = {0.166667f, 0.625f, 0.8f};
+        push_fixedfunc(l, TOC_FF_HSV_TO_RGB, NULL, 0);
+        toc_apply(l, px, 1, 3);
+        CHECK(approx(px[0], 0.8f, 1e-4f) && approx(px[1], 0.8f, 1e-4f) &&
+              approx(px[2], 0.3f, 1e-4f), "HSV_TO_RGB direct");
+        toc_op_list_free(l);
+    }
+}
+
 /* ---- x64 JIT: emitted machine code == interpreter ------------------------ */
 static void test_jit(void) {
     toc_op_list *l = newlist();
@@ -864,9 +1534,14 @@ int main(void) {
     test_yaml();
     printf("== tocio processor ==\n");
     test_processor();
+    test_cdl_inverse();
+    test_display_view();
+    test_looks();
     printf("== tocio file LUTs ==\n");
     test_lutfile();
     test_filetransform();
+    printf("== tocio edge cases ==\n");
+    test_edge_cases();
     printf("== tocio AOT-C codegen ==\n");
     test_codegen_c();
     printf("== tocio GLSL codegen ==\n");
@@ -875,6 +1550,8 @@ int main(void) {
     test_simd_parity();
     printf("== tocio builtins + fixedfunc ==\n");
     test_builtins();
+    printf("== tocio fixedfunc styles ==\n");
+    test_fixedfunc_styles();
     printf("== tocio x64 JIT ==\n");
     test_jit();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

@@ -185,6 +185,15 @@ void toc_range_batch_avx2(const float *scale, const float *offset,
 unsigned toc_cpu_has_avx2(void);
 #endif
 
+#if defined(__aarch64__)
+#define TOC_NEON 1
+void toc_matrix_batch_neon(const float *m, const float *off, float *rgba,
+                           size_t npix, int ch);
+void toc_range_batch_neon(const float *scale, const float *offset,
+                          const float *vmin, const float *vmax, int clamp_lo,
+                          int clamp_hi, float *rgba, size_t npix, int ch);
+#endif
+
 /* ============================================================================
  * Config model (opaque to the public API; defined here for config + processor)
  * ========================================================================== */
@@ -207,6 +216,15 @@ int toc_cfg_is_data(const toc_node *cs);
  * Returns NULL if neither direction is defined (identity). */
 const toc_node *toc_cfg_cs_transform(const toc_node *cs, int want_to_ref,
                                      int *out_invert);
+/* Find a ViewTransform node by name. */
+const toc_node *toc_cfg_find_view_transform(const toc_config *cfg, const char *name);
+/* Find a Look node by name (from the `looks` top-level seq). */
+const toc_node *toc_cfg_find_look(const toc_config *cfg, const char *name);
+/* Parse a comma-separated `looks` list from a view node. Returns count written
+ * to `names` (up to max), or 0 if absent/empty. Mutates the arena-owned string
+ * in place (NUL-separating the entries). */
+int toc_cfg_view_looks(const toc_node *vnode, const char **names, int max);
+/* Public active-displays/views API is in tocio.h (toc_config_* names). */
 
 /* ============================================================================
  * Processor internals (toc_processor.c) + LUT-file loaders (toc_lutfile.c)
@@ -223,6 +241,10 @@ toc_result toc_invert_op(toc_op *op);
  * LUT3D). The sample array is added to `list->owned`. */
 toc_result toc_load_lutfile(toc_op_list *list, const char *name,
                             const char *data, size_t len, int invert);
+/* Parse a CLF (Common LUT Format) XML blob into a sequence of ops. */
+toc_result toc_load_clf(toc_op_list *list, const char *data, size_t len);
+/* Parse a CSP (ColorSpace Process) LUT blob into PRE_1D -> 3D -> POST_1D ops. */
+toc_result toc_load_csp(toc_op_list *list, const char *data, size_t len);
 
 /* Expand a BuiltinTransform style into primitive ops (toc_builtins.c). */
 toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert);

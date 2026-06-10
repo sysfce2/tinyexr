@@ -252,6 +252,10 @@ toc_result toc_load_lutfile(toc_op_list *list, const char *name,
         return load_cube(list, &c);
     if (name && ends_with(name, ".spi1d")) return load_spi1d(list, &c);
     if (name && ends_with(name, ".spi3d")) return load_spi3d(list, &c);
+    if (name && (ends_with(name, ".clf") || ends_with(name, ".CLF")))
+        return toc_load_clf(list, data, len);
+    if (name && (ends_with(name, ".csp") || ends_with(name, ".CSP")))
+        return toc_load_csp(list, data, len);
     /* sniff by content */
     {
         cur s = c;
@@ -261,6 +265,24 @@ toc_result toc_load_lutfile(toc_op_list *list, const char *name,
             read_word(&s, w, sizeof(w));
             if (kweq(w, "SPILUT")) return load_spi3d(list, &c);
             if (kweq(w, "Version")) return load_spi1d(list, &c);
+        }
+    }
+    /* sniff for CSP: CSPLUTV1.0 or CSPLUT0001 */
+    if (len > 9) {
+        const char *p = data;
+        while (p < data + len && (unsigned char)*p <= 0x20) ++p;
+        if ((size_t)(data + len - p) > 9 &&
+            memcmp(p, "CSPLUT", 6) == 0)
+            return toc_load_csp(list, data, len);
+    }
+    /* sniff for CLF: look for <?xml or <ProcessList */
+    if (len > 12) {
+        const char *p = data;
+        while (p < data + len && (unsigned char)*p <= 0x20) ++p;
+        if ((size_t)(data + len - p) > 12) {
+            if ((p[0] == '<' && p[1] == '?') ||
+                (p[0] == '<' && memcmp(p + 1, "ProcessList", 11) == 0))
+                return toc_load_clf(list, data, len);
         }
     }
     return load_cube(list, &c);

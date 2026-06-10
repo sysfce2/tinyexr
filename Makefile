@@ -341,6 +341,16 @@ tocio-test: | build
 	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -ldl -o build/toc_test
 	ASAN_OPTIONS=detect_leaks=0 ./build/toc_test
 
+# ---- tocio ARM64 (aarch64 NEON) cross build + qemu test ---------------------
+# Cross-compile the full tocio test suite and run under qemu-aarch64.
+# toc_jit.c provides stub implementations on non-x86, so include it.
+.PHONY: tocio-arm-test
+tocio-arm-test: | build
+	$(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 \
+	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -o build/toc_test_arm
+	@file build/toc_test_arm | sed 's/^/  /'
+	$(ARM_QEMU) ./build/toc_test_arm
+
 # ---- tocio WASM (Emscripten ES6 module for the web viewer) -----------------
 TOCW_EXPORTS = ['_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_malloc','_free']
 TOCW_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','UTF8ToString','stringToUTF8','lengthBytesUTF8']

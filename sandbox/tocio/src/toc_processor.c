@@ -196,12 +196,62 @@ toc_result toc_lower_transform(const toc_config *cfg, toc_op_list *list,
         float sl[3] = {1, 1, 1}, of[3] = {0, 0, 0}, pw[3] = {1, 1, 1};
         float sat = 1.0f;
         const toc_node *style;
-        int i;
-        if (invert) return TOC_ERROR_NONINVERTIBLE; /* pass 1: forward only */
+        int i, clamp_val = 1;
         read_vec(node, "slope", sl, 3);
         read_vec(node, "offset", of, 3);
         read_vec(node, "power", pw, 3);
         read_scalar(node, "sat", &sat);
+        style = toc_node_map_get(node, "style");
+        if (style) {
+            const char *s = toc_node_scalar(style);
+            if (s && strcmp(s, "noclamp") == 0) clamp_val = 0;
+        }
+        if (invert) {
+            /* Decompose CDL inverse into basic ops for backend-agnostic support.
+             * Forward: slope*in+offset -> power -> saturation.
+             * Inverse: inv_saturation -> inv_power -> inv_slope+offset. */
+            float luma[3] = {0.2126f, 0.7152f, 0.0593f};
+            float ny = 1.0f / sat;
+            /* 1. Inverse saturation as a matrix:
+             *    c' = c/s - ((1-s)/s)*broadcast(luma·c)
+             *  => M[i][j] = delta(i,j)/s + (1-1/s)*luma[j]   (col-major). */
+            {
+                toc_op *m = toc_op_list_push(list, TOC_OP_MATRIX);
+                if (!m) return TOC_ERROR_OUT_OF_MEMORY;
+                memset(m->u.matrix.m, 0, sizeof(m->u.matrix.m));
+                for (i = 0; i < 3; ++i) {
+                    int j;
+                    for (j = 0; j < 3; ++j)
+                        m->u.matrix.m[j * 4 + i] =
+                            (i == j ? ny : 0.0f) + (1.0f - ny) * luma[j];
+                }
+                m->u.matrix.m[15] = 1.0f;
+                memset(m->u.matrix.off, 0, sizeof(m->u.matrix.off));
+            }
+            /* 2. Inverse power: pow(c, 1/power) */
+            {
+                toc_op *e = toc_op_list_push(list, TOC_OP_EXPONENT);
+                if (!e) return TOC_ERROR_OUT_OF_MEMORY;
+                for (i = 0; i < 3; ++i)
+                    e->u.exponent.e[i] = (pw[i] != 0.0f) ? 1.0f / pw[i] : 1.0f;
+                e->u.exponent.e[3] = 1.0f;
+            }
+            /* 3. Inverse (slope,offset): (c - offset) / slope = (1/slope)*c - offset/slope */
+            {
+                toc_op *r = toc_op_list_push(list, TOC_OP_RANGE);
+                if (!r) return TOC_ERROR_OUT_OF_MEMORY;
+                for (i = 0; i < 4; ++i) {
+                    float s = (i < 3 && sl[i] != 0.0f) ? 1.0f / sl[i] : 1.0f;
+                    r->u.range.scale[i] = s;
+                    r->u.range.offset[i] = (i < 3) ? -of[i] * s : 0.0f;
+                    r->u.range.min[i] = 0.0f;
+                    r->u.range.max[i] = 1.0f;
+                }
+                r->u.range.clamp_lo = clamp_val;
+                r->u.range.clamp_hi = clamp_val;
+            }
+            return TOC_SUCCESS;
+        }
         op = toc_op_list_push(list, TOC_OP_CDL);
         if (!op) return TOC_ERROR_OUT_OF_MEMORY;
         for (i = 0; i < 3; ++i) {
@@ -210,12 +260,7 @@ toc_result toc_lower_transform(const toc_config *cfg, toc_op_list *list,
             op->u.cdl.power[i] = pw[i];
         }
         op->u.cdl.saturation = sat;
-        op->u.cdl.clamp = 1; /* ASC default clamps */
-        style = toc_node_map_get(node, "style");
-        if (style) {
-            const char *s = toc_node_scalar(style);
-            if (s && strcmp(s, "noclamp") == 0) op->u.cdl.clamp = 0;
-        }
+        op->u.cdl.clamp = clamp_val;
         return TOC_SUCCESS;
     }
 
@@ -440,13 +485,14 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
                                            const char *display, const char *view,
                                            const toc_allocator *a,
                                            toc_op_list **out) {
-    /* Display/view composition is filled in by phase 8; for now resolve the
-     * view's colorspace (simple views) and convert src_cs -> that colorspace. */
     const toc_node *d, *views, *vnode;
-    const char *view_cs;
+    const char *view_cs, *view_vt, *view_dc;
     size_t i;
+    toc_op_list *list;
+    toc_result rc;
     if (!cfg || !src_cs || !display || !view || !out)
         return TOC_ERROR_INVALID_ARGUMENT;
+    *out = NULL;
     d = toc_node_map_get(cfg->root, "displays");
     views = d ? toc_node_map_get(d, display) : NULL;
     if (!views || views->kind != TOC_NODE_SEQ) return TOC_ERROR_NOT_FOUND;
@@ -457,7 +503,64 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
         if (vn && strcmp(vn, view) == 0) { vnode = views->items[i]; break; }
     }
     if (!vnode) return TOC_ERROR_NOT_FOUND;
+    /* Determine view type, build pipeline.
+     * Simple view:  src -> reference -> [looks] -> display_colorspace
+     * VT view:      src -> reference -> [looks] -> view_transform -> [display_colorspace] */
     view_cs = toc_node_scalar(toc_node_map_get(vnode, "colorspace"));
-    if (!view_cs) return TOC_ERROR_UNSUPPORTED; /* view_transform views: phase 8 */
-    return toc_processor_from_colorspaces(cfg, src_cs, view_cs, a, out);
+    view_vt = toc_node_scalar(toc_node_map_get(vnode, "view_transform"));
+    if (!view_cs && !view_vt) return TOC_ERROR_UNSUPPORTED;
+    if (!a) a = toc_default_allocator();
+    list = new_list(a);
+    if (!list) return TOC_ERROR_OUT_OF_MEMORY;
+    /* 1. src -> reference */
+    rc = emit_to_ref(cfg, list, src_cs, 0);
+    if (!TOC_OK(rc)) goto fail;
+    /* 2. apply looks (comma-separated) in order */
+    {
+        const char *lk_names[8];
+        int nlk = toc_cfg_view_looks(vnode, lk_names, 8);
+        int li;
+        for (li = 0; li < nlk; ++li) {
+            const toc_node *lk = toc_cfg_find_look(cfg, lk_names[li]);
+            const toc_node *tf, *ps;
+            if (!lk) { rc = TOC_ERROR_NOT_FOUND; goto fail; }
+            ps = toc_node_map_get(lk, "process_space");
+            if (ps) {
+                const char *ps_name = toc_node_scalar(ps);
+                if (ps_name) {
+                    rc = emit_from_ref(cfg, list, ps_name, 0);
+                    if (!TOC_OK(rc)) goto fail;
+                    tf = toc_node_map_get(lk, "transform");
+                    if (tf) { rc = walk(cfg, list, tf, 0); if (!TOC_OK(rc)) goto fail; }
+                    rc = emit_to_ref(cfg, list, ps_name, 0);
+                    if (!TOC_OK(rc)) goto fail;
+                    continue;
+                }
+            }
+            tf = toc_node_map_get(lk, "transform");
+            if (tf) { rc = walk(cfg, list, tf, 0); if (!TOC_OK(rc)) goto fail; }
+        }
+    }
+    /* 3. apply view_transform (if present) */
+    if (view_vt) {
+        const toc_node *vt = toc_cfg_find_view_transform(cfg, view_vt);
+        const toc_node *tf;
+        if (!vt) { rc = TOC_ERROR_NOT_FOUND; goto fail; }
+        tf = toc_node_map_get(vt, "from_reference");
+        if (!tf) { rc = TOC_ERROR_UNSUPPORTED; goto fail; }
+        rc = walk(cfg, list, tf, 0);
+        if (!TOC_OK(rc)) goto fail;
+    }
+    /* 4. display colorspace (view_cs for simple, display_colorspace for VT views) */
+    view_dc = view_cs ? view_cs
+                      : toc_node_scalar(toc_node_map_get(vnode, "display_colorspace"));
+    if (view_dc) {
+        rc = emit_from_ref(cfg, list, view_dc, 0);
+        if (!TOC_OK(rc)) goto fail;
+    }
+    *out = list;
+    return TOC_SUCCESS;
+fail:
+    toc_op_list_free(list);
+    return rc;
 }

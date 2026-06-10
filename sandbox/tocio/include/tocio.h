@@ -89,7 +89,21 @@ typedef enum toc_ff_style {
     TOC_FF_ACES_GAMUTCOMP13,
     TOC_FF_ACES_GAMUTCOMP13_INV,
     TOC_FF_REC2100_SURROUND,
-    TOC_FF_REC2100_SURROUND_INV
+    TOC_FF_REC2100_SURROUND_INV,
+    TOC_FF_ACES_GLOW03 = 8,
+    TOC_FF_ACES_GLOW03_INV,
+    TOC_FF_ACES_RED_MOD_03 = 10,
+    TOC_FF_ACES_RED_MOD_03_INV,
+    TOC_FF_ACES_RED_MOD_10 = 12,
+    TOC_FF_ACES_RED_MOD_10_INV,
+    TOC_FF_RGB_TO_HSV = 14,
+    TOC_FF_HSV_TO_RGB = 15,
+    TOC_FF_XYZ_TO_xyY = 16,
+    TOC_FF_xyY_TO_XYZ = 17,
+    TOC_FF_XYZ_TO_uvY = 18,
+    TOC_FF_uvY_TO_XYZ = 19,
+    TOC_FF_XYZ_TO_LUV = 20,
+    TOC_FF_LUV_TO_XYZ = 21
 } toc_ff_style;
 
 typedef struct toc_lut1d {
@@ -190,6 +204,15 @@ const char *toc_config_display_name(const toc_config *cfg, int index);
 int toc_config_num_views(const toc_config *cfg, const char *display);
 const char *toc_config_view_name(const toc_config *cfg, const char *display,
                                  int index);
+int toc_config_num_view_transforms(const toc_config *cfg);
+const char *toc_config_view_transform_name(const toc_config *cfg, int index);
+int toc_config_num_looks(const toc_config *cfg);
+const char *toc_config_look_name(const toc_config *cfg, int index);
+/* Returns -1 if not set (meaning all active), or count of active displays/views. */
+int toc_config_num_active_displays(const toc_config *cfg);
+const char *toc_config_active_display_name(const toc_config *cfg, int index);
+int toc_config_num_active_views(const toc_config *cfg);
+const char *toc_config_active_view_name(const toc_config *cfg, int index);
 
 /* Hosted-only convenience (toc_stdio.c): load a config + default file reader. */
 toc_result toc_config_load_file(const char *path, const toc_allocator *a,

@@ -71,3 +71,100 @@ Keep first-party code out of the allowlist.
 - SIMD kernels use `__attribute__((target(...)))` + a runtime CPUID vtable so
   everything compiles at baseline; scalar fallback is always present and is the
   source of truth (SIMD must be bit-identical).
+
+## tocio (sandbox/tocio) — pure-C11 OCIO Config Processor
+
+Build / test:
+- `make tocio-c11-gate`   — C11 strict gate for all `sandbox/tocio/src/*.c`
+- `make tocio-freestanding-gate` — freestanding gate (nm-scans for libm symbols)
+- `make tocio-test`       — unit tests (ASan+UBSan)
+- `make wasm-tocio`       — WASM/emscripten build (`build/tocio.mjs` + `.wasm`)
+- `make wasm-tocio-test`  — WASM smoke check via Node (set PATH to emsdk's node)
+- `make tocio-wasm`       — WASM build of core
+
+## tocio status — all phases
+
+```
+Phase 1 (FixedFunction)    ██████████████░░░░  70%  106 tests
+Phase 2 (view_transform)   ████████████████░░  80%  118 tests
+Phase 3 (CDL inverse)      ████████████████░░  80%  118 tests  
+Phase 4 (YAML keys)        ████████████████░░  80%  127 tests
+Phase 5 (looks/aliases)    ████████████████░░  80%  127 tests
+Phase 6 (file LUTs)        ████████████████░░  80%  127 tests
+```
+
+### Phase 1 — FixedFunction styles (all OCIO styles)
+
+**Done:**
+- `toc_ff_style` enum extended to 22 values in `tocio.h` (invert-pair pattern)
+- All math kernels in `toc_builtins.c`:
+  - ACES Glow 03/10 fwd+inv (sigmoid, saturation-weighted)
+  - ACES Red Mod 03/10 fwd+inv (B-spline hue lobe, quadratic inv)
+  - ACES DarkToDim 10 fwd+inv (luma gamma scale)
+  - ACES GamutComp 13 fwd+inv (per-axis distance compression, 7 params)
+  - RGB_TO_HSV / HSV_TO_RGB (extended range: negative V, S>1)
+  - XYZ_TO/TO_xyY, XYZ_TO/TO_uvY, XYZ_TO/TO_LUV (D65)
+- Freestanding `ff_atan2f` (minimax rational) replaces libc `atan2f`
+- `toc_lower_fixedfunc` string parser extended for all styles + params
+- AOT-C codegen: helper `static` source strings + per-op `case TOC_OP_FIXEDFUNC:` emit
+- GLSL codegen: per-style inline math emit for all styles (RedMod inv & GamutComp13 fall back to CPU)
+- Round-trip tests in `toc_test.c` for all 10 style pairs
+
+**Remaining:**
+- Verify GLSL output compiles in a real shader (glslangValidator not always available)
+
+### Phase 2 — view_transform / display_view path
+
+**Done:**
+- `toc_cfg_find_view_transform` — look up ViewTransform by name from `view_transform` top-level seq
+- `toc_processor_from_display_view` handles three cases:
+  - Simple views (colorspace key) → src → colorspace
+  - VT views (view_transform key) → src → reference → vt.from_reference → display_colorspace
+  - Both support optional looks
+- Config introspection: `toc_config_num_view_transforms`, `toc_config_view_transform_name`
+
+### Phase 3 — CDL inverse
+
+**Done:**
+- CDL inverse decomposed at lowering time into basic ops:
+  - Inverse saturation → MatrixTransform
+  - Inverse power → ExponentTransform  
+  - Inverse (slope, offset) → RangeTransform
+- Forward CDL remains a single TOC_OP_CDL (all backends handle it)
+- Round-trip test cdlin↔lin passes within 2e-3
+
+### Phase 4 — YAML config keys
+
+**Done:**
+- `view_transform` parsing (seq of ViewTransform nodes with from_reference/to_reference)
+- `looks` parsing (seq of Look nodes with name/process_space/transform/inverse_transform)
+- `active_displays` / `active_views` parsing (seq of names)
+- Config introspection: `toc_config_num_looks`, `toc_config_look_name`
+- Config introspection: `toc_config_num_active_displays`, `toc_config_active_display_name`
+
+### Phase 5 — look support
+
+**Done:**
+- Views can reference looks via comma-separated `looks` key
+- `toc_cfg_view_looks` parses the comma-separated list
+- Processor applies each look: convert to process_space → apply transform → convert back
+- Color space aliases already handled by `name_matches` in `toc_config.c`
+- Roles already handled by `toc_cfg_resolve_role`
+
+### Phase 6 — file-format LUTs
+
+**Done:**
+- `.cube` 1D/3D (toc_lutfile.c)
+- `.spi1d` / `.spi3d` (toc_lutfile.c)
+- `.clf` (Common LUT Format, XML-based ACES standard) (toc_clf.c)
+  - Supports: Matrix, Range, Exponent, Log, LUT1D, LUT3D
+  - Minimal single-pass XML parser (no DOM tree)
+  - Content sniffing via `<?xml` or `<ProcessList` prefix
+- FileTransform resolution via `toc_file_reader` hook
+- Round-trip tests for all formats
+
+### Rules
+- `toc_builtins.c` is freestanding core — never use `<math.h>` or libm symbols
+- Every new FixedFunction style must have an inverse pair (`_INV = forward+1`)
+- GamutComp13 is complex — AOT-C and GLSL codegens fall back to interpreter for it
+- Decompose inverse ops at lowering time (not in backends) for backend-agnostic support

@@ -93,8 +93,7 @@ static void k_cdl(const toc_op *op, float *px, int ch) {
     if (lr == 0.0f && lg == 0.0f && lb == 0.0f) {
         lr = 0.2126f; lg = 0.7152f; lb = 0.0722f;
     }
-    /* forward ASC CDL (inverse handled by precomputed params is non-trivial;
-     * pass-1 supports forward; inverse flagged as unsupported upstream). */
+    /* forward ASC CDL (inverse is decomposed into basic ops at lowering time). */
     for (c = 0; c < 3; ++c) {
         float x = px[c] * op->u.cdl.slope[c] + op->u.cdl.offset[c];
         if (op->u.cdl.clamp) x = clampf(x, 0.0f, 1.0f);
@@ -190,6 +189,11 @@ void toc_simd_force(int level) {
         toc_simd.range = toc_range_batch_sse2;
     }
     if (level >= 2 && toc_cpu_has_avx2()) toc_simd.range = toc_range_batch_avx2;
+#elif defined(TOC_NEON)
+    if (level >= 1) {
+        toc_simd.matrix = toc_matrix_batch_neon;
+        toc_simd.range = toc_range_batch_neon;
+    }
 #else
     (void)level;
 #endif
@@ -202,6 +206,9 @@ void toc_simd_init(void) {
     toc_simd.matrix = toc_matrix_batch_sse2; /* SSE2 is baseline on x86-64 */
     toc_simd.range = toc_range_batch_sse2;
     if (toc_cpu_has_avx2()) toc_simd.range = toc_range_batch_avx2;
+#elif defined(TOC_NEON)
+    toc_simd.matrix = toc_matrix_batch_neon; /* NEON is baseline on aarch64 */
+    toc_simd.range = toc_range_batch_neon;
 #endif
     done = 1;
 }

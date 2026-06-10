@@ -8,8 +8,12 @@ title = "TinyEXR gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Vendored third-party code (zstd/xxHash amalgamation) — not first-party secrets"
+description = "Vendored third-party code + OpenGL keycode constants — not first-party secrets"
 paths = [
     '''deps/zstd/tinyexr_zstd\.c''',
     '''deps/zstd/tinyexr_zstd\.h''',
+    # OpenGL boilerplate: keycode constants (VK_LEFT / kVK_LeftArrow) trigger
+    # generic-api-key but are not credentials.
+    '''examples/exrbokeh/OpenGLWindow/''',
+    '''examples/exrview/OpenGLWindow/''',
 ]

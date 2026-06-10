@@ -261,6 +261,130 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                 ++tex_idx;
                 break;
             }
+            case TOC_OP_FIXEDFUNC: {
+                int s = op->u.fixedfunc.style;
+                if (s == TOC_FF_REC2100_SURROUND ||
+                    s == TOC_FF_REC2100_SURROUND_INV) {
+                    float g = op->u.fixedfunc.params[0];
+                    float e = (s == TOC_FF_REC2100_SURROUND)
+                                  ? (g - 1.0f) : (1.0f / g - 1.0f);
+                    toc_sb_puts(&sb, "  { float Y = 0.2627*v.r+0.6780*v.g+0.0593*v.b;\n"
+                                     "  float s = Y>0.0?pow(Y,");
+                    emit_f(&sb, e);
+                    toc_sb_puts(&sb, "):0.0;\n  v.rgb *= s; }\n");
+                } else if (s == TOC_FF_ACES_GLOW03 ||
+                           s == TOC_FF_ACES_GLOW10) {
+                    float gg = op->u.fixedfunc.params[0];
+                    float gm = op->u.fixedfunc.params[1];
+                    toc_sb_puts(&sb, "  { float YC=(v.r+v.g+v.b+1.75*sqrt(max(v.b*(v.b-v.g)+v.g*(v.g-v.r)+v.r*(v.r-v.b),0.0)))/3.0;\n"
+                                     "  float mn=min(v.r,min(v.g,v.b));float mx=max(v.r,max(v.g,v.b));\n"
+                                     "  float sat=(max(1e-10,mx)-max(1e-10,mn))/max(0.01,mx);\n"
+                                     "  float x=(sat-0.4)*5.0;float sg=sign(x);float t=max(0.0,1.0-0.5*sg*x);\n"
+                                     "  float s=(1.0+sg*(1.0-t*t))*0.5;\n"
+                                     "  float GG="); emit_f(&sb, gg); toc_sb_puts(&sb, "*s;\n"
+                                     "  float go;\n"
+                                     "  if(YC>= "); emit_f(&sb, gm * 2.0f); toc_sb_puts(&sb, ")go=0.0;\n"
+                                     "  else if(YC<= "); emit_f(&sb, gm * 2.0f / 3.0f); toc_sb_puts(&sb, ")go=GG;\n"
+                                     "  else go=GG*("); emit_f(&sb, gm); toc_sb_puts(&sb, "/YC-0.5);\n"
+                                     "  v.rgb *= 1.0+go; }\n");
+                } else if (s == TOC_FF_ACES_GLOW03_INV ||
+                           s == TOC_FF_ACES_GLOW10_INV) {
+                    float gg = op->u.fixedfunc.params[0];
+                    float gm = op->u.fixedfunc.params[1];
+                    toc_sb_puts(&sb, "  { float YC=(v.r+v.g+v.b+1.75*sqrt(max(v.b*(v.b-v.g)+v.g*(v.g-v.r)+v.r*(v.r-v.b),0.0)))/3.0;\n"
+                                     "  float mn=min(v.r,min(v.g,v.b));float mx=max(v.r,max(v.g,v.b));\n"
+                                     "  float sat=(max(1e-10,mx)-max(1e-10,mn))/max(0.01,mx);\n"
+                                     "  float x=(sat-0.4)*5.0;float sg=sign(x);float t=max(0.0,1.0-0.5*sg*x);\n"
+                                     "  float s=(1.0+sg*(1.0-t*t))*0.5;\n"
+                                     "  float GG="); emit_f(&sb, gg); toc_sb_puts(&sb, "*s;\n"
+                                     "  float go;\n"
+                                     "  if(YC>= "); emit_f(&sb, gm * 2.0f); toc_sb_puts(&sb, ")go=0.0;\n"
+                                     "  else if(YC<= "); emit_f(&sb, (1.0f + gg) * gm * 2.0f / 3.0f); toc_sb_puts(&sb, ")go=-GG/(1.0+GG);\n"
+                                     "  else go=GG*("); emit_f(&sb, gm); toc_sb_puts(&sb, "/YC-0.5)/(GG*0.5-1.0);\n"
+                                     "  v.rgb *= 1.0+go; }\n");
+                } else if (s == TOC_FF_ACES_DARKTODIM10) {
+                    float g = op->u.fixedfunc.params[0];
+                    toc_sb_puts(&sb, "  { float Y=max(1e-10,0.27222872*v.r+0.67408177*v.g+0.05368952*v.b);\n"
+                                     "  v.rgb *= pow(Y,");
+                    emit_f(&sb, g - 1.0f);
+                    toc_sb_puts(&sb, "); }\n");
+                } else if (s == TOC_FF_ACES_DARKTODIM10_INV) {
+                    float g = op->u.fixedfunc.params[0];
+                    toc_sb_puts(&sb, "  { float Y=max(1e-10,0.27222872*v.r+0.67408177*v.g+0.05368952*v.b);\n"
+                                     "  v.rgb *= pow(Y,");
+                    emit_f(&sb, 1.0f / g - 1.0f);
+                    toc_sb_puts(&sb, "); }\n");
+                } else if (s == TOC_FF_ACES_RED_MOD_03) {
+                    toc_sb_puts(&sb, "  { vec3 c=v.rgb;float a=2.0*c.r-(c.g+c.b);float b=1.73205*(c.g-c.b);\n"
+                                     "  float h=atan(b,a);float k=h*1.909859+2.0;int j=int(k);\n"
+                                     "  if(j>=0&&j<4){float t=k-float(j);float fH;\n"
+                                     "  if(j==0)fH=0.25*t*t;else if(j==1)fH=-0.75+0.75*t+0.75*t*t-0.25*t*t*t;\n"
+                                     "  else if(j==2)fH=0.75-1.5*t+1.0*t*t*t;else fH=-0.25+0.75*t-0.75*t*t+0.25*t*t*t;\n"
+                                     "  if(fH>0.0){float mn=min(c.r,min(c.g,c.b));float mx=max(c.r,max(c.g,c.b));\n"
+                                     "  float fS=(max(1e-10,mx)-max(1e-10,mn))/max(0.01,mx);\n"
+                                     "  float nr=c.r+fH*fS*(0.03-c.r)*0.15;\n"
+                                     "  if(c.g>=c.b)c.g=(c.g-c.b)/max(1e-10,c.r-c.b)*(nr-c.b)+c.b;\n"
+                                     "  else c.b=(c.b-c.g)/max(1e-10,c.r-c.g)*(nr-c.g)+c.g;\n"
+                                     "  c.r=nr;}v.rgb=c;}\n");
+                } else if (s == TOC_FF_ACES_RED_MOD_10) {
+                    toc_sb_puts(&sb, "  { vec3 c=v.rgb;float a=2.0*c.r-(c.g+c.b);float b=1.73205*(c.g-c.b);\n"
+                                     "  float h=atan(b,a);float k=h*1.697653+2.0;int j=int(k);\n"
+                                     "  if(j>=0&&j<4){float t=k-float(j);float fH;\n"
+                                     "  if(j==0)fH=0.25*t*t;else if(j==1)fH=-0.75+0.75*t+0.75*t*t-0.25*t*t*t;\n"
+                                     "  else if(j==2)fH=0.75-1.5*t+1.0*t*t*t;else fH=-0.25+0.75*t-0.75*t*t+0.25*t*t*t;\n"
+                                     "  if(fH>0.0){float mn=min(c.r,min(c.g,c.b));float mx=max(c.r,max(c.g,c.b));\n"
+                                     "  float fS=(max(1e-10,mx)-max(1e-10,mn))/max(0.01,mx);\n"
+                                     "  c.r=c.r+fH*fS*(0.03-c.r)*0.18;}v.rgb=c;}\n");
+                } else if (s == TOC_FF_ACES_RED_MOD_03_INV) {
+                    toc_sb_puts(&sb, "  /* RED_MOD_03_INV not emitted; use CPU */\n");
+                } else if (s == TOC_FF_ACES_RED_MOD_10_INV) {
+                    toc_sb_puts(&sb, "  /* RED_MOD_10_INV not emitted; use CPU */\n");
+                } else if (s == TOC_FF_ACES_GAMUTCOMP13 ||
+                           s == TOC_FF_ACES_GAMUTCOMP13_INV) {
+                    toc_sb_puts(&sb, "  /* GAMUT_COMP_13 not emitted; use CPU */\n");
+                } else if (s == TOC_FF_RGB_TO_HSV) {
+                    toc_sb_puts(&sb, "  { float mn=min(v.r,min(v.g,v.b));float mx=max(v.r,max(v.g,v.b));\n"
+                                     "  float h=0,s=0,vv=mx;if(mn!=mx){float d=mx-mn;\n"
+                                     "  if(mx!=0.0)s=d/mx;\n"
+                                     "  if(v.r==mx)h=(v.g-v.b)/d;else if(v.g==mx)h=2.0+(v.b-v.r)/d;else h=4.0+(v.r-v.g)/d;\n"
+                                     "  if(h<0)h+=6.0;h*=0.16666667;}\n"
+                                     "  if(mn<0)vv+=mn;if(-mn>mx)s=(mx-mn)/-mn;\n"
+                                     "  v=vec4(h,s,vv,v.a);}\n");
+                } else if (s == TOC_FF_HSV_TO_RGB) {
+                    toc_sb_puts(&sb, "  { float h=(v.r-floor(v.r))*6.0,s=clamp(v.g,0.0,1.999),vv=v.b;\n"
+                                     "  float rp=clamp(abs(h-3.0)-1.0,0.0,1.0);\n"
+                                     "  float gp=1.0-clamp(abs(h-2.0),0.0,1.0);\n"
+                                     "  float bp=1.0-clamp(abs(h-4.0),0.0,1.0);\n"
+                                     "  float mx=vv,mn=vv*(1.0-s);\n"
+                                     "  if(s>1.0){mn=vv*(1.0-s)/(2.0-s);mx=vv-mn;}\n"
+                                     "  if(vv<0.0){mn=vv/(2.0-s);mx=vv-mn;}float d=mx-mn;\n"
+                                     "  v=vec4(rp*d+mn,gp*d+mn,bp*d+mn,v.a);}\n");
+                } else if (s == TOC_FF_XYZ_TO_xyY) {
+                    toc_sb_puts(&sb, "  { float d=1.0/max(v.r+v.g+v.b,1e-10);v=vec4(v.r*d,v.g*d,v.b,v.a);}\n");
+                } else if (s == TOC_FF_xyY_TO_XYZ) {
+                    toc_sb_puts(&sb, "  { float d=1.0/max(v.g,1e-10);\n"
+                                     "  v=vec4(v.b*v.r*d,v.b,v.b*(1.0-v.r-v.g)*d,v.a);}\n");
+                } else if (s == TOC_FF_XYZ_TO_uvY) {
+                    toc_sb_puts(&sb, "  { float d=1.0/max(v.r+15.0*v.g+3.0*v.b,1e-10);\n"
+                                     "  v=vec4(4.0*v.r*d,9.0*v.g*d,v.b,v.a);}\n");
+                } else if (s == TOC_FF_uvY_TO_XYZ) {
+                    toc_sb_puts(&sb, "  { float d=1.0/max(v.g,1e-10);\n"
+                                     "  v=vec4(2.25*v.b*v.r*d,v.b,0.75*v.b*(4.0-v.r-6.66667*v.g)*d,v.a);}\n");
+                } else if (s == TOC_FF_XYZ_TO_LUV) {
+                    toc_sb_puts(&sb, "  { float d=1.0/max(v.r+15.0*v.g+3.0*v.b,1e-10);\n"
+                                     "  float u=4.0*v.r*d,vv=9.0*v.g*d;\n"
+                                     "  float ls=v.b<=0.008856?9.03296*v.b:1.16*pow(v.b,0.33333)-0.16;\n"
+                                     "  v=vec4(ls,13.0*ls*(u-0.19783),13.0*ls*(vv-0.46832),v.a);}\n");
+                } else if (s == TOC_FF_LUV_TO_XYZ) {
+                    toc_sb_puts(&sb, "  { float d=0.076923/max(v.r,1e-10);\n"
+                                     "  float u=v.g*d+0.19783,vv=v.b*d+0.46832;\n"
+                                     "  float t=(v.r+0.16)*0.862069;\n"
+                                     "  float Y=v.r<=0.08?0.110706*v.r:t*t*t;\n"
+                                     "  float dd=0.25/max(vv,1e-10);\n"
+                                     "  v=vec4(9.0*Y*u*dd,Y,Y*(12.0-3.0*u-20.0*vv)*dd,v.a);}\n");
+                }
+                break;
+            }
             default: break;
         }
     }
