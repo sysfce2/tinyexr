@@ -744,6 +744,76 @@ static void test_jit(void) {
         }
         toc_jit_destroy(j);
     }
+    /* inline SSE2 pow: exponent-only pipelines across several gammas */
+    {
+        float gammas[4] = {2.2f, 1.0f / 2.4f, 2.4f, 0.5f};
+        int gi;
+        for (gi = 0; gi < 4; ++gi) {
+            toc_op_list *le = newlist();
+            toc_op *e = toc_op_list_push(le, TOC_OP_EXPONENT);
+            toc_jit *je = NULL;
+            int c;
+            for (c = 0; c < 4; ++c) e->u.exponent.e[c] = (c < 3) ? gammas[gi] : 1.0f;
+            if (TOC_OK(toc_jit_compile(le, 4, NULL, &je)) && je) {
+                int p;
+                ok = 1;
+                for (p = 0; p < 32; ++p) {
+                    float a[4], b[4];
+                    for (c = 0; c < 4; ++c) {
+                        float v = (float)((p * 31 + c * 7) % 100) / 99.0f;
+                        a[c] = b[c] = v;
+                    }
+                    toc_apply(le, a, 1, 4);
+                    toc_jit_func(je)(b, 1);
+                    for (c = 0; c < 4; ++c)
+                        if (!approx(a[c], b[c], 1e-5f)) ok = 0;
+                }
+                CHECK(ok, "JIT inline pow == interpreter (gamma sweep)");
+                toc_jit_destroy(je);
+            }
+            toc_op_list_free(le);
+        }
+    }
+    /* AVX 2px path: pure matrix+range pipeline on an ODD pixel count so both
+     * the 2-pixel main loop and the 1-pixel SSE tail execute. */
+    {
+        toc_op_list *la = newlist();
+        toc_op *m1 = toc_op_list_push(la, TOC_OP_MATRIX);
+        toc_op *m2 = toc_op_list_push(la, TOC_OP_MATRIX);
+        toc_op *r = toc_op_list_push(la, TOC_OP_RANGE);
+        static const float A[16] = {0.6f, 0.3f, 0.1f, 0, 0.2f, 0.7f, 0.1f, 0,
+                                    0.1f, 0.2f, 0.7f, 0, 0, 0, 0, 1};
+        static const float B[16] = {1.1f, -0.1f, 0, 0, -0.05f, 1.05f, 0, 0,
+                                    0, 0, 1.0f, 0, 0, 0, 0, 1};
+        int i, jx, c;
+        toc_jit *ja = NULL;
+        for (i = 0; i < 4; ++i)
+            for (jx = 0; jx < 4; ++jx) {
+                m1->u.matrix.m[jx * 4 + i] = A[i * 4 + jx];
+                m2->u.matrix.m[jx * 4 + i] = B[i * 4 + jx];
+            }
+        for (c = 0; c < 4; ++c) {
+            r->u.range.scale[c] = 1.0f; r->u.range.min[c] = 0.0f;
+            r->u.range.max[c] = 1.0f;
+        }
+        r->u.range.clamp_lo = r->u.range.clamp_hi = 1;
+        rc = toc_jit_compile(la, 4, NULL, &ja);
+        if (TOC_OK(rc) && ja) {
+            enum { NP = 17 };
+            static float buf[NP * 4], ref[NP * 4];
+            int n;
+            for (n = 0; n < NP * 4; ++n)
+                buf[n] = ref[n] = (float)((n * 29) % 150 - 30) / 100.0f;
+            toc_apply(la, ref, NP, 4);
+            toc_jit_func(ja)(buf, NP);
+            ok = 1;
+            for (n = 0; n < NP * 4; ++n)
+                if (!approx(buf[n], ref[n], 1e-6f)) ok = 0;
+            CHECK(ok, "JIT AVX 2px (matrix+matrix+range, 17 px) == interpreter");
+            toc_jit_destroy(ja);
+        }
+        toc_op_list_free(la);
+    }
     /* a LUT op (helper-call path) also runs through the JIT */
     {
         toc_op_list *l2 = newlist();
