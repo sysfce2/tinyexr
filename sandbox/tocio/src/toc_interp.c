@@ -10,6 +10,15 @@
 
 #include "toc_internal.h"
 
+/* The scalar matrix/range kernels here are the bit-exact reference the SIMD
+ * tiers (SSE2/NEON) must reproduce. Disable FP contraction so the compiler
+ * cannot fuse a*b+c into an FMA: on aarch64 it otherwise emits fmla here (and
+ * in the NEON kernels), and the two contraction patterns diverge, breaking the
+ * bit-exact parity test. x86-64 has no baseline packed FMA so it was unaffected. */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 static float clampf(float x, float lo, float hi) {
     if (x < lo) return lo;
     if (x > hi) return hi;
@@ -97,10 +106,8 @@ static void k_cdl(const toc_op *op, float *px, int ch) {
     for (c = 0; c < 3; ++c) {
         float x = px[c] * op->u.cdl.slope[c] + op->u.cdl.offset[c];
         if (op->u.cdl.clamp) x = clampf(x, 0.0f, 1.0f);
-        if (x >= 0.0f)
-            x = toc_powf(x, op->u.cdl.power[c]);
-        else
-            x = x; /* leave negative as-is when not clamped */
+        if (x >= 0.0f) x = toc_powf(x, op->u.cdl.power[c]);
+        /* else: leave negative as-is when not clamped */
         v[c] = x;
     }
     luma = lr * v[0] + lg * v[1] + lb * v[2];

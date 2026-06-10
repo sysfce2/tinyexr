@@ -1,12 +1,13 @@
 /*
- * tocio - x86-64 JIT backend. Emits SSE2 machine code for an op chain into
- * executable memory and runs it directly (no disk / dlopen). Hosted-only
- * (needs OS executable memory via mmap); excluded from the freestanding core.
+ * tocio - JIT backend (x86-64 SSE2/AVX + AArch64 NEON). Emits machine code for
+ * an op chain into executable memory and runs it directly (no disk / dlopen).
+ * Hosted-only (needs OS executable memory via mmap); excluded from the
+ * freestanding core.
  *
  * The emitted function is `void fn(float *rgba, size_t npix)` over interleaved
- * RGBA. matrix/range are inlined as SSE (bit-exact with the SSE2 interpreter
- * tier); every other op calls toc_apply_op_pixel(op, px, ch) with the op's
- * address baked in. `channels` is baked at compile time.
+ * RGBA. matrix/range are inlined as SIMD (bit-exact with the matching
+ * interpreter tier); every other op calls toc_apply_op_pixel(op, px, ch) with
+ * the op's address baked in. `channels` is baked at compile time.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
  * SPDX-License-Identifier: BSD-3-Clause
@@ -451,7 +452,283 @@ void toc_jit_destroy(toc_jit *j) {
     toc_free(&a, j);
 }
 
-#else /* non x86-64 */
+#elif defined(__aarch64__) || defined(_M_ARM64)
+
+/* ============================================================================
+ * AArch64 (ARM64) JIT backend. Emits A64 machine code for an op chain into
+ * executable memory and runs it directly. Mirrors the x86-64 backend: the
+ * emitted `void fn(float *rgba, size_t npix)` runs a per-pixel loop with
+ * `channels` baked in. For channels==4, MATRIX and RANGE are inlined as NEON
+ * (bit-exact with the NEON interpreter tier: same dup+fmul+fadd order, no FMA
+ * contraction); every other op (and all of channels==3, to avoid a 16-byte
+ * vector touching past a 12-byte pixel) is a `blr` to toc_apply_op_pixel(op,
+ * px, ch) with the op address baked as a movz/movk imm64.
+ *
+ * ABI (AAPCS64): args x0=rgba, x1=npix. rgba/counter live in callee-saved
+ * x19/x20 so they survive helper calls; x9 is a scratch for the op/helper
+ * address. The stack stays 16-byte aligned for the calls.
+ * ========================================================================== */
+
+#include <stddef.h>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#define TOC_HAVE_MMAP 1
+#endif
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h> /* sys_icache_invalidate */
+#include <pthread.h>                /* pthread_jit_write_protect_np */
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
+
+struct toc_jit {
+    void *mem;
+    size_t mapsz;
+    toc_jit_fn fn;
+    toc_allocator alloc;
+};
+
+/* ---- growable code buffer (32-bit instruction words) --------------------- */
+typedef struct {
+    uint8_t *buf;
+    size_t len, cap;
+    const toc_allocator *a;
+    int oom;
+} codebuf;
+
+static int cb_reserve(codebuf *c, size_t extra) {
+    if (c->oom) return 0;
+    if (c->len + extra <= c->cap) return 1;
+    {
+        size_t ncap = c->cap ? c->cap * 2 : 1024;
+        uint8_t *n;
+        while (ncap < c->len + extra) ncap *= 2;
+        n = (uint8_t *)toc_malloc(c->a, ncap);
+        if (!n) { c->oom = 1; return 0; }
+        if (c->buf) { memcpy(n, c->buf, c->len); toc_free(c->a, c->buf); }
+        c->buf = n;
+        c->cap = ncap;
+    }
+    return 1;
+}
+/* emit one little-endian 32-bit A64 instruction word */
+static void e32(codebuf *c, uint32_t w) {
+    if (cb_reserve(c, 4)) {
+        c->buf[c->len++] = (uint8_t)w;
+        c->buf[c->len++] = (uint8_t)(w >> 8);
+        c->buf[c->len++] = (uint8_t)(w >> 16);
+        c->buf[c->len++] = (uint8_t)(w >> 24);
+    }
+}
+
+static uint64_t addr_of(const void *p) { return (uint64_t)(uintptr_t)p; }
+
+/* ---- instruction encoders ------------------------------------------------ */
+/* mov Xd, Xm  (ORR Xd, XZR, Xm) */
+static void emit_mov_reg(codebuf *c, int xd, int xm) {
+    e32(c, 0xAA0003E0u | ((unsigned)xm << 16) | (unsigned)xd);
+}
+static void emit_movz_x(codebuf *c, int xd, unsigned imm16, unsigned hw) {
+    e32(c, 0xD2800000u | (hw << 21) | (imm16 << 5) | (unsigned)xd);
+}
+static void emit_movk_x(codebuf *c, int xd, unsigned imm16, unsigned hw) {
+    e32(c, 0xF2800000u | (hw << 21) | (imm16 << 5) | (unsigned)xd);
+}
+/* load a full 64-bit immediate into Xd via movz + 3x movk */
+static void emit_load_imm64(codebuf *c, int xd, uint64_t v) {
+    emit_movz_x(c, xd, (unsigned)(v & 0xffffu), 0);
+    emit_movk_x(c, xd, (unsigned)((v >> 16) & 0xffffu), 1);
+    emit_movk_x(c, xd, (unsigned)((v >> 32) & 0xffffu), 2);
+    emit_movk_x(c, xd, (unsigned)((v >> 48) & 0xffffu), 3);
+}
+/* mov Wd, #imm16 (movz, 32-bit) */
+static void emit_movz_w(codebuf *c, int wd, unsigned imm16) {
+    e32(c, 0x52800000u | (imm16 << 5) | (unsigned)wd);
+}
+/* LDUR/STUR Qt, [Xn, #simm9]  (unscaled byte offset; any field offset fits) */
+static void emit_ldur_q(codebuf *c, int qt, int xn, int off) {
+    e32(c, 0x3CC00000u | (((unsigned)off & 0x1ffu) << 12) | ((unsigned)xn << 5) |
+               (unsigned)qt);
+}
+static void emit_stur_q(codebuf *c, int qt, int xn, int off) {
+    e32(c, 0x3C800000u | (((unsigned)off & 0x1ffu) << 12) | ((unsigned)xn << 5) |
+               (unsigned)qt);
+}
+/* DUP Vd.4S, Vn.S[idx] */
+static void emit_dup_s(codebuf *c, int vd, int vn, int idx) {
+    unsigned imm5 = ((unsigned)idx << 3) | 4u;
+    e32(c, 0x4E000400u | (imm5 << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+/* three-same FP ops on .4S */
+static void emit_fmul(codebuf *c, int vd, int vn, int vm) {
+    e32(c, 0x6E20DC00u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_fadd(codebuf *c, int vd, int vn, int vm) {
+    e32(c, 0x4E20D400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_fmax(codebuf *c, int vd, int vn, int vm) {
+    e32(c, 0x4E20F400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_fmin(codebuf *c, int vd, int vn, int vm) {
+    e32(c, 0x4EA0F400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_add_imm(codebuf *c, int xd, int xn, unsigned imm12) {
+    e32(c, 0x91000000u | ((imm12 & 0xfffu) << 10) | ((unsigned)xn << 5) | (unsigned)xd);
+}
+static void emit_sub_imm(codebuf *c, int xd, int xn, unsigned imm12) {
+    e32(c, 0xD1000000u | ((imm12 & 0xfffu) << 10) | ((unsigned)xn << 5) | (unsigned)xd);
+}
+static void emit_blr(codebuf *c, int xn) { e32(c, 0xD63F0000u | ((unsigned)xn << 5)); }
+
+/* MATRIX (ch==4): v = (c0*r + c1*g) + c2*b + c3*a + off, in NEON, matching the
+ * NEON interpreter's association exactly. x9 := &op. */
+static void emit_matrix_arm(codebuf *c, const toc_op *op) {
+    int M = (int)offsetof(toc_op, u.matrix.m);
+    int O = (int)offsetof(toc_op, u.matrix.off);
+    emit_load_imm64(c, 9, addr_of(op));
+    emit_ldur_q(c, 0, 19, 0);                /* v0 = pixel [r,g,b,a] */
+    emit_dup_s(c, 1, 0, 0); emit_dup_s(c, 2, 0, 1);
+    emit_dup_s(c, 3, 0, 2); emit_dup_s(c, 4, 0, 3);
+    emit_ldur_q(c, 5, 9, M + 0);  emit_fmul(c, 5, 5, 1);
+    emit_ldur_q(c, 6, 9, M + 16); emit_fmul(c, 6, 6, 2); emit_fadd(c, 5, 5, 6);
+    emit_ldur_q(c, 6, 9, M + 32); emit_fmul(c, 6, 6, 3); emit_fadd(c, 5, 5, 6);
+    emit_ldur_q(c, 6, 9, M + 48); emit_fmul(c, 6, 6, 4); emit_fadd(c, 5, 5, 6);
+    emit_ldur_q(c, 6, 9, O);      emit_fadd(c, 5, 5, 6);
+    emit_stur_q(c, 5, 19, 0);
+}
+
+/* RANGE (ch==4): v = clamp(in*scale + offset, min, max) per channel. */
+static void emit_range_arm(codebuf *c, const toc_op *op) {
+    int S = (int)offsetof(toc_op, u.range.scale);
+    int OF = (int)offsetof(toc_op, u.range.offset);
+    int MN = (int)offsetof(toc_op, u.range.min);
+    int MX = (int)offsetof(toc_op, u.range.max);
+    emit_load_imm64(c, 9, addr_of(op));
+    emit_ldur_q(c, 0, 19, 0);
+    emit_ldur_q(c, 1, 9, S);  emit_fmul(c, 0, 0, 1);
+    emit_ldur_q(c, 1, 9, OF); emit_fadd(c, 0, 0, 1);
+    if (op->u.range.clamp_lo) { emit_ldur_q(c, 1, 9, MN); emit_fmax(c, 0, 0, 1); }
+    if (op->u.range.clamp_hi) { emit_ldur_q(c, 1, 9, MX); emit_fmin(c, 0, 0, 1); }
+    emit_stur_q(c, 0, 19, 0);
+}
+
+/* call toc_apply_op_pixel(op, px=x19, ch) */
+static void emit_helper_call_arm(codebuf *c, const toc_op *op, int ch) {
+    emit_load_imm64(c, 0, addr_of(op));   /* x0 = op */
+    emit_mov_reg(c, 1, 19);               /* x1 = px */
+    emit_movz_w(c, 2, (unsigned)ch);      /* w2 = ch */
+    emit_load_imm64(c, 9, addr_of((const void *)&toc_apply_op_pixel));
+    emit_blr(c, 9);
+}
+
+static void emit_op_arm(codebuf *c, const toc_op *op, int channels) {
+    if (channels == 4 && op->kind == TOC_OP_MATRIX) emit_matrix_arm(c, op);
+    else if (channels == 4 && op->kind == TOC_OP_RANGE) emit_range_arm(c, op);
+    else if (op->kind != TOC_OP_NOOP) emit_helper_call_arm(c, op, channels);
+}
+
+toc_result toc_jit_compile(const toc_op_list *ops, int channels,
+                           const toc_allocator *a, toc_jit **out) {
+    codebuf c;
+    size_t k;
+    toc_jit *j;
+#if !defined(TOC_HAVE_MMAP)
+    (void)ops; (void)channels; (void)a; (void)out;
+    return TOC_ERROR_UNSUPPORTED;
+#else
+    size_t pgsz = 4096, mapsz, loop_pos, cbz_at;
+    void *mem;
+    if (!ops || !out || (channels != 3 && channels != 4))
+        return TOC_ERROR_INVALID_ARGUMENT;
+    if (!a) a = toc_default_allocator();
+    *out = NULL;
+    memset(&c, 0, sizeof(c));
+    c.a = a;
+
+    /* prologue: save fp/lr + callee-saved x19/x20 (32B frame, 16-aligned). */
+    e32(&c, 0xA9BE7BFDu);          /* stp x29, x30, [sp, #-32]! */
+    e32(&c, 0xA90153F3u);          /* stp x19, x20, [sp, #16]  */
+    emit_mov_reg(&c, 19, 0);       /* x19 = rgba */
+    emit_mov_reg(&c, 20, 1);       /* x20 = npix */
+
+    /* per-pixel loop: while (x20) { ops on [x19]; x19+=ch*4; x20--; } */
+    loop_pos = c.len;
+    cbz_at = c.len;
+    e32(&c, 0xB4000000u | 20u);    /* cbz x20, done  (imm19 patched below) */
+    for (k = 0; k < ops->count; ++k) emit_op_arm(&c, &ops->ops[k], channels);
+    emit_add_imm(&c, 19, 19, (unsigned)(channels * 4));
+    emit_sub_imm(&c, 20, 20, 1);
+    {
+        int32_t off = (int32_t)((int64_t)loop_pos - (int64_t)c.len); /* b -> loop */
+        e32(&c, 0x14000000u | ((uint32_t)(off >> 2) & 0x03ffffffu));
+    }
+    if (!c.oom) {                  /* patch cbz -> done (here) */
+        int32_t off = (int32_t)((int64_t)c.len - (int64_t)cbz_at);
+        uint32_t insn =
+            0xB4000000u | (((uint32_t)(off >> 2) & 0x7ffffu) << 5) | 20u;
+        c.buf[cbz_at] = (uint8_t)insn;
+        c.buf[cbz_at + 1] = (uint8_t)(insn >> 8);
+        c.buf[cbz_at + 2] = (uint8_t)(insn >> 16);
+        c.buf[cbz_at + 3] = (uint8_t)(insn >> 24);
+    }
+
+    /* epilogue */
+    e32(&c, 0xA94153F3u);          /* ldp x19, x20, [sp, #16] */
+    e32(&c, 0xA8C27BFDu);          /* ldp x29, x30, [sp], #32 */
+    e32(&c, 0xD65F03C0u);          /* ret */
+
+    if (c.oom) { toc_free(a, c.buf); return TOC_ERROR_OUT_OF_MEMORY; }
+
+    mapsz = (c.len + pgsz - 1) & ~(pgsz - 1);
+#if defined(__APPLE__)
+    /* Apple Silicon enforces W^X: map MAP_JIT, toggle write-protect per thread,
+     * then flush the icache before executing. */
+    mem = mmap(NULL, mapsz, PROT_READ | PROT_WRITE | PROT_EXEC,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+    if (mem == MAP_FAILED) { toc_free(a, c.buf); return TOC_ERROR_UNSUPPORTED; }
+    pthread_jit_write_protect_np(0);
+    memcpy(mem, c.buf, c.len);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(mem, c.len);
+    toc_free(a, c.buf);
+#else
+    mem = mmap(NULL, mapsz, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) { toc_free(a, c.buf); return TOC_ERROR_UNSUPPORTED; }
+    memcpy(mem, c.buf, c.len);
+    toc_free(a, c.buf);
+    if (mprotect(mem, mapsz, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, mapsz);
+        return TOC_ERROR_UNSUPPORTED;
+    }
+    __builtin___clear_cache((char *)mem, (char *)mem + c.len);
+#endif
+    j = (toc_jit *)toc_malloc(a, sizeof(*j));
+    if (!j) { munmap(mem, mapsz); return TOC_ERROR_OUT_OF_MEMORY; }
+    j->mem = mem;
+    j->mapsz = mapsz;
+    j->alloc = *a;
+    memcpy(&j->fn, &mem, sizeof(void *)); /* avoid object<->fn ptr warning */
+    *out = j;
+    return TOC_SUCCESS;
+#endif
+}
+
+toc_jit_fn toc_jit_func(const toc_jit *j) { return j ? j->fn : NULL; }
+
+void toc_jit_destroy(toc_jit *j) {
+    toc_allocator a;
+    if (!j) return;
+    a = j->alloc;
+#if defined(TOC_HAVE_MMAP)
+    if (j->mem) munmap(j->mem, j->mapsz);
+#endif
+    toc_free(&a, j);
+}
+
+#else /* other architectures: stub */
 
 #include <stddef.h>
 struct toc_jit { int unused; };

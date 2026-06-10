@@ -14,6 +14,12 @@
 
 #include <arm_neon.h>
 
+/* Match the scalar reference bit-for-bit: forbid the compiler from fusing the
+ * separate vmulq/vaddq pairs below into vfmla (see toc_interp.c parity note). */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 /* matrix: same column-major layout as SSE2 and scalar.
  * Process one RGBA pixel per iteration using 128-bit NEON vectors. */
 void toc_matrix_batch_neon(const float *m, const float *off, float *rgba,

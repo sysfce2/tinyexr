@@ -343,7 +343,8 @@ tocio-test: | build
 
 # ---- tocio ARM64 (aarch64 NEON) cross build + qemu test ---------------------
 # Cross-compile the full tocio test suite and run under qemu-aarch64.
-# toc_jit.c provides stub implementations on non-x86, so include it.
+# toc_jit.c has a native AArch64/NEON backend (emits A64 code to executable
+# memory); under qemu-user the JIT may report TOC_ERROR_UNSUPPORTED and skip.
 .PHONY: tocio-arm-test
 tocio-arm-test: | build
 	$(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 \
