@@ -64,7 +64,7 @@ selected path). Tiers measured:
 | scalar | ✅            | ✅         | ✅                |
 | SSE2   | ✅            | —          | ✅                |
 | AVX2   | ✅            | F16C       | (uses SSE2)       |
-| NEON   | ✅            | (scalar)   | ✅ (aarch64)      |
+| NEON   | ✅ (aarch64)  | (scalar)   | ✅ (aarch64)      |
 
 **ARM / NEON.** The byte de-interleave and the predictor (prefix-sum decode /
 delta encode) have NEON kernels (`src/exr_simd_neon.c`), selected automatically
@@ -127,6 +127,55 @@ across chunks (~3.5× over scalar). It runs on every ZIP/ZIPS/PXR24/RLE decode.
 De-interleave and `pack` are memory-bandwidth-bound, so AVX2 does not beat SSE
 much. The compute-bound kernels — F16C half→float, PSHUFB Huffman lookup, JPH
 NLT — get the biggest wins, and AVX2 lifts HTJ2K256 decode by ~1.4×.
+
+### ARM64 / NEON results (`make bench`)
+
+Machine: **Apple M1** (4 P-core + 4 E-core), macOS 26, Apple clang 21. SIMD
+reported as `neon` (caps `0x8`). Source: `asakusa.exr` (660×440, 4 ch). The codec
+auto-dispatches to NEON; `make bench` runs natively.
+
+Codec throughput (single thread, in-tree codec):
+
+| codec | enc MP/s | dec MP/s | | codec | enc MP/s | dec MP/s |
+|---|--:|--:|---|---|--:|--:|
+| none | 1041 | 2447 | | piz      | 26.4 | 28.0 |
+| rle  | 65.0 |  164 | | htj2k256 | 18.3 | 28.6 |
+| zips | 12.5 | 22.2 | | htj2k32  | 17.7 | 26.7 |
+| zip  | 11.5 | 42.4 | | | | |
+
+End-to-end decode by forced tier (ZIP = SIMD predictor + de-interleave):
+
+| path              | scalar | NEON |
+|-------------------|-------:|-----:|
+| ZIP decode (MP/s) |   36.0 | **42.6** |
+| ZIP decode, `LIBDEFLATE=1` (MP/s) | 55.0 | **72.4** |
+
+SIMD micro-kernels (throughput, speedup vs scalar):
+
+| kernel                   | scalar    | NEON                  |
+|--------------------------|----------:|----------------------:|
+| byte de-interleave       | 3.84 GB/s | **29.1 GB/s** (7.6×)  |
+| predictor decode (delta) | 1.59 GB/s | **3.09 GB/s** (1.94×) |
+| half→float (FCVTL)       | 10.2 GB/s | **59.5 GB/s** (5.8×)  |
+| JPH NLT type-3           | 336 M/s   | **2740 M/s** (8.2×)   |
+| JPH pixel pack (i32→half)| 9.4 GM/s  | 9.5 GM/s (1.0×, bw-bound) |
+
+The byte de-interleave (a 4-channel byte scatter NEON does with `vst2`) is the
+standout — ~7.6× over the byte-at-a-time scalar loop. half↔float uses the
+baseline AArch64 `FCVTL`/`FCVTN` convert instructions (5.8×; bit-exact with the
+integer scalar for all finite/zero/inf/subnormal values, quieting signalling
+NaNs like x86 F16C). The JPH NLT involution is 8× as a 2-lane int64 masked
+negate; the int32→half pack is memory-bandwidth-bound (no SIMD win, as on x86).
+
+**HTJ2K/JPH.** The reversible 5/3 wavelet (forward + inverse, 1D + column
+vertical, int32 and int64), the NLT type-3, the int32→half pack and the
+sign-magnitude→signed extraction all have NEON kernels (`exr_jph_simd_neon.c`),
+bit-identical to scalar and selected at compile time. End-to-end this lifts
+htj2k256 **decode ~12% (25.3 → 28.6 MP/s)**; encode is unchanged because both it
+and the last of decode are dominated by the **scalar entropy coder** (cleanup-pass
+VLC/MEL + MagSgn), which does not benefit from SIMD (see
+`doc/htj2k-entropy-simd-scope.md`). The fpnge PSHUFB Huffman-emit kernel is
+x86-only and absent from the ARM report.
 
 ### tinyexr vs OpenEXR
 

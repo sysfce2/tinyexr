@@ -720,6 +720,9 @@ exr_result exr_jph_apply_nlt_type3_i32(int32_t *data, size_t count,
             jph_nlt_type3_i32_sse2(data, count, biasm1);
             return EXR_SUCCESS;
         }
+#elif defined(EXR_NEON)
+        jph_nlt_type3_i32_neon(data, count, biasm1);
+        return EXR_SUCCESS;
 #endif
         jph_nlt_type3_i32_scalar(data, count, biasm1);
         return EXR_SUCCESS;
@@ -831,13 +834,15 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
                                      size_t width, size_t height,
                                      unsigned levels) {
     unsigned level;
-    int use_avx2 = 0;
+    int use_simd = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    use_simd = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#elif defined(EXR_NEON)
+    use_simd = 1;
 #endif
 
     for (level = levels; level > 0; --level) {
@@ -847,7 +852,7 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
         size_t temp_count, temp_bytes, scratch_len, sb64;
         int32_t *temp = NULL;
-        int64_t *ev = NULL, *od = NULL; /* AVX2 1D row-pass scratch */
+        int64_t *ev = NULL, *od = NULL; /* SIMD 1D row-pass scratch */
         size_t y;
         exr_result rc = EXR_SUCCESS;
 
@@ -860,11 +865,11 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
             return EXR_ERROR_CORRUPT;
 
         temp = (int32_t *)exr_malloc(a, temp_bytes);
-        if (use_avx2) {
+        if (use_simd) {
             ev = (int64_t *)exr_malloc(a, sb64);
             od = (int64_t *)exr_malloc(a, sb64);
         }
-        if (!temp || (use_avx2 && (!ev || !od))) {
+        if (!temp || (use_simd && (!ev || !od))) {
             exr_free(a, temp); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
@@ -873,8 +878,13 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         for (y = 0; y < rh; ++y) {
             const int32_t *row = data + y * width;
 #if defined(EXR_X86)
-            if (use_avx2)
+            if (use_simd)
                 rc = jph_inverse_53_i32_avx2(row, lw, row + lw, hw,
+                                             temp + y * rw, rw, ev, od);
+            else
+#elif defined(EXR_NEON)
+            if (use_simd)
+                rc = jph_inverse_53_i32_neon(row, lw, row + lw, hw,
                                              temp + y * rw, rw, ev, od);
             else
 #endif
@@ -885,8 +895,12 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         /* Vertical (column) pass, row-wise across all columns -- no gather/
          * scatter. temp's lh low-rows / hh high-rows -> interleaved data rows. */
 #if defined(EXR_X86)
-        if (use_avx2)
+        if (use_simd)
             rc = jph_inverse_53_vert_i32_avx2(temp, rw, lh, hh, data, width);
+        else
+#elif defined(EXR_NEON)
+        if (use_simd)
+            rc = jph_inverse_53_vert_i32_neon(temp, rw, lh, hh, data, width);
         else
 #endif
             rc = exr_jph_inverse_53_vert_i32(temp, rw, lh, hh, data, width);
@@ -973,13 +987,15 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
                                         size_t width, size_t height,
                                         unsigned levels) {
     unsigned level;
-    int use_avx2 = 0;
+    int use_simd = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    use_simd = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#elif defined(EXR_NEON)
+    use_simd = 1;
 #endif
 
     for (level = levels; level > 0; --level) {
@@ -1001,11 +1017,11 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
             return EXR_ERROR_CORRUPT;
 
         temp = (int64_t *)exr_malloc(a, temp_bytes);
-        if (use_avx2) {
+        if (use_simd) {
             ev = (int64_t *)exr_malloc(a, scratch_bytes);
             od = (int64_t *)exr_malloc(a, scratch_bytes);
         }
-        if (!temp || (use_avx2 && (!ev || !od))) {
+        if (!temp || (use_simd && (!ev || !od))) {
             exr_free(a, temp); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
@@ -1014,8 +1030,13 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
         for (y = 0; y < rh; ++y) {
             const int64_t *row = data + y * width;
 #if defined(EXR_X86)
-            if (use_avx2)
+            if (use_simd)
                 rc = jph_inverse_53_i64_avx2(row, lw, row + lw, hw,
+                                             temp + y * rw, rw, ev, od);
+            else
+#elif defined(EXR_NEON)
+            if (use_simd)
+                rc = jph_inverse_53_i64_neon(row, lw, row + lw, hw,
                                              temp + y * rw, rw, ev, od);
             else
 #endif
@@ -1024,8 +1045,12 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
         }
         /* Vertical (column) pass, row-wise across all columns -- no gather. */
 #if defined(EXR_X86)
-        if (use_avx2)
+        if (use_simd)
             rc = jph_inverse_53_vert_i64_avx2(temp, rw, lh, hh, data, width);
+        else
+#elif defined(EXR_NEON)
+        if (use_simd)
+            rc = jph_inverse_53_vert_i64_neon(temp, rw, lh, hh, data, width);
         else
 #endif
             rc = jph_inverse_53_vert_i64(temp, rw, lh, hh, data, width);
@@ -1081,6 +1106,9 @@ static exr_result jph_apply_nlt_type3_i64(int64_t *data, size_t count,
             return EXR_SUCCESS;
         }
     }
+#elif defined(EXR_NEON)
+    jph_nlt_type3_i64_neon(data, count, bias);
+    return EXR_SUCCESS;
 #endif
     jph_nlt_type3_i64_scalar(data, count, bias);
     return EXR_SUCCESS;
@@ -1941,6 +1969,9 @@ static void jph_pack_i32_to_half(uint8_t *dst, const int32_t *src, size_t n) {
     uint32_t caps = exr_cpu_caps();
     if (caps & EXR_SIMD_AVX2) { jph_pack_i32_to_half_avx2(dst, src, n); return; }
     if (caps & EXR_SIMD_SSE41) { jph_pack_i32_to_half_sse41(dst, src, n); return; }
+#elif defined(EXR_NEON)
+    jph_pack_i32_to_half_neon(dst, src, n);
+    return;
 #endif
     jph_pack_i32_to_half_scalar(dst, src, n);
 }
@@ -3889,6 +3920,9 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 jph_extract_signmag_i32_to_i64_avx2(orow, brow, width, shift);
                 continue;
             }
+#elif defined(EXR_NEON)
+            jph_extract_signmag_i32_to_i64_neon(orow, brow, width, shift);
+            continue;
 #endif
             for (x = 0u; x < width; ++x) {
                 uint32_t v = brow[x];
@@ -4536,13 +4570,16 @@ static exr_result jph_forward_53_i64(const int64_t *src, size_t n,
  * which may alias the `low` output — pass a distinct source for that case. */
 static exr_result jph_forward_53_1d_i64(const int64_t *src, size_t n,
                                         int64_t *low, size_t lc, int64_t *high,
-                                        size_t hc, int use_avx2, int64_t *ev,
+                                        size_t hc, int use_simd, int64_t *ev,
                                         int64_t *od) {
 #if defined(EXR_X86)
-    if (use_avx2)
+    if (use_simd)
         return jph_forward_53_i64_avx2(src, n, low, lc, high, hc, ev, od);
+#elif defined(EXR_NEON)
+    if (use_simd)
+        return jph_forward_53_i64_neon(src, n, low, lc, high, hc, ev, od);
 #else
-    (void)use_avx2; (void)ev; (void)od;
+    (void)use_simd; (void)ev; (void)od;
 #endif
     return jph_forward_53_i64(src, n, low, lc, high, hc);
 }
@@ -4589,13 +4626,15 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
                                         size_t width, size_t height,
                                         unsigned levels) {
     unsigned level;
-    int use_avx2 = 0;
+    int use_simd = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    use_simd = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#elif defined(EXR_NEON)
+    use_simd = 1;
 #endif
 
     for (level = 1; level <= levels; ++level) {
@@ -4620,12 +4659,12 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         temp = (int64_t *)exr_malloc(a, temp_bytes);
         col_low = (int64_t *)exr_malloc(a, scratch_bytes);
         col_high = (int64_t *)exr_malloc(a, scratch_bytes);
-        if (use_avx2) {
+        if (use_simd) {
             ev = (int64_t *)exr_malloc(a, scratch_bytes);
             od = (int64_t *)exr_malloc(a, scratch_bytes);
         }
         if (!temp || !col_low || !col_high ||
-            (use_avx2 && (!ev || !od))) {
+            (use_simd && (!ev || !od))) {
             exr_free(a, temp); exr_free(a, col_low);
             exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
@@ -4634,8 +4673,12 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         /* Vertical (column) analysis, row-wise across all columns -- no gather/
          * scatter. data's interleaved rows -> temp's lh low-rows / hh high-rows. */
 #if defined(EXR_X86)
-        if (use_avx2)
+        if (use_simd)
             rc = jph_forward_53_vert_i64_avx2(data, width, rw, lh, hh, temp);
+        else
+#elif defined(EXR_NEON)
+        if (use_simd)
+            rc = jph_forward_53_vert_i64_neon(data, width, rw, lh, hh, temp);
         else
 #endif
             rc = jph_forward_53_vert_i64(data, width, rw, lh, hh, temp);
@@ -4643,7 +4686,7 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         /* Horizontal (row) analysis: each temp row is contiguous. */
         for (y = 0; y < rh; ++y) {
             rc = jph_forward_53_1d_i64(temp + y * rw, rw, col_low, lw, col_high,
-                                       hw, use_avx2, ev, od);
+                                       hw, use_simd, ev, od);
             if (rc != EXR_SUCCESS) goto done_fwd64;
             for (x = 0; x < lw; ++x) data[y * width + x] = col_low[x];
             for (x = 0; x < hw; ++x) data[y * width + lw + x] = col_high[x];

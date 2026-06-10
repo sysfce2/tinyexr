@@ -252,11 +252,41 @@ void jph_nlt_type3_i32_scalar(int32_t *data, size_t count, int32_t biasm1);
 void jph_pack_i32_to_half_scalar(uint8_t *dst, const int32_t *src, size_t n);
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define EXR_NEON 1
+/* NEON half<->float via FCVTL/FCVTN (mirrors the x86 F16C kernels). */
+void exr_half_to_float_neon(const uint16_t *src, float *dst, size_t count);
+void exr_float_to_half_neon(const float *src, uint16_t *dst, size_t count);
 void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n);
 /* NEON predictor: prefix-sum (decode) / delta (encode), bit-identical to the
  * scalar reference. */
 void exr_predictor_decode_neon(uint8_t *p, size_t n);
 void exr_predictor_encode_neon(uint8_t *p, size_t n);
+/* NEON JPH (HTJ2K) kernels (src/exr_jph_simd_neon.c), bit-identical to the
+ * `_scalar` references; the NEON path is selected at compile time. */
+void jph_nlt_type3_i64_neon(int64_t *data, size_t count, int64_t bias);
+void jph_nlt_type3_i32_neon(int32_t *data, size_t count, int32_t biasm1);
+void jph_pack_i32_to_half_neon(uint8_t *dst, const int32_t *src, size_t n);
+void jph_extract_signmag_i32_to_i64_neon(int64_t *out, const uint32_t *buf,
+                                         size_t n, unsigned shift);
+exr_result jph_inverse_53_i32_neon(const int32_t *low, size_t low_count,
+                                   const int32_t *high, size_t high_count,
+                                   int32_t *out, size_t out_count,
+                                   int64_t *ev, int64_t *od);
+exr_result jph_inverse_53_vert_i32_neon(const int32_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int32_t *data, size_t width);
+exr_result jph_inverse_53_i64_neon(const int64_t *low, size_t low_count,
+                                   const int64_t *high, size_t high_count,
+                                   int64_t *out, size_t out_count,
+                                   int64_t *ev, int64_t *od);
+exr_result jph_inverse_53_vert_i64_neon(const int64_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int64_t *data, size_t width);
+exr_result jph_forward_53_i64_neon(const int64_t *src, size_t n, int64_t *low,
+                                   size_t low_count, int64_t *high,
+                                   size_t high_count, int64_t *ev, int64_t *od);
+exr_result jph_forward_53_vert_i64_neon(const int64_t *data, size_t width,
+                                        size_t rw, size_t lh, size_t hh,
+                                        int64_t *temp);
 #endif
 
 /* ============================================================================

@@ -167,6 +167,8 @@ void exr_simd_init(void) {
     util_set_simd(2);
 #endif
 #if defined(EXR_NEON)
+    exr_simd.half_to_float = exr_half_to_float_neon;
+    exr_simd.float_to_half = exr_float_to_half_neon;
     exr_simd.interleave = exr_interleave_neon;
     exr_simd.predictor_decode = exr_predictor_decode_neon;
     exr_simd.predictor_encode = exr_predictor_encode_neon;
@@ -200,6 +202,8 @@ void exr_simd_force(int level) {
     }
 #elif defined(EXR_NEON)
     if (level >= 1) {
+        exr_simd.half_to_float = exr_half_to_float_neon;
+        exr_simd.float_to_half = exr_float_to_half_neon;
         exr_simd.interleave = exr_interleave_neon;
         exr_simd.predictor_decode = exr_predictor_decode_neon;
         exr_simd.predictor_encode = exr_predictor_encode_neon;

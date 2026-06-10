@@ -2332,6 +2332,195 @@ static void jph_simd_check(void) {
         free(low); free(high); free(o0); free(o1); free(ev); free(od);
         free(temp); free(ds); free(da); free(ref); free(cl); free(ch); free(co);
     }
+#elif defined(EXR_NEON)
+    /* NEON JPH kernels vs scalar (compile-time selected on aarch64). */
+    {
+        const size_t n = 1003; /* not a multiple of 4 -> exercises SIMD tails */
+        int64_t *orig = (int64_t *)malloc(n * sizeof(int64_t));
+        int64_t *ref = (int64_t *)malloc(n * sizeof(int64_t));
+        int64_t *got = (int64_t *)malloc(n * sizeof(int64_t));
+        uint32_t rng = 0xC0FFEEu;
+        int bds[2] = {16, 32};
+        int ok = 1, k;
+        if (!orig || !ref || !got) { free(orig); free(ref); free(got); return; }
+        for (k = 0; k < 2; ++k) {
+            uint32_t bd = (uint32_t)bds[k];
+            int64_t bias = ((int64_t)1 << (bd - 1)) + 1;
+            size_t i;
+            for (i = 0; i < n; ++i) {
+                int64_t v;
+                rng = rng * 1664525u + 1013904223u;
+                v = (int64_t)(int32_t)rng;
+                if (bd == 32u && (rng & 7u) == 0u) v *= 41;
+                orig[i] = v;
+            }
+            memcpy(ref, orig, n * sizeof(int64_t));
+            jph_nlt_type3_i64_scalar(ref, n, bias);
+            memcpy(got, orig, n * sizeof(int64_t));
+            jph_nlt_type3_i64_neon(got, n, bias);
+            if (memcmp(ref, got, n * sizeof(int64_t)) != 0) ok = 0;
+        }
+        CHECK(ok, "JPH NLT type3 i64 NEON == scalar");
+        if (ok) printf("  ok: JPH NLT type3 i64 NEON == scalar\n");
+        free(orig); free(ref); free(got);
+    }
+    {   /* int32 NLT */
+        const size_t n = 1003;
+        int32_t *orig = (int32_t *)malloc(n * 4), *ref = (int32_t *)malloc(n * 4);
+        int32_t *got = (int32_t *)malloc(n * 4);
+        uint32_t rng = 0x5151u;
+        int ok = 1;
+        if (orig && ref && got) {
+            size_t i;
+            int32_t biasm1 = (int32_t)((((int64_t)1 << 15) + 1) - 1);
+            for (i = 0; i < n; ++i) { rng = rng * 1664525u + 1013904223u;
+                orig[i] = (int32_t)(rng & 0x7fffffffu) - 0x40000000; }
+            memcpy(ref, orig, n * 4); jph_nlt_type3_i32_scalar(ref, n, biasm1);
+            memcpy(got, orig, n * 4); jph_nlt_type3_i32_neon(got, n, biasm1);
+            if (memcmp(ref, got, n * 4) != 0) ok = 0;
+        }
+        CHECK(ok, "JPH NLT type3 i32 NEON == scalar");
+        free(orig); free(ref); free(got);
+    }
+    {   /* int32 -> uint16 pack: truncation, incl. out-of-int16 values. */
+        const size_t pn = 1003;
+        int32_t *ps = (int32_t *)malloc(pn * 4);
+        uint8_t *pr = (uint8_t *)malloc(pn * 2), *px = (uint8_t *)malloc(pn * 2);
+        int pok = 1;
+        if (ps && pr && px) {
+            size_t i; uint32_t r2 = 0x12345u;
+            for (i = 0; i < pn; ++i) { r2 = r2 * 1664525u + 1013904223u;
+                ps[i] = (int32_t)r2; }
+            jph_pack_i32_to_half_scalar(pr, ps, pn);
+            jph_pack_i32_to_half_neon(px, ps, pn);
+            if (memcmp(pr, px, pn * 2) != 0) pok = 0;
+        }
+        CHECK(pok, "JPH pack i32->half NEON == scalar");
+        free(ps); free(pr); free(px);
+    }
+    {   /* sign-magnitude extraction over several shifts. */
+        const size_t en = 1003;
+        uint32_t *src = (uint32_t *)malloc(en * 4);
+        int64_t *r0 = (int64_t *)malloc(en * 8), *r1 = (int64_t *)malloc(en * 8);
+        int ok = 1; unsigned shifts[3] = {0u, 7u, 30u}; int s;
+        if (src && r0 && r1) {
+            size_t i; uint32_t rr = 0x9e37u;
+            for (i = 0; i < en; ++i) { rr = rr * 1664525u + 1013904223u; src[i] = rr; }
+            for (s = 0; s < 3; ++s) {
+                size_t x; unsigned shift = shifts[s];
+                for (x = 0; x < en; ++x) { uint32_t v = src[x];
+                    int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
+                    r0[x] = (v & 0x80000000u) ? -mag : mag; }
+                jph_extract_signmag_i32_to_i64_neon(r1, src, en, shift);
+                if (memcmp(r0, r1, en * 8) != 0) ok = 0;
+            }
+        }
+        CHECK(ok, "JPH extract signmag NEON == scalar");
+        free(src); free(r0); free(r1);
+    }
+    {   /* inverse 5/3 1D: i32 (range-checked) and i64, NEON == scalar. */
+        int32_t *low = (int32_t *)malloc(2048 * 4), *high = (int32_t *)malloc(2048 * 4);
+        int32_t *o0 = (int32_t *)malloc(4096 * 4), *o1 = (int32_t *)malloc(4096 * 4);
+        int64_t *L = (int64_t *)malloc(2048 * 8), *H = (int64_t *)malloc(2048 * 8);
+        int64_t *q0 = (int64_t *)malloc(4096 * 8), *q1 = (int64_t *)malloc(4096 * 8);
+        int64_t *ev = (int64_t *)malloc(2048 * 8), *od = (int64_t *)malloc(2048 * 8);
+        uint32_t rng = 0xBEEF01u;
+        int wok = 1, w64 = 1, trial;
+        if (low && high && o0 && o1 && L && H && q0 && q1 && ev && od) {
+            for (trial = 0; trial < 3000 && wok && w64; ++trial) {
+                size_t oc, lc, hc, i; exr_result r0, r1; int sb;
+                rng = rng * 1664525u + 1013904223u;
+                oc = (trial < 100) ? (size_t)trial : (rng % 2000u);
+                lc = (oc + 1u) / 2u; hc = oc / 2u; sb = (int)(trial % 32u);
+                for (i = 0; i < lc; ++i) { rng = rng * 1664525u + 1013904223u;
+                    low[i] = (int32_t)((int32_t)rng >> sb); L[i] = low[i]; }
+                for (i = 0; i < hc; ++i) { rng = rng * 1664525u + 1013904223u;
+                    high[i] = (int32_t)((int32_t)rng >> sb); H[i] = high[i]; }
+                memset(o0, 0x5a, 4096 * 4); memset(o1, 0x5a, 4096 * 4);
+                r0 = exr_jph_inverse_53_i32(low, lc, high, hc, o0, oc);
+                r1 = jph_inverse_53_i32_neon(low, lc, high, hc, o1, oc, ev, od);
+                if (r0 != r1) wok = 0;
+                else if (r0 == EXR_SUCCESS && memcmp(o0, o1, oc * 4) != 0) wok = 0;
+                jph_inverse_53_i64(L, lc, H, hc, q0, oc);
+                jph_inverse_53_i64_neon(L, lc, H, hc, q1, oc, ev, od);
+                if (memcmp(q0, q1, oc * 8) != 0) w64 = 0;
+            }
+        }
+        CHECK(wok, "JPH inverse 5/3 1D i32 NEON == scalar");
+        CHECK(w64, "JPH inverse 5/3 1D i64 NEON == scalar");
+        free(low); free(high); free(o0); free(o1);
+        free(L); free(H); free(q0); free(q1); free(ev); free(od);
+    }
+    {   /* vertical inverse 5/3 (i32 + i64) and forward 5/3 (i64) NEON==scalar. */
+        const size_t RWMAX = 130u, RHMAX = 40u, N = 130u * 40u;
+        int32_t *t32 = (int32_t *)malloc(N * 4), *ds = (int32_t *)malloc(N * 4);
+        int32_t *da = (int32_t *)malloc(N * 4);
+        int64_t *t64 = (int64_t *)malloc(N * 8), *vs = (int64_t *)malloc(N * 8);
+        int64_t *va = (int64_t *)malloc(N * 8);
+        int64_t *fd = (int64_t *)malloc(N * 8), *fs = (int64_t *)malloc(N * 8);
+        int64_t *fa = (int64_t *)malloc(N * 8);
+        int vi32 = 1, vi64 = 1, ff = 1;
+        uint32_t rng = 0x1357abcu;
+        size_t trial;
+        if (t32 && ds && da && t64 && vs && va && fd && fs && fa) {
+            for (trial = 0; trial < 3000 && vi32 && vi64 && ff; ++trial) {
+                size_t rw, rh, lh, hh, i, n; int sb; exr_result rs, ra;
+                rng = rng * 1664525u + 1013904223u; rw = 1u + (rng % RWMAX);
+                rng = rng * 1664525u + 1013904223u; rh = 1u + (rng % RHMAX);
+                lh = (rh + 1u) / 2u; hh = rh / 2u; sb = (int)(trial % 32u);
+                n = (lh + hh) * rw;
+                for (i = 0; i < n; ++i) { rng = rng * 1664525u + 1013904223u;
+                    t32[i] = (int32_t)((int32_t)rng >> sb); t64[i] = t32[i]; }
+                /* inverse vertical i32 */
+                memset(ds, 0x5a, N * 4); memset(da, 0x5a, N * 4);
+                rs = exr_jph_inverse_53_vert_i32(t32, rw, lh, hh, ds, rw);
+                ra = jph_inverse_53_vert_i32_neon(t32, rw, lh, hh, da, rw);
+                if (rs != ra) vi32 = 0;
+                else if (rs == EXR_SUCCESS && memcmp(ds, da, n * 4) != 0) vi32 = 0;
+                /* inverse vertical i64 */
+                memset(vs, 0x5a, N * 8); memset(va, 0x5a, N * 8);
+                jph_inverse_53_vert_i64(t64, rw, lh, hh, vs, rw);
+                jph_inverse_53_vert_i64_neon(t64, rw, lh, hh, va, rw);
+                if (memcmp(vs, va, n * 8) != 0) vi64 = 0;
+                /* forward vertical i64 (data interleaved rh rows -> subbands) */
+                for (i = 0; i < rh * rw; ++i) { rng = rng * 1664525u + 1013904223u;
+                    fd[i] = (int32_t)((int32_t)rng >> sb); }
+                jph_forward_53_vert_i64(fd, rw, rw, lh, hh, fs);
+                jph_forward_53_vert_i64_neon(fd, rw, rw, lh, hh, fa);
+                if (memcmp(fs, fa, n * 8) != 0) ff = 0;
+            }
+        }
+        CHECK(vi32, "JPH inverse 5/3 vertical i32 NEON == scalar");
+        CHECK(vi64, "JPH inverse 5/3 vertical i64 NEON == scalar");
+        CHECK(ff, "JPH forward 5/3 vertical i64 NEON == scalar");
+        free(t32); free(ds); free(da); free(t64); free(vs); free(va);
+        free(fd); free(fs); free(fa);
+    }
+    {   /* forward 5/3 1D i64 NEON: round-trips losslessly through the (already
+         * scalar-verified) inverse 1D i64 NEON kernel -> reconstructs the input.
+         * (The scalar forward 1D is static; the forward arithmetic is also
+         * directly checked scalar-vs-NEON by the vertical test above.) */
+        int64_t *src = (int64_t *)malloc(4096 * 8), *rec = (int64_t *)malloc(4096 * 8);
+        int64_t *lo = (int64_t *)malloc(2048 * 8), *hi = (int64_t *)malloc(2048 * 8);
+        int64_t *ev = (int64_t *)malloc(2048 * 8), *od = (int64_t *)malloc(2048 * 8);
+        uint32_t rng = 0x9a7f3u;
+        int fok = 1, trial;
+        if (src && rec && lo && hi && ev && od) {
+            for (trial = 0; trial < 3000 && fok; ++trial) {
+                size_t n, nl, nh, i; int sb;
+                rng = rng * 1664525u + 1013904223u;
+                n = (trial < 100) ? (size_t)trial : (rng % 4000u);
+                nl = (n + 1u) / 2u; nh = n / 2u; sb = (int)(trial % 16u);
+                for (i = 0; i < n; ++i) { rng = rng * 1664525u + 1013904223u;
+                    src[i] = (int32_t)((int32_t)rng >> sb); }
+                jph_forward_53_i64_neon(src, n, lo, nl, hi, nh, ev, od);
+                jph_inverse_53_i64_neon(lo, nl, hi, nh, rec, n, ev, od);
+                if (n && memcmp(src, rec, n * 8) != 0) fok = 0;
+            }
+        }
+        CHECK(fok, "JPH forward 5/3 1D i64 NEON round-trips (fwd->inv)");
+        free(src); free(rec); free(lo); free(hi); free(ev); free(od);
+    }
 #endif
 }
 
@@ -2624,6 +2813,53 @@ static void util_simd_parity_tests(void) {
             for (i = 0; i < px * 4; ++i)
                 if (!approx(ms[i], mv[i], 1e-5f)) ok = 0;
             CHECK(ok, "SIMD mat3 matches scalar");
+        }
+    }
+    /* half<->float SIMD parity vs scalar. The hardware-convert tiers (x86 F16C,
+     * ARM NEON FCVTL/FCVTN) are bit-exact with the integer scalar for every
+     * finite / zero / inf / subnormal value; like F16C they quiet signalling
+     * NaNs, so NaN inputs need only stay NaN (not bit-identical). float->half is
+     * fully bit-exact, NaN payloads included. */
+    {
+        static uint16_t hin[65536];
+        static float hf_s[65536], hf_v[65536];
+        int q, hok = 1;
+        for (q = 0; q < 65536; ++q) hin[q] = (uint16_t)q;
+        exr_simd_force(0);
+        exr_half_to_float(hin, hf_s, 65536);
+        exr_simd_force(2);
+        exr_half_to_float(hin, hf_v, 65536);
+        for (q = 0; q < 65536; ++q) {
+            if (((q & 0x7c00) == 0x7c00) && (q & 0x3ff)) {
+                if (!(hf_v[q] != hf_v[q])) hok = 0; /* NaN must stay NaN */
+            } else {
+                uint32_t a, b;
+                memcpy(&a, &hf_s[q], 4);
+                memcpy(&b, &hf_v[q], 4);
+                if (a != b) hok = 0;
+            }
+        }
+        CHECK(hok, "SIMD half->float matches scalar (NaN stays NaN)");
+        {
+            static uint16_t qs[65536], qv[65536];
+            static float fv[65536];
+            uint32_t rng = 0x1234567u;
+            int j;
+            hok = 1;
+            for (q = 0; q < 65536; ++q) fv[q] = hf_s[q]; /* every half's float */
+            exr_simd_force(0); exr_float_to_half(fv, qs, 65536);
+            exr_simd_force(2); exr_float_to_half(fv, qv, 65536);
+            for (q = 0; q < 65536; ++q) if (qs[q] != qv[q]) hok = 0;
+            for (j = 0; j < 4 && hok; ++j) { /* + raw float bit patterns */
+                for (q = 0; q < 65536; ++q) {
+                    rng = rng * 1664525u + 1013904223u;
+                    memcpy(&fv[q], &rng, 4);
+                }
+                exr_simd_force(0); exr_float_to_half(fv, qs, 65536);
+                exr_simd_force(2); exr_float_to_half(fv, qv, 65536);
+                for (q = 0; q < 65536; ++q) if (qs[q] != qv[q]) hok = 0;
+            }
+            CHECK(hok, "SIMD float->half bit-exact with scalar");
         }
     }
     exr_simd_force(2);

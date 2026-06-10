@@ -6,8 +6,9 @@
  *   ./build/bench [file.exr ...]
  *
  * Reports, per codec, decode and encode throughput (megapixels/s), and per
- * SIMD primitive (byte de-interleave, half<->float) the throughput at each
- * available ISA tier (scalar / SSE2 / AVX2 / F16C), with speedups.
+ * SIMD primitive (byte de-interleave, predictor, half<->float) the throughput at
+ * each available ISA tier (scalar / SSE2 / AVX2 / F16C on x86, scalar / NEON on
+ * aarch64), with speedups.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
  * SPDX-License-Identifier: BSD-3-Clause
@@ -117,11 +118,19 @@ static void bench_codecs(const char *path) {
         if (EXR_OK(exr_save_to_memory(&buf, &sz, NULL, &src, EXR_COMPRESSION_ZIP))) {
             struct codec_ctx dc;
             int lvl;
+#if defined(EXR_NEON)
+            /* On aarch64, exr_simd_force(>=1) selects the NEON kernels; there is
+             * no separate sse2/avx2 tier, so sweep scalar vs neon only. */
+            const char *lv[] = {"scalar", "neon"};
+            const int ntier = 2;
+#else
             const char *lv[] = {"scalar", "sse2", "avx2"};
+            const int ntier = 3;
+#endif
             dc.buf = buf;
             dc.buf_size = sz;
             printf("  ZIP decode by forced SIMD tier (predictor + de-interleave):\n");
-            for (lvl = 0; lvl <= 2; ++lvl) {
+            for (lvl = 0; lvl < ntier; ++lvl) {
                 double td;
                 exr_simd_force(lvl);
                 td = timeit(do_decode, &dc, 0.3, NULL);
@@ -143,7 +152,16 @@ static void bench_codecs(const char *path) {
                                       EXR_COMPRESSION_HTJ2K256))) {
             struct codec_ctx dc, ec;
             int lvl;
+#if defined(EXR_NEON)
+            /* The JPH (HTJ2K) entropy/wavelet kernels have no NEON path yet, so
+             * the codec runs scalar on aarch64 (only the de-interleave/util
+             * helpers are NEON). Report a single representative row. */
+            const char *lv[] = {"neon"};
+            const int ntier = 1;
+#else
             const char *lv[] = {"scalar", "sse4.1", "avx2"};
+            const int ntier = 3;
+#endif
             dc.buf = buf;
             dc.buf_size = sz;
             dc.comp = EXR_COMPRESSION_HTJ2K256;
@@ -151,10 +169,14 @@ static void bench_codecs(const char *path) {
             ec.comp = EXR_COMPRESSION_HTJ2K256;
             printf("  HTJ2K256 by forced SIMD tier (JPH dispatch):\n");
             printf("    %-7s %12s %12s\n", "tier", "encode MP/s", "decode MP/s");
-            for (lvl = 0; lvl <= 2; ++lvl) {
+            for (lvl = 0; lvl < ntier; ++lvl) {
                 double te, td;
+#if defined(EXR_NEON)
+                exr_simd_force(1);       /* NEON interleave/util; JPH stays scalar */
+#else
                 exr_cpu_caps_force(lvl); /* JPH path */
                 exr_simd_force(lvl);     /* interleave/half table, for parity */
+#endif
                 te = timeit(do_encode, &ec, 0.3, NULL);
                 td = timeit(do_decode, &dc, 0.3, NULL);
                 printf("    %-7s %12.1f %12.1f\n", lv[lvl], mpix / te, mpix / td);
@@ -176,6 +198,7 @@ static void bench_kernels(void) {
     double t;
     long it;
     uint32_t caps = exr_simd_capabilities();
+    (void)caps; /* only consulted by the x86 tier tables below */
 
     if (!src || !dst) { free(src); free(dst); return; }
     for (i = 0; i < N; ++i) src[i] = (uint8_t)i;
@@ -189,6 +212,8 @@ static void bench_kernels(void) {
 #if defined(EXR_X86)
             {"sse2", exr_interleave_sse2, (caps & EXR_SIMD_SSE2) != 0},
             {"avx2", exr_interleave_avx2, (caps & EXR_SIMD_AVX2) != 0},
+#elif defined(EXR_NEON)
+            {"neon", exr_interleave_neon, 1},
 #endif
         };
         double base = 0;
@@ -200,6 +225,37 @@ static void bench_kernels(void) {
                 double t0 = now_sec();
                 long n = 0;
                 do { v[k].f(src, dst, N); ++n; } while (now_sec() - t0 < 0.3);
+                t = (now_sec() - t0) / (double)n;
+                it = n;
+            }
+            gbs = (double)N / t / 1e9;
+            if (k == 0) base = gbs;
+            printf("    %-7s %8.2f GB/s  (%.2fx)  [%ld it]\n", v[k].n, gbs,
+                   base > 0 ? gbs / base : 1.0, it);
+        }
+    }
+
+    printf("  predictor decode (delta prefix-sum):\n");
+    {
+        struct { const char *n; void (*f)(uint8_t *, size_t); int ok; } v[] = {
+            {"scalar", exr_predictor_decode_scalar, 1},
+#if defined(EXR_X86)
+            {"sse2", exr_predictor_decode_sse2, (caps & EXR_SIMD_SSE2) != 0},
+#elif defined(EXR_NEON)
+            {"neon", exr_predictor_decode_neon, 1},
+#endif
+        };
+        double base = 0;
+        size_t k;
+        memcpy(dst, src, N);
+        for (k = 0; k < sizeof(v) / sizeof(v[0]); ++k) {
+            double gbs;
+            if (!v[k].ok) { printf("    %-7s   (unavailable)\n", v[k].n); continue; }
+            { /* in-place prefix-sum; data-independent, so repeat on dst directly
+               * (values wrap mod 256 — harmless, the per-byte work is identical) */
+                double t0 = now_sec();
+                long n = 0;
+                do { v[k].f(dst, N); ++n; } while (now_sec() - t0 < 0.3);
                 t = (now_sec() - t0) / (double)n;
                 it = n;
             }
@@ -230,6 +286,14 @@ static void bench_kernels(void) {
                 t = (now_sec() - t0) / n;
                 gbs = (double)M * 6 / t / 1e9;
                 printf("    %-7s %8.2f GB/s  (%.2fx)\n", "f16c", gbs, gbs / base);
+            }
+#elif defined(EXR_NEON)
+            {
+                t0 = now_sec(); n = 0;
+                do { exr_half_to_float_neon(h, f, M); ++n; } while (now_sec() - t0 < 0.3);
+                t = (now_sec() - t0) / n;
+                gbs = (double)M * 6 / t / 1e9;
+                printf("    %-7s %8.2f GB/s  (%.2fx)\n", "neon", gbs, gbs / base);
             }
 #endif
             (void)gbs;
@@ -318,10 +382,12 @@ static void bench_deflate(const char *path) {
         struct { const char *name; int kind; } v[] = {
             {"fpng LZ77 (scalar)", 0},
             {"fpnge PSHUFB-huff scalar", 1},
-            {"fpnge PSHUFB-huff sse4.1", 2},
+#if defined(EXR_X86)
+            {"fpnge PSHUFB-huff sse4.1", 2}, /* PSHUFB lookup is x86-only */
+#endif
         };
         size_t k;
-        for (k = 0; k < 3; ++k) {
+        for (k = 0; k < sizeof(v) / sizeof(v[0]); ++k) {
             double t0 = now_sec(), t;
             long it = 0;
             uint8_t *out = NULL;
@@ -366,6 +432,8 @@ static void bench_jph_kernels(void) {
 #if defined(EXR_X86)
             {"nlt3 sse2", jph_nlt_type3_i64_sse2, (caps & EXR_SIMD_SSE2) != 0},
             {"nlt3 avx2", jph_nlt_type3_i64_avx2, (caps & EXR_SIMD_AVX2) != 0},
+#elif defined(EXR_NEON)
+            {"nlt3 neon", jph_nlt_type3_i64_neon, 1},
 #endif
         };
         double base = 0;
@@ -391,6 +459,8 @@ static void bench_jph_kernels(void) {
 #if defined(EXR_X86)
             {"pack sse4.1", jph_pack_i32_to_half_sse41, (caps & EXR_SIMD_SSE41) != 0},
             {"pack avx2", jph_pack_i32_to_half_avx2, (caps & EXR_SIMD_AVX2) != 0},
+#elif defined(EXR_NEON)
+            {"pack neon", jph_pack_i32_to_half_neon, 1},
 #endif
         };
         double base = 0;

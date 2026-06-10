@@ -11,6 +11,41 @@
 
 #include <arm_neon.h>
 
+/* half <-> float via the AArch64 baseline FCVTL/FCVTN convert instructions
+ * (vcvt_f32_f16 / vcvt_f16_f32), 8 elements per iteration with a 1-wide tail.
+ * This mirrors the x86 F16C kernels (exr_half_to_float_f16c et al.): like F16C,
+ * the hardware convert is bit-identical to the integer scalar path for every
+ * finite / zero / inf / subnormal value, and quiets signalling NaNs (sets the
+ * MSB of the payload) where the integer scalar preserves them. float->half is
+ * round-to-nearest-even and bit-exact with the scalar (incl. NaN payloads). */
+void exr_half_to_float_neon(const uint16_t *src, float *dst, size_t count) {
+    size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        uint16x8_t h = vld1q_u16(src + i);
+        vst1q_f32(dst + i, vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(h))));
+        vst1q_f32(dst + i + 4,
+                  vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(h))));
+    }
+    for (; i < count; ++i) {
+        uint16x4_t t = vdup_n_u16(src[i]);
+        dst[i] = vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(t)), 0);
+    }
+}
+
+void exr_float_to_half_neon(const float *src, uint16_t *dst, size_t count) {
+    size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        float16x4_t lo = vcvt_f16_f32(vld1q_f32(src + i));
+        float16x4_t hi = vcvt_f16_f32(vld1q_f32(src + i + 4));
+        vst1q_u16(dst + i,
+                  vcombine_u16(vreinterpret_u16_f16(lo), vreinterpret_u16_f16(hi)));
+    }
+    for (; i < count; ++i) {
+        float16x4_t h = vcvt_f16_f32(vdupq_n_f32(src[i]));
+        dst[i] = vget_lane_u16(vreinterpret_u16_f16(h), 0);
+    }
+}
+
 void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n) {
     size_t half = (n + 1) / 2, n2 = n / 2, i = 0;
     const uint8_t *t1 = src, *t2 = src + half;

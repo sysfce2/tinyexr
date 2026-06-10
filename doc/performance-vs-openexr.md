@@ -138,7 +138,8 @@ pxr24 16.4/15.8/83.6/83.8 (tx enc / exr enc / tx dec / exr dec).
 ## Multi-threading
 
 TinyEXR supports **per-block parallel encode and decode** via portable C11
-`<threads.h>` and a small ephemeral worker pool. It is **opt-in** (build
+`<threads.h>` (or **Grand Central Dispatch** on Apple platforms, which do not
+ship `<threads.h>`) and a small ephemeral worker pool. It is **opt-in** (build
 `THREADS=1` / `-DEXR_USE_THREADS`; default and freestanding builds stay
 single-threaded); the count is set at runtime:
 
@@ -187,9 +188,74 @@ EXR_THREADS=16 ./build/bench_compare                 # 16 threads, both libs
 make bench-compare THREADS=1 LIBDEFLATE=1            # + libdeflate backend
 ```
 
-Still future work: parallelize the deep and mipmap/ripmap paths; add ARM/NEON
-throughput numbers (the NEON path is correctness-verified under qemu but not
-benchmarked here); sweep larger images and channel counts.
+## ARM64 / NEON (Apple Silicon)
+
+The same comparison on **Apple M1** (4 P-core + 4 E-core, macOS 26, Apple
+clang 21), `asakusa.exr`. TinyEXR's codec auto-dispatches to **NEON**; threading
+uses **Grand Central Dispatch** (Apple ships no `<threads.h>`). OpenEXR 4.0-dev
+built from source for arm64 (vendored libdeflate, external OpenJPH 0.27 for
+HTJ2K). The NEON micro-kernel speedups (de-interleave 7.6×, half↔float 5.8×, JPH
+NLT 8.2×, predictor 1.9×) and the full HTJ2K kernel list are in
+[`benchmark/README.md`](../benchmark/README.md#arm64--neon-results-make-bench).
+
+### Single thread
+
+| codec | tx enc | exr enc | tx dec | exr dec |
+|-------|-------:|--------:|-------:|--------:|
+| none  | 1080 | 423  | **2456** | 859 |
+| rle   | 65.2 | 58.3 | **163**  | 89.3 |
+| zips  | 12.5 | 17.0 | 22.2 | 60.6 |
+| zip   | 11.5 | 16.4 | 42.6 | 80.2 |
+| piz   | 26.4 | 25.9 | 28.2 | 66.1 |
+| pxr24 | 10.8 | 20.1 | 43.7 | 82.0 |
+| b44   | 46.6 | 68.6 | **318** | 217 |
+| htj2k256 | 18.3 | 21.6 | 28.5 | 30.3 |
+| htj2k32  | 17.8 | 20.9 | 26.7 | 29.4 |
+
+Same shape as x64: TinyEXR wins the cheap codecs (**none ~2.9×**, **rle ~1.8×**,
+**b44 dec ~1.5×**); OpenEXR leads the DEFLATE family / PIZ via its libdeflate
+inflate and tuned PIZ. With **`LIBDEFLATE=1`** the deflate family comes to
+near-parity (zip 72.3 vs 80.2, zips 57.4 vs 60.8, **pxr24 83.1 vs 82.0**; tx enc /
+exr enc / tx dec / exr dec).
+
+**HTJ2K is near parity on ARM.** With the NEON reversible-5/3 wavelet, NLT,
+sign-magnitude extraction and pack kernels, htj2k256 **decode reaches 28.5 vs
+30.3 MP/s (~94%)** and htj2k32 26.7 vs 29.4; encode is 18.3 vs 21.6 (~85%). The
+residual gap is **not** SIMD — OpenJPH ships AVX2/AVX-512/SSSE3 block coders but
+**no NEON** entropy coder, so on ARM *both* libraries run their scalar cleanup-pass
+entropy coder (VLC/MEL + MagSgn), which dominates both profiles once the transform
+is vectorized. OpenJPH's scalar entropy coder is a little more tuned; SIMD does not
+help here (the decode-side attempts are written up in
+[`doc/htj2k-entropy-simd-scope.md`](htj2k-entropy-simd-scope.md), and NEON's
+128-bit vectors are narrower still). On x64, by contrast, OpenEXR's AVX2 JPH coder
+makes the encode gap ~3×; ARM closes most of it.
+
+### Multi-threaded (8 threads, in-tree)
+
+| codec | tx enc | exr enc | tx dec | exr dec |
+|-------|-------:|--------:|-------:|--------:|
+| none  | 928  | 212  | **2391** | 160 |
+| rle   | 276  | 127  | **684**  | 139 |
+| zips  | 61.4 | 60.7 | 109  | 128 |
+| zip   | 47.9 | 75.4 | 174  | **328** |
+| piz   | 88.7 | 106  | 96.2 | 258 |
+| pxr24 | 45.0 | 90.8 | 181  | **334** |
+| b44   | 160  | 254  | **796** | 701 |
+| htj2k256 | 18.2 | 35.7 | 28.4 | 50.3 |
+| htj2k32  | 58.6 | 86.1 | 83.1 | 116 |
+
+TinyEXR decode scales **~4×** to 8 threads (rle 163→684, zip 42→174, b44
+318→796) and out-decodes OpenEXR on **none / rle / zips / b44**. OpenEXR's
+libdeflate inflate scales harder, so it leads **zip / pxr24 / piz** decode at 8
+threads in-tree. With **`LIBDEFLATE=1` at 8 threads** TinyEXR leads **zips
+(272 vs 124)** and reaches parity on **zip (298 vs 321)** and **pxr24 (329 vs
+324)** decode. (HTJ2K256 decode stays flat — at 256 lines/block `asakusa.exr` has
+too few chunks to parallelize; HTJ2K32 scales to ~75 MP/s. The JPH codec itself is
+scalar on ARM — no NEON entropy/wavelet kernels yet.)
+
+Still future work: parallelize the deep and mipmap/ripmap paths; optimize the
+scalar HTJ2K entropy coder (the remaining encode/decode gap on ARM, where neither
+library has a NEON entropy path); sweep larger images and channel counts.
 
 ---
 
