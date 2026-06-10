@@ -143,6 +143,16 @@ typedef struct {
     void (*interleave)(const uint8_t *src, uint8_t *dst, size_t n); /* de-split */
     void (*predictor_decode)(uint8_t *p, size_t n); /* delta -> prefix sum */
     void (*predictor_encode)(uint8_t *p, size_t n); /* prefix sum -> delta */
+    /* Util-module hot kernels (src/exr_util_simd_*). `scale` folds the
+     * raw-vs-normalized factor; the float->int kernels clamp then round to
+     * nearest (ties to even) to match the hardware convert. */
+    void (*u8_to_f32)(float *dst, const uint8_t *src, size_t n, float scale);
+    void (*u16_to_f32)(float *dst, const uint16_t *src, size_t n, float scale);
+    void (*f32_to_u8)(uint8_t *dst, const float *src, size_t n, float scale);
+    void (*f32_to_u16)(uint16_t *dst, const float *src, size_t n, float scale);
+    void (*axpy)(float *acc, const float *x, float w, size_t n); /* acc += w*x */
+    /* Apply row-major 3x3 to interleaved RGB(A); alpha (4th ch) passes through. */
+    void (*mat3)(float *dst, const float *src, size_t px, int ch, const float *m);
 } exr_simd_vtbl;
 
 extern exr_simd_vtbl exr_simd;
@@ -247,6 +257,48 @@ void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n);
  * scalar reference. */
 void exr_predictor_decode_neon(uint8_t *p, size_t n);
 void exr_predictor_encode_neon(uint8_t *p, size_t n);
+#endif
+
+/* ============================================================================
+ * Util-module kernels (scalar reference = source of truth; SIMD must match).
+ * Scalar refs are defined in their natural TU (convert/resize/color); the SIMD
+ * variants live in src/exr_util_simd_x86.c / src/exr_util_simd_neon.c.
+ * ========================================================================== */
+
+void exr_u8_to_f32_scalar(float *dst, const uint8_t *src, size_t n, float scale);
+void exr_u16_to_f32_scalar(float *dst, const uint16_t *src, size_t n, float scale);
+void exr_f32_to_u8_scalar(uint8_t *dst, const float *src, size_t n, float scale);
+void exr_f32_to_u16_scalar(uint16_t *dst, const float *src, size_t n, float scale);
+void exr_axpy_scalar(float *acc, const float *x, float w, size_t n);
+void exr_mat3_scalar(float *dst, const float *src, size_t px, int ch,
+                     const float *m);
+
+/* Hand-rolled, libm-free transcendentals used by transfer functions (kept out
+ * of the freestanding forbidden set: names are not the bare exp/log/pow words).
+ * Accurate to ~1e-6 relative over the working range; verified against libm in
+ * the test build. */
+float exr_util_log2f(float x);
+float exr_util_exp2f(float x);
+float exr_util_powf(float x, float y);
+float exr_util_sqrtf(float x);
+
+#if defined(EXR_X86)
+void exr_u8_to_f32_sse41(float *dst, const uint8_t *src, size_t n, float scale);
+void exr_u16_to_f32_sse41(float *dst, const uint16_t *src, size_t n, float scale);
+void exr_f32_to_u8_sse41(uint8_t *dst, const float *src, size_t n, float scale);
+void exr_f32_to_u16_sse41(uint16_t *dst, const float *src, size_t n, float scale);
+void exr_axpy_avx2(float *acc, const float *x, float w, size_t n);
+void exr_mat3_avx2(float *dst, const float *src, size_t px, int ch,
+                   const float *m);
+#endif
+#if defined(EXR_NEON)
+void exr_u8_to_f32_neon(float *dst, const uint8_t *src, size_t n, float scale);
+void exr_u16_to_f32_neon(float *dst, const uint16_t *src, size_t n, float scale);
+void exr_f32_to_u8_neon(uint8_t *dst, const float *src, size_t n, float scale);
+void exr_f32_to_u16_neon(uint16_t *dst, const float *src, size_t n, float scale);
+void exr_axpy_neon(float *acc, const float *x, float w, size_t n);
+void exr_mat3_neon(float *dst, const float *src, size_t px, int ch,
+                   const float *m);
 #endif
 
 /* ============================================================================

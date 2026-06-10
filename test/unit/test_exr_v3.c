@@ -2494,6 +2494,377 @@ static void spectral_tests(void) {
     }
 }
 
+/* ============================================================================
+ * Util module: conversions, resize, tonemap, colorspace, transfer, LUT
+ * ========================================================================== */
+
+static int approx(float a, float b, float eps) {
+    float d = a - b;
+    if (d < 0) d = -d;
+    return d <= eps;
+}
+
+static void util_convert_tests(void) {
+    int i;
+    uint16_t u16[256], r16[256];
+    float f[256];
+    /* u16 normalized round-trip (exact: 65535 is representable). */
+    for (i = 0; i < 256; ++i) u16[i] = (uint16_t)(i * 257); /* 0..65535 */
+    exr_u16_to_float(u16, f, 256, 1);
+    exr_float_to_u16(f, r16, 256, 1);
+    {
+        int ok = 1;
+        for (i = 0; i < 256; ++i)
+            if (u16[i] != r16[i]) ok = 0;
+        CHECK(ok, "u16<->float normalized round-trip exact");
+    }
+    CHECK(approx(f[0], 0.0f, 0.0f) && approx(f[255], 1.0f, 1e-6f),
+          "u16 normalized endpoints");
+
+    /* clamp + round: HDR/negative inputs. */
+    {
+        float in[4] = {-1.0f, 0.4f / 65535.0f, 2.0f, 0.50001f / 65535.0f};
+        uint16_t o[4];
+        exr_float_to_u16(in, o, 4, 1);
+        CHECK(o[0] == 0 && o[2] == 65535, "float->u16 clamps out-of-range");
+        CHECK(o[1] == 0 && o[3] == 1, "float->u16 round-to-nearest");
+    }
+    /* convert_pixels: HALF<->FLOAT matches the dedicated kernels. */
+    {
+        uint16_t h[64];
+        float a[64], b[64];
+        for (i = 0; i < 64; ++i) a[i] = (float)i * 0.123f - 3.0f;
+        exr_float_to_half(a, h, 64);
+        exr_convert_pixels(b, EXR_PIXEL_FLOAT, h, EXR_PIXEL_HALF, 64,
+                           EXR_CONVERT_RAW);
+        {
+            float ref[64];
+            int ok = 1;
+            exr_half_to_float(h, ref, 64);
+            for (i = 0; i < 64; ++i)
+                if (b[i] != ref[i]) ok = 0;
+            CHECK(ok, "convert_pixels HALF->FLOAT matches kernel");
+        }
+    }
+    /* uint32 normalized round-trip via convert_pixels. */
+    {
+        uint32_t u[5] = {0u, 1u, 2147483648u, 4294967294u, 4294967295u}, ru[5];
+        float fv[5];
+        exr_convert_pixels(fv, EXR_PIXEL_FLOAT, u, EXR_PIXEL_UINT, 5,
+                           EXR_CONVERT_NORMALIZED);
+        exr_convert_pixels(ru, EXR_PIXEL_UINT, fv, EXR_PIXEL_FLOAT, 5,
+                           EXR_CONVERT_NORMALIZED);
+        CHECK(ru[0] == 0u && ru[4] == 4294967295u, "u32 normalized endpoints");
+        CHECK(approx(fv[4], 1.0f, 1e-6f), "u32 normalized 1.0");
+    }
+}
+
+static void util_simd_parity_tests(void) {
+    int i, n = 1000;
+    static uint16_t u16[1000];
+    static uint8_t u8[1000];
+    static float fin[1000], a_s[1000], a_v[1000], b_s[1000], b_v[1000];
+    static uint16_t q_s[1000], q_v[1000];
+    static uint8_t c_s[1000], c_v[1000];
+    srand(12345);
+    for (i = 0; i < n; ++i) {
+        u16[i] = (uint16_t)(rand() & 0xffff);
+        u8[i] = (uint8_t)(rand() & 0xff);
+        /* mix of normal, HDR, negative, and non-finite-ish values */
+        switch (i % 5) {
+            case 0: fin[i] = (float)(rand() % 200000) / 65535.0f; break;
+            case 1: fin[i] = -(float)(rand() % 100) / 65535.0f; break;
+            case 2: fin[i] = 1.5f; break;
+            default: fin[i] = (float)(rand() % 70000) / 65535.0f; break;
+        }
+    }
+    /* scalar tier */
+    exr_simd_force(0);
+    exr_u16_to_float(u16, a_s, n, 1);
+    exr_u8_to_float(u8, b_s, n, 1);
+    exr_float_to_u16(fin, q_s, n, 1);
+    exr_float_to_u8(fin, c_s, n, 1);
+    /* best tier */
+    exr_simd_force(2);
+    exr_u16_to_float(u16, a_v, n, 1);
+    exr_u8_to_float(u8, b_v, n, 1);
+    exr_float_to_u16(fin, q_v, n, 1);
+    exr_float_to_u8(fin, c_v, n, 1);
+    {
+        int ok = 1;
+        for (i = 0; i < n; ++i) {
+            if (!approx(a_s[i], a_v[i], 1e-6f)) ok = 0;
+            if (!approx(b_s[i], b_v[i], 1e-6f)) ok = 0;
+            if (q_s[i] != q_v[i]) ok = 0;
+            if (c_s[i] != c_v[i]) ok = 0;
+        }
+        CHECK(ok, "SIMD convert kernels match scalar (incl. clamp/round)");
+    }
+    /* axpy + mat3 parity */
+    {
+        static float acc_s[1000], acc_v[1000], x[1000];
+        float m[9] = {0.6f, 0.3f, 0.1f, 0.2f, 0.7f, 0.1f, 0.1f, 0.2f, 0.7f};
+        int ok = 1;
+        for (i = 0; i < n; ++i) { x[i] = fin[i]; acc_s[i] = acc_v[i] = 0.25f; }
+        exr_simd_force(0);
+        exr_simd.axpy(acc_s, x, 0.5f, n);
+        exr_simd_force(2);
+        exr_simd.axpy(acc_v, x, 0.5f, n);
+        for (i = 0; i < n; ++i)
+            if (!approx(acc_s[i], acc_v[i], 1e-5f)) ok = 0;
+        CHECK(ok, "SIMD axpy matches scalar");
+        {
+            static float ms[1000], mv[1000];
+            int px = n / 4;
+            exr_simd_force(0);
+            exr_simd.mat3(ms, x, (size_t)px, 4, m);
+            exr_simd_force(2);
+            exr_simd.mat3(mv, x, (size_t)px, 4, m);
+            ok = 1;
+            for (i = 0; i < px * 4; ++i)
+                if (!approx(ms[i], mv[i], 1e-5f)) ok = 0;
+            CHECK(ok, "SIMD mat3 matches scalar");
+        }
+    }
+    exr_simd_force(2);
+}
+
+static void util_resize_tests(void) {
+    const exr_allocator *a = NULL;
+    int w = 8, h = 6, i;
+    float src[8 * 6]; /* 1 channel */
+    /* identity resize reproduces input (triangle). */
+    for (i = 0; i < w * h; ++i) src[i] = (float)i;
+    {
+        float dst[8 * 6];
+        exr_result rc = exr_resize_float(a, src, w, h, 0, dst, w, h, 0, 1,
+                                         EXR_RESIZE_TRIANGLE, EXR_EDGE_CLAMP, -1);
+        int ok = EXR_OK(rc);
+        for (i = 0; i < w * h; ++i)
+            if (!approx(dst[i], src[i], 1e-4f)) ok = 0;
+        CHECK(ok, "resize identity (triangle) reproduces input");
+    }
+    /* 2x box downscale == exact 2x2 block average. */
+    {
+        float dst[4 * 3];
+        int x, y, ok;
+        exr_result rc = exr_resize_float(a, src, w, h, 0, dst, 4, 3, 0, 1,
+                                         EXR_RESIZE_BOX, EXR_EDGE_CLAMP, -1);
+        ok = EXR_OK(rc);
+        for (y = 0; y < 3; ++y)
+            for (x = 0; x < 4; ++x) {
+                float avg = (src[(2 * y) * w + 2 * x] +
+                             src[(2 * y) * w + 2 * x + 1] +
+                             src[(2 * y + 1) * w + 2 * x] +
+                             src[(2 * y + 1) * w + 2 * x + 1]) /
+                            4.0f;
+                if (!approx(dst[y * 4 + x], avg, 1e-4f)) ok = 0;
+            }
+        CHECK(ok, "2x box downscale == 2x2 average");
+    }
+    /* streaming resizer == whole-image (parity). */
+    {
+        int sw = 17, sh = 13, dw = 9, dh = 7, c = 3, n = sw * sh * 3;
+        float *si = (float *)malloc((size_t)n * sizeof(float));
+        float *whole = (float *)malloc((size_t)dw * dh * c * sizeof(float));
+        float *strm = (float *)malloc((size_t)dw * dh * c * sizeof(float));
+        exr_resizer *rz = NULL;
+        int sy = 0, ok = 1, k;
+        for (k = 0; k < n; ++k) si[k] = (float)((k * 7) % 101) * 0.03f;
+        exr_resize_float(a, si, sw, sh, 0, whole, dw, dh, 0, c,
+                         EXR_RESIZE_MITCHELL, EXR_EDGE_CLAMP, -1);
+        exr_resizer_create(a, sw, sh, dw, dh, c, EXR_PIXEL_FLOAT,
+                           EXR_RESIZE_MITCHELL, EXR_EDGE_CLAMP, &rz);
+        for (;;) {
+            int dy;
+            float rowbuf[9 * 3];
+            exr_result rc = exr_resizer_pull_row(rz, &dy, rowbuf);
+            if (rc == EXR_WOULD_BLOCK) {
+                exr_resizer_push_row(rz, sy, si + (size_t)sy * sw * c);
+                sy++;
+                continue;
+            }
+            if (dy >= dh) break;
+            memcpy(strm + (size_t)dy * dw * c, rowbuf,
+                   (size_t)dw * c * sizeof(float));
+        }
+        for (k = 0; k < dw * dh * c; ++k)
+            if (!approx(whole[k], strm[k], 1e-5f)) ok = 0;
+        CHECK(ok, "streaming resizer == whole-image resize");
+        exr_resizer_destroy(rz);
+        free(si); free(whole); free(strm);
+    }
+}
+
+static void util_tonemap_tests(void) {
+    float in[12], out[12];
+    int i;
+    for (i = 0; i < 4; ++i) {
+        in[i * 3 + 0] = (float)i;       /* increasing */
+        in[i * 3 + 1] = (float)i * 2.0f;
+        in[i * 3 + 2] = (float)i * 0.5f;
+    }
+    exr_tonemap_float(out, in, 4, 3, EXR_TONEMAP_ACES, NULL);
+    CHECK(approx(out[0], 0.0f, 1e-6f), "ACES maps 0 to 0");
+    CHECK(out[3] <= out[6] + 1e-6f && out[6] <= out[9] + 1e-6f,
+          "ACES monotonic in input");
+    CHECK(out[9] <= 1.0f + 1e-6f, "ACES saturates <= 1");
+    /* in-place == out-of-place (Reinhard). */
+    {
+        float a[12], b[12];
+        memcpy(a, in, sizeof(in));
+        memcpy(b, in, sizeof(in));
+        exr_tonemap_float(a, a, 4, 3, EXR_TONEMAP_REINHARD, NULL);
+        exr_tonemap_float(out, b, 4, 3, EXR_TONEMAP_REINHARD, NULL);
+        {
+            int ok = 1;
+            for (i = 0; i < 12; ++i)
+                if (a[i] != out[i]) ok = 0;
+            CHECK(ok, "tonemap in-place == out-of-place");
+        }
+    }
+}
+
+static void util_color_tests(void) {
+    float m1[9], m2[9], comp[9];
+    int i, j;
+    /* round-trip: M(to,from) * M(from,to) ~ I */
+    exr_color_matrix(EXR_CS_SRGB, EXR_CS_REC2020, m1);
+    exr_color_matrix(EXR_CS_REC2020, EXR_CS_SRGB, m2);
+    for (i = 0; i < 3; ++i)
+        for (j = 0; j < 3; ++j) {
+            float s = 0.0f;
+            int k;
+            for (k = 0; k < 3; ++k) s += m2[i * 3 + k] * m1[k * 3 + j];
+            comp[i * 3 + j] = s;
+        }
+    {
+        int ok = 1;
+        for (i = 0; i < 3; ++i)
+            for (j = 0; j < 3; ++j)
+                if (!approx(comp[i * 3 + j], i == j ? 1.0f : 0.0f, 1e-4f))
+                    ok = 0;
+        CHECK(ok, "colorspace matrix round-trip ~ identity");
+    }
+    /* sRGB white -> XYZ ~ D65 white (apply matrix). */
+    {
+        float white[3] = {1.0f, 1.0f, 1.0f}, xyz[3];
+        exr_color_matrix(EXR_CS_SRGB, EXR_CS_XYZ, m1);
+        exr_color_apply_matrix(xyz, white, 1, 3, m1);
+        CHECK(approx(xyz[0], 0.95047f, 1e-3f) && approx(xyz[1], 1.0f, 1e-3f) &&
+                  approx(xyz[2], 1.08883f, 1e-3f),
+              "sRGB(1,1,1) -> XYZ D65");
+    }
+}
+
+static void util_transfer_tests(void) {
+    int i;
+    float v[64], lin[64], back[64];
+    exr_transfer tfs[5] = {EXR_TF_SRGB, EXR_TF_GAMMA_22, EXR_TF_REC709,
+                           EXR_TF_PQ, EXR_TF_HLG};
+    int t;
+    for (i = 0; i < 64; ++i) v[i] = (float)i / 63.0f;
+    for (t = 0; t < 5; ++t) {
+        int ok = 1;
+        exr_encode_transfer(lin, v, 64, tfs[t]); /* code from "linear" v */
+        exr_decode_transfer(back, lin, 64, tfs[t]);
+        for (i = 0; i < 64; ++i)
+            if (!approx(back[i], v[i], 2e-3f)) ok = 0;
+        CHECK(ok, "transfer EOTF(OETF(x)) ~ x");
+    }
+    /* hand-rolled transcendentals vs libm. */
+    {
+        int ok = 1;
+        for (i = 1; i < 200; ++i) {
+            float x = (float)i * 0.05f;
+            if (!approx(exr_util_log2f(x), log2f(x), 3e-5f * (1.0f + x))) ok = 0;
+            if (!approx(exr_util_exp2f((float)i * 0.03f - 3.0f),
+                        exp2f((float)i * 0.03f - 3.0f),
+                        1e-5f * exp2f((float)i * 0.03f - 3.0f)))
+                ok = 0;
+            if (!approx(exr_util_powf(x, 1.0f / 2.4f), powf(x, 1.0f / 2.4f),
+                        2e-5f * (1.0f + x)))
+                ok = 0;
+        }
+        CHECK(ok, "hand-rolled log2/exp2/pow match libm (~1e-5)");
+    }
+}
+
+static void util_lut_tests(void) {
+    int N = 2, ir, ig, ib, ok;
+    float data[2 * 2 * 2 * 3];
+    exr_lut3d lut;
+    float in[12], out[12];
+    int i;
+    /* identity LUT on [0,1]: sample(ir,ig,ib) = (ir,ig,ib)/(N-1). */
+    for (ib = 0; ib < N; ++ib)
+        for (ig = 0; ig < N; ++ig)
+            for (ir = 0; ir < N; ++ir) {
+                size_t idx = (((size_t)ib * N + ig) * N + ir) * 3;
+                data[idx + 0] = (float)ir / (N - 1);
+                data[idx + 1] = (float)ig / (N - 1);
+                data[idx + 2] = (float)ib / (N - 1);
+            }
+    lut.size = N;
+    lut.data = data;
+    lut.domain_min[0] = lut.domain_min[1] = lut.domain_min[2] = 0.0f;
+    lut.domain_max[0] = lut.domain_max[1] = lut.domain_max[2] = 1.0f;
+    for (i = 0; i < 4; ++i) {
+        in[i * 3 + 0] = 0.1f + 0.2f * i;
+        in[i * 3 + 1] = 0.3f;
+        in[i * 3 + 2] = 0.8f - 0.1f * i;
+    }
+    exr_lut3d_apply(out, in, 4, 3, &lut, EXR_LUT_TRILINEAR);
+    ok = 1;
+    for (i = 0; i < 12; ++i)
+        if (!approx(out[i], in[i], 1e-5f)) ok = 0;
+    CHECK(ok, "identity LUT (trilinear) reproduces input");
+    exr_lut3d_apply(out, in, 4, 3, &lut, EXR_LUT_TETRAHEDRAL);
+    ok = 1;
+    for (i = 0; i < 12; ++i)
+        if (!approx(out[i], in[i], 1e-5f)) ok = 0;
+    CHECK(ok, "identity LUT (tetrahedral) reproduces input");
+    /* parse a tiny .cube and apply identity. */
+    {
+        const char *cube =
+            "# comment\nTITLE \"id\"\nLUT_3D_SIZE 2\n"
+            "DOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n"
+            "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+            "0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        exr_lut3d pl;
+        float *owned = NULL;
+        exr_result rc =
+            exr_lut3d_parse_cube(NULL, cube, strlen(cube), &pl, &owned);
+        CHECK(EXR_OK(rc) && pl.size == 2 && owned != NULL, ".cube parse ok");
+        if (EXR_OK(rc)) {
+            exr_lut3d_apply(out, in, 4, 3, &pl, EXR_LUT_TRILINEAR);
+            ok = 1;
+            for (i = 0; i < 12; ++i)
+                if (!approx(out[i], in[i], 1e-5f)) ok = 0;
+            CHECK(ok, "parsed .cube identity reproduces input");
+            free(owned);
+        }
+    }
+}
+
+static void util_tests(void) {
+    exr_simd_init(); /* ensure dispatch is initialized so force() sticks */
+    printf("== util: conversions ==\n");
+    util_convert_tests();
+    printf("== util: SIMD parity ==\n");
+    util_simd_parity_tests();
+    printf("== util: resize ==\n");
+    util_resize_tests();
+    printf("== util: tonemap ==\n");
+    util_tonemap_tests();
+    printf("== util: colorspace ==\n");
+    util_color_tests();
+    printf("== util: transfer functions ==\n");
+    util_transfer_tests();
+    printf("== util: 3D LUT ==\n");
+    util_lut_tests();
+}
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -2695,6 +3066,9 @@ int main(void) {
 
     printf("== spectral (JCGT layout) ==\n");
     spectral_tests();
+
+    printf("== util module ==\n");
+    util_tests();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

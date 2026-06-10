@@ -626,6 +626,189 @@ const char *exr_simd_info(void);
 void exr_half_to_float(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half(const float *src, uint16_t *dst, size_t count);
 
+/* ============================================================================
+ * Image utilities (post-decode processing on float/half/uint pixel data)
+ *
+ * These operate on plain typed buffers, decoupled from the EXR containers; thin
+ * exr_part bridges (further down) gather/scatter the planar EXR storage. The
+ * canonical working format is interleaved float32 RGB(A); half/uint inputs are
+ * widened at the boundary and narrowed on output. All entry points are pure C
+ * and libm-free (the few transcendentals used by transfer functions are
+ * hand-rolled), so the whole module is available in freestanding builds.
+ *
+ * Hot paths are runtime SIMD-dispatched (SSE2/AVX2/F16C, NEON) with a scalar
+ * reference that is the source of truth.
+ * ========================================================================== */
+
+/* ---- Pixel-format conversion helpers ------------------------------------- */
+
+/* RAW: numeric cast (uint 5 -> 5.0f). NORMALIZED: full integer range <-> [0,1]
+ * (u16/65535, u32/4294967295). For float->uint the value is clamped then
+ * rounded to nearest (ties to even). Note: RAW uint32 values > 2^24 are not
+ * exactly representable in float32 and are rounded. */
+typedef enum exr_convert_mode {
+    EXR_CONVERT_RAW = 0,
+    EXR_CONVERT_NORMALIZED = 1
+} exr_convert_mode;
+
+/* Convert `count` elements between any two EXR pixel types (HALF/FLOAT/UINT). */
+exr_result exr_convert_pixels(void *dst, exr_pixel_type dst_type, const void *src,
+                              exr_pixel_type src_type, size_t count,
+                              exr_convert_mode mode);
+
+/* 8-/16-bit integer <-> float interop (PNG/screenshot pipelines). `normalized`
+ * selects [0,1] scaling vs a raw numeric cast. float->int clamps + rounds. */
+void exr_u8_to_float(const uint8_t *src, float *dst, size_t n, int normalized);
+void exr_u16_to_float(const uint16_t *src, float *dst, size_t n, int normalized);
+void exr_float_to_u8(const float *src, uint8_t *dst, size_t n, int normalized);
+void exr_float_to_u16(const float *src, uint16_t *dst, size_t n, int normalized);
+
+/* ---- HDR resize / resampling --------------------------------------------- */
+
+typedef enum exr_resize_filter {
+    EXR_RESIZE_BOX = 0,         /* nearest-area average */
+    EXR_RESIZE_TRIANGLE = 1,    /* linear / bilinear */
+    EXR_RESIZE_CATMULL_ROM = 2, /* sharp interpolating cubic */
+    EXR_RESIZE_MITCHELL = 3     /* smooth cubic (B=C=1/3); good default */
+} exr_resize_filter;
+
+typedef enum exr_edge_mode {
+    EXR_EDGE_CLAMP = 0,
+    EXR_EDGE_REFLECT = 1,
+    EXR_EDGE_WRAP = 2
+} exr_edge_mode;
+
+/* Resize interleaved float32 in linear light (HDR-safe: values are never
+ * clamped). `channels` is 1..4; row strides are in elements (0 = tight, i.e.
+ * width*channels). If `alpha_channel` >= 0 the RGB channels are resampled
+ * premultiplied by that alpha and un-premultiplied afterwards. */
+exr_result exr_resize_float(const exr_allocator *a, const float *src, int src_w,
+                            int src_h, size_t src_row_stride, float *dst,
+                            int dst_w, int dst_h, size_t dst_row_stride,
+                            int channels, exr_resize_filter filter,
+                            exr_edge_mode edge, int alpha_channel);
+
+/* Streaming resizer: O(filter_support * dst_w) memory, independent of image
+ * height. Push source rows (top to bottom) and pull destination rows; pull
+ * returns EXR_WOULD_BLOCK when more source rows are required first. `io_type`
+ * is the pixel type of the rows passed to push/pull (HALF/FLOAT/UINT). */
+typedef struct exr_resizer exr_resizer;
+
+exr_result exr_resizer_create(const exr_allocator *a, int src_w, int src_h,
+                              int dst_w, int dst_h, int channels,
+                              exr_pixel_type io_type, exr_resize_filter filter,
+                              exr_edge_mode edge, exr_resizer **out);
+/* Feed source scanline `src_y` (must be supplied in increasing order). */
+exr_result exr_resizer_push_row(exr_resizer *r, int src_y, const void *src_row);
+/* Emit the next destination scanline into `dst_row`; *out_dst_y receives its
+ * index. Returns EXR_WOULD_BLOCK if more source rows must be pushed first, or
+ * EXR_SUCCESS with *out_dst_y == dst_h once finished. */
+exr_result exr_resizer_pull_row(exr_resizer *r, int *out_dst_y, void *dst_row);
+void exr_resizer_destroy(exr_resizer *r);
+
+/* ---- Tonemapping (linear-light float RGB -> display-referred) ------------- */
+
+typedef enum exr_tonemap_op {
+    EXR_TONEMAP_REINHARD = 0,
+    EXR_TONEMAP_REINHARD_EXT = 1, /* with white point */
+    EXR_TONEMAP_ACES = 2,         /* Narkowicz fitted RRT+ODT */
+    EXR_TONEMAP_HABLE = 3         /* Uncharted2 filmic */
+} exr_tonemap_op;
+
+typedef struct exr_tonemap_params {
+    float exposure;    /* linear pre-scale; 0 is treated as 1.0 */
+    float white_point; /* REINHARD_EXT (Lwhite); 0 is treated as 1.0 */
+    float A, B, C, D, E, F, W; /* HABLE curve; all-zero uses Uncharted2 defaults */
+} exr_tonemap_params;
+
+/* Operates on channels 0..min(channels,3)-1; any 4th (alpha) passes through.
+ * In-place (dst == src) is allowed. `params` may be NULL for defaults. */
+exr_result exr_tonemap_float(float *dst, const float *src, size_t pixel_count,
+                             int channels, exr_tonemap_op op,
+                             const exr_tonemap_params *params);
+
+/* ---- Colorspace conversion ----------------------------------------------- */
+
+typedef enum exr_colorspace {
+    EXR_CS_SRGB = 0, /* Rec.709 primaries, D65 (alias for Rec.709 linear) */
+    EXR_CS_REC709 = 0,
+    EXR_CS_REC2020 = 1,
+    EXR_CS_ACES_AP0 = 2, /* ACES2065-1, ~D60 */
+    EXR_CS_ACES_AP1 = 3, /* ACEScg, ~D60 */
+    EXR_CS_XYZ = 4
+} exr_colorspace;
+
+/* Fill `m` (row-major 3x3) with the linear RGB->RGB matrix taking `from`
+ * primaries to `to` primaries (Bradford-adapted across whitepoints). */
+exr_result exr_color_matrix(exr_colorspace from, exr_colorspace to, float m[9]);
+
+/* Apply a row-major 3x3 to interleaved float RGB(A); alpha passes through.
+ * In-place allowed. */
+exr_result exr_color_apply_matrix(float *dst, const float *src,
+                                  size_t pixel_count, int channels,
+                                  const float m[9]);
+
+/* Transfer functions (per element; operate on each value independently).
+ * encode = OETF (linear -> code), decode = EOTF (code -> linear). */
+typedef enum exr_transfer {
+    EXR_TF_LINEAR = 0,
+    EXR_TF_SRGB = 1,
+    EXR_TF_GAMMA_22 = 2,
+    EXR_TF_GAMMA_24 = 3,
+    EXR_TF_REC709 = 4,
+    EXR_TF_PQ = 5, /* SMPTE ST 2084 (1.0 == 10000 cd/m^2) */
+    EXR_TF_HLG = 6 /* ARIB STD-B67 */
+} exr_transfer;
+
+exr_result exr_encode_transfer(float *dst, const float *src, size_t count,
+                               exr_transfer tf);
+exr_result exr_decode_transfer(float *dst, const float *src, size_t count,
+                               exr_transfer tf);
+
+/* ---- Baked 3D LUT (apply OCIO/.cube output without OCIO) ------------------ */
+
+typedef enum exr_lut_interp {
+    EXR_LUT_TRILINEAR = 0,
+    EXR_LUT_TETRAHEDRAL = 1
+} exr_lut_interp;
+
+/* `data` holds size^3 RGB triples, R-fastest: sample (ir,ig,ib) is at index
+ * ((ib*size + ig)*size + ir)*3. Inputs are mapped through [domain_min,
+ * domain_max] then clamped to the grid. */
+typedef struct exr_lut3d {
+    int size;
+    const float *data;
+    float domain_min[3];
+    float domain_max[3];
+} exr_lut3d;
+
+exr_result exr_lut3d_apply(float *dst, const float *src, size_t pixel_count,
+                           int channels, const exr_lut3d *lut,
+                           exr_lut_interp interp);
+
+/* Parse a baked Adobe/OCIO ".cube" 3D LUT from a memory blob. On success *out
+ * references *out_owned (the malloc'd sample array); free *out_owned with the
+ * same allocator. 1D ".cube" LUTs are rejected (EXR_ERROR_UNSUPPORTED). */
+exr_result exr_lut3d_parse_cube(const exr_allocator *a, const char *text,
+                                size_t len, exr_lut3d *out, float **out_owned);
+
+/* ---- exr_part <-> interleaved float bridges ------------------------------ */
+
+/* Gather a part's channels (sorted order; subsampling expanded to full res,
+ * any pixel type widened to float) into a freshly allocated interleaved buffer.
+ * *out must be freed with the same allocator. */
+exr_result exr_part_to_rgba_float(const exr_allocator *a, const exr_part *part,
+                                  float **out, int *out_width, int *out_height,
+                                  int *out_channels);
+
+/* Scatter an interleaved float buffer into freshly allocated planar channels of
+ * `dst_type`, filling `out` (a single-part-style exr_part: header.channels and
+ * images are allocated and owned; release with exr_part_free). Channels are
+ * named R,G,B,A for channels 1..4. */
+exr_result exr_rgba_float_to_part(const exr_allocator *a, const float *rgba,
+                                  int width, int height, int channels,
+                                  exr_pixel_type dst_type, exr_part *out);
+
 /* Worker-thread count for per-block parallel encode/decode. 0 or 1 means
  * single-threaded (the default). This is a no-op unless the library is built
  * with thread support (-DEXR_USE_THREADS / `make ... THREADS=1`); without it
