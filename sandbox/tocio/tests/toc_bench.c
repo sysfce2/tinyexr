@@ -146,6 +146,53 @@ int main(void) {
                (double)NP / ts / 1e6, (double)NP / tv / 1e6, ts / tv);
         toc_op_list_free(l);
     }
+
+    /* JIT: native code for matrix + exponent + range, with pow inlined. Times
+     * the compiled function directly (vs the NEON-batch interpreter on the same
+     * pipeline). The exponent's pow/log/exp are emitted inline -- no per-pixel
+     * helper call -- so the whole pixel stays in registers across the loop. */
+    {
+        toc_op_list *l = mklist();
+        toc_op *m = toc_op_list_push(l, TOC_OP_MATRIX);
+        toc_op *e = toc_op_list_push(l, TOC_OP_EXPONENT);
+        toc_op *r = toc_op_list_push(l, TOC_OP_RANGE);
+        toc_jit *j = NULL;
+        toc_result rc;
+        int c;
+        for (c = 0; c < 16; ++c) m->u.matrix.m[c] = (c % 5 == 0) ? 0.9f : 0.05f;
+        for (c = 0; c < 4; ++c) e->u.exponent.e[c] = (c < 3) ? 2.2f : 1.0f;
+        for (c = 0; c < 4; ++c) {
+            r->u.range.scale[c] = 1.0f; r->u.range.min[c] = 0.0f;
+            r->u.range.max[c] = 1.0f;
+        }
+        r->u.range.clamp_lo = r->u.range.clamp_hi = 1;
+        rc = toc_jit_compile(l, 4, NULL, &j);
+        printf("\n  pipeline: matrix + exponent + range\n");
+        toc_simd_force(1);
+        {
+            double tv = time_apply(l, buf, src, NP, mc);
+            printf("  %-18s %12.1f MP/s\n", "interp (NEON)",
+                   (double)NP / tv / 1e6);
+        }
+        if (rc == TOC_SUCCESS && j) {
+            toc_jit_fn fn = toc_jit_func(j);
+            double t0 = now_sec(), t;
+            long it = 0;
+            do {
+                memcpy(buf, src, NP * 4 * sizeof(float));
+                fn(buf, NP);
+                ++it;
+            } while (now_sec() - t0 < 0.3);
+            t = (now_sec() - t0) / (double)it - mc;
+            if (t < 1e-12) t = 1e-12;
+            printf("  %-18s %12.1f MP/s  (pow inlined)\n", "JIT (native)",
+                   (double)NP / t / 1e6);
+            toc_jit_destroy(j);
+        } else {
+            printf("  %-18s   (unsupported)\n", "JIT (native)");
+        }
+        toc_op_list_free(l);
+    }
     free(buf);
     free(src);
     return 0;

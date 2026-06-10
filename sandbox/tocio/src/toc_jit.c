@@ -582,6 +582,158 @@ static void emit_sub_imm(codebuf *c, int xd, int xn, unsigned imm12) {
 }
 static void emit_blr(codebuf *c, int xn) { e32(c, 0xD63F0000u | ((unsigned)xn << 5)); }
 
+/* ---- additional NEON encoders for the inline-pow (log2/exp2) path --------- */
+static void emit_fsub(codebuf *c, int vd, int vn, int vm) {
+    e32(c, 0x4EA0D400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_fdiv(codebuf *c, int vd, int vn, int vm) {
+    e32(c, 0x6E20FC00u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_add_i32(codebuf *c, int vd, int vn, int vm) { /* ADD Vd.4S */
+    e32(c, 0x4EA08400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_sub_i32(codebuf *c, int vd, int vn, int vm) { /* SUB Vd.4S */
+    e32(c, 0x6EA08400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_and16(codebuf *c, int vd, int vn, int vm) { /* AND Vd.16B */
+    e32(c, 0x4E201C00u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_orr16(codebuf *c, int vd, int vn, int vm) { /* ORR Vd.16B */
+    e32(c, 0x4EA01C00u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_mov_v(codebuf *c, int vd, int vn) { emit_orr16(c, vd, vn, vn); }
+static void emit_ushr_i32(codebuf *c, int vd, int vn, int sh) { /* USHR Vd.4S,#sh */
+    e32(c, 0x6F000400u | (((unsigned)(64 - sh)) << 16) | ((unsigned)vn << 5) |
+               (unsigned)vd);
+}
+static void emit_shl_i32(codebuf *c, int vd, int vn, int sh) { /* SHL Vd.4S,#sh */
+    e32(c, 0x4F005400u | (((unsigned)(32 + sh)) << 16) | ((unsigned)vn << 5) |
+               (unsigned)vd);
+}
+static void emit_scvtf(codebuf *c, int vd, int vn) { /* SCVTF Vd.4S (int->float) */
+    e32(c, 0x4E21D800u | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_fcvtns(codebuf *c, int vd, int vn) { /* FCVTNS Vd.4S (round nearest) */
+    e32(c, 0x4E21A800u | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_movk_w(codebuf *c, int wd, unsigned imm16, unsigned hw) {
+    e32(c, 0x72800000u | (hw << 21) | (imm16 << 5) | (unsigned)wd);
+}
+static void emit_dup_w(codebuf *c, int vd, int wn) { /* DUP Vd.4S, Wn */
+    e32(c, 0x4E040C00u | ((unsigned)wn << 5) | (unsigned)vd);
+}
+/* broadcast a 32-bit constant to all lanes of Vd via the scratch w10 (so x9,
+ * holding the op address, is preserved across the polynomial unlike the x86
+ * path which reloads it after clobbering eax). */
+static void emit_bcast_bits(codebuf *c, int vd, uint32_t bits) {
+    emit_movz_w(c, 10, bits & 0xffffu);
+    emit_movk_w(c, 10, (bits >> 16) & 0xffffu, 1);
+    emit_dup_w(c, vd, 10);
+}
+static void emit_bcast_f(codebuf *c, int vd, float v) {
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    emit_bcast_bits(c, vd, u);
+}
+
+/* The inline-pow polynomial constants are hoisted into v8..v28 ONCE before the
+ * per-pixel loop (emit_pow_consts) and referenced from there, so the hot loop
+ * does no movz/movk/dup per pixel. v8..v15 are AAPCS64 callee-saved (low 64b),
+ * so the compile path that uses pow saves/restores d8..d15. Working scratch for
+ * the kernels stays in v0..v5; matrix/range only touch v0..v6, so the constants
+ * survive across other ops in the same loop body. */
+enum {
+    K_ZERO = 8, K_FLTMIN, K_0xFF, K_127I, K_MANT, K_EXP1, K_1F, K_1_9, K_1_7,
+    K_1_5, K_1_3, K_2F, K_LOG2E, K_127F, K_N126F, K_LN2, K_1_720, K_1_120,
+    K_1_24, K_1_6, K_HALF /* = v28 */
+};
+static void emit_pow_consts(codebuf *c) {
+    emit_bcast_f(c, K_ZERO, 0.0f);
+    emit_bcast_f(c, K_FLTMIN, 1.17549435e-38f);
+    emit_bcast_bits(c, K_0xFF, 0xffu);
+    emit_bcast_bits(c, K_127I, 127u);
+    emit_bcast_bits(c, K_MANT, 0x7fffffu);
+    emit_bcast_bits(c, K_EXP1, 0x3f800000u);
+    emit_bcast_f(c, K_1F, 1.0f);
+    emit_bcast_f(c, K_1_9, 1.0f / 9.0f);
+    emit_bcast_f(c, K_1_7, 1.0f / 7.0f);
+    emit_bcast_f(c, K_1_5, 1.0f / 5.0f);
+    emit_bcast_f(c, K_1_3, 1.0f / 3.0f);
+    emit_bcast_f(c, K_2F, 2.0f);
+    emit_bcast_f(c, K_LOG2E, 1.4426950408889634f);
+    emit_bcast_f(c, K_127F, 127.0f);
+    emit_bcast_f(c, K_N126F, -126.0f);
+    emit_bcast_f(c, K_LN2, 0.6931471805599453f);
+    emit_bcast_f(c, K_1_720, 1.0f / 720.0f);
+    emit_bcast_f(c, K_1_120, 1.0f / 120.0f);
+    emit_bcast_f(c, K_1_24, 1.0f / 24.0f);
+    emit_bcast_f(c, K_1_6, 1.0f / 6.0f);
+    emit_bcast_f(c, K_HALF, 0.5f);
+}
+
+/* 4-wide log2 in place on v1; scratch v2,v3,v4. Mirrors the scalar toc_log2f
+ * (atanh series); uses the hoisted constants, so JIT output matches the
+ * interpreter to the test's 1e-6 with no per-pixel constant setup. */
+static void emit_log2_neon(codebuf *c) {
+    emit_mov_v(c, 2, 1);                                 /* v2 = bits copy */
+    emit_ushr_i32(c, 2, 2, 23);
+    emit_and16(c, 2, 2, K_0xFF);
+    emit_sub_i32(c, 2, 2, K_127I);
+    emit_scvtf(c, 2, 2);                                 /* v2 = e_f */
+    emit_and16(c, 1, 1, K_MANT);
+    emit_orr16(c, 1, 1, K_EXP1);                         /* v1 = m in [1,2) */
+    emit_mov_v(c, 3, 1); emit_fsub(c, 3, 3, K_1F);       /* m-1 */
+    emit_fadd(c, 1, 1, K_1F);                            /* m+1 */
+    emit_fdiv(c, 3, 3, 1);                               /* v3 = t */
+    emit_mov_v(c, 4, 3); emit_fmul(c, 4, 4, 4);          /* v4 = t2 */
+    emit_mov_v(c, 1, K_1_9);
+    emit_fmul(c, 1, 1, 4); emit_fadd(c, 1, 1, K_1_7);
+    emit_fmul(c, 1, 1, 4); emit_fadd(c, 1, 1, K_1_5);
+    emit_fmul(c, 1, 1, 4); emit_fadd(c, 1, 1, K_1_3);
+    emit_fmul(c, 1, 1, 4); emit_fadd(c, 1, 1, K_1F);
+    emit_fmul(c, 3, 3, K_2F);                            /* 2t */
+    emit_fmul(c, 1, 1, 3);                               /* ln = poly*2t */
+    emit_fmul(c, 1, 1, K_LOG2E);
+    emit_fadd(c, 1, 1, 2);                               /* v1 = log2 */
+}
+
+/* 4-wide exp2 in place on v1; scratch v2,v3,v4,v5. Hoisted constants. */
+static void emit_exp2_neon(codebuf *c) {
+    emit_fmin(c, 1, 1, K_127F);
+    emit_fmax(c, 1, 1, K_N126F);
+    emit_fcvtns(c, 2, 1);                                /* v2 = k_int (nearest) */
+    emit_scvtf(c, 3, 2);                                 /* v3 = k_f */
+    emit_mov_v(c, 4, 1); emit_fsub(c, 4, 4, 3);          /* v4 = f */
+    emit_fmul(c, 4, 4, K_LN2);                           /* g = f*ln2 */
+    emit_mov_v(c, 5, K_1_720);
+    emit_fmul(c, 5, 5, 4); emit_fadd(c, 5, 5, K_1_120);
+    emit_fmul(c, 5, 5, 4); emit_fadd(c, 5, 5, K_1_24);
+    emit_fmul(c, 5, 5, 4); emit_fadd(c, 5, 5, K_1_6);
+    emit_fmul(c, 5, 5, 4); emit_fadd(c, 5, 5, K_HALF);
+    emit_fmul(c, 5, 5, 4); emit_fadd(c, 5, 5, K_1F);
+    emit_fmul(c, 5, 5, 4); emit_fadd(c, 5, 5, K_1F);     /* p */
+    emit_add_i32(c, 2, 2, K_127I); emit_shl_i32(c, 2, 2, 23); /* 2^k bits */
+    emit_fmul(c, 5, 5, 2);                               /* p * 2^k */
+    emit_mov_v(c, 1, 5);                                 /* v1 = exp2 */
+}
+
+/* EXPONENT (ch==4): v = pow(max(0,v), e[4]) per lane, inline. x9 := &op; only
+ * the per-op exponent vector is loaded from memory per pixel (the polynomial
+ * constants are hoisted). */
+static void emit_exponent_arm(codebuf *c, const toc_op *op) {
+    int E = (int)offsetof(toc_op, u.exponent.e);
+    emit_load_imm64(c, 9, addr_of(op));
+    emit_ldur_q(c, 0, 19, 0);
+    emit_fmax(c, 0, 0, K_ZERO);                          /* max(v,0) */
+    emit_fmax(c, 0, 0, K_FLTMIN);                        /* >= FLT_MIN for log2 */
+    emit_mov_v(c, 1, 0);
+    emit_log2_neon(c);
+    emit_ldur_q(c, 2, 9, E); emit_fmul(c, 1, 1, 2);     /* y = e*log2(v) */
+    emit_exp2_neon(c);
+    emit_mov_v(c, 0, 1);
+    emit_stur_q(c, 0, 19, 0);
+}
+
 /* MATRIX (ch==4): v = (c0*r + c1*g) + c2*b + c3*a + off, in NEON, matching the
  * NEON interpreter's association exactly. x9 := &op. */
 static void emit_matrix_arm(codebuf *c, const toc_op *op) {
@@ -626,6 +778,7 @@ static void emit_helper_call_arm(codebuf *c, const toc_op *op, int ch) {
 static void emit_op_arm(codebuf *c, const toc_op *op, int channels) {
     if (channels == 4 && op->kind == TOC_OP_MATRIX) emit_matrix_arm(c, op);
     else if (channels == 4 && op->kind == TOC_OP_RANGE) emit_range_arm(c, op);
+    else if (channels == 4 && op->kind == TOC_OP_EXPONENT) emit_exponent_arm(c, op);
     else if (op->kind != TOC_OP_NOOP) emit_helper_call_arm(c, op, channels);
 }
 
@@ -639,6 +792,7 @@ toc_result toc_jit_compile(const toc_op_list *ops, int channels,
     return TOC_ERROR_UNSUPPORTED;
 #else
     size_t pgsz = 4096, mapsz, loop_pos, cbz_at;
+    int has_pow = 0;
     void *mem;
     if (!ops || !out || (channels != 3 && channels != 4))
         return TOC_ERROR_INVALID_ARGUMENT;
@@ -647,11 +801,30 @@ toc_result toc_jit_compile(const toc_op_list *ops, int channels,
     memset(&c, 0, sizeof(c));
     c.a = a;
 
-    /* prologue: save fp/lr + callee-saved x19/x20 (32B frame, 16-aligned). */
-    e32(&c, 0xA9BE7BFDu);          /* stp x29, x30, [sp, #-32]! */
-    e32(&c, 0xA90153F3u);          /* stp x19, x20, [sp, #16]  */
-    emit_mov_reg(&c, 19, 0);       /* x19 = rgba */
-    emit_mov_reg(&c, 20, 1);       /* x20 = npix */
+    /* A pipeline with an inline-pow (exponent) op hoists its polynomial
+     * constants into v8..v28 before the loop; v8..v15 are callee-saved (d8..d15)
+     * so that path uses a larger frame and saves/restores them. */
+    for (k = 0; k < ops->count; ++k)
+        if (channels == 4 && ops->ops[k].kind == TOC_OP_EXPONENT) has_pow = 1;
+
+    if (has_pow) {
+        /* 96B frame: x29/x30, x19/x20, d8..d15 (16-aligned). */
+        e32(&c, 0xA9BA7BFDu);      /* stp x29, x30, [sp, #-96]! */
+        e32(&c, 0xA90153F3u);      /* stp x19, x20, [sp, #16] */
+        e32(&c, 0x6D0227E8u);      /* stp d8,  d9,  [sp, #32] */
+        e32(&c, 0x6D032FEAu);      /* stp d10, d11, [sp, #48] */
+        e32(&c, 0x6D0437ECu);      /* stp d12, d13, [sp, #64] */
+        e32(&c, 0x6D053FEEu);      /* stp d14, d15, [sp, #80] */
+        emit_mov_reg(&c, 19, 0);
+        emit_mov_reg(&c, 20, 1);
+        emit_pow_consts(&c);       /* load v8..v28 once */
+    } else {
+        /* prologue: fp/lr + callee-saved x19/x20 (32B frame, 16-aligned). */
+        e32(&c, 0xA9BE7BFDu);      /* stp x29, x30, [sp, #-32]! */
+        e32(&c, 0xA90153F3u);      /* stp x19, x20, [sp, #16] */
+        emit_mov_reg(&c, 19, 0);   /* x19 = rgba */
+        emit_mov_reg(&c, 20, 1);   /* x20 = npix */
+    }
 
     /* per-pixel loop: while (x20) { ops on [x19]; x19+=ch*4; x20--; } */
     loop_pos = c.len;
@@ -674,9 +847,18 @@ toc_result toc_jit_compile(const toc_op_list *ops, int channels,
         c.buf[cbz_at + 3] = (uint8_t)(insn >> 24);
     }
 
-    /* epilogue */
-    e32(&c, 0xA94153F3u);          /* ldp x19, x20, [sp, #16] */
-    e32(&c, 0xA8C27BFDu);          /* ldp x29, x30, [sp], #32 */
+    /* epilogue (matches the prologue frame) */
+    if (has_pow) {
+        e32(&c, 0x6D4227E8u);      /* ldp d8,  d9,  [sp, #32] */
+        e32(&c, 0x6D432FEAu);      /* ldp d10, d11, [sp, #48] */
+        e32(&c, 0x6D4437ECu);      /* ldp d12, d13, [sp, #64] */
+        e32(&c, 0x6D453FEEu);      /* ldp d14, d15, [sp, #80] */
+        e32(&c, 0xA94153F3u);      /* ldp x19, x20, [sp, #16] */
+        e32(&c, 0xA8C67BFDu);      /* ldp x29, x30, [sp], #96 */
+    } else {
+        e32(&c, 0xA94153F3u);      /* ldp x19, x20, [sp, #16] */
+        e32(&c, 0xA8C27BFDu);      /* ldp x29, x30, [sp], #32 */
+    }
     e32(&c, 0xD65F03C0u);          /* ret */
 
     if (c.oom) { toc_free(a, c.buf); return TOC_ERROR_OUT_OF_MEMORY; }
