@@ -25,6 +25,7 @@
 
 #include "exr.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -869,6 +870,101 @@ EXRV_EXPORT int exrv_spectral_show(int h, int wi) {
         s->rgba[p * 4 + 2] = v;
         s->rgba[p * 4 + 3] = 1.0f;
     }
+    return 1;
+}
+
+/* CIE 1931 2-deg color-matching functions via the multi-lobe Gaussian fit of
+ * Wyman, Sloan & Shirley, "Simple Analytic Approximations to the CIE XYZ Color
+ * Matching Functions" (JCGT 2013) — compact and accurate enough for a preview. */
+static float cie_lobe(float x, float mu, float s1, float s2) {
+    float t = (x - mu) * (x < mu ? 1.0f / s1 : 1.0f / s2);
+    return expf(-0.5f * t * t);
+}
+static void cie_xyz_bar(float wl, float *X, float *Y, float *Z) {
+    *X = 1.056f * cie_lobe(wl, 599.8f, 37.9f, 31.0f) +
+         0.362f * cie_lobe(wl, 442.0f, 16.0f, 26.7f) -
+         0.065f * cie_lobe(wl, 501.1f, 20.4f, 26.2f);
+    *Y = 0.821f * cie_lobe(wl, 568.8f, 46.9f, 40.5f) +
+         0.286f * cie_lobe(wl, 530.9f, 16.3f, 31.1f);
+    *Z = 1.217f * cie_lobe(wl, 437.0f, 11.8f, 36.0f) +
+         0.681f * cie_lobe(wl, 459.0f, 26.0f, 13.8f);
+}
+
+/* Composite the spectral cube to a linear-sRGB preview in the shared RGBA buffer
+ * (the shader then applies exposure + the sRGB curve). For each pixel we
+ * integrate S(lambda) against the CMFs (trapezoidal dlambda from the wavelength
+ * spacing), normalize so an equal-energy spectrum has luminance 1, convert XYZ
+ * to linear sRGB (D65 matrix), and white-balance so a flat spectrum maps to
+ * neutral (1,1,1). Returns 1 on success, -1 otherwise. */
+EXRV_EXPORT int exrv_spectral_composite(int h) {
+    exrv_session *s = session_from_handle(h);
+    int nwl, k;
+    size_t npix, p;
+    const float *wl;
+    float *Xw, *Yw, *Zw;
+    float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f, inv, wr, wg, wb;
+    /* XYZ (D65) -> linear sRGB */
+    static const float M[9] = {
+        3.2406255f, -1.5372080f, -0.4986286f,
+        -0.9689307f, 1.8757561f, 0.0415175f,
+        0.0557101f, -0.2040211f, 1.0569959f};
+
+    if (!s || !s->spec_loaded || !s->rgba || !s->spec.stokes[0]) return -1;
+    nwl = s->spec.num_wavelengths;
+    wl = s->spec.wavelengths;
+    if (nwl <= 0) return -1;
+    npix = (size_t)s->spec.width * (size_t)s->spec.height;
+
+    Xw = (float *)malloc((size_t)nwl * sizeof(float));
+    Yw = (float *)malloc((size_t)nwl * sizeof(float));
+    Zw = (float *)malloc((size_t)nwl * sizeof(float));
+    if (!Xw || !Yw || !Zw) { free(Xw); free(Yw); free(Zw); return -1; }
+
+    for (k = 0; k < nwl; ++k) {
+        float x, y, z, dl;
+        float lo = (k > 0) ? wl[k - 1] : wl[k];
+        float hi = (k + 1 < nwl) ? wl[k + 1] : wl[k];
+        dl = 0.5f * (hi - lo);
+        if (dl <= 0.0f) dl = 1.0f;
+        cie_xyz_bar(wl[k], &x, &y, &z);
+        Xw[k] = x * dl;
+        Yw[k] = y * dl;
+        Zw[k] = z * dl;
+        sumX += Xw[k];
+        sumY += Yw[k];
+        sumZ += Zw[k];
+    }
+    if (sumY <= 0.0f) sumY = 1.0f;
+    inv = 1.0f / sumY;
+    for (k = 0; k < nwl; ++k) { Xw[k] *= inv; Yw[k] *= inv; Zw[k] *= inv; }
+    sumX *= inv; sumZ *= inv; sumY = 1.0f;
+
+    /* equal-energy white in linear sRGB, used for per-channel white balance */
+    wr = M[0] * sumX + M[1] * sumY + M[2] * sumZ;
+    wg = M[3] * sumX + M[4] * sumY + M[5] * sumZ;
+    wb = M[6] * sumX + M[7] * sumY + M[8] * sumZ;
+    if (wr <= 0.0f) wr = 1.0f;
+    if (wg <= 0.0f) wg = 1.0f;
+    if (wb <= 0.0f) wb = 1.0f;
+
+    for (p = 0; p < npix; ++p) {
+        float X = 0.0f, Y = 0.0f, Z = 0.0f, r, g, b;
+        const float *plane = s->spec.stokes[0] + p;
+        for (k = 0; k < nwl; ++k) {
+            float v = plane[(size_t)k * npix];
+            X += v * Xw[k];
+            Y += v * Yw[k];
+            Z += v * Zw[k];
+        }
+        r = (M[0] * X + M[1] * Y + M[2] * Z) / wr;
+        g = (M[3] * X + M[4] * Y + M[5] * Z) / wg;
+        b = (M[6] * X + M[7] * Y + M[8] * Z) / wb;
+        s->rgba[p * 4 + 0] = r > 0.0f ? r : 0.0f;
+        s->rgba[p * 4 + 1] = g > 0.0f ? g : 0.0f;
+        s->rgba[p * 4 + 2] = b > 0.0f ? b : 0.0f;
+        s->rgba[p * 4 + 3] = 1.0f;
+    }
+    free(Xw); free(Yw); free(Zw);
     return 1;
 }
 

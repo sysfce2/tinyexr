@@ -26,6 +26,7 @@ let mode = "2d";          // "2d" flat image, "3d" deep cloud, or "spectral"
 let specWl = null;        // Float32Array of wavelengths (nm), ascending
 let specNwl = 0;          // number of wavelength bands
 let specWi = 0;           // current wavelength index
+let specColor = false;    // CIE→sRGB composite vs single-wavelength grayscale
 let specDims = { w: 0, h: 0 };
 let lastSpecPixel = null; // { x, y, spec: Float32Array } last hovered pixel
 // deep 3D state
@@ -204,6 +205,16 @@ function render() {
   drawOverlay();
   updateZoomLabel();
   updateLegend();
+}
+
+// Set the active display channel and sync the segmented-button UI.
+function setChannel(ch) {
+  ctl.channel = ch;
+  const seg = document.getElementById("channels");
+  for (const x of seg.children)
+    x.classList.toggle("active", parseInt(x.dataset.ch, 10) === ch);
+  // False color only applies to a single scalar channel (not RGB).
+  document.getElementById("falseColor").disabled = ch === 0;
 }
 
 // Channel labels for the false-color legend (index matches the channel buttons).
@@ -476,7 +487,9 @@ function updatePixel(sx, sy) {
   const f = (x) => (Math.abs(x) >= 1e4 || (Math.abs(x) < 1e-4 && x !== 0))
     ? x.toExponential(3) : x.toFixed(4);
   if (mode === "spectral") {
-    el.textContent = `x ${ax}  y ${ay}\n${specWl[specWi].toFixed(1)} nm  ${f(r)}`;
+    el.textContent = specColor
+      ? `x ${ax}  y ${ay}\nsRGB ${f(r)} ${f(g)} ${f(b)}`
+      : `x ${ax}  y ${ay}\n${specWl[specWi].toFixed(1)} nm  ${f(r)}`;
     updateSpecPixel(ix, iy);
   } else {
     el.textContent =
@@ -779,6 +792,85 @@ function setupInput() {
   window.addEventListener("mouseup", () => { d3 = null; });
   glc.addEventListener("contextmenu", (e) => { if (mode === "3d") e.preventDefault(); });
 
+  // --- touch controls (2D pan/pinch + tap-pick, 3D orbit/pinch/pan) ---
+  let tState = null;
+  const tPos = (t) => {
+    const r = glc.getBoundingClientRect();
+    return [(t.clientX - r.left) * dpr(), (t.clientY - r.top) * dpr()];
+  };
+  const tDist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+  const tMid = (a, b) => {
+    const r = glc.getBoundingClientRect();
+    return [((a.clientX + b.clientX) / 2 - r.left) * dpr(),
+            ((a.clientY + b.clientY) / 2 - r.top) * dpr()];
+  };
+  function initTouch(touches) {
+    if (mode === "3d") {
+      if (touches.length === 1)
+        tState = { k: "orbit", x: touches[0].clientX, y: touches[0].clientY,
+                   az: cam.az, el: cam.el };
+      else if (touches.length >= 2)
+        tState = { k: "tp3d", d: tDist(touches[0], touches[1]), dist: cam.dist,
+                   mx: (touches[0].clientX + touches[1].clientX) / 2,
+                   my: (touches[0].clientY + touches[1].clientY) / 2,
+                   panX: cam.panX, panY: cam.panY };
+      else tState = null;
+      return;
+    }
+    if (!img) { tState = null; return; }
+    if (touches.length === 1) {
+      const [mx, my] = tPos(touches[0]);
+      tState = { k: "pan", mx, my, sx: mx, sy: my,
+                 panX: view.panX, panY: view.panY, moved: false };
+    } else if (touches.length >= 2) {
+      const [mx, my] = tMid(touches[0], touches[1]);
+      const [ix, iy] = screenToImg(mx, my);
+      tState = { k: "pinch", d: tDist(touches[0], touches[1]), zoom: view.zoom, ix, iy };
+    } else tState = null;
+  }
+  glc.addEventListener("touchstart", (e) => {
+    if (mode !== "3d" && !img) return;
+    e.preventDefault();
+    initTouch(e.touches);
+  }, { passive: false });
+  glc.addEventListener("touchmove", (e) => {
+    if (!tState) return;
+    e.preventDefault();
+    const st = tState, T = e.touches;
+    if (st.k === "orbit") {
+      cam.az = st.az + (T[0].clientX - st.x) * 0.01;
+      cam.el = clamp(st.el + (T[0].clientY - st.y) * 0.01, -1.55, 1.55);
+      render3d();
+    } else if (st.k === "tp3d" && T.length >= 2) {
+      const d = tDist(T[0], T[1]);
+      if (st.d > 0) cam.dist = clamp(st.dist * st.d / d, 0.2, 50);
+      const mx = (T[0].clientX + T[1].clientX) / 2, my = (T[0].clientY + T[1].clientY) / 2;
+      cam.panX = st.panX + (mx - st.mx) * 0.0025 * cam.dist;
+      cam.panY = st.panY - (my - st.my) * 0.0025 * cam.dist;
+      render3d();
+    } else if (st.k === "pan") {
+      const [mx, my] = tPos(T[0]);
+      view.panX = st.panX + (mx - st.mx);
+      view.panY = st.panY + (my - st.my);
+      if (Math.abs(mx - st.sx) + Math.abs(my - st.sy) > 6 * dpr()) st.moved = true;
+      render();
+    } else if (st.k === "pinch" && T.length >= 2) {
+      const d = tDist(T[0], T[1]);
+      const [mx, my] = tMid(T[0], T[1]);
+      if (st.d > 0) view.zoom = clamp(st.zoom * d / st.d, 0.01, 5000);
+      view.panX = mx - st.ix * view.zoom;
+      view.panY = my - st.iy * view.zoom;
+      render();
+    }
+  }, { passive: false });
+  glc.addEventListener("touchend", (e) => {
+    if (tState && tState.k === "pan" && !tState.moved && mode !== "3d")
+      updatePixel(tState.sx, tState.sy); // tap = pixel pick
+    if (e.touches.length > 0) initTouch(e.touches); // re-seat for remaining fingers
+    else tState = null;
+  }, { passive: false });
+  glc.addEventListener("touchcancel", () => { tState = null; }, { passive: false });
+
   // view buttons
   document.getElementById("btnFit").addEventListener("click", fitView);
   document.getElementById("btn11").addEventListener("click", oneToOne);
@@ -809,10 +901,7 @@ function setupInput() {
   document.getElementById("channels").addEventListener("click", (e) => {
     const b = e.target.closest("button");
     if (!b) return;
-    ctl.channel = parseInt(b.dataset.ch, 10);
-    for (const x of e.currentTarget.children) x.classList.toggle("active", x === b);
-    // False color only applies to a single scalar channel (not RGB).
-    document.getElementById("falseColor").disabled = ctl.channel === 0;
+    setChannel(parseInt(b.dataset.ch, 10));
     render();
   });
   document.getElementById("falseColor").addEventListener("change", (e) => {
@@ -836,6 +925,13 @@ function setupInput() {
   // wavelength scrubber (spectral mode)
   document.getElementById("wavelength").addEventListener("input", (e) => {
     showWavelength(parseInt(e.target.value, 10), false);
+  });
+  // CIE color composite toggle (spectral mode)
+  document.getElementById("spectralColor").addEventListener("change", (e) => {
+    specColor = e.target.checked;
+    document.getElementById("wavelength").disabled = specColor;
+    document.getElementById("wavelengthCtrl").classList.toggle("dim", specColor);
+    applySpectralView(false);
   });
   document.getElementById("levelSel").addEventListener("change", (e) => {
     const [lx, ly] = e.target.value.split(",").map(Number);
@@ -1268,11 +1364,42 @@ async function enterSpectralMode(part) {
     `${spectrumLabel(ph)} · ${w}×${h} · ${nwl} bands · ` +
     `${specWl[0].toFixed(1)}–${specWl[nwl - 1].toFixed(1)} nm`;
 
+  // Reset to single-wavelength grayscale on each new spectral image.
+  specColor = false;
+  document.getElementById("spectralColor").checked = false;
+  document.getElementById("wavelength").disabled = false;
+  document.getElementById("wavelengthCtrl").classList.remove("dim");
+
   lastSpecPixel = null;
   clearSpecPlot();
   document.getElementById("specPixelPos").textContent = "—";
-  showWavelength(0, true);
+  applySpectralView(true);
   renderInfo();
+}
+
+// Show either the CIE-composite color image or the current wavelength plane.
+function applySpectralView(doFit) {
+  if (specColor) showComposite(doFit);
+  else showWavelength(specWi, doFit);
+}
+
+// Composite the whole spectral cube to an sRGB color preview (CIE 1931 → sRGB,
+// computed in WASM into the shared RGBA buffer; the shader applies exposure +
+// the sRGB curve, so we force the RGB channel view).
+function showComposite(doFit) {
+  if (mode !== "spectral") return;
+  if (M._exrv_spectral_composite(handle) < 0) {
+    showError("CIE composite failed.");
+    return;
+  }
+  setChannel(0);
+  const ptr = M._exrv_rgba(handle);
+  const w = specDims.w, h = specDims.h;
+  img = { w, h, data: M.HEAPF32.slice(ptr >> 2, (ptr >> 2) + w * h * 4) };
+  uploadTexture();
+  document.getElementById("wlVal").textContent = "CIE";
+  if (doFit) fitView(); else render();
+  redrawSpecPlot();
 }
 
 // Upload the grayscale plane for wavelength index `wi` and refresh the view.
@@ -1477,10 +1604,55 @@ function setupSpecBrowser() {
   filterEl.addEventListener("input", () => { if (entries) rerender(); });
 }
 
+/* ------------------------------------------- fullscreen + panel collapse -- */
+function setupChrome() {
+  const app = document.getElementById("app");
+  const toggleBtn = document.getElementById("panelToggle");
+  const backdrop = document.getElementById("panelBackdrop");
+  const fsBtn = document.getElementById("btnFullscreen");
+  const isMobile = () => window.matchMedia("(max-width: 760px)").matches;
+
+  const reflow = () => {
+    // resize the canvas to the new stage size, now and after the CSS transition
+    requestAnimationFrame(() => { syncCanvasSize(); render(); });
+    setTimeout(() => { syncCanvasSize(); render(); }, 240);
+  };
+  function syncPanel() {
+    const collapsed = app.classList.contains("panel-collapsed");
+    toggleBtn.setAttribute("aria-expanded", String(!collapsed));
+    toggleBtn.textContent = collapsed ? "☰" : "⮞";
+    toggleBtn.title = collapsed ? "Show panel" : "Hide panel";
+    backdrop.classList.toggle("hidden", collapsed || !isMobile());
+    reflow();
+  }
+  const setCollapsed = (c) => { app.classList.toggle("panel-collapsed", c); syncPanel(); };
+
+  toggleBtn.addEventListener("click", () =>
+    setCollapsed(!app.classList.contains("panel-collapsed")));
+  backdrop.addEventListener("click", () => setCollapsed(true));
+
+  // start collapsed on small screens (panel opens on demand)
+  if (isMobile()) app.classList.add("panel-collapsed");
+  syncPanel();
+
+  // fullscreen on the whole document
+  fsBtn.addEventListener("click", () => {
+    const el = document.documentElement;
+    if (!document.fullscreenElement)
+      (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+    else
+      (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+  });
+  document.addEventListener("fullscreenchange", reflow);
+  document.addEventListener("webkitfullscreenchange", reflow);
+  window.addEventListener("orientationchange", reflow);
+}
+
 (async function main() {
   setupInput();
   setupBrowser();
   setupSpecBrowser();
+  setupChrome();
   initLegendGradient();
   document.getElementById("gamma").disabled = ctl.srgb;
   try {

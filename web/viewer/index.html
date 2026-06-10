@@ -14,6 +14,12 @@
     <canvas id="gl"></canvas>
     <canvas id="overlay"></canvas>
 
+    <!-- Top-right floating controls (always visible, touch-friendly) -->
+    <div id="topctrls">
+      <button id="btnFullscreen" title="Toggle fullscreen" aria-label="Toggle fullscreen">⛶</button>
+      <button id="panelToggle" title="Hide panel" aria-label="Toggle panel" aria-expanded="true">⮞</button>
+    </div>
+
     <!-- Drop / empty state -->
     <div id="dropzone">
       <div class="dz-inner">
@@ -49,6 +55,9 @@
 
     <div id="errorToast" class="hidden"></div>
   </div>
+
+  <!-- Backdrop behind the panel drawer on small screens -->
+  <div id="panelBackdrop" class="hidden"></div>
 
   <!-- Side panel ------------------------------------------------------- -->
   <aside id="panel">
@@ -150,7 +159,9 @@
     <section id="spectralCtrls" class="hidden">
       <h2>Spectral</h2>
       <div id="spectralInfo" class="mono"></div>
-      <div class="ctrl">
+      <label class="chk"><input id="spectralColor" type="checkbox" />
+        CIE color (sRGB) — composite all wavelengths</label>
+      <div class="ctrl" id="wavelengthCtrl" style="margin-top:12px">
         <div class="ctrl-head"><span>Wavelength</span><span id="wlVal">—</span></div>
         <input id="wavelength" type="range" min="0" max="0" step="1" value="0" />
       </div>
@@ -159,8 +170,9 @@
         <canvas id="specPlot" width="280" height="150"></canvas>
         <div class="specplot-hint">Hover the image to read a pixel's spectrum.</div>
       </div>
-      <footer style="padding:10px 0 0">Each plane is shown as grayscale; exposure
-        and gamma above still apply. Polarised images show S0.</footer>
+      <footer style="padding:10px 0 0">Scrub a single wavelength (grayscale) or
+        enable CIE color for a true-color sRGB composite; exposure/gamma still
+        apply. Polarised images use S0.</footer>
     </section>
 
     <section id="info" class="hidden">
