@@ -2609,6 +2609,27 @@ static void thread_tests(const char *path) {
         free(b);
     }
 
+    /* mipmap + ripmap level generation: the parallel downsample must be
+     * bit-deterministic, so a 1-thread and a 4-thread save produce identical
+     * bytes (asakusa's level 1+ rows clear the dh>=64 parallel threshold). */
+    {
+        int modes[2] = {EXR_TILE_MIPMAP_LEVELS, EXR_TILE_RIPMAP_LEVELS};
+        const char *mn[2] = {"mipmap", "ripmap"};
+        int m;
+        for (m = 0; m < 2; ++m) {
+            void *a = NULL, *b = NULL;
+            size_t na = 0, nb = 0;
+            src.parts[0].header.level_mode = modes[m];
+            thread_save(&src, EXR_COMPRESSION_ZIP, 1, &a, &na);
+            thread_save(&src, EXR_COMPRESSION_ZIP, 4, &b, &nb);
+            CHECK(a && b && na == nb && na > 0 && memcmp(a, b, na) == 0, mn[m]);
+            printf("  ok: %s level gen  enc-deterministic (parallel downsample)\n",
+                   mn[m]);
+            free(a);
+            free(b);
+        }
+    }
+
     exr_set_num_threads(1);
     exr_image_free(&src);
 }
