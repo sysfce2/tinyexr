@@ -351,6 +351,146 @@ static toc_result lut1d_invert(toc_op_list *list, toc_lut1d *lut) {
     return TOC_SUCCESS;
 }
 
+/* Evaluate the forward LUT3D at an arbitrary input (reads the original op). */
+static void lut3d_eval(const toc_op *op, const float in[3], float out[3]) {
+    float p[4];
+    p[0] = in[0]; p[1] = in[1]; p[2] = in[2]; p[3] = 1.0f;
+    toc_lut3d_apply_pixel(op, p, 3);
+    out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+}
+
+/* Build the inverse of a LUT3D by, for each point of a regular grid over the
+ * forward output box, solving f(x)=y: a coarse nearest-output search seeds
+ * Newton's method (finite-difference Jacobian, solved via toc_inv4x4). The
+ * result samples the inverse map and is stored as a new owned LUT3D whose domain
+ * is the forward output box. Targets outside the achievable gamut converge to
+ * the nearest reachable input. Capped at size 64 (the search is O(M^3*N) and
+ * runs once at processor-build time). */
+static toc_result lut3d_invert(toc_op_list *list, toc_op *op) {
+    toc_lut3d *L = &op->u.lut3d;
+    int N = L->size, M, Kc, ncand, k, it;
+    float idmin[3], idmax[3], omin[3], omax[3], eps[3];
+    float *cand_out = NULL, *cand_in = NULL, *inv = NULL;
+    if (!list || N < 2 || N > 64 || !L->data) return TOC_ERROR_NONINVERTIBLE;
+    M = N;
+    for (k = 0; k < 3; ++k) {
+        idmin[k] = L->domain_min[k];
+        idmax[k] = L->domain_max[k];
+        omin[k] = 1e30f;
+        omax[k] = -1e30f;
+        if (idmax[k] == idmin[k]) return TOC_ERROR_NONINVERTIBLE;
+    }
+    {   /* forward output bounding box */
+        size_t cnt = (size_t)N * N * N, i;
+        for (i = 0; i < cnt; ++i)
+            for (k = 0; k < 3; ++k) {
+                float v = L->data[i * 3 + k];
+                if (v < omin[k]) omin[k] = v;
+                if (v > omax[k]) omax[k] = v;
+            }
+    }
+    for (k = 0; k < 3; ++k)
+        if (!(omax[k] > omin[k])) return TOC_ERROR_NONINVERTIBLE;
+
+    Kc = N < 16 ? N : 16; /* coarse seed grid for the initial guess */
+    ncand = Kc * Kc * Kc;
+    cand_out = (float *)toc_malloc(&list->alloc, (size_t)ncand * 3 * sizeof(float));
+    cand_in = (float *)toc_malloc(&list->alloc, (size_t)ncand * 3 * sizeof(float));
+    inv = (float *)toc_malloc(&list->alloc, (size_t)M * M * M * 3 * sizeof(float));
+    if (!cand_out || !cand_in || !inv) {
+        toc_free(&list->alloc, cand_out);
+        toc_free(&list->alloc, cand_in);
+        toc_free(&list->alloc, inv);
+        return TOC_ERROR_OUT_OF_MEMORY;
+    }
+    {   /* sample the forward map on the coarse seed grid */
+        int a, b, c, q = 0;
+        for (c = 0; c < Kc; ++c)
+            for (b = 0; b < Kc; ++b)
+                for (a = 0; a < Kc; ++a, ++q) {
+                    float in[3];
+                    in[0] = idmin[0] + (idmax[0] - idmin[0]) * (float)a / (float)(Kc - 1);
+                    in[1] = idmin[1] + (idmax[1] - idmin[1]) * (float)b / (float)(Kc - 1);
+                    in[2] = idmin[2] + (idmax[2] - idmin[2]) * (float)c / (float)(Kc - 1);
+                    cand_in[q * 3] = in[0]; cand_in[q * 3 + 1] = in[1]; cand_in[q * 3 + 2] = in[2];
+                    lut3d_eval(op, in, &cand_out[q * 3]);
+                }
+    }
+    for (k = 0; k < 3; ++k)
+        eps[k] = (idmax[k] - idmin[k]) / (float)(N - 1) * 0.5f;
+
+    {   /* solve f(x)=y for every inverse grid point */
+        int gr, gg, gb, gi = 0, ci;
+        for (gb = 0; gb < M; ++gb)
+            for (gg = 0; gg < M; ++gg)
+                for (gr = 0; gr < M; ++gr, ++gi) {
+                    float y[3], x[3], bestx[3], bestr = 1e30f, bd = 1e30f;
+                    int besti = 0;
+                    y[0] = omin[0] + (omax[0] - omin[0]) * (float)gr / (float)(M - 1);
+                    y[1] = omin[1] + (omax[1] - omin[1]) * (float)gg / (float)(M - 1);
+                    y[2] = omin[2] + (omax[2] - omin[2]) * (float)gb / (float)(M - 1);
+                    for (ci = 0; ci < ncand; ++ci) {
+                        float ex = cand_out[ci * 3] - y[0];
+                        float ey = cand_out[ci * 3 + 1] - y[1];
+                        float ez = cand_out[ci * 3 + 2] - y[2];
+                        float d = ex * ex + ey * ey + ez * ez;
+                        if (d < bd) { bd = d; besti = ci; }
+                    }
+                    x[0] = cand_in[besti * 3]; x[1] = cand_in[besti * 3 + 1];
+                    x[2] = cand_in[besti * 3 + 2];
+                    bestx[0] = x[0]; bestx[1] = x[1]; bestx[2] = x[2];
+                    for (it = 0; it < 12; ++it) {
+                        float fx[3], r[3], rr, J[9], Mm[16], Mi[16], dxv[3];
+                        lut3d_eval(op, x, fx);
+                        r[0] = y[0] - fx[0]; r[1] = y[1] - fx[1]; r[2] = y[2] - fx[2];
+                        rr = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+                        if (rr < bestr) {
+                            bestr = rr;
+                            bestx[0] = x[0]; bestx[1] = x[1]; bestx[2] = x[2];
+                        }
+                        if (rr < 1e-12f) break;
+                        for (k = 0; k < 3; ++k) {
+                            float xp[3], fp[3];
+                            xp[0] = x[0]; xp[1] = x[1]; xp[2] = x[2];
+                            xp[k] += eps[k];
+                            lut3d_eval(op, xp, fp);
+                            J[0 * 3 + k] = (fp[0] - fx[0]) / eps[k];
+                            J[1 * 3 + k] = (fp[1] - fx[1]) / eps[k];
+                            J[2 * 3 + k] = (fp[2] - fx[2]) / eps[k];
+                        }
+                        memset(Mm, 0, sizeof(Mm));
+                        Mm[0] = J[0]; Mm[1] = J[1]; Mm[2] = J[2];
+                        Mm[4] = J[3]; Mm[5] = J[4]; Mm[6] = J[5];
+                        Mm[8] = J[6]; Mm[9] = J[7]; Mm[10] = J[8];
+                        Mm[15] = 1.0f;
+                        if (!toc_inv4x4(Mm, Mi)) break; /* singular: keep best */
+                        dxv[0] = Mi[0] * r[0] + Mi[1] * r[1] + Mi[2] * r[2];
+                        dxv[1] = Mi[4] * r[0] + Mi[5] * r[1] + Mi[6] * r[2];
+                        dxv[2] = Mi[8] * r[0] + Mi[9] * r[1] + Mi[10] * r[2];
+                        x[0] += dxv[0]; x[1] += dxv[1]; x[2] += dxv[2];
+                        for (k = 0; k < 3; ++k) {
+                            float lo = idmin[k] < idmax[k] ? idmin[k] : idmax[k];
+                            float hi = idmin[k] < idmax[k] ? idmax[k] : idmin[k];
+                            if (x[k] < lo) x[k] = lo;
+                            if (x[k] > hi) x[k] = hi;
+                        }
+                    }
+                    inv[gi * 3] = bestx[0]; inv[gi * 3 + 1] = bestx[1];
+                    inv[gi * 3 + 2] = bestx[2];
+                }
+    }
+    toc_free(&list->alloc, cand_out);
+    toc_free(&list->alloc, cand_in);
+    if (!toc_op_list_own(list, inv)) {
+        toc_free(&list->alloc, inv);
+        return TOC_ERROR_OUT_OF_MEMORY;
+    }
+    L->data = inv;
+    L->size = M;
+    for (k = 0; k < 3; ++k) { L->domain_min[k] = omin[k]; L->domain_max[k] = omax[k]; }
+    return TOC_SUCCESS;
+}
+
 toc_result toc_invert_op(toc_op_list *list, toc_op *op) {
     int i;
     switch (op->kind) {
@@ -415,7 +555,8 @@ toc_result toc_invert_op(toc_op_list *list, toc_op *op) {
             return TOC_SUCCESS;
         case TOC_OP_LUT1D:
             return lut1d_invert(list, &op->u.lut1d);
-        case TOC_OP_LUT3D: /* tetrahedral inverse: hard, not implemented */
+        case TOC_OP_LUT3D:
+            return lut3d_invert(list, op);
         default:
             return TOC_ERROR_NONINVERTIBLE;
     }

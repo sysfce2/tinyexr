@@ -106,6 +106,8 @@ int toc_parse_float(const char **pp, const char *end, float *out);
 int toc_parse_int(const char **pp, const char *end, long *out);
 /* Invert a row-major 4x4 (returns 0 on singular). */
 int toc_inv4x4(const float *m, float *out);
+/* Apply a forward LUT3D op to one pixel in place (used by LUT3D inversion). */
+void toc_lut3d_apply_pixel(const toc_op *op, float *px, int ch);
 
 /* ============================================================================
  * Op-list builder helpers (used by the processor + builtins)

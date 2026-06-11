@@ -1585,6 +1585,88 @@ static void test_lut1d_inverse(void) {
     toc_op_list_free(l);
 }
 
+/* LUT3D inverse: build a small invertible 3D map, invert via toc_invert_op
+ * (coarse seed + Newton), and confirm forward+inverse round-trips. */
+static void test_lut3d_inverse(void) {
+    toc_op_list *l = newlist();
+    toc_op *o = toc_op_list_push(l, TOC_OP_LUT3D);
+    enum { N = 9 };
+    static float data[N * N * N * 3];
+    float buf[24], orig[24];
+    int ir, ig, ib, kk, ok = 1;
+    for (ib = 0; ib < N; ++ib)
+        for (ig = 0; ig < N; ++ig)
+            for (ir = 0; ir < N; ++ir) {
+                float r = (float)ir / (N - 1), g = (float)ig / (N - 1),
+                      b = (float)ib / (N - 1);
+                size_t idx = (((size_t)ib * N + ig) * N + ir) * 3;
+                /* diagonally dominant linear mix: invertible + trilinear-exact */
+                data[idx + 0] = 0.9f * r + 0.05f * g;
+                data[idx + 1] = 0.9f * g + 0.05f * b;
+                data[idx + 2] = 0.9f * b + 0.05f * r;
+            }
+    o->u.lut3d.size = N;
+    for (kk = 0; kk < 3; ++kk) {
+        o->u.lut3d.domain_min[kk] = 0.0f;
+        o->u.lut3d.domain_max[kk] = 1.0f;
+    }
+    o->u.lut3d.data = data;
+    o->u.lut3d.interp = TOC_INTERP_TRILINEAR;
+    for (kk = 0; kk < 8; ++kk) {
+        float t = 0.2f + (float)kk * 0.07f; /* interior, well inside the gamut */
+        orig[kk * 3] = buf[kk * 3] = t;
+        orig[kk * 3 + 1] = buf[kk * 3 + 1] = 0.25f + t * 0.4f;
+        orig[kk * 3 + 2] = buf[kk * 3 + 2] = 0.7f - t * 0.4f;
+    }
+    toc_apply(l, buf, 8, 3); /* forward */
+    CHECK(TOC_OK(toc_invert_op(l, &l->ops[0])), "LUT3D op invertible");
+    toc_apply(l, buf, 8, 3); /* inverse */
+    for (kk = 0; kk < 24; ++kk)
+        if (!approx(buf[kk], orig[kk], 8e-3f)) ok = 0;
+    CHECK(ok, "LUT3D forward+inverse round-trip (linear mix)");
+    toc_op_list_free(l);
+
+    /* A curved (non-affine) map: Newton must actually iterate to converge. */
+    {
+        toc_op_list *l2 = newlist();
+        toc_op *o2 = toc_op_list_push(l2, TOC_OP_LUT3D);
+        enum { M = 17 };
+        static float d2[M * M * M * 3];
+        float b2[24], og2[24];
+        int ok2 = 1;
+        for (ib = 0; ib < M; ++ib)
+            for (ig = 0; ig < M; ++ig)
+                for (ir = 0; ir < M; ++ir) {
+                    float r = (float)ir / (M - 1), g = (float)ig / (M - 1),
+                          b = (float)ib / (M - 1);
+                    size_t idx = (((size_t)ib * M + ig) * M + ir) * 3;
+                    d2[idx + 0] = 0.85f * r + 0.10f * r * r + 0.05f * g;
+                    d2[idx + 1] = 0.85f * g + 0.10f * g * g + 0.05f * b;
+                    d2[idx + 2] = 0.85f * b + 0.10f * b * b + 0.05f * r;
+                }
+        o2->u.lut3d.size = M;
+        for (kk = 0; kk < 3; ++kk) {
+            o2->u.lut3d.domain_min[kk] = 0.0f;
+            o2->u.lut3d.domain_max[kk] = 1.0f;
+        }
+        o2->u.lut3d.data = d2;
+        o2->u.lut3d.interp = TOC_INTERP_TRILINEAR;
+        for (kk = 0; kk < 8; ++kk) {
+            float t = 0.2f + (float)kk * 0.07f;
+            og2[kk * 3] = b2[kk * 3] = t;
+            og2[kk * 3 + 1] = b2[kk * 3 + 1] = 0.25f + t * 0.4f;
+            og2[kk * 3 + 2] = b2[kk * 3 + 2] = 0.7f - t * 0.4f;
+        }
+        toc_apply(l2, b2, 8, 3);
+        CHECK(TOC_OK(toc_invert_op(l2, &l2->ops[0])), "LUT3D op invertible (curved)");
+        toc_apply(l2, b2, 8, 3);
+        for (kk = 0; kk < 24; ++kk)
+            if (!approx(b2[kk], og2[kk], 1.2e-2f)) ok2 = 0;
+        CHECK(ok2, "LUT3D forward+inverse round-trip (curved)");
+        toc_op_list_free(l2);
+    }
+}
+
 /* The gamut-compression scale must map the limit distance to the gamut
  * boundary (f(lim)=1): a sample whose distance from achromatic equals the Y
  * limit compresses to 0. This catches a wrong scale that merely round-trips. */
@@ -2277,6 +2359,7 @@ int main(void) {
     test_cdl_op_inverse();
     test_gamutcomp_boundary();
     test_lut1d_inverse();
+    test_lut3d_inverse();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();
