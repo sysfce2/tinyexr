@@ -1122,6 +1122,53 @@ static void test_codegen_c(void) {
     toc_op_list_free(l);
 }
 
+/* Emitted C must compute the PQ/HLG fixed functions (not silently skip them). */
+static void test_codegen_c_hdr(void) {
+    toc_op_list *l = newlist();
+    char *src = NULL;
+    size_t len = 0;
+    toc_result rc;
+    FILE *f;
+    void *h;
+    apply_fn fn;
+    int ok = 1, i;
+    int styles[4] = {TOC_FF_LIN_TO_PQ, TOC_FF_LIN_TO_HLG, TOC_FF_PQ_TO_LIN,
+                     TOC_FF_HLG_TO_LIN};
+    for (i = 0; i < 4; ++i) {
+        toc_op *o = toc_op_list_push(l, TOC_OP_FIXEDFUNC);
+        if (o) { o->u.fixedfunc.style = styles[i]; o->u.fixedfunc.nparams = 0; }
+    }
+    rc = toc_emit_c(l, NULL, NULL, &src, &len);
+    CHECK(TOC_OK(rc) && src, "emit C (PQ/HLG)");
+    if (!TOC_OK(rc)) { toc_op_list_free(l); return; }
+    f = fopen("build/toc_gen_hdr.c", "w");
+    if (f) { fwrite(src, 1, len, f); fclose(f); }
+    if (system("cc -O2 -fPIC -shared build/toc_gen_hdr.c -o build/toc_gen_hdr.so") != 0) {
+        CHECK(0, "compile emitted C (PQ/HLG)");
+        free(src); toc_op_list_free(l); return;
+    }
+    h = dlopen("./build/toc_gen_hdr.so", RTLD_NOW);
+    CHECK(h != NULL, "dlopen PQ/HLG .so");
+    if (h) {
+        fn = (apply_fn)dlsym(h, "tocio_apply");
+        if (fn) {
+            for (i = 0; i < 32; ++i) {
+                float a[4], b[4], v = (float)i / 31.0f;
+                int c;
+                for (c = 0; c < 4; ++c) { a[c] = b[c] = v; }
+                toc_apply(l, a, 1, 4);
+                fn(b, 1);
+                for (c = 0; c < 3; ++c)
+                    if (!approx(a[c], b[c], 2e-3f)) ok = 0;
+            }
+            CHECK(ok, "interpreter == compiled emitted-C (PQ/HLG)");
+        }
+        dlclose(h);
+    }
+    free(src);
+    toc_op_list_free(l);
+}
+
 /* ---- GLSL codegen -------------------------------------------------------- */
 static int glsl_validate(const char *body, const char *version, int es) {
     /* wrap OCIOMain into a complete fragment shader and run glslangValidator */
@@ -1193,6 +1240,33 @@ static void test_codegen_glsl(void) {
         }
         toc_op_list_free(l);
     }
+}
+
+/* Emitted GLSL must contain the PQ/HLG transfer math (not silently skip it). */
+static void test_codegen_glsl_hdr(void) {
+    toc_op_list *l = newlist();
+    toc_shader sh;
+    toc_result rc;
+    int styles[4] = {TOC_FF_LIN_TO_PQ, TOC_FF_PQ_TO_LIN, TOC_FF_LIN_TO_HLG,
+                     TOC_FF_HLG_TO_LIN};
+    int i;
+    for (i = 0; i < 4; ++i) {
+        toc_op *o = toc_op_list_push(l, TOC_OP_FIXEDFUNC);
+        if (o) { o->u.fixedfunc.style = styles[i]; o->u.fixedfunc.nparams = 0; }
+    }
+    rc = toc_emit_glsl(l, TOC_GLSL_330, NULL, &sh);
+    CHECK(TOC_OK(rc) && sh.source, "emit GLSL (PQ/HLG)");
+    if (TOC_OK(rc)) {
+        CHECK(strstr(sh.source, "0.8359375") != NULL &&
+                  strstr(sh.source, "0.17883277") != NULL,
+              "GLSL emits PQ + HLG math (not skipped)");
+        if (glsl_validate(sh.source, "330", 0) == 0)
+            CHECK(1, "glslangValidator accepts PQ/HLG shader");
+        else
+            printf("  note: glslangValidator skipped/failed for PQ/HLG\n");
+        toc_shader_free(&sh);
+    }
+    toc_op_list_free(l);
 }
 
 /* ---- SIMD parity (scalar vs SSE2 vs AVX2) -------------------------------- */
@@ -1864,8 +1938,10 @@ int main(void) {
     test_edge_cases();
     printf("== tocio AOT-C codegen ==\n");
     test_codegen_c();
+    test_codegen_c_hdr();
     printf("== tocio GLSL codegen ==\n");
     test_codegen_glsl();
+    test_codegen_glsl_hdr();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();

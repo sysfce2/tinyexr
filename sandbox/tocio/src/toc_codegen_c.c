@@ -306,6 +306,23 @@ static const char *FIXEDFUNC_SRC_XYZ =
     "float dd=v==0?0:0.25f/v;"
     "px[0]=9.0f*Y*u*dd;px[1]=Y;px[2]=Y*(12.0f-3.0f*u-20.0f*v)*dd;}\n";
 
+/* PQ (ST 2084) + HLG transfer functions (libm-free; same as the interpreter). */
+static const char *FIXEDFUNC_SRC_HDR =
+    "static float tc_pq_enc(float L){float m1=0.1593017578125f,m2=78.84375f,"
+    "c1=0.8359375f,c2=18.8515625f,c3=18.6875f,Lm;if(L<=0.0f)return 0.0f;"
+    "Lm=tc_powf(L,m1);return tc_powf((c1+c2*Lm)/(1.0f+c3*Lm),m2);}\n"
+    "static float tc_pq_dec(float N){float m1=0.1593017578125f,m2=78.84375f,"
+    "c1=0.8359375f,c2=18.8515625f,c3=18.6875f,Np,nu,de;if(N<=0.0f)return 0.0f;"
+    "Np=tc_powf(N,1.0f/m2);nu=Np-c1;if(nu<0.0f)nu=0.0f;de=c2-c3*Np;"
+    "if(de<=0.0f)return 0.0f;return tc_powf(nu/de,1.0f/m1);}\n"
+    "static float tc_hlg_enc(float E){float a=0.17883277f,b=0.28466892f,"
+    "c=0.55991073f;if(E<=0.0f)return 0.0f;if(E<=1.0f/12.0f)return "
+    "tc_exp2f(0.5f*tc_log2f(3.0f*E));return a*(tc_log2f(12.0f*E-b)*"
+    "0.6931471805599453f)+c;}\n"
+    "static float tc_hlg_dec(float E){float a=0.17883277f,b=0.28466892f,"
+    "c=0.55991073f;if(E<=0.0f)return 0.0f;if(E<=0.5f)return E*E/3.0f;"
+    "return (tc_exp2f(((E-c)/a)*1.4426950408889634f)+b)/12.0f;}\n";
+
 static const char *LUT3D_SRC =
     "static void tc_lut3d(const float*d,int N,const float*dn,const float*dx,int"
     " tet,float*c){int ic[3],k;float f[3];for(k=0;k<3;++k){float den=dx[k]-dn[k"
@@ -336,6 +353,7 @@ toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
     const char *fname = (opts && opts->func_name) ? opts->func_name : "tocio_apply";
     int need_math = 0, need_lut1d = 0, need_lut3d = 0, lut_idx = 0;
     int need_glow = 0, need_darktodim = 0, need_rgbhsv = 0, need_xyz = 0;
+    int need_hdr = 0;
     size_t k;
     if (!ops || !out_src) return TOC_ERROR_INVALID_ARGUMENT;
     if (!a) a = toc_default_allocator();
@@ -358,6 +376,9 @@ toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
                     need_rgbhsv = 1;
                 if (s >= TOC_FF_XYZ_TO_xyY && s <= TOC_FF_LUV_TO_XYZ)
                     need_xyz = 1;
+                if (s >= TOC_FF_LIN_TO_PQ && s <= TOC_FF_HLG_TO_LIN) {
+                    need_hdr = 1; need_math = 1;
+                }
                 break;
             }
             default: break;
@@ -375,6 +396,7 @@ toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
     if (need_darktodim) toc_sb_puts(&sb, FIXEDFUNC_SRC_DARKTODIM);
     if (need_rgbhsv) toc_sb_puts(&sb, FIXEDFUNC_SRC_RGB2HSV);
     if (need_xyz) toc_sb_puts(&sb, FIXEDFUNC_SRC_XYZ);
+    if (need_hdr) toc_sb_puts(&sb, FIXEDFUNC_SRC_HDR);
     /* embed LUT arrays */
     for (k = 0; k < ops->count; ++k) {
         const toc_op *op = &ops->ops[k];
@@ -502,6 +524,15 @@ toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
                     toc_sb_puts(&sb, "  { float c[3]={r,g,b};");
                     toc_sb_puts(&sb, fn[idx][inv]);
                     toc_sb_puts(&sb, "; r=c[0];g=c[1];b=c[2];}\n");
+                } else if (s >= TOC_FF_LIN_TO_PQ && s <= TOC_FF_HLG_TO_LIN) {
+                    const char *fn = s == TOC_FF_LIN_TO_PQ ? "tc_pq_enc"
+                                   : s == TOC_FF_PQ_TO_LIN ? "tc_pq_dec"
+                                   : s == TOC_FF_LIN_TO_HLG ? "tc_hlg_enc"
+                                                            : "tc_hlg_dec";
+                    toc_sb_puts(&sb, "  r=");  toc_sb_puts(&sb, fn);
+                    toc_sb_puts(&sb, "(r); g="); toc_sb_puts(&sb, fn);
+                    toc_sb_puts(&sb, "(g); b="); toc_sb_puts(&sb, fn);
+                    toc_sb_puts(&sb, "(b);\n");
                 }
                 break;
             }

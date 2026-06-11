@@ -382,6 +382,24 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                                      "  float Y=v.r<=0.08?0.110706*v.r:t*t*t;\n"
                                      "  float dd=0.25/max(vv,1e-10);\n"
                                      "  v=vec4(9.0*Y*u*dd,Y,Y*(12.0-3.0*u-20.0*vv)*dd,v.a);}\n");
+                } else if (s == TOC_FF_LIN_TO_PQ) {
+                    toc_sb_puts(&sb,
+                        "  { vec3 Lm=pow(max(v.rgb,0.0),vec3(0.1593017578125));\n"
+                        "  v.rgb=pow((0.8359375+18.8515625*Lm)/(1.0+18.6875*Lm),vec3(78.84375)); }\n");
+                } else if (s == TOC_FF_PQ_TO_LIN) {
+                    toc_sb_puts(&sb,
+                        "  { vec3 Np=pow(max(v.rgb,0.0),vec3(0.012683313));\n"
+                        "  vec3 nu=max(Np-0.8359375,0.0),de=max(18.8515625-18.6875*Np,1e-10);\n"
+                        "  v.rgb=pow(nu/de,vec3(6.2773438)); }\n");
+                } else if (s == TOC_FF_LIN_TO_HLG) {
+                    toc_sb_puts(&sb,
+                        "  { vec3 e=max(v.rgb,0.0);\n"
+                        "  v.rgb=mix(0.17883277*log(max(12.0*e-0.28466892,1e-10))+0.55991073,\n"
+                        "            sqrt(3.0*e), lessThanEqual(e,vec3(0.083333333))); }\n");
+                } else if (s == TOC_FF_HLG_TO_LIN) {
+                    toc_sb_puts(&sb,
+                        "  { v.rgb=mix((exp((v.rgb-0.55991073)/0.17883277)+0.28466892)/12.0,\n"
+                        "            v.rgb*v.rgb/3.0, lessThanEqual(v.rgb,vec3(0.5))); }\n");
                 }
                 break;
             }
