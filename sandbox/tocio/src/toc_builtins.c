@@ -114,6 +114,176 @@ static toc_op *push_acescct_log(toc_op_list *list, int log_to_lin) {
     return op;
 }
 
+/* ===========================================================================
+ * Colorimetry: derive linear RGB<->RGB / RGB<->CIE-XYZ matrices from primaries
+ * + white point, with Bradford chromatic adaptation. All pure float arithmetic
+ * (freestanding-safe). Lets the builtin expander synthesize conversions between
+ * sRGB/Rec.709, Display-P3, DCI-P3, Rec.2020/2100, Adobe RGB, ACEScg (AP1),
+ * ACES2065-1 (AP0) and CIE-XYZ-D65 without baking every matrix by hand.
+ * ========================================================================= */
+
+/* row-major 3x3 */
+static void mat3_mul(const float a[9], const float b[9], float o[9]) {
+    int r, c, k;
+    for (r = 0; r < 3; ++r)
+        for (c = 0; c < 3; ++c) {
+            float s = 0.0f;
+            for (k = 0; k < 3; ++k) s += a[r * 3 + k] * b[k * 3 + c];
+            o[r * 3 + c] = s;
+        }
+}
+static void mat3_vec(const float m[9], const float v[3], float o[3]) {
+    int r;
+    for (r = 0; r < 3; ++r)
+        o[r] = m[r * 3 + 0] * v[0] + m[r * 3 + 1] * v[1] + m[r * 3 + 2] * v[2];
+}
+static int mat3_inv(const float m[9], float o[9]) {
+    float det;
+    float c00 = m[4] * m[8] - m[5] * m[7];
+    float c01 = m[5] * m[6] - m[3] * m[8];
+    float c02 = m[3] * m[7] - m[4] * m[6];
+    det = m[0] * c00 + m[1] * c01 + m[2] * c02;
+    if (det == 0.0f) return 0;
+    det = 1.0f / det;
+    o[0] = c00 * det;
+    o[1] = (m[2] * m[7] - m[1] * m[8]) * det;
+    o[2] = (m[1] * m[5] - m[2] * m[4]) * det;
+    o[3] = c01 * det;
+    o[4] = (m[0] * m[8] - m[2] * m[6]) * det;
+    o[5] = (m[2] * m[3] - m[0] * m[5]) * det;
+    o[6] = c02 * det;
+    o[7] = (m[1] * m[6] - m[0] * m[7]) * det;
+    o[8] = (m[0] * m[4] - m[1] * m[3]) * det;
+    return 1;
+}
+
+/* xy -> XYZ at unit luminance (Y=1). */
+static void xy_to_xyz(float x, float y, float o[3]) {
+    o[0] = x / y;
+    o[1] = 1.0f;
+    o[2] = (1.0f - x - y) / y;
+}
+
+/* A linear RGB encoding: R/G/B chromaticities + white (xy). is_xyz marks the
+ * CIE-XYZ-D65 pseudo-space (identity NPM, D65 white). */
+typedef struct {
+    float rx, ry, gx, gy, bx, by, wx, wy;
+    int is_xyz;
+} toc_cspace;
+
+/* RGB->XYZ normalized primary matrix (NPM) for `cs`. */
+static int cspace_npm(const toc_cspace *cs, float M[9]) {
+    float C[9], Cinv[9], W[3], S[3], pr[3], pg[3], pb[3];
+    if (cs->is_xyz) {
+        int i;
+        for (i = 0; i < 9; ++i) M[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        return 1;
+    }
+    xy_to_xyz(cs->rx, cs->ry, pr);
+    xy_to_xyz(cs->gx, cs->gy, pg);
+    xy_to_xyz(cs->bx, cs->by, pb);
+    C[0] = pr[0]; C[1] = pg[0]; C[2] = pb[0]; /* columns = primaries */
+    C[3] = pr[1]; C[4] = pg[1]; C[5] = pb[1];
+    C[6] = pr[2]; C[7] = pg[2]; C[8] = pb[2];
+    xy_to_xyz(cs->wx, cs->wy, W);
+    if (!mat3_inv(C, Cinv)) return 0;
+    mat3_vec(Cinv, W, S); /* per-primary scale so RGB(1,1,1) -> white */
+    M[0] = C[0] * S[0]; M[1] = C[1] * S[1]; M[2] = C[2] * S[2];
+    M[3] = C[3] * S[0]; M[4] = C[4] * S[1]; M[5] = C[5] * S[2];
+    M[6] = C[6] * S[0]; M[7] = C[7] * S[1]; M[8] = C[8] * S[2];
+    return 1;
+}
+
+/* Bradford chromatic adaptation from white ws(xy) to wd(xy). */
+static void bradford_cat(float wsx, float wsy, float wdx, float wdy, float M[9]) {
+    static const float B[9] = {0.8951f,  0.2664f,  -0.1614f,
+                               -0.7502f, 1.7135f,  0.0367f,
+                               0.0389f,  -0.0685f, 1.0296f};
+    float Binv[9], Ws[3], Wd[3], cs[3], cd[3], D[9], t[9];
+    int i;
+    mat3_inv(B, Binv);
+    xy_to_xyz(wsx, wsy, Ws);
+    xy_to_xyz(wdx, wdy, Wd);
+    mat3_vec(B, Ws, cs);
+    mat3_vec(B, Wd, cd);
+    for (i = 0; i < 9; ++i) D[i] = 0.0f;
+    D[0] = cd[0] / cs[0];
+    D[4] = cd[1] / cs[1];
+    D[8] = cd[2] / cs[2];
+    mat3_mul(D, B, t);
+    mat3_mul(Binv, t, M); /* Binv * D * B */
+}
+
+/* M (row-major) = linear src -> linear dst, Bradford-adapting the white. */
+static int cspace_convert(const toc_cspace *s, const toc_cspace *d, float M[9]) {
+    float Ms[9], Md[9], Mdinv[9];
+    int same_w = (s->wx == d->wx && s->wy == d->wy);
+    if (!cspace_npm(s, Ms) || !cspace_npm(d, Md) || !mat3_inv(Md, Mdinv))
+        return 0;
+    if (same_w) {
+        mat3_mul(Mdinv, Ms, M);
+    } else {
+        float cat[9], a[9];
+        bradford_cat(s->wx, s->wy, d->wx, d->wy, cat);
+        mat3_mul(cat, Ms, a);  /* adapt src XYZ to dst white */
+        mat3_mul(Mdinv, a, M);
+    }
+    return 1;
+}
+
+/* White points (xy). */
+#define TOC_WP_D65 0.3127f, 0.3290f
+#define TOC_WP_D60 0.32168f, 0.33767f /* ACES */
+#define TOC_WP_DCI 0.314f, 0.351f
+
+/* Named linear color spaces. Aliases share an entry. */
+static const struct { const char *name; toc_cspace cs; } TOC_CSPACES[] = {
+    {"Linear-sRGB",   {0.640f, 0.330f, 0.300f, 0.600f, 0.150f, 0.060f, TOC_WP_D65, 0}},
+    {"Linear-Rec709", {0.640f, 0.330f, 0.300f, 0.600f, 0.150f, 0.060f, TOC_WP_D65, 0}},
+    {"Linear-P3-D65", {0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, TOC_WP_D65, 0}},
+    {"Linear-Display-P3", {0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, TOC_WP_D65, 0}},
+    {"Linear-P3-DCI", {0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, TOC_WP_DCI, 0}},
+    {"Linear-DCI-P3", {0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, TOC_WP_DCI, 0}},
+    {"Linear-Rec2020", {0.708f, 0.292f, 0.170f, 0.797f, 0.131f, 0.046f, TOC_WP_D65, 0}},
+    {"Linear-Rec2100", {0.708f, 0.292f, 0.170f, 0.797f, 0.131f, 0.046f, TOC_WP_D65, 0}},
+    {"Linear-AdobeRGB", {0.640f, 0.330f, 0.210f, 0.710f, 0.150f, 0.060f, TOC_WP_D65, 0}},
+    {"ACEScg",      {0.713f, 0.293f, 0.165f, 0.830f, 0.128f, 0.044f, TOC_WP_D60, 0}},
+    {"Linear-AP1",  {0.713f, 0.293f, 0.165f, 0.830f, 0.128f, 0.044f, TOC_WP_D60, 0}},
+    {"ACES2065-1",  {0.7347f, 0.2653f, 0.0f, 1.0f, 0.0001f, -0.077f, TOC_WP_D60, 0}},
+    {"Linear-AP0",  {0.7347f, 0.2653f, 0.0f, 1.0f, 0.0001f, -0.077f, TOC_WP_D60, 0}},
+    {"CIE-XYZ-D65", {0, 0, 0, 0, 0, 0, TOC_WP_D65, 1}},
+};
+
+static const toc_cspace *cspace_lookup(const char *name, size_t len) {
+    size_t i;
+    for (i = 0; i < sizeof(TOC_CSPACES) / sizeof(TOC_CSPACES[0]); ++i)
+        if (strlen(TOC_CSPACES[i].name) == len &&
+            memcmp(TOC_CSPACES[i].name, name, len) == 0)
+            return &TOC_CSPACES[i].cs;
+    return NULL;
+}
+
+/* Try "<A>_to_<B>" as a linear color-space conversion; push a matrix op. Returns
+ * 1 if handled (matrix pushed or OOM via *rc), 0 if the names are unknown. */
+static const char *find_to(const char *s) { /* locate "_to_" (no libc strstr) */
+    for (; *s; ++s)
+        if (s[0] == '_' && s[1] == 't' && s[2] == 'o' && s[3] == '_') return s;
+    return NULL;
+}
+static int push_cspace_convert(toc_op_list *list, const char *style,
+                               toc_result *rc) {
+    const char *sep = find_to(style);
+    const toc_cspace *s, *d;
+    float M[9];
+    if (!sep) return 0;
+    s = cspace_lookup(style, (size_t)(sep - style));
+    d = cspace_lookup(sep + 4, strlen(sep + 4));
+    if (!s || !d) return 0;
+    if (!cspace_convert(s, d, M)) { *rc = TOC_ERROR_UNSUPPORTED; return 1; }
+    if (!push_mat3(list, M)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+    return 1;
+}
+
 static toc_result reverse_invert(toc_op_list *list, size_t start) {
     size_t i, j;
     for (i = start, j = list->count; i < j; ++i, --j) {
@@ -142,6 +312,8 @@ toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert) 
     } else if (strcmp(style, "ACES2065-1_to_ACEScct") == 0) {
         if (!push_mat3(list, AP0_TO_AP1) || !push_acescct_log(list, 0))
             rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (push_cspace_convert(list, style, &rc)) {
+        /* handled: a linear color-space (primaries) conversion */
     } else {
         matched = 0;
     }

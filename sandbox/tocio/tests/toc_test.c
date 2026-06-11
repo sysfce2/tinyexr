@@ -1375,6 +1375,70 @@ static void test_builtins(void) {
     toc_config_free(cfg);
 }
 
+/* ---- Colorimetry: primaries -> XYZ NPM + Bradford + RGB<->RGB ------------- */
+static void apply_builtin3(const char *style, int inv, float px[3]) {
+    toc_op_list *l = newlist();
+    if (TOC_OK(toc_builtin_expand(l, style, inv))) toc_apply(l, px, 1, 3);
+    toc_op_list_free(l);
+}
+static void test_colorimetry(void) {
+    /* Linear-sRGB -> CIE-XYZ-D65 reproduces the canonical sRGB NPM columns. */
+    {
+        float r[3] = {1, 0, 0}, g[3] = {0, 1, 0}, b[3] = {0, 0, 1};
+        apply_builtin3("Linear-sRGB_to_CIE-XYZ-D65", 0, r);
+        apply_builtin3("Linear-sRGB_to_CIE-XYZ-D65", 0, g);
+        apply_builtin3("Linear-sRGB_to_CIE-XYZ-D65", 0, b);
+        CHECK(approx(r[0], 0.4124f, 2e-3f) && approx(r[1], 0.2126f, 2e-3f) &&
+                  approx(r[2], 0.0193f, 2e-3f), "sRGB R -> XYZ-D65");
+        CHECK(approx(g[0], 0.3576f, 2e-3f) && approx(g[1], 0.7152f, 2e-3f) &&
+                  approx(g[2], 0.1192f, 2e-3f), "sRGB G -> XYZ-D65");
+        CHECK(approx(b[0], 0.1805f, 2e-3f) && approx(b[1], 0.0722f, 2e-3f) &&
+                  approx(b[2], 0.9505f, 2e-3f), "sRGB B -> XYZ-D65");
+    }
+    /* Display-P3 -> CIE-XYZ-D65 reference columns. */
+    {
+        float r[3] = {1, 0, 0}, g[3] = {0, 1, 0}, b[3] = {0, 0, 1};
+        apply_builtin3("Linear-Display-P3_to_CIE-XYZ-D65", 0, r);
+        apply_builtin3("Linear-Display-P3_to_CIE-XYZ-D65", 0, g);
+        apply_builtin3("Linear-Display-P3_to_CIE-XYZ-D65", 0, b);
+        CHECK(approx(r[0], 0.4866f, 2e-3f) && approx(r[1], 0.2290f, 2e-3f),
+              "Display-P3 R -> XYZ-D65");
+        CHECK(approx(g[1], 0.6917f, 2e-3f) && approx(b[2], 1.0439f, 2e-3f),
+              "Display-P3 G/B -> XYZ-D65");
+    }
+    /* RGB<->RGB round-trips (incl. Bradford-adapted ACES D60<->D65). */
+    {
+        static const char *pairs[4][2] = {
+            {"Linear-sRGB_to_Linear-Display-P3", "Linear-Display-P3_to_Linear-sRGB"},
+            {"Linear-sRGB_to_Linear-Rec2020", "Linear-Rec2020_to_Linear-sRGB"},
+            {"ACEScg_to_CIE-XYZ-D65", "CIE-XYZ-D65_to_ACEScg"},
+            {"Linear-Display-P3_to_ACES2065-1", "ACES2065-1_to_Linear-Display-P3"}};
+        int k;
+        for (k = 0; k < 4; ++k) {
+            float p[3] = {0.2f, 0.5f, 0.8f};
+            apply_builtin3(pairs[k][0], 0, p);
+            apply_builtin3(pairs[k][1], 0, p);
+            CHECK(approx(p[0], 0.2f, 1e-4f) && approx(p[1], 0.5f, 1e-4f) &&
+                      approx(p[2], 0.8f, 1e-4f), pairs[k][0]);
+        }
+    }
+    /* white-balanced: sRGB(D65) -> ACEScg(D60) keeps mid-grey neutral. */
+    {
+        float p[3] = {0.18f, 0.18f, 0.18f};
+        apply_builtin3("Linear-sRGB_to_ACEScg", 0, p);
+        CHECK(approx(p[0], p[1], 2e-3f) && approx(p[1], p[2], 2e-3f),
+              "neutral stays neutral across white adaptation");
+    }
+    /* invert flag == the reverse-named conversion. */
+    {
+        float a[3] = {0.3f, 0.6f, 0.1f}, b[3] = {0.3f, 0.6f, 0.1f};
+        apply_builtin3("Linear-sRGB_to_Linear-Display-P3", 1, a);
+        apply_builtin3("Linear-Display-P3_to_Linear-sRGB", 0, b);
+        CHECK(approx(a[0], b[0], 1e-4f) && approx(a[1], b[1], 1e-4f) &&
+                  approx(a[2], b[2], 1e-4f), "builtin invert == reverse conversion");
+    }
+}
+
 /* ---- FixedFunction styles (round-trip for all invert pairs) -------------- */
 static void push_fixedfunc(toc_op_list *l, int style, const float *params,
                             int nparams) {
@@ -1742,6 +1806,7 @@ int main(void) {
     test_simd_parity_transcendentals();
     printf("== tocio builtins + fixedfunc ==\n");
     test_builtins();
+    test_colorimetry();
     printf("== tocio fixedfunc styles ==\n");
     test_fixedfunc_styles();
     printf("== tocio x64 JIT ==\n");
