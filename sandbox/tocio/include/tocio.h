@@ -103,7 +103,12 @@ typedef enum toc_ff_style {
     TOC_FF_XYZ_TO_uvY = 18,
     TOC_FF_uvY_TO_XYZ = 19,
     TOC_FF_XYZ_TO_LUV = 20,
-    TOC_FF_LUV_TO_XYZ = 21
+    TOC_FF_LUV_TO_XYZ = 21,
+    /* HDR display transfer functions (per-channel). Forward = linear->encoded. */
+    TOC_FF_LIN_TO_PQ = 22,  /* SMPTE ST 2084 (PQ) inverse-EOTF */
+    TOC_FF_PQ_TO_LIN = 23,
+    TOC_FF_LIN_TO_HLG = 24, /* Rec.2100 HLG OETF (per-channel; no OOTF) */
+    TOC_FF_HLG_TO_LIN = 25
 } toc_ff_style;
 
 typedef struct toc_lut1d {

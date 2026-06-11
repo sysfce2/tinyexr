@@ -346,6 +346,11 @@ toc_result toc_invert_op(toc_op *op) {
             }
             return TOC_SUCCESS;
         }
+        case TOC_OP_FIXEDFUNC:
+            /* every style is an even/odd forward/inverse pair, so toggling the
+             * low bit selects the inverse (PQ<->lin, HSV<->RGB, glow fwd<->inv). */
+            op->u.fixedfunc.style ^= 1;
+            return TOC_SUCCESS;
         case TOC_OP_LUT1D:
         case TOC_OP_LUT3D:
         case TOC_OP_CDL:

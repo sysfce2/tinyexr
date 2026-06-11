@@ -270,18 +270,90 @@ static const char *find_to(const char *s) { /* locate "_to_" (no libc strstr) */
         if (s[0] == '_' && s[1] == 't' && s[2] == 'o' && s[3] == '_') return s;
     return NULL;
 }
+/* Push the linear src->dst conversion matrix (names from the cspace table). */
+static int push_cspace_named(toc_op_list *list, const char *src, const char *dst,
+                             toc_result *rc) {
+    const toc_cspace *s = cspace_lookup(src, strlen(src));
+    const toc_cspace *d = cspace_lookup(dst, strlen(dst));
+    float M[9];
+    if (!s || !d || !cspace_convert(s, d, M)) { *rc = TOC_ERROR_UNSUPPORTED; return 0; }
+    if (!push_mat3(list, M)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+    return TOC_OK(*rc);
+}
 static int push_cspace_convert(toc_op_list *list, const char *style,
                                toc_result *rc) {
     const char *sep = find_to(style);
-    const toc_cspace *s, *d;
-    float M[9];
+    char src[48];
+    size_t n;
     if (!sep) return 0;
-    s = cspace_lookup(style, (size_t)(sep - style));
-    d = cspace_lookup(sep + 4, strlen(sep + 4));
-    if (!s || !d) return 0;
-    if (!cspace_convert(s, d, M)) { *rc = TOC_ERROR_UNSUPPORTED; return 1; }
-    if (!push_mat3(list, M)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+    n = (size_t)(sep - style);
+    if (n >= sizeof(src)) return 0;
+    if (!cspace_lookup(style, n) || !cspace_lookup(sep + 4, strlen(sep + 4)))
+        return 0;
+    memcpy(src, style, n);
+    src[n] = '\0';
+    push_cspace_named(list, src, sep + 4, rc);
     return 1;
+}
+
+/* ---- display transfer functions (linear <-> display-encoded) ------------- */
+/* sRGB / Display-P3 piecewise curve as an ExponentWithLinear (the forward op is
+ * the EOTF: encoded->linear; encode=1 emits the inverse, linear->encoded). */
+static toc_op *push_srgb_curve(toc_op_list *list, int encode) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_EXP_LINEAR);
+    int i;
+    if (!op) return NULL;
+    for (i = 0; i < 4; ++i) {
+        op->u.exp_linear.scale[i] = 1.0f / 1.055f;
+        op->u.exp_linear.offset[i] = 0.055f / 1.055f;
+        op->u.exp_linear.gamma[i] = 2.4f;
+        op->u.exp_linear.breakpoint[i] = 0.04045f;
+        op->u.exp_linear.slope[i] = 1.0f / 12.92f;
+    }
+    op->u.exp_linear.inverse = encode ? 1 : 0;
+    return op;
+}
+/* Pure-power EOTF (gamma): forward op = display->linear (pow(x,g)); encode emits
+ * linear->display (pow(x,1/g)). Alpha unchanged. */
+static toc_op *push_gamma(toc_op_list *list, float g, int encode) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_EXPONENT);
+    int i;
+    float e = encode ? 1.0f / g : g;
+    if (!op) return NULL;
+    for (i = 0; i < 4; ++i) op->u.exponent.e[i] = (i < 3) ? e : 1.0f;
+    return op;
+}
+static toc_op *push_ff_style(toc_op_list *list, int style) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_FIXEDFUNC);
+    if (!op) return NULL;
+    op->u.fixedfunc.style = style;
+    op->u.fixedfunc.nparams = 0;
+    return op;
+}
+
+/* Try a composed "CIE-XYZ-D65_to_<display>" output transform: a primaries matrix
+ * followed by the display's transfer-function encode. Returns 1 if handled. */
+static int push_display_xform(toc_op_list *list, const char *style,
+                              toc_result *rc) {
+    struct { const char *name, *prim; int kind; float g; } d[] = {
+        {"CIE-XYZ-D65_to_sRGB",             "Linear-sRGB",       0, 0.0f},
+        {"CIE-XYZ-D65_to_Display-P3",       "Linear-Display-P3", 0, 0.0f},
+        {"CIE-XYZ-D65_to_DCI-P3",           "Linear-DCI-P3",     1, 2.6f},
+        {"CIE-XYZ-D65_to_Rec.1886-Rec.709", "Linear-Rec709",     1, 2.4f},
+        {"CIE-XYZ-D65_to_Rec.2100-PQ",      "Linear-Rec2020",    2, 0.0f},
+        {"CIE-XYZ-D65_to_Rec.2100-HLG",     "Linear-Rec2020",    3, 0.0f},
+    };
+    size_t i;
+    for (i = 0; i < sizeof(d) / sizeof(d[0]); ++i) {
+        if (strcmp(style, d[i].name) != 0) continue;
+        if (!push_cspace_named(list, "CIE-XYZ-D65", d[i].prim, rc)) return 1;
+        if (d[i].kind == 0 && !push_srgb_curve(list, 1)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 1 && !push_gamma(list, d[i].g, 1)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 2 && !push_ff_style(list, TOC_FF_LIN_TO_PQ)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 3 && !push_ff_style(list, TOC_FF_LIN_TO_HLG)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+        return 1;
+    }
+    return 0;
 }
 
 static toc_result reverse_invert(toc_op_list *list, size_t start) {
@@ -312,6 +384,8 @@ toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert) 
     } else if (strcmp(style, "ACES2065-1_to_ACEScct") == 0) {
         if (!push_mat3(list, AP0_TO_AP1) || !push_acescct_log(list, 0))
             rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (push_display_xform(list, style, &rc)) {
+        /* handled: a composed CIE-XYZ-D65 -> display output transform */
     } else if (push_cspace_convert(list, style, &rc)) {
         /* handled: a linear color-space (primaries) conversion */
     } else {
@@ -777,9 +851,60 @@ static void apply_luv_to_xyz(float *px) {
 }
 
 /* ---- FixedFunction apply (the single dispatch point) ----------------------- */
+/* ---- HDR display transfer functions (per-channel) ------------------------ */
+#define TOC_LN2 0.6931471805599453f
+#define TOC_LOG2E 1.4426950408889634f
+
+/* SMPTE ST 2084 (PQ). L normalized so 1.0 == 10000 cd/m^2. */
+static float pq_encode(float L) {
+    float m1 = 0.1593017578125f, m2 = 78.84375f;
+    float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+    float Lm;
+    if (L <= 0.0f) return 0.0f;
+    Lm = toc_powf(L, m1);
+    return toc_powf((c1 + c2 * Lm) / (1.0f + c3 * Lm), m2);
+}
+static float pq_decode(float N) {
+    float m1 = 0.1593017578125f, m2 = 78.84375f;
+    float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+    float Np, num, den;
+    if (N <= 0.0f) return 0.0f;
+    Np = toc_powf(N, 1.0f / m2);
+    num = Np - c1;
+    if (num < 0.0f) num = 0.0f;
+    den = c2 - c3 * Np;
+    if (den <= 0.0f) return 0.0f;
+    return toc_powf(num / den, 1.0f / m1);
+}
+/* Rec.2100 HLG OETF (per-channel; the OOTF/system-gamma is not applied here). */
+static float hlg_encode(float E) {
+    float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
+    if (E <= 0.0f) return 0.0f;
+    if (E <= 1.0f / 12.0f) return toc_sqrtf(3.0f * E);
+    return a * (toc_log2f(12.0f * E - b) * TOC_LN2) + c;
+}
+static float hlg_decode(float Ep) {
+    float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
+    if (Ep <= 0.0f) return 0.0f;
+    if (Ep <= 0.5f) return Ep * Ep / 3.0f;
+    return (toc_exp2f(((Ep - c) / a) * TOC_LOG2E) + b) / 12.0f;
+}
+
 void toc_fixedfunc_apply_pixel(const toc_op *op, float *px, int ch) {
     (void)ch;
     switch (op->u.fixedfunc.style) {
+        case TOC_FF_LIN_TO_PQ:
+            px[0] = pq_encode(px[0]); px[1] = pq_encode(px[1]);
+            px[2] = pq_encode(px[2]); return;
+        case TOC_FF_PQ_TO_LIN:
+            px[0] = pq_decode(px[0]); px[1] = pq_decode(px[1]);
+            px[2] = pq_decode(px[2]); return;
+        case TOC_FF_LIN_TO_HLG:
+            px[0] = hlg_encode(px[0]); px[1] = hlg_encode(px[1]);
+            px[2] = hlg_encode(px[2]); return;
+        case TOC_FF_HLG_TO_LIN:
+            px[0] = hlg_decode(px[0]); px[1] = hlg_decode(px[1]);
+            px[2] = hlg_decode(px[2]); return;
         case TOC_FF_REC2100_SURROUND:
         case TOC_FF_REC2100_SURROUND_INV: {
             float g = op->u.fixedfunc.params[0];

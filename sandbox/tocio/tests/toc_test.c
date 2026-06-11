@@ -1439,6 +1439,71 @@ static void test_colorimetry(void) {
     }
 }
 
+/* ---- Display transfer functions + composed output transforms ------------- */
+static void push_ff_raw(toc_op_list *l, int style) {
+    toc_op *o = toc_op_list_push(l, TOC_OP_FIXEDFUNC);
+    if (o) { o->u.fixedfunc.style = style; o->u.fixedfunc.nparams = 0; }
+}
+static void test_display_transfer(void) {
+    /* PQ / HLG per-channel encode->decode round-trips over [0,1]. */
+    {
+        int s, styles[2] = {TOC_FF_LIN_TO_PQ, TOC_FF_LIN_TO_HLG};
+        for (s = 0; s < 2; ++s) {
+            toc_op_list *l = newlist();
+            int p, ok = 1;
+            push_ff_raw(l, styles[s]);
+            push_ff_raw(l, styles[s] ^ 1); /* inverse */
+            /* PQ's m2=78.84 exponent amplifies the ~1e-6 approximate-pow error,
+             * so allow a looser bound there than for HLG (sqrt/log/exp). */
+            float eps = (styles[s] == TOC_FF_LIN_TO_PQ) ? 1e-3f : 1e-4f;
+            for (p = 0; p <= 20; ++p) {
+                float x = (float)p / 20.0f, v[3];
+                v[0] = v[1] = v[2] = x;
+                toc_apply(l, v, 1, 3);
+                if (!approx(v[0], x, eps)) ok = 0;
+            }
+            CHECK(ok, s ? "HLG encode<->decode round-trip"
+                        : "PQ encode<->decode round-trip");
+            toc_op_list_free(l);
+        }
+    }
+    /* PQ maps [0,1] -> [0,1] (0->0, peak 1->1). */
+    {
+        toc_op_list *l = newlist();
+        float a[3] = {1, 1, 1}, z[3] = {0, 0, 0};
+        push_ff_raw(l, TOC_FF_LIN_TO_PQ);
+        toc_apply(l, a, 1, 3);
+        toc_apply(l, z, 1, 3);
+        CHECK(approx(a[0], 1.0f, 1e-3f) && approx(z[0], 0.0f, 1e-4f),
+              "PQ maps [0,1] -> [0,1]");
+        toc_op_list_free(l);
+    }
+    /* Composed output transforms: display value -> XYZ (invert) -> display
+     * (forward) reconstructs the display value (in-[0,1] stays invertible). */
+    {
+        static const char *xf[6] = {
+            "CIE-XYZ-D65_to_sRGB", "CIE-XYZ-D65_to_Display-P3",
+            "CIE-XYZ-D65_to_DCI-P3", "CIE-XYZ-D65_to_Rec.1886-Rec.709",
+            "CIE-XYZ-D65_to_Rec.2100-PQ", "CIE-XYZ-D65_to_Rec.2100-HLG"};
+        int k;
+        for (k = 0; k < 6; ++k) {
+            toc_op_list *fwd = newlist(), *inv = newlist();
+            toc_result r1 = toc_builtin_expand(fwd, xf[k], 0);
+            toc_result r2 = toc_builtin_expand(inv, xf[k], 1);
+            float p[3] = {0.5f, 0.4f, 0.6f}, o[3] = {0.5f, 0.4f, 0.6f};
+            CHECK(TOC_OK(r1) && TOC_OK(r2) && fwd->count == 2, xf[k]);
+            if (TOC_OK(r1) && TOC_OK(r2)) {
+                toc_apply(inv, p, 1, 3); /* display -> XYZ */
+                toc_apply(fwd, p, 1, 3); /* XYZ -> display */
+                CHECK(approx(p[0], o[0], 2e-3f) && approx(p[1], o[1], 2e-3f) &&
+                          approx(p[2], o[2], 2e-3f), "output xform round-trip");
+            }
+            toc_op_list_free(fwd);
+            toc_op_list_free(inv);
+        }
+    }
+}
+
 /* ---- FixedFunction styles (round-trip for all invert pairs) -------------- */
 static void push_fixedfunc(toc_op_list *l, int style, const float *params,
                             int nparams) {
@@ -1807,6 +1872,7 @@ int main(void) {
     printf("== tocio builtins + fixedfunc ==\n");
     test_builtins();
     test_colorimetry();
+    test_display_transfer();
     printf("== tocio fixedfunc styles ==\n");
     test_fixedfunc_styles();
     printf("== tocio x64 JIT ==\n");
