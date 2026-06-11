@@ -285,7 +285,7 @@ toc_result toc_lower_transform(const toc_config *cfg, toc_op_list *list,
         }
         op->u.range.clamp_lo = hasOut;
         op->u.range.clamp_hi = hasOutH;
-        if (invert) return toc_invert_op(op);
+        if (invert) return toc_invert_op(list, op);
         return TOC_SUCCESS;
     }
 
@@ -293,7 +293,65 @@ toc_result toc_lower_transform(const toc_config *cfg, toc_op_list *list,
 }
 
 /* ---- invert an already-lowered op in place ------------------------------- */
-toc_result toc_invert_op(toc_op *op) {
+/* Build the inverse of a monotonic (non-decreasing) LUT1D into newly-allocated
+ * owned storage. Per channel f maps the input domain to [omin_c, omax_c]; the
+ * inverse is sampled on a common output domain [min omin_c, max omax_c] and, for
+ * each target, the input is found by binary search + linear interpolation on the
+ * forward curve. Non-monotonic or degenerate curves are not invertible. */
+static toc_result lut1d_invert(toc_op_list *list, toc_lut1d *lut) {
+    int N = lut->length, ch = lut->channels, c, j;
+    const float *fwd = lut->data;
+    float dmin = lut->domain_min, dmax = lut->domain_max;
+    float omin = 1e30f, omax = -1e30f, *inv;
+    if (!list || N < 2 || (ch != 1 && ch != 3) || !fwd)
+        return TOC_ERROR_NONINVERTIBLE;
+    for (c = 0; c < ch; ++c) {
+        int i;
+        for (i = 0; i + 1 < N; ++i)
+            if (fwd[(i + 1) * ch + c] < fwd[i * ch + c])
+                return TOC_ERROR_NONINVERTIBLE; /* not non-decreasing */
+        if (fwd[c] < omin) omin = fwd[c];
+        if (fwd[(N - 1) * ch + c] > omax) omax = fwd[(N - 1) * ch + c];
+    }
+    if (!(omax > omin)) return TOC_ERROR_NONINVERTIBLE; /* flat / degenerate */
+    inv = (float *)toc_malloc(&list->alloc, (size_t)N * ch * sizeof(float));
+    if (!inv) return TOC_ERROR_OUT_OF_MEMORY;
+    for (c = 0; c < ch; ++c) {
+        for (j = 0; j < N; ++j) {
+            float t = omin + (omax - omin) * (float)j / (float)(N - 1);
+            float x;
+            if (t <= fwd[c]) {
+                x = dmin;
+            } else if (t >= fwd[(N - 1) * ch + c]) {
+                x = dmax;
+            } else {
+                int lo = 0, hi = N - 1;
+                float y0, y1, x0, x1, frac;
+                while (hi - lo > 1) {
+                    int mid = (lo + hi) / 2;
+                    if (fwd[mid * ch + c] <= t) lo = mid; else hi = mid;
+                }
+                y0 = fwd[lo * ch + c]; y1 = fwd[hi * ch + c];
+                x0 = dmin + (dmax - dmin) * (float)lo / (float)(N - 1);
+                x1 = dmin + (dmax - dmin) * (float)hi / (float)(N - 1);
+                frac = (y1 != y0) ? (t - y0) / (y1 - y0) : 0.0f;
+                x = x0 + frac * (x1 - x0);
+            }
+            inv[j * ch + c] = x;
+        }
+    }
+    if (!toc_op_list_own(list, inv)) {
+        toc_free(&list->alloc, inv);
+        return TOC_ERROR_OUT_OF_MEMORY;
+    }
+    lut->data = inv;
+    lut->domain_min = omin;
+    lut->domain_max = omax;
+    lut->interp = TOC_INTERP_LINEAR;
+    return TOC_SUCCESS;
+}
+
+toc_result toc_invert_op(toc_op_list *list, toc_op *op) {
     int i;
     switch (op->kind) {
         case TOC_OP_RANGE: {
@@ -355,7 +413,8 @@ toc_result toc_invert_op(toc_op *op) {
             /* ASC CDL is analytically invertible (saturation preserves luma). */
             op->u.cdl.inverse = !op->u.cdl.inverse;
             return TOC_SUCCESS;
-        case TOC_OP_LUT1D: /* needs a newly-built inverse LUT (owned storage) */
+        case TOC_OP_LUT1D:
+            return lut1d_invert(list, &op->u.lut1d);
         case TOC_OP_LUT3D: /* tetrahedral inverse: hard, not implemented */
         default:
             return TOC_ERROR_NONINVERTIBLE;

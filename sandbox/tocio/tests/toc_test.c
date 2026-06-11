@@ -1507,7 +1507,7 @@ static void test_cdl_op_inverse(void) {
         orig[i * 3 + 2] = buf[i * 3 + 2] = seed[i][2];
     }
     toc_apply(l, buf, 8, 3);                 /* forward */
-    CHECK(TOC_OK(toc_invert_op(&l->ops[0])), "CDL op invertible");
+    CHECK(TOC_OK(toc_invert_op(l, &l->ops[0])), "CDL op invertible");
     toc_apply(l, buf, 8, 3);                 /* inverse */
     for (i = 0; i < 24; ++i)
         if (!approx(buf[i], orig[i], 2e-3f)) ok = 0;
@@ -1538,6 +1538,49 @@ static void test_cdl_op_inverse(void) {
             dlclose(h);
         }
         free(src);
+    }
+    toc_op_list_free(l);
+}
+
+/* LUT1D inverse: toc_invert_op rebuilds a monotonic curve's inverse into owned
+ * storage; forward+inverse round-trips, and non-monotonic LUTs are rejected. */
+static void test_lut1d_inverse(void) {
+    toc_op_list *l = newlist();
+    toc_op *o = toc_op_list_push(l, TOC_OP_LUT1D);
+    static float curve[33];
+    float buf[24], orig[24];
+    int i, ok = 1;
+    for (i = 0; i < 33; ++i) {
+        float x = (float)i / 32.0f;
+        curve[i] = 0.5f * x + 0.5f * x * x; /* monotonic, derivative >= 0.5 */
+    }
+    o->u.lut1d.length = 33;
+    o->u.lut1d.channels = 1;
+    o->u.lut1d.domain_min = 0.0f;
+    o->u.lut1d.domain_max = 1.0f;
+    o->u.lut1d.data = curve;
+    o->u.lut1d.interp = TOC_INTERP_LINEAR;
+    for (i = 0; i < 8; ++i) {
+        float x = 0.1f + (float)i * 0.1f; /* 0.1 .. 0.8 */
+        orig[i * 3] = orig[i * 3 + 1] = orig[i * 3 + 2] = x;
+        buf[i * 3] = buf[i * 3 + 1] = buf[i * 3 + 2] = x;
+    }
+    toc_apply(l, buf, 8, 3); /* forward */
+    CHECK(TOC_OK(toc_invert_op(l, &l->ops[0])), "LUT1D op invertible");
+    toc_apply(l, buf, 8, 3); /* inverse */
+    for (i = 0; i < 24; ++i)
+        if (!approx(buf[i], orig[i], 1e-2f)) ok = 0;
+    CHECK(ok, "LUT1D forward+inverse round-trip");
+    {
+        toc_op_list *l2 = newlist();
+        toc_op *o2 = toc_op_list_push(l2, TOC_OP_LUT1D);
+        static float nm[4] = {0.0f, 1.0f, 0.5f, 1.0f}; /* dips -> non-monotonic */
+        o2->u.lut1d.length = 4; o2->u.lut1d.channels = 1;
+        o2->u.lut1d.domain_min = 0.0f; o2->u.lut1d.domain_max = 1.0f;
+        o2->u.lut1d.data = nm; o2->u.lut1d.interp = TOC_INTERP_LINEAR;
+        CHECK(toc_invert_op(l2, &l2->ops[0]) == TOC_ERROR_NONINVERTIBLE,
+              "non-monotonic LUT1D rejected");
+        toc_op_list_free(l2);
     }
     toc_op_list_free(l);
 }
@@ -2233,6 +2276,7 @@ int main(void) {
     test_codegen_aces();
     test_cdl_op_inverse();
     test_gamutcomp_boundary();
+    test_lut1d_inverse();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();

@@ -364,7 +364,7 @@ static toc_result reverse_invert(toc_op_list *list, size_t start) {
         list->ops[j - 1] = t;
     }
     for (i = start; i < list->count; ++i) {
-        toc_result rc = toc_invert_op(&list->ops[i]);
+        toc_result rc = toc_invert_op(list, &list->ops[i]);
         if (!TOC_OK(rc)) return rc;
     }
     return TOC_SUCCESS;

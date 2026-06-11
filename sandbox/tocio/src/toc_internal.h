@@ -256,8 +256,9 @@ int toc_cfg_view_looks(const toc_node *vnode, const char **names, int max);
  * Builtin are handled by the processor's recursive walk, not here. */
 toc_result toc_lower_transform(const toc_config *cfg, toc_op_list *list,
                                const toc_node *node, int invert);
-/* Invert an already-lowered op in place. */
-toc_result toc_invert_op(toc_op *op);
+/* Invert an already-lowered op in place. `list` owns any new storage the inverse
+ * needs (a rebuilt LUT1D); it may be NULL only if no op in play is a LUT. */
+toc_result toc_invert_op(toc_op_list *list, toc_op *op);
 
 /* Parse a LUT file blob by extension hint into a freshly-allocated op (LUT1D or
  * LUT3D). The sample array is added to `list->owned`. */
