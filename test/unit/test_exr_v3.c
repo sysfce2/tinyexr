@@ -1823,18 +1823,38 @@ static exr_result blocking_read(void *user, uint64_t off, uint64_t len,
     return EXR_WOULD_BLOCK; /* force the suspend/resume path */
 }
 
-/* Decode block 0 over a streaming source that always blocks; the host feeds the
- * file incrementally. Result must match the memory-path decode. */
+/* Re-issue exr_reader_decode_block while it suspends, feeding the pending range
+ * in 64K steps; *fed counts how many supply cycles happened. */
+static exr_result stream_drive_decode(exr_reader *rs, const uint8_t *file,
+                                      uint32_t blk, void *dst, size_t dst_size,
+                                      int *fed) {
+    int guard = 0;
+    for (;;) {
+        exr_result rc = exr_reader_decode_block(rs, 0, blk, dst, dst_size);
+        exr_pending_read pr;
+        size_t step;
+        if (rc != EXR_WOULD_BLOCK) return rc;
+        if (!EXR_OK(exr_reader_pending(rs, &pr))) return EXR_ERROR_CORRUPT;
+        step = pr.size < 65536u ? (size_t)pr.size : 65536u;
+        if (!EXR_OK(exr_reader_supply(rs, file + pr.offset, step)))
+            return EXR_ERROR_CORRUPT;
+        *fed += 1;
+        if (++guard > 2000000) return EXR_ERROR_CORRUPT;
+    }
+}
+
+/* Decode EVERY block over a streaming source that always blocks, driving the
+ * suspend/resume loop through decode_block itself; each block must match the
+ * memory-path decode, and the suspend path must actually fire (fed > 0). */
 static void stream_would_block_check(const char *path, exr_compression comp,
                                      const char *name) {
     exr_image tmpimg;
     void *buf = NULL;
     size_t sz = 0;
     exr_reader *rm = NULL, *rs = NULL;
-    exr_block_info bi;
     void *ref = NULL, *got = NULL;
-    uint32_t nb = 0;
-    int ok = 1;
+    uint32_t nb = 0, b;
+    int ok = 1, fed = 0;
     exr_data_source dsrc;
 
     memset(&tmpimg, 0, sizeof(tmpimg));
@@ -1851,52 +1871,37 @@ static void stream_would_block_check(const char *path, exr_compression comp,
     exr_image_free(&tmpimg);
 
     if (!EXR_OK(exr_reader_open_memory(buf, sz, NULL, &rm)) ||
-        !EXR_OK(exr_reader_num_blocks(rm, 0, &nb)) ||
-        !EXR_OK(exr_reader_block_info(rm, 0, 0, &bi))) {
+        !EXR_OK(exr_reader_num_blocks(rm, 0, &nb))) {
         g_fail++; printf("  FAIL: mem setup (would-block %s)\n", name);
         if (rm) exr_reader_close(rm);
         free(buf); return;
     }
-    ref = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
-    if (!EXR_OK(exr_reader_decode_block(rm, 0, 0, ref, bi.uncompressed_size)))
-        ok = 0;
-    exr_reader_close(rm);
 
     dsrc.user = NULL;
     dsrc.read = blocking_read;
     dsrc.total_size = sz;
-    if (ok && EXR_OK(exr_reader_open_source(&dsrc, NULL, &rs))) {
-        exr_result rc;
-        int guard = 0;
-        for (;;) {
-            rc = exr_reader_parse_header(rs);
-            if (rc == EXR_SUCCESS) break;
-            if (rc != EXR_WOULD_BLOCK) { ok = 0; break; }
-            {
-                exr_pending_read pr;
-                size_t step;
-                if (!EXR_OK(exr_reader_pending(rs, &pr))) { ok = 0; break; }
-                step = 65536;
-                if (step > pr.size) step = (size_t)pr.size;
-                if (!EXR_OK(exr_reader_supply(rs, (uint8_t *)buf + pr.offset,
-                                              step))) { ok = 0; break; }
-            }
-            if (++guard > 1000000) { ok = 0; break; }
-        }
-        if (ok) {
-            got = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
-            if (!EXR_OK(exr_reader_decode_block(rs, 0, 0, got,
-                                                bi.uncompressed_size)))
-                ok = 0;
-            else if (memcmp(ref, got, bi.uncompressed_size) != 0)
-                ok = 0;
-        }
-        exr_reader_close(rs);
-    } else if (ok) {
-        ok = 0;
+    if (!EXR_OK(exr_reader_open_source(&dsrc, NULL, &rs))) {
+        g_fail++; exr_reader_close(rm); free(buf); return;
     }
+    for (b = 0; b < nb && ok; ++b) {
+        exr_block_info bi;
+        if (!EXR_OK(exr_reader_block_info(rm, 0, b, &bi))) { ok = 0; break; }
+        ref = realloc(ref, bi.uncompressed_size ? bi.uncompressed_size : 1);
+        got = realloc(got, bi.uncompressed_size ? bi.uncompressed_size : 1);
+        if (!EXR_OK(exr_reader_decode_block(rm, 0, b, ref, bi.uncompressed_size)))
+            ok = 0;
+        else if (!EXR_OK(stream_drive_decode(rs, (uint8_t *)buf, b, got,
+                                             bi.uncompressed_size, &fed)))
+            ok = 0;
+        else if (memcmp(ref, got, bi.uncompressed_size) != 0)
+            ok = 0;
+    }
+    if (fed == 0) ok = 0; /* the suspend/resume path must have actually run */
+    exr_reader_close(rm);
+    exr_reader_close(rs);
     CHECK(ok, name);
-    if (ok) printf("  ok: stream WOULD_BLOCK %s\n", name);
+    if (ok) printf("  ok: stream WOULD_BLOCK %s (%u blocks, %d supplies)\n",
+                   name, nb, fed);
     free(ref);
     free(got);
     free(buf);
@@ -3290,8 +3295,12 @@ int main(void) {
             CHECK(0, "deep-tiled sample loads (data/deep_tiled_sample.exr)");
         }
     }
+    stream_would_block_check("asakusa.exr", EXR_COMPRESSION_NONE,
+                             "asakusa NONE");
     stream_would_block_check("asakusa.exr", EXR_COMPRESSION_ZIP,
                              "asakusa ZIP");
+    stream_would_block_check("asakusa.exr", EXR_COMPRESSION_PIZ,
+                             "asakusa PIZ");
     stream_memory_bound_check("asakusa.exr", EXR_COMPRESSION_ZIP,
                               "asakusa ZIP");
 

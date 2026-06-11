@@ -1674,7 +1674,11 @@ exr_result exr_reader_decode_deep_samples(exr_reader *r, int32_t part,
 }
 
 /* ============================================================================
- * Streaming suspend/resume (Phase 9 stubs)
+ * Streaming suspend/resume. With an EXR_SRC_CALLBACK source, any reader call
+ * (parse_header / decode_block / decode_deep_*) runs exr_reader_ensure_buffered
+ * first; when the source has no bytes ready it returns EXR_WOULD_BLOCK and
+ * records the pending byte range. The host fetches that range, feeds it via
+ * exr_reader_supply(), and re-issues the same call to resume.
  * ========================================================================== */
 
 exr_result exr_reader_pending(const exr_reader *r, exr_pending_read *out) {
