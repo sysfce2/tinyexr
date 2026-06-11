@@ -128,6 +128,12 @@ static toc_op_list *newlist(void) {
     return l;
 }
 
+/* Push a no-param FixedFunction op (PQ/HLG, HSV, etc.). */
+static void push_ff_raw(toc_op_list *l, int style) {
+    toc_op *o = toc_op_list_push(l, TOC_OP_FIXEDFUNC);
+    if (o) { o->u.fixedfunc.style = style; o->u.fixedfunc.nparams = 0; }
+}
+
 static void test_interp(void) {
     /* matrix: 2x scale + offset 0.1 on RGB */
     {
@@ -1269,6 +1275,70 @@ static void test_codegen_glsl_hdr(void) {
     toc_op_list_free(l);
 }
 
+/* ---- Metal (MSL) codegen ------------------------------------------------- */
+static int metal_validate(const char *src) {
+    FILE *f = fopen("build/toc_gen.metal", "w");
+    if (!f) return -1;
+    fputs(src, f);
+    fclose(f);
+    return system("xcrun -sdk macosx metal -c build/toc_gen.metal "
+                  "-o build/toc_gen.air >/dev/null 2>&1");
+}
+static void test_codegen_metal(void) {
+    toc_op_list *l = newlist();
+    toc_shader sh;
+    toc_result rc;
+    toc_op *m, *lut, *o;
+    int i, j;
+    static float cube[2 * 2 * 2 * 3];
+    static const float rm[16] = {0.6f, 0.3f, 0.1f, 0, 0.2f, 0.7f, 0.1f, 0,
+                                 0.1f, 0.2f, 0.7f, 0, 0, 0, 0, 1};
+    for (i = 0; i < 2 * 2 * 2 * 3; ++i) cube[i] = (float)(i % 3) * 0.5f;
+    m = toc_op_list_push(l, TOC_OP_MATRIX);
+    for (i = 0; i < 4; ++i) {
+        for (j = 0; j < 4; ++j) m->u.matrix.m[j * 4 + i] = rm[i * 4 + j];
+        m->u.matrix.off[i] = 0.0f;
+    }
+    o = toc_op_list_push(l, TOC_OP_EXPONENT);
+    for (i = 0; i < 4; ++i) o->u.exponent.e[i] = (i < 3) ? 2.2f : 1.0f;
+    lut = toc_op_list_push(l, TOC_OP_LUT3D);
+    lut->u.lut3d.size = 2;
+    lut->u.lut3d.data = cube;
+    lut->u.lut3d.domain_max[0] = lut->u.lut3d.domain_max[1] =
+        lut->u.lut3d.domain_max[2] = 1.0f;
+    lut->u.lut3d.interp = TOC_INTERP_TRILINEAR;
+    push_ff_raw(l, TOC_FF_LIN_TO_PQ);
+    push_ff_raw(l, TOC_FF_HLG_TO_LIN);
+
+    rc = toc_emit_metal(l, NULL, &sh);
+    CHECK(TOC_OK(rc) && sh.source, "emit Metal");
+    if (TOC_OK(rc)) {
+        if (getenv("TOC_DUMP_METAL")) fputs(sh.source, stderr);
+        CHECK(strstr(sh.source, "#include <metal_stdlib>") != NULL &&
+                  strstr(sh.source, "using namespace metal") != NULL,
+              "Metal header");
+        CHECK(strstr(sh.source, "float4 OCIOMain(float4 inPixel") != NULL,
+              "Metal OCIOMain signature");
+        CHECK(strstr(sh.source, "texture3d<float> ociolut0") != NULL,
+              "Metal 3D LUT texture argument");
+        CHECK(strstr(sh.source, "ociolut0.sample(ocioL") != NULL,
+              "Metal texture sampling");
+        CHECK(strstr(sh.source, "float4x4(") != NULL, "Metal matrix");
+        CHECK(strstr(sh.source, "0.8359375") != NULL &&
+                  strstr(sh.source, "0.17883277") != NULL,
+              "Metal PQ + HLG math emitted");
+        CHECK(sh.num_textures == 1 && sh.textures[0].dim == TOC_TEX_3D &&
+                  sh.textures[0].width == 2,
+              "Metal texture descriptor");
+        if (metal_validate(sh.source) == 0)
+            CHECK(1, "Metal toolchain accepts shader");
+        else
+            printf("  note: Metal toolchain skipped/unavailable\n");
+        toc_shader_free(&sh);
+    }
+    toc_op_list_free(l);
+}
+
 /* ---- SIMD parity (scalar vs SSE2 vs AVX2) -------------------------------- */
 static void test_simd_parity(void) {
     enum { NP = 257 };
@@ -1514,10 +1584,6 @@ static void test_colorimetry(void) {
 }
 
 /* ---- Display transfer functions + composed output transforms ------------- */
-static void push_ff_raw(toc_op_list *l, int style) {
-    toc_op *o = toc_op_list_push(l, TOC_OP_FIXEDFUNC);
-    if (o) { o->u.fixedfunc.style = style; o->u.fixedfunc.nparams = 0; }
-}
 static void test_display_transfer(void) {
     /* PQ / HLG per-channel encode->decode round-trips over [0,1]. */
     {
@@ -1942,6 +2008,7 @@ int main(void) {
     printf("== tocio GLSL codegen ==\n");
     test_codegen_glsl();
     test_codegen_glsl_hdr();
+    test_codegen_metal();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();

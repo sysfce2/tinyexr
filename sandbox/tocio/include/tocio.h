@@ -293,6 +293,11 @@ typedef struct toc_shader {
 
 toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                          const toc_allocator *a, toc_shader *out);
+/* Metal Shading Language (macOS/iOS). Emits a `float4 OCIOMain(float4, <LUT
+ * textures>)` helper; LUT textures are appended as function arguments (named
+ * per toc_texture_desc.sampler_name) and sampled with an in-shader sampler. */
+toc_result toc_emit_metal(const toc_op_list *ops, const toc_allocator *a,
+                          toc_shader *out);
 void toc_shader_free(toc_shader *sh);
 
 /* ============================================================================
