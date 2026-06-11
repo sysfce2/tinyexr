@@ -307,6 +307,73 @@ static void jph_encode_subsampling_roundtrip(void) {
     exr_image_free(&dec);
 }
 
+/* Encode a 3-channel RGB file (HALF + FLOAT) and decode it losslessly. Exactly
+ * 3 same-type channels triggers the multicomponent RCT (mc_trans=1) on encode;
+ * a bit-exact round-trip proves the forward RCT + inverse RCT agree. */
+static void jph_encode_rct_roundtrip(void) {
+    const int W = 5, H = 4, N = 20;
+    int i, ok = 1;
+    float Rf[20], Gf[20], Bf[20];
+    uint16_t Rh[20], Gh[20], Bh[20];
+    for (i = 0; i < N; ++i) {
+        Rf[i] = (float)i * 0.1f - 0.5f;       /* incl. negatives */
+        Gf[i] = (float)((i * 7) % 13) * 0.3f;
+        Bf[i] = (float)(N - i) * 0.07f;
+    }
+    exr_float_to_half(Rf, Rh, N);
+    exr_float_to_half(Gf, Gh, N);
+    exr_float_to_half(Bf, Bh, N);
+    {
+        struct { exr_pixel_type pt; void *r, *g, *b; size_t bytes; const char *nm; }
+        cases[2] = {
+            {EXR_PIXEL_HALF, Rh, Gh, Bh, (size_t)N * 2, "HALF"},
+            {EXR_PIXEL_FLOAT, Rf, Gf, Bf, (size_t)N * 4, "FLOAT"}};
+        int k;
+        for (k = 0; k < 2; ++k) {
+            exr_image img, dec;
+            exr_part part;
+            exr_channel ch[3];
+            void *images[3], *buf = NULL;
+            size_t sz = 0;
+            exr_result rc;
+            memset(&img, 0, sizeof(img));
+            img.num_parts = 1; img.parts = &part;
+            memset(&part, 0, sizeof(part));
+            part.header.num_channels = 3;
+            part.header.channels = ch;
+            memset(ch, 0, sizeof(ch));
+            ch[0] = (exr_channel){"B", cases[k].pt, 1, 1, 0}; /* sorted B,G,R */
+            ch[1] = (exr_channel){"G", cases[k].pt, 1, 1, 0};
+            ch[2] = (exr_channel){"R", cases[k].pt, 1, 1, 0};
+            part.header.data_window.min_x = 0;
+            part.header.data_window.min_y = 0;
+            part.header.data_window.max_x = W - 1;
+            part.header.data_window.max_y = H - 1;
+            part.header.display_window = part.header.data_window;
+            part.width = W; part.height = H;
+            part.images = images;
+            images[0] = cases[k].b; images[1] = cases[k].g; images[2] = cases[k].r;
+            part.header.compression = EXR_COMPRESSION_HTJ2K32;
+            rc = exr_save_to_memory(&buf, &sz, NULL, &img, EXR_COMPRESSION_HTJ2K32);
+            if (!EXR_OK(rc)) { ok = 0; continue; }
+            memset(&dec, 0, sizeof(dec));
+            rc = exr_load_from_memory(buf, sz, NULL, &dec);
+            free(buf);
+            if (!EXR_OK(rc) || dec.parts[0].header.num_channels != 3) {
+                ok = 0;
+            } else {
+                if (memcmp(dec.parts[0].images[0], cases[k].b, cases[k].bytes) ||
+                    memcmp(dec.parts[0].images[1], cases[k].g, cases[k].bytes) ||
+                    memcmp(dec.parts[0].images[2], cases[k].r, cases[k].bytes))
+                    ok = 0;
+                exr_image_free(&dec);
+            }
+        }
+    }
+    CHECK(ok, "3-channel RGB HTJ2K (RCT) round-trips losslessly (HALF+FLOAT)");
+    if (ok) printf("  ok: 3-channel HTJ2K RCT round-trips (mc_trans=1)\n");
+}
+
 /* Encode a UINT-only file and decode it losslessly. */
 static void jph_encode_uint_roundtrip(void) {
     exr_image img, dec;
@@ -3372,6 +3439,7 @@ int main(void) {
               EXR_COMPRESSION_HTJ2K256, "HTJ2K256 WideFloatRange");
     jph_encode_subsampling_roundtrip();
     jph_encode_uint_roundtrip();
+    jph_encode_rct_roundtrip();
     jph_encode_mixed_precision_roundtrip();
 
     printf("== JPH SIMD kernels ==\n");

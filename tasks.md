@@ -35,7 +35,7 @@ Current state:
 | Reversible 5/3 wavelet | ✅ | ✅ |
 | NLT type 0 (no transform) | ✅ | ✅ |
 | NLT type 3 (sign-magnitude) | ✅ | ✅ |
-| Multicomponent RCT (mc_trans=1) | ✅ (int32 + int64) | ❌ (not yet) |
+| Multicomponent RCT (mc_trans=1) | ✅ (int32 + int64) | ✅ (3-channel same-type parts) |
 | Deep data | ❌ (writer emits HTJ2K chunks as uncompressed blocks for deep) | ❌ |
 
 ## Intentionally unsupported (non-goals)
