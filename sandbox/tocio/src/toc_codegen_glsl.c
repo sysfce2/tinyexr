@@ -189,6 +189,39 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                     toc_sb_puts(&sb, ";\n");
                 }
                 break;
+            case TOC_OP_EXP_LINEAR: {
+                /* MonCurve on RGB (alpha preserved): power above the breakpoint,
+                 * linear below, selected per channel. */
+                const float *sc = op->u.exp_linear.scale, *of = op->u.exp_linear.offset;
+                const float *gm = op->u.exp_linear.gamma, *bk = op->u.exp_linear.breakpoint;
+                const float *sl = op->u.exp_linear.slope;
+                if (!op->u.exp_linear.inverse) {
+                    toc_sb_puts(&sb, "  v.rgb = mix(v.rgb * ");
+                    emit_vec3(&sb, sl[0], sl[1], sl[2]);
+                    toc_sb_puts(&sb, ", pow(v.rgb * ");
+                    emit_vec3(&sb, sc[0], sc[1], sc[2]);
+                    toc_sb_puts(&sb, " + ");
+                    emit_vec3(&sb, of[0], of[1], of[2]);
+                    toc_sb_puts(&sb, ", ");
+                    emit_vec3(&sb, gm[0], gm[1], gm[2]);
+                    toc_sb_puts(&sb, "), greaterThan(v.rgb, ");
+                    emit_vec3(&sb, bk[0], bk[1], bk[2]);
+                    toc_sb_puts(&sb, "));\n");
+                } else {
+                    toc_sb_puts(&sb, "  v.rgb = mix(v.rgb / ");
+                    emit_vec3(&sb, sl[0], sl[1], sl[2]);
+                    toc_sb_puts(&sb, ", (pow(v.rgb, ");
+                    emit_vec3(&sb, 1.0f / gm[0], 1.0f / gm[1], 1.0f / gm[2]);
+                    toc_sb_puts(&sb, ") - ");
+                    emit_vec3(&sb, of[0], of[1], of[2]);
+                    toc_sb_puts(&sb, ") / ");
+                    emit_vec3(&sb, sc[0], sc[1], sc[2]);
+                    toc_sb_puts(&sb, ", greaterThan(v.rgb, ");
+                    emit_vec3(&sb, bk[0] * sl[0], bk[1] * sl[1], bk[2] * sl[2]);
+                    toc_sb_puts(&sb, "));\n");
+                }
+                break;
+            }
             case TOC_OP_CDL: {
                 const float *L = op->u.cdl.luma;
                 float lr = L[0], lg = L[1], lb = L[2];

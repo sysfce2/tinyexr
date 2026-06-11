@@ -1339,6 +1339,67 @@ static void test_codegen_metal(void) {
     toc_op_list_free(l);
 }
 
+/* ExponentWithLinear (sRGB-style MonCurve) must be emitted by all backends. */
+static void test_codegen_exp_linear(void) {
+    toc_op_list *l = newlist();
+    toc_op *o = toc_op_list_push(l, TOC_OP_EXP_LINEAR);
+    char *src = NULL;
+    size_t len = 0;
+    toc_result rc;
+    FILE *f;
+    void *h;
+    apply_fn fn;
+    int ok = 1, i, c;
+    for (c = 0; c < 4; ++c) { /* the sRGB decode curve used by display xforms */
+        o->u.exp_linear.scale[c] = 1.0f / 1.055f;
+        o->u.exp_linear.offset[c] = 0.055f / 1.055f;
+        o->u.exp_linear.gamma[c] = 2.4f;
+        o->u.exp_linear.breakpoint[c] = 0.04045f;
+        o->u.exp_linear.slope[c] = 1.0f / 12.92f;
+    }
+    /* C: compile the emitted source and match the interpreter. */
+    rc = toc_emit_c(l, NULL, NULL, &src, &len);
+    CHECK(TOC_OK(rc) && src, "emit C (exp_linear)");
+    if (TOC_OK(rc)) {
+        f = fopen("build/toc_gen_el.c", "w");
+        if (f) { fwrite(src, 1, len, f); fclose(f); }
+        if (system("cc -O2 -fPIC -shared build/toc_gen_el.c -o build/toc_gen_el.so") == 0 &&
+            (h = dlopen("./build/toc_gen_el.so", RTLD_NOW)) != NULL) {
+            fn = (apply_fn)dlsym(h, "tocio_apply");
+            if (fn) {
+                for (i = 0; i < 32; ++i) {
+                    float a[4], b[4], v = (float)i / 31.0f;
+                    for (c = 0; c < 4; ++c) a[c] = b[c] = v;
+                    toc_apply(l, a, 1, 4);
+                    fn(b, 1);
+                    for (c = 0; c < 3; ++c)
+                        if (!approx(a[c], b[c], 1e-4f)) ok = 0;
+                }
+                CHECK(ok, "interpreter == compiled emitted-C (exp_linear)");
+            }
+            dlclose(h);
+        } else {
+            CHECK(0, "compile emitted C (exp_linear)");
+        }
+        free(src);
+    }
+    /* GLSL + Metal: the MonCurve must be emitted (not silently skipped). */
+    {
+        toc_shader sh;
+        if (TOC_OK(toc_emit_glsl(l, TOC_GLSL_330, NULL, &sh))) {
+            CHECK(strstr(sh.source, "mix(") != NULL && strstr(sh.source, "pow(") != NULL,
+                  "GLSL emits exp_linear (mix + pow)");
+            toc_shader_free(&sh);
+        }
+        if (TOC_OK(toc_emit_metal(l, NULL, &sh))) {
+            CHECK(strstr(sh.source, "select(") != NULL && strstr(sh.source, "pow(") != NULL,
+                  "Metal emits exp_linear (select + pow)");
+            toc_shader_free(&sh);
+        }
+    }
+    toc_op_list_free(l);
+}
+
 /* ---- SIMD parity (scalar vs SSE2 vs AVX2) -------------------------------- */
 static void test_simd_parity(void) {
     enum { NP = 257 };
@@ -2009,6 +2070,7 @@ int main(void) {
     test_codegen_glsl();
     test_codegen_glsl_hdr();
     test_codegen_metal();
+    test_codegen_exp_linear();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();
