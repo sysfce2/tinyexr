@@ -625,6 +625,34 @@ static void emit_dup_w(codebuf *c, int vd, int wn) { /* DUP Vd.4S, Wn */
 static void emit_ins_lane3(codebuf *c, int vd, int vn) { /* INS Vd.S[3], Vn.S[3] */
     e32(c, 0x6E1C6400u | ((unsigned)vn << 5) | (unsigned)vd);
 }
+static void emit_fcmgt(codebuf *c, int vd, int vn, int vm) { /* Vd.4S = Vn > Vm */
+    e32(c, 0x6EA0E400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_fcmge0(codebuf *c, int vd, int vn) { /* Vd.4S = Vn >= 0.0 */
+    e32(c, 0x6EA0C800u | ((unsigned)vn << 5) | (unsigned)vd);
+}
+/* BSL Vd.16B, Vn.16B, Vm.16B: Vd = (Vn & Vd) | (Vm & ~Vd) -- Vd is the mask in
+ * and the result out, so result = mask ? Vn : Vm. */
+static void emit_bsl(codebuf *c, int vd, int vn, int vm) {
+    e32(c, 0x6E601C00u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_faddp_v(codebuf *c, int vd, int vn, int vm) { /* FADDP Vd.4S */
+    e32(c, 0x6E20D400u | ((unsigned)vm << 16) | ((unsigned)vn << 5) | (unsigned)vd);
+}
+static void emit_faddp_s(codebuf *c, int sd, int vn) { /* FADDP Sd, Vn.2S */
+    e32(c, 0x7E30D800u | ((unsigned)vn << 5) | (unsigned)sd);
+}
+static void emit_ins_s_w(codebuf *c, int vd, int idx, int wn) { /* INS Vd.S[idx], Wn */
+    e32(c, 0x4E001C00u | ((((unsigned)idx << 3) | 4u) << 16) | ((unsigned)wn << 5) |
+               (unsigned)vd);
+}
+static void emit_set_lane_f(codebuf *c, int vd, int idx, float v) {
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    emit_movz_w(c, 10, u & 0xffffu);
+    emit_movk_w(c, 10, (u >> 16) & 0xffffu, 1);
+    emit_ins_s_w(c, vd, idx, 10);
+}
 /* broadcast a 32-bit constant to all lanes of Vd via the scratch w10 (so x9,
  * holding the op address, is preserved across the polynomial unlike the x86
  * path which reloads it after clobbering eax). */
@@ -770,6 +798,87 @@ static void emit_log_arm(codebuf *c, const toc_op *op) {
     emit_stur_q(c, 1, 19, 0);
 }
 
+/* EXP_LINEAR (MonCurve, ch==4): power above the breakpoint, linear below, on
+ * RGB (alpha preserved). The per-lane branch is a compare (fcmgt) + bit-select
+ * (bsl); both branches are computed and then selected. v0 keeps the pixel. */
+static void emit_explin_arm(codebuf *c, const toc_op *op) {
+    int SC = (int)offsetof(toc_op, u.exp_linear.scale);
+    int OF = (int)offsetof(toc_op, u.exp_linear.offset);
+    int GM = (int)offsetof(toc_op, u.exp_linear.gamma);
+    int BK = (int)offsetof(toc_op, u.exp_linear.breakpoint);
+    int SL = (int)offsetof(toc_op, u.exp_linear.slope);
+    emit_load_imm64(c, 9, addr_of(op));
+    emit_ldur_q(c, 0, 19, 0);
+    if (!op->u.exp_linear.inverse) {
+        emit_ldur_q(c, 2, 9, SC); emit_fmul(c, 1, 0, 2);  /* base = x*scale */
+        emit_ldur_q(c, 2, 9, OF); emit_fadd(c, 1, 1, 2);  /* + offset */
+        emit_fmax(c, 1, 1, K_FLTMIN);
+        emit_log2_neon(c);
+        emit_ldur_q(c, 5, 9, GM); emit_fmul(c, 1, 1, 5);  /* gamma*log2 */
+        emit_exp2_neon(c);                                /* v1 = pow */
+        emit_ldur_q(c, 2, 9, SL); emit_fmul(c, 5, 0, 2);  /* lin = x*slope */
+        emit_ldur_q(c, 2, 9, BK); emit_fcmgt(c, 6, 0, 2); /* mask = x>brk */
+        emit_bsl(c, 6, 1, 5);                             /* mask ? pow : lin */
+    } else {
+        emit_mov_v(c, 1, 0); emit_fmax(c, 1, 1, K_FLTMIN);
+        emit_log2_neon(c);
+        emit_ldur_q(c, 5, 9, GM);
+        emit_fdiv(c, 6, K_1F, 5);                         /* 1/gamma */
+        emit_fmul(c, 1, 1, 6);
+        emit_exp2_neon(c);                                /* v1 = pow(x,1/g) */
+        emit_ldur_q(c, 2, 9, OF); emit_fsub(c, 1, 1, 2);  /* pow - offset */
+        emit_ldur_q(c, 2, 9, SC); emit_fdiv(c, 1, 1, 2);  /* / scale */
+        emit_ldur_q(c, 2, 9, SL); emit_fdiv(c, 5, 0, 2);  /* lin = x/slope */
+        emit_ldur_q(c, 2, 9, BK); emit_ldur_q(c, 3, 9, SL);
+        emit_fmul(c, 6, 2, 3);                            /* ybrk = brk*slope */
+        emit_fcmgt(c, 6, 0, 6);                           /* mask = x>ybrk */
+        emit_bsl(c, 6, 1, 5);                             /* mask ? hi : lin */
+    }
+    emit_ins_lane3(c, 6, 0);
+    emit_stur_q(c, 6, 19, 0);
+}
+
+/* CDL (ASC, ch==4): (in*slope+offset)^power then saturation around luma, RGB
+ * only. pow uses a per-lane x>=0 select; the luma dot product is built with a
+ * materialized weight vector (lr,lg,lb,0) and ADDV. v7 keeps the pre-pow x; v0
+ * the pixel. */
+static void emit_cdl_arm(codebuf *c, const toc_op *op) {
+    int SL = (int)offsetof(toc_op, u.cdl.slope);
+    int OF = (int)offsetof(toc_op, u.cdl.offset);
+    int PW = (int)offsetof(toc_op, u.cdl.power);
+    int clamp = op->u.cdl.clamp;
+    float lr = op->u.cdl.luma[0], lg = op->u.cdl.luma[1], lb = op->u.cdl.luma[2];
+    float sat = op->u.cdl.saturation;
+    if (lr == 0.0f && lg == 0.0f && lb == 0.0f) {
+        lr = 0.2126f; lg = 0.7152f; lb = 0.0722f;
+    }
+    emit_load_imm64(c, 9, addr_of(op));
+    emit_ldur_q(c, 0, 19, 0);
+    emit_ldur_q(c, 2, 9, SL); emit_fmul(c, 1, 0, 2);      /* x = pixel*slope */
+    emit_ldur_q(c, 2, 9, OF); emit_fadd(c, 1, 1, 2);      /* + offset */
+    if (clamp) { emit_fmax(c, 1, 1, K_ZERO); emit_fmin(c, 1, 1, K_1F); }
+    emit_mov_v(c, 7, 1);                                  /* save x */
+    emit_fmax(c, 1, 1, K_FLTMIN);
+    emit_log2_neon(c);
+    emit_ldur_q(c, 6, 9, PW); emit_fmul(c, 1, 1, 6);      /* power*log2 */
+    emit_exp2_neon(c);                                    /* v1 = pow(x,power) */
+    emit_fcmge0(c, 6, 7);                                 /* mask = x>=0 */
+    emit_bsl(c, 6, 1, 7);                                 /* vv = x>=0 ? pow : x */
+    /* luma = lr*vv0 + lg*vv1 + lb*vv2  (weight vector in v2) */
+    emit_bcast_f(c, 2, lr);
+    emit_set_lane_f(c, 2, 1, lg);
+    emit_set_lane_f(c, 2, 2, lb);
+    emit_set_lane_f(c, 2, 3, 0.0f);
+    emit_fmul(c, 3, 6, 2);                                /* prod = vv*weights */
+    emit_faddp_v(c, 3, 3, 3); emit_faddp_s(c, 3, 3);      /* luma = sum lanes */
+    emit_dup_s(c, 4, 3, 0);                               /* broadcast luma */
+    emit_bcast_f(c, 2, sat);
+    emit_fsub(c, 5, 6, 4); emit_fmul(c, 5, 5, 2); emit_fadd(c, 5, 4, 5);
+    if (clamp) { emit_fmax(c, 5, 5, K_ZERO); emit_fmin(c, 5, 5, K_1F); }
+    emit_ins_lane3(c, 5, 0);
+    emit_stur_q(c, 5, 19, 0);
+}
+
 /* MATRIX (ch==4): v = (c0*r + c1*g) + c2*b + c3*a + off, in NEON, matching the
  * NEON interpreter's association exactly. x9 := &op. */
 static void emit_matrix_arm(codebuf *c, const toc_op *op) {
@@ -816,6 +925,8 @@ static void emit_op_arm(codebuf *c, const toc_op *op, int channels) {
     else if (channels == 4 && op->kind == TOC_OP_RANGE) emit_range_arm(c, op);
     else if (channels == 4 && op->kind == TOC_OP_EXPONENT) emit_exponent_arm(c, op);
     else if (channels == 4 && op->kind == TOC_OP_LOG) emit_log_arm(c, op);
+    else if (channels == 4 && op->kind == TOC_OP_EXP_LINEAR) emit_explin_arm(c, op);
+    else if (channels == 4 && op->kind == TOC_OP_CDL) emit_cdl_arm(c, op);
     else if (op->kind != TOC_OP_NOOP) emit_helper_call_arm(c, op, channels);
 }
 
@@ -841,10 +952,12 @@ toc_result toc_jit_compile(const toc_op_list *ops, int channels,
     /* A pipeline with an inline-pow (exponent) op hoists its polynomial
      * constants into v8..v28 before the loop; v8..v15 are callee-saved (d8..d15)
      * so that path uses a larger frame and saves/restores them. */
-    for (k = 0; k < ops->count; ++k)
-        if (channels == 4 && (ops->ops[k].kind == TOC_OP_EXPONENT ||
-                              ops->ops[k].kind == TOC_OP_LOG))
+    for (k = 0; k < ops->count; ++k) {
+        toc_op_kind kk = ops->ops[k].kind;
+        if (channels == 4 && (kk == TOC_OP_EXPONENT || kk == TOC_OP_LOG ||
+                              kk == TOC_OP_EXP_LINEAR || kk == TOC_OP_CDL))
             has_pow = 1;
+    }
 
     if (has_pow) {
         /* 96B frame: x29/x30, x19/x20, d8..d15 (16-aligned). */

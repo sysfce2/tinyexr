@@ -228,6 +228,54 @@ int main(void) {
         }
         toc_op_list_free(l);
     }
+
+    /* JIT pipelines with inline exp_linear and cdl. */
+    {
+        int which;
+        for (which = 0; which < 2; ++which) {
+            toc_op_list *l = mklist();
+            toc_jit *j = NULL;
+            int c;
+            const char *nm;
+            if (which == 0) {
+                toc_op *o = toc_op_list_push(l, TOC_OP_EXP_LINEAR);
+                nm = "exp_linear";
+                for (c = 0; c < 4; ++c) {
+                    o->u.exp_linear.scale[c] = 0.95f; o->u.exp_linear.offset[c] = 0.05f;
+                    o->u.exp_linear.gamma[c] = 2.4f; o->u.exp_linear.breakpoint[c] = 0.04f;
+                    o->u.exp_linear.slope[c] = 0.077f;
+                }
+            } else {
+                toc_op *o = toc_op_list_push(l, TOC_OP_CDL);
+                nm = "cdl";
+                o->u.cdl.saturation = 1.2f; o->u.cdl.clamp = 1;
+                for (c = 0; c < 3; ++c) {
+                    o->u.cdl.slope[c] = 1.1f; o->u.cdl.offset[c] = 0.02f;
+                    o->u.cdl.power[c] = 0.9f; o->u.cdl.luma[c] = 0.0f;
+                }
+            }
+            printf("\n  pipeline: %s\n", nm);
+            toc_simd_force(1);
+            printf("  %-18s %12.1f MP/s\n", "interp (NEON)",
+                   (double)NP / time_apply(l, buf, src, NP, mc) / 1e6);
+            if (TOC_SUCCESS == toc_jit_compile(l, 4, NULL, &j) && j) {
+                toc_jit_fn fn = toc_jit_func(j);
+                double t0 = now_sec(), t;
+                long it = 0;
+                do {
+                    memcpy(buf, src, NP * 4 * sizeof(float));
+                    fn(buf, NP);
+                    ++it;
+                } while (now_sec() - t0 < 0.3);
+                t = (now_sec() - t0) / (double)it - mc;
+                if (t < 1e-12) t = 1e-12;
+                printf("  %-18s %12.1f MP/s  (inlined)\n", "JIT (native)",
+                       (double)NP / t / 1e6);
+                toc_jit_destroy(j);
+            }
+            toc_op_list_free(l);
+        }
+    }
     free(buf);
     free(src);
     return 0;

@@ -1565,6 +1565,76 @@ static void test_jit(void) {
             toc_op_list_free(ll);
         }
     }
+    /* inline exp_linear (MonCurve): forward + inverse, JIT vs interpreter. */
+    {
+        int inv;
+        for (inv = 0; inv < 2; ++inv) {
+            toc_op_list *le = newlist();
+            toc_op *o = toc_op_list_push(le, TOC_OP_EXP_LINEAR);
+            toc_jit *je = NULL;
+            int c;
+            o->u.exp_linear.inverse = inv;
+            for (c = 0; c < 4; ++c) {
+                o->u.exp_linear.scale[c] = 0.95f; o->u.exp_linear.offset[c] = 0.05f;
+                o->u.exp_linear.gamma[c] = 2.4f; o->u.exp_linear.breakpoint[c] = 0.04f;
+                o->u.exp_linear.slope[c] = 0.077f;
+            }
+            if (TOC_OK(toc_jit_compile(le, 4, NULL, &je)) && je) {
+                int p; ok = 1;
+                for (p = 0; p < 48; ++p) {
+                    float a[4], b[4];
+                    for (c = 0; c < 4; ++c) {
+                        float v = (float)((p * 31 + c * 7) % 120 - 10) / 100.0f;
+                        a[c] = b[c] = v;
+                    }
+                    toc_apply(le, a, 1, 4);
+                    toc_jit_func(je)(b, 1);
+                    for (c = 0; c < 3; ++c)
+                        if (!approx(a[c], b[c], 1e-5f)) ok = 0;
+                    if (a[3] != b[3]) ok = 0;
+                }
+                CHECK(ok, inv ? "JIT inline exp_linear inverse == interpreter"
+                              : "JIT inline exp_linear forward == interpreter");
+                toc_jit_destroy(je);
+            }
+            toc_op_list_free(le);
+        }
+    }
+    /* inline CDL: with and without clamp, JIT vs interpreter. */
+    {
+        int cl;
+        for (cl = 0; cl < 2; ++cl) {
+            toc_op_list *lc = newlist();
+            toc_op *o = toc_op_list_push(lc, TOC_OP_CDL);
+            toc_jit *jc = NULL;
+            int c;
+            o->u.cdl.saturation = 1.2f;
+            o->u.cdl.clamp = cl;
+            for (c = 0; c < 3; ++c) {
+                o->u.cdl.slope[c] = 1.1f; o->u.cdl.offset[c] = 0.02f;
+                o->u.cdl.power[c] = 0.9f; o->u.cdl.luma[c] = 0.0f;
+            }
+            if (TOC_OK(toc_jit_compile(lc, 4, NULL, &jc)) && jc) {
+                int p; ok = 1;
+                for (p = 0; p < 48; ++p) {
+                    float a[4], b[4];
+                    for (c = 0; c < 4; ++c) {
+                        float v = (float)((p * 31 + c * 7) % 120 - 10) / 100.0f;
+                        a[c] = b[c] = v;
+                    }
+                    toc_apply(lc, a, 1, 4);
+                    toc_jit_func(jc)(b, 1);
+                    for (c = 0; c < 3; ++c)
+                        if (!approx(a[c], b[c], 1e-5f)) ok = 0;
+                    if (a[3] != b[3]) ok = 0;
+                }
+                CHECK(ok, cl ? "JIT inline cdl (clamp) == interpreter"
+                             : "JIT inline cdl (no clamp) == interpreter");
+                toc_jit_destroy(jc);
+            }
+            toc_op_list_free(lc);
+        }
+    }
     /* AVX 2px path: pure matrix+range pipeline on an ODD pixel count so both
      * the 2-pixel main loop and the 1-pixel SSE tail execute. */
     {
