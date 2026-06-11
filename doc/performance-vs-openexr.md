@@ -147,9 +147,11 @@ single-threaded); the count is set at runtime:
 exr_set_num_threads(16);   /* 0/1 = serial (default) */
 ```
 
-It covers scanline and single-level tiled parts on the in-memory load/save paths;
-deep, mipmap/ripmap, and the streaming APIs remain single-threaded. Encode stays
-byte-deterministic and decode bit-identical regardless of thread count (unit-tested).
+It covers scanline and single-level tiled parts, the deep scanline/tiled
+encode and decode paths, and mipmap/ripmap level generation (the box downsample
+is row-parallel) on the in-memory load/save paths; the streaming APIs remain
+single-threaded. Encode stays byte-deterministic and decode bit-identical
+regardless of thread count (unit-tested, ThreadSanitizer-clean).
 
 ### Scaling
 
@@ -253,9 +255,10 @@ threads in-tree. With **`LIBDEFLATE=1` at 8 threads** TinyEXR leads **zips
 too few chunks to parallelize; HTJ2K32 scales to ~75 MP/s. The JPH codec itself is
 scalar on ARM — no NEON entropy/wavelet kernels yet.)
 
-Still future work: parallelize the deep and mipmap/ripmap paths; optimize the
-scalar HTJ2K entropy coder (the remaining encode/decode gap on ARM, where neither
-library has a NEON entropy path); sweep larger images and channel counts.
+The deep (scanline + tiled, encode + decode) and mipmap/ripmap paths are now
+threaded. Still future work: optimize the scalar HTJ2K entropy coder (the
+remaining encode/decode gap on ARM, where neither library has a NEON entropy
+path); thread the streaming APIs; sweep larger images and channel counts.
 
 ---
 
