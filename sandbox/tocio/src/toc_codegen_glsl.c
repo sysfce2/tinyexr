@@ -65,6 +65,52 @@ static int sh_add_texture(toc_shader *sh, const toc_op *op, int idx) {
     return 1;
 }
 
+/* ACES Red Modifier + Gamut Compression as GLSL helper functions (emitted once
+ * before OCIOMain when the pipeline uses them). Reproduces the interpreter math
+ * with GLSL built-ins. */
+static const char *GLSL_ACES_SRC =
+    "float tocRmHue(float r,float g,float b,float iw){\n"
+    "  float a=2.0*r-(g+b),bb=1.7320508075688772*(g-b);\n"
+    "  float knot=atan(bb,a)*iw+2.0;int j=int(knot);\n"
+    "  if(j<0||j>=4)return 0.0;\n"
+    "  vec4 c=j==0?vec4(0.25,0.0,0.0,0.0):j==1?vec4(-0.75,0.75,0.75,0.25):\n"
+    "          j==2?vec4(0.75,-1.5,0.0,1.0):vec4(-0.25,0.75,-0.75,0.25);\n"
+    "  float t=knot-float(j);return c.w+t*(c.z+t*(c.y+t*c.x));}\n"
+    "float tocRmSat(vec3 c){float mn=min(c.r,min(c.g,c.b)),mx=max(c.r,max(c.g,c.b));\n"
+    "  return (max(1e-10,mx)-max(1e-10,mn))/max(1e-2,mx);}\n"
+    "vec3 tocRedmod(vec3 c,float scale,float pivot,float iw,bool inv){\n"
+    "  float fH=tocRmHue(c.r,c.g,c.b,iw);if(fH<=0.0)return c;\n"
+    "  float r=c.r,g=c.g,b=c.b,oms=1.0-scale,nr;\n"
+    "  if(inv){float mc=min(g,b),aa=fH*oms-1.0,bb=r-fH*(pivot+mc)*oms,cc=fH*pivot*mc*oms;\n"
+    "    float disc=bb*bb-4.0*aa*cc;nr=disc>=0.0?(-bb-sqrt(disc))/(2.0*aa):r;}\n"
+    "  else{float fS=tocRmSat(c);nr=r+fH*fS*(pivot-r)*oms;}\n"
+    "  if(g>=b)g=(g-b)/max(1e-10,r-b)*(nr-b)+b;else b=(b-g)/max(1e-10,r-g)*(nr-g)+g;\n"
+    "  return vec3(nr,g,b);}\n"
+    "float tocGcOne(float dist,float thr,float scale,float power,bool inv){\n"
+    "  float ip=1.0/power,nd,p;\n"
+    "  if(inv){if(dist>=thr+scale)return dist;nd=(dist-thr)/scale;p=pow(nd,power);\n"
+    "    return thr+scale*pow(-(p/(p-1.0)),ip);}\n"
+    "  nd=(dist-thr)/scale;p=pow(nd,power);return thr+scale*nd/pow(1.0+p,ip);}\n"
+    "float tocGcApply(float v,float ach,float thr,float scale,float power,bool inv){\n"
+    "  if(ach==0.0)return 0.0;float af=abs(ach),dist=(ach-v)/af;\n"
+    "  if(dist<thr)return v;return ach-tocGcOne(dist,thr,scale,power,inv)*af;}\n"
+    "vec3 tocGamutComp(vec3 c,vec3 thr,vec3 sc,float power,bool inv){\n"
+    "  float ach=max(c.r,max(c.g,c.b));\n"
+    "  return vec3(tocGcApply(c.r,ach,thr.x,sc.x,power,inv),\n"
+    "              tocGcApply(c.g,ach,thr.y,sc.y,power,inv),\n"
+    "              tocGcApply(c.b,ach,thr.z,sc.z,power,inv));}\n";
+
+/* gamut-compression scale (codegen-time constant; matches interpreter gc_scale). */
+static float glsl_gc_scale(float lim, float thr, float power) {
+    float ip, t, p, d;
+    if (lim <= thr) return 1.0f;
+    ip = 1.0f / power;
+    t = (1.0f - thr) / (lim - thr);
+    p = toc_powf(t, power);
+    d = toc_powf(p - 1.0f, ip);
+    return (1.0f - thr) / d;
+}
+
 toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                          const toc_allocator *a, toc_shader *out) {
     toc_sb sb;
@@ -106,6 +152,18 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
         toc_sb_puts(&sb, ";\n");
         if (!sh_add_texture(out, op, tex_idx)) { toc_sb_free(&sb); return TOC_ERROR_OUT_OF_MEMORY; }
         ++tex_idx;
+    }
+
+    /* ACES Red-Mod / Gamut-Comp helper functions, if the pipeline uses them. */
+    for (k = 0; k < ops->count; ++k) {
+        const toc_op *op = &ops->ops[k];
+        int s = op->u.fixedfunc.style;
+        if (op->kind == TOC_OP_FIXEDFUNC &&
+            ((s >= TOC_FF_ACES_RED_MOD_03 && s <= TOC_FF_ACES_RED_MOD_10_INV) ||
+             s == TOC_FF_ACES_GAMUTCOMP13 || s == TOC_FF_ACES_GAMUTCOMP13_INV)) {
+            toc_sb_puts(&sb, GLSL_ACES_SRC);
+            break;
+        }
     }
 
     toc_sb_puts(&sb, "vec4 OCIOMain(vec4 inPixel){\n  vec4 v = inPixel;\n");
@@ -347,34 +405,33 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                                      "  v.rgb *= pow(Y,");
                     emit_f(&sb, 1.0f / g - 1.0f);
                     toc_sb_puts(&sb, "); }\n");
-                } else if (s == TOC_FF_ACES_RED_MOD_03) {
-                    toc_sb_puts(&sb, "  { vec3 c=v.rgb;float a=2.0*c.r-(c.g+c.b);float b=1.73205*(c.g-c.b);\n"
-                                     "  float h=atan(b,a);float k=h*1.909859+2.0;int j=int(k);\n"
-                                     "  if(j>=0&&j<4){float t=k-float(j);float fH;\n"
-                                     "  if(j==0)fH=0.25*t*t;else if(j==1)fH=-0.75+0.75*t+0.75*t*t-0.25*t*t*t;\n"
-                                     "  else if(j==2)fH=0.75-1.5*t+1.0*t*t*t;else fH=-0.25+0.75*t-0.75*t*t+0.25*t*t*t;\n"
-                                     "  if(fH>0.0){float mn=min(c.r,min(c.g,c.b));float mx=max(c.r,max(c.g,c.b));\n"
-                                     "  float fS=(max(1e-10,mx)-max(1e-10,mn))/max(0.01,mx);\n"
-                                     "  float nr=c.r+fH*fS*(0.03-c.r)*0.15;\n"
-                                     "  if(c.g>=c.b)c.g=(c.g-c.b)/max(1e-10,c.r-c.b)*(nr-c.b)+c.b;\n"
-                                     "  else c.b=(c.b-c.g)/max(1e-10,c.r-c.g)*(nr-c.g)+c.g;\n"
-                                     "  c.r=nr;}v.rgb=c;}\n");
-                } else if (s == TOC_FF_ACES_RED_MOD_10) {
-                    toc_sb_puts(&sb, "  { vec3 c=v.rgb;float a=2.0*c.r-(c.g+c.b);float b=1.73205*(c.g-c.b);\n"
-                                     "  float h=atan(b,a);float k=h*1.697653+2.0;int j=int(k);\n"
-                                     "  if(j>=0&&j<4){float t=k-float(j);float fH;\n"
-                                     "  if(j==0)fH=0.25*t*t;else if(j==1)fH=-0.75+0.75*t+0.75*t*t-0.25*t*t*t;\n"
-                                     "  else if(j==2)fH=0.75-1.5*t+1.0*t*t*t;else fH=-0.25+0.75*t-0.75*t*t+0.25*t*t*t;\n"
-                                     "  if(fH>0.0){float mn=min(c.r,min(c.g,c.b));float mx=max(c.r,max(c.g,c.b));\n"
-                                     "  float fS=(max(1e-10,mx)-max(1e-10,mn))/max(0.01,mx);\n"
-                                     "  c.r=c.r+fH*fS*(0.03-c.r)*0.18;}v.rgb=c;}\n");
-                } else if (s == TOC_FF_ACES_RED_MOD_03_INV) {
-                    toc_sb_puts(&sb, "  /* RED_MOD_03_INV not emitted; use CPU */\n");
-                } else if (s == TOC_FF_ACES_RED_MOD_10_INV) {
-                    toc_sb_puts(&sb, "  /* RED_MOD_10_INV not emitted; use CPU */\n");
+                } else if (s == TOC_FF_ACES_RED_MOD_03 ||
+                           s == TOC_FF_ACES_RED_MOD_03_INV ||
+                           s == TOC_FF_ACES_RED_MOD_10 ||
+                           s == TOC_FF_ACES_RED_MOD_10_INV) {
+                    int is03 = (s == TOC_FF_ACES_RED_MOD_03 ||
+                                s == TOC_FF_ACES_RED_MOD_03_INV);
+                    int inv = (s == TOC_FF_ACES_RED_MOD_03_INV ||
+                               s == TOC_FF_ACES_RED_MOD_10_INV);
+                    toc_sb_puts(&sb, "  v.rgb = tocRedmod(v.rgb, ");
+                    emit_f(&sb, is03 ? 0.85f : 0.82f);
+                    toc_sb_puts(&sb, ", 0.03, ");
+                    emit_f(&sb, is03 ? 1.9098593171027443f : 1.6976527263135504f);
+                    toc_sb_puts(&sb, inv ? ", true);\n" : ", false);\n");
                 } else if (s == TOC_FF_ACES_GAMUTCOMP13 ||
                            s == TOC_FF_ACES_GAMUTCOMP13_INV) {
-                    toc_sb_puts(&sb, "  /* GAMUT_COMP_13 not emitted; use CPU */\n");
+                    const float *pp = op->u.fixedfunc.params;
+                    float pw = pp[6];
+                    int inv = (s == TOC_FF_ACES_GAMUTCOMP13_INV);
+                    toc_sb_puts(&sb, "  v.rgb = tocGamutComp(v.rgb, vec3(");
+                    emit_f(&sb, pp[3]); toc_sb_putc(&sb, ',');
+                    emit_f(&sb, pp[4]); toc_sb_putc(&sb, ',');
+                    emit_f(&sb, pp[5]); toc_sb_puts(&sb, "), vec3(");
+                    emit_f(&sb, glsl_gc_scale(pp[0], pp[3], pw)); toc_sb_putc(&sb, ',');
+                    emit_f(&sb, glsl_gc_scale(pp[1], pp[4], pw)); toc_sb_putc(&sb, ',');
+                    emit_f(&sb, glsl_gc_scale(pp[2], pp[5], pw)); toc_sb_puts(&sb, "), ");
+                    emit_f(&sb, pw);
+                    toc_sb_puts(&sb, inv ? ", true);\n" : ", false);\n");
                 } else if (s == TOC_FF_RGB_TO_HSV) {
                     toc_sb_puts(&sb, "  { float mn=min(v.r,min(v.g,v.b));float mx=max(v.r,max(v.g,v.b));\n"
                                      "  float h=0,s=0,vv=mx;if(mn!=mx){float d=mx-mn;\n"

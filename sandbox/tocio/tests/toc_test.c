@@ -1400,6 +1400,85 @@ static void test_codegen_exp_linear(void) {
     toc_op_list_free(l);
 }
 
+/* ACES Red Modifier (fwd+inv) and Gamut Compression (fwd+inv) in all backends. */
+static void set_gamutcomp(toc_op *o, int inv) {
+    o->u.fixedfunc.style = inv ? TOC_FF_ACES_GAMUTCOMP13_INV
+                               : TOC_FF_ACES_GAMUTCOMP13;
+    o->u.fixedfunc.params[0] = 0.5f;  /* lim C/M/Y (matches interpreter test) */
+    o->u.fixedfunc.params[1] = 0.5f;
+    o->u.fixedfunc.params[2] = 0.5f;
+    o->u.fixedfunc.params[3] = 0.1f;  /* thr C/M/Y */
+    o->u.fixedfunc.params[4] = 0.1f;
+    o->u.fixedfunc.params[5] = 0.1f;
+    o->u.fixedfunc.params[6] = 0.7f;  /* power */
+    o->u.fixedfunc.nparams = 7;
+}
+static void test_codegen_aces(void) {
+    toc_op_list *l = newlist();
+    char *src = NULL;
+    size_t len = 0;
+    toc_result rc;
+    FILE *f;
+    void *h;
+    apply_fn fn;
+    int ok = 1, i, c;
+    /* ACES-ish linear values incl. out-of-gamut and saturated hues. */
+    static const float px[8][3] = {
+        {0.80f, 0.10f, 0.05f}, {0.10f, 0.70f, 0.20f}, {0.05f, 0.20f, 0.90f},
+        {0.50f, 0.50f, 0.50f}, {1.20f, 0.30f, -0.05f}, {0.02f, 0.02f, 0.02f},
+        {0.90f, 0.85f, 0.10f}, {-0.04f, 0.60f, 0.55f}};
+    /* mixed directions so a silently-skipped op shifts the result */
+    push_ff_raw(l, TOC_FF_ACES_RED_MOD_03);
+    set_gamutcomp(toc_op_list_push(l, TOC_OP_FIXEDFUNC), 0);
+    push_ff_raw(l, TOC_FF_ACES_RED_MOD_10_INV);
+    set_gamutcomp(toc_op_list_push(l, TOC_OP_FIXEDFUNC), 1);
+
+    rc = toc_emit_c(l, NULL, NULL, &src, &len);
+    CHECK(TOC_OK(rc) && src, "emit C (ACES redmod+gamutcomp)");
+    if (TOC_OK(rc)) {
+        f = fopen("build/toc_gen_aces.c", "w");
+        if (f) { fwrite(src, 1, len, f); fclose(f); }
+        if (system("cc -O2 -fPIC -shared build/toc_gen_aces.c -o build/toc_gen_aces.so") == 0 &&
+            (h = dlopen("./build/toc_gen_aces.so", RTLD_NOW)) != NULL) {
+            fn = (apply_fn)dlsym(h, "tocio_apply");
+            if (fn) {
+                for (i = 0; i < 8; ++i) {
+                    float a[4], b[4];
+                    for (c = 0; c < 3; ++c) a[c] = b[c] = px[i][c];
+                    a[3] = b[3] = 1.0f;
+                    toc_apply(l, a, 1, 4);
+                    fn(b, 1);
+                    for (c = 0; c < 3; ++c)
+                        if (!approx(a[c], b[c], 2e-3f)) ok = 0;
+                }
+                CHECK(ok, "interpreter == compiled emitted-C (ACES)");
+            }
+            dlclose(h);
+        } else {
+            CHECK(0, "compile emitted C (ACES)");
+        }
+        free(src);
+    }
+    /* GLSL + Metal: the ops must be emitted (helper calls present, not skipped). */
+    {
+        toc_shader sh;
+        if (TOC_OK(toc_emit_glsl(l, TOC_GLSL_330, NULL, &sh))) {
+            CHECK(strstr(sh.source, "tocRedmod(") != NULL &&
+                      strstr(sh.source, "tocGamutComp(") != NULL &&
+                      strstr(sh.source, "not emitted") == NULL,
+                  "GLSL emits ACES redmod + gamutcomp");
+            toc_shader_free(&sh);
+        }
+        if (TOC_OK(toc_emit_metal(l, NULL, &sh))) {
+            CHECK(strstr(sh.source, "tocRedmod(") != NULL &&
+                      strstr(sh.source, "tocGamutComp(") != NULL,
+                  "Metal emits ACES redmod + gamutcomp");
+            toc_shader_free(&sh);
+        }
+    }
+    toc_op_list_free(l);
+}
+
 /* ---- SIMD parity (scalar vs SSE2 vs AVX2) -------------------------------- */
 static void test_simd_parity(void) {
     enum { NP = 257 };
@@ -2071,6 +2150,7 @@ int main(void) {
     test_codegen_glsl_hdr();
     test_codegen_metal();
     test_codegen_exp_linear();
+    test_codegen_aces();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();

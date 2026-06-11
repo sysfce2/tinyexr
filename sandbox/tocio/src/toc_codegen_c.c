@@ -347,13 +347,63 @@ static const char *LUT3D_SRC =
     "[k]+(c110[k]-c010[k])*fr,x11=c011[k]+(c111[k]-c011[k])*fr,y0=x00+(x10-x00)"
     "*fg,y1=x01+(x11-x01)*fg;v=y0+(y1-y0)*fb;}c[k]=v;}}\n#undef C\n}\n";
 
+/* ACES Red Modifier + Gamut Compression. Uses the bundled tc_powf/tc_log2f/
+ * tc_exp2f so the generated code reproduces the interpreter's approximations
+ * exactly (tc_sqrtf == toc_sqrtf, tc_atan2f == ff_atan2f). Needs MATH_SRC. */
+static const char *FIXEDFUNC_SRC_ACES =
+    "static float tc_sqrtf(float x){return x>0.0f?tc_exp2f(0.5f*tc_log2f(x)):0.0f;}\n"
+    "static float tc_atan2f(float y,float x){float ax=x<0.0f?-x:x,ay=y<0.0f?-y:y,"
+    "a,r,a2;int q;if(ax+ay==0.0f)return 0.0f;if(ay<ax){a=y/x;q=0;}else{a=x/y;q=2;}"
+    "if(x<0.0f&&ay<ax)q=1;if(y<0.0f&&ay>=ax)q=3;a2=a*a;r=a*(1.0f-a2*(1.0f/3.0f-a2"
+    "*(1.0f/5.0f-a2*(1.0f/7.0f-a2*(1.0f/9.0f)))));if(q==1)r=(r<0.0f?-3.1415926535"
+    "89793f:3.141592653589793f)+r;else if(q==2)r=1.5707963267948966f-r;else if(q="
+    "=3)r=-1.5707963267948966f-r;return r;}\n"
+    "static float tc_rm_hue(float r,float g,float b,float iw){float a=2.0f*r-(g+b)"
+    ",bb=1.7320508075688772f*(g-b),hue=tc_atan2f(bb,a),knot=hue*iw+2.0f;int j=(int"
+    ")knot;static const float M[4][4]={{0.25f,0,0,0},{-0.75f,0.75f,0.75f,0.25f},{0"
+    ".75f,-1.5f,0,1.0f},{-0.25f,0.75f,-0.75f,0.25f}};if(j<0||j>=4)return 0.0f;{floa"
+    "t t=knot-(float)j;const float*c=M[j];return c[3]+t*(c[2]+t*(c[1]+t*c[0]));}}\n"
+    "static float tc_rm_sat(float r,float g,float b){float mn=r<g?r:g,mx=r>g?r:g;"
+    "mn=mn<b?mn:b;mx=mx>b?mx:b;return((mx>1e-10f?mx:1e-10f)-(mn>1e-10f?mn:1e-10f))/"
+    "(mx>1e-2f?mx:1e-2f);}\n"
+    "static void tc_redmod(float*px,float scale,float pivot,float iw,int inv){floa"
+    "t r=px[0],g=px[1],b=px[2],fH=tc_rm_hue(r,g,b,iw);if(fH>0.0f){float nr,oms=1.0"
+    "f-scale;if(inv){float mc=g<b?g:b,aa=fH*oms-1.0f,bb=r-fH*(pivot+mc)*oms,cc=fH*"
+    "pivot*mc*oms,disc=bb*bb-4.0f*aa*cc;nr=disc>=0.0f?(-bb-tc_sqrtf(disc))/(2.0f*aa"
+    "):r;}else{float fS=tc_rm_sat(r,g,b);nr=r+fH*fS*(pivot-r)*oms;}if(g>=b){float "
+    "hf=(g-b)/((r-b)>1e-10f?(r-b):1e-10f);g=hf*(nr-b)+b;}else{float hf=(b-g)/((r-g)"
+    ">1e-10f?(r-g):1e-10f);b=hf*(nr-g)+g;}r=nr;}px[0]=r;px[1]=g;px[2]=b;}\n"
+    "static float tc_gc_one(float dist,float thr,float scale,float power,int inv){"
+    "float ip=1.0f/power,nd,p;if(inv){if(dist>=thr+scale)return dist;nd=(dist-thr)"
+    "/scale;p=tc_powf(nd,power);return thr+scale*tc_powf(-(p/(p-1.0f)),ip);}nd=(di"
+    "st-thr)/scale;p=tc_powf(nd,power);return thr+scale*nd/tc_powf(1.0f+p,ip);}\n"
+    "static float tc_gc_apply(float v,float ach,float thr,float scale,float power,"
+    "int inv){float dist,af;if(ach==0.0f)return 0.0f;af=ach<0.0f?-ach:ach;dist=(ac"
+    "h-v)/af;if(dist<thr)return v;return ach-tc_gc_one(dist,thr,scale,power,inv)*af"
+    ";}\n"
+    "static void tc_gamutcomp(float*px,float tC,float tM,float tY,float sC,float sM"
+    ",float sY,float pw,int inv){float r=px[0],g=px[1],b=px[2],ach=r>g?r:g;ach=ach>"
+    "b?ach:b;px[0]=tc_gc_apply(r,ach,tC,sC,pw,inv);px[1]=tc_gc_apply(g,ach,tM,sM,pw"
+    ",inv);px[2]=tc_gc_apply(b,ach,tY,sY,pw,inv);}\n";
+
+/* gamut-compression scale (codegen-time constant; matches interpreter gc_scale). */
+static float cg_gc_scale(float lim, float thr, float power) {
+    float ip, t, p, d;
+    if (lim <= thr) return 1.0f;
+    ip = 1.0f / power;
+    t = (1.0f - thr) / (lim - thr);
+    p = toc_powf(t, power);
+    d = toc_powf(p - 1.0f, ip);
+    return (1.0f - thr) / d;
+}
+
 toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
                       const toc_allocator *a, char **out_src, size_t *out_len) {
     toc_sb sb;
     const char *fname = (opts && opts->func_name) ? opts->func_name : "tocio_apply";
     int need_math = 0, need_lut1d = 0, need_lut3d = 0, lut_idx = 0;
     int need_glow = 0, need_darktodim = 0, need_rgbhsv = 0, need_xyz = 0;
-    int need_hdr = 0;
+    int need_hdr = 0, need_aces = 0;
     size_t k;
     if (!ops || !out_src) return TOC_ERROR_INVALID_ARGUMENT;
     if (!a) a = toc_default_allocator();
@@ -371,7 +421,10 @@ toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
                 if (s == TOC_FF_ACES_DARKTODIM10 || s == TOC_FF_ACES_DARKTODIM10_INV)
                     need_darktodim = 1;
                 if (s == TOC_FF_ACES_GAMUTCOMP13 || s == TOC_FF_ACES_GAMUTCOMP13_INV)
-                    need_math = 1;
+                    need_math = need_aces = 1;
+                if (s == TOC_FF_ACES_RED_MOD_03 || s == TOC_FF_ACES_RED_MOD_03_INV ||
+                    s == TOC_FF_ACES_RED_MOD_10 || s == TOC_FF_ACES_RED_MOD_10_INV)
+                    need_math = need_aces = 1;
                 if (s == TOC_FF_RGB_TO_HSV || s == TOC_FF_HSV_TO_RGB)
                     need_rgbhsv = 1;
                 if (s >= TOC_FF_XYZ_TO_xyY && s <= TOC_FF_LUV_TO_XYZ)
@@ -397,6 +450,7 @@ toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
     if (need_rgbhsv) toc_sb_puts(&sb, FIXEDFUNC_SRC_RGB2HSV);
     if (need_xyz) toc_sb_puts(&sb, FIXEDFUNC_SRC_XYZ);
     if (need_hdr) toc_sb_puts(&sb, FIXEDFUNC_SRC_HDR);
+    if (need_aces) toc_sb_puts(&sb, FIXEDFUNC_SRC_ACES);
     /* embed LUT arrays */
     for (k = 0; k < ops->count; ++k) {
         const toc_op *op = &ops->ops[k];
@@ -496,9 +550,31 @@ toc_result toc_emit_c(const toc_op_list *ops, const toc_codegen_c_opts *opts,
                 } else if (n >= 6 &&
                     (s == TOC_FF_ACES_GAMUTCOMP13 ||
                      s == TOC_FF_ACES_GAMUTCOMP13_INV)) {
-                    /* For gamut compression, emit the builtins inline */
-                    toc_sb_puts(&sb, "  { /* GamutComp13 - "
-                        "not inlined; run through interpreter */ }\n");
+                    const float *pp = op->u.fixedfunc.params;
+                    float pw = pp[6];
+                    int inv = (s == TOC_FF_ACES_GAMUTCOMP13_INV);
+                    toc_sb_puts(&sb, "  { float c[3]={r,g,b};tc_gamutcomp(c,");
+                    emit_hf(&sb, pp[3]); toc_sb_putc(&sb, ',');   /* thr C/M/Y */
+                    emit_hf(&sb, pp[4]); toc_sb_putc(&sb, ',');
+                    emit_hf(&sb, pp[5]); toc_sb_putc(&sb, ',');
+                    emit_hf(&sb, cg_gc_scale(pp[0], pp[3], pw)); toc_sb_putc(&sb, ',');
+                    emit_hf(&sb, cg_gc_scale(pp[1], pp[4], pw)); toc_sb_putc(&sb, ',');
+                    emit_hf(&sb, cg_gc_scale(pp[2], pp[5], pw)); toc_sb_putc(&sb, ',');
+                    emit_hf(&sb, pw); toc_sb_puts(&sb, inv ? ",1);" : ",0);");
+                    toc_sb_puts(&sb, " r=c[0];g=c[1];b=c[2];}\n");
+                } else if (s == TOC_FF_ACES_RED_MOD_03 ||
+                           s == TOC_FF_ACES_RED_MOD_03_INV ||
+                           s == TOC_FF_ACES_RED_MOD_10 ||
+                           s == TOC_FF_ACES_RED_MOD_10_INV) {
+                    int is03 = (s == TOC_FF_ACES_RED_MOD_03 ||
+                                s == TOC_FF_ACES_RED_MOD_03_INV);
+                    int inv = (s == TOC_FF_ACES_RED_MOD_03_INV ||
+                               s == TOC_FF_ACES_RED_MOD_10_INV);
+                    toc_sb_puts(&sb, "  { float c[3]={r,g,b};tc_redmod(c,");
+                    emit_hf(&sb, is03 ? 0.85f : 0.82f); toc_sb_puts(&sb, ",0.03f,");
+                    emit_hf(&sb, is03 ? 1.9098593171027443f : 1.6976527263135504f);
+                    toc_sb_puts(&sb, inv ? ",1);" : ",0);");
+                    toc_sb_puts(&sb, " r=c[0];g=c[1];b=c[2];}\n");
                 } else if (s == TOC_FF_RGB_TO_HSV ||
                            s == TOC_FF_HSV_TO_RGB) {
                     toc_sb_puts(&sb, "  { float c[3]={r,g,b};");
