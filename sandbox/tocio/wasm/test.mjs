@@ -1,5 +1,5 @@
 // tocio WASM smoke test (node). Parses a config, builds a processor, applies
-// it to a float buffer on the CPU, and emits a GLSL shader.
+// it to a float buffer on the CPU, and emits GLSL + Metal shaders.
 //
 // Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
 // SPDX-License-Identifier: BSD-3-Clause
@@ -63,6 +63,15 @@ const glsl = M.UTF8ToString(pGlsl);
 check(glsl.includes('OCIOMain') && glsl.includes('#version 300 es'),
       'GLSL has OCIOMain + ES3.0 version');
 M._tocw_free_str(pGlsl);
+
+// emit Metal (macOS/iOS GPU)
+const pMetal = M._tocw_emit_metal(ops);
+check(pMetal !== 0, 'emit Metal');
+const metal = M.UTF8ToString(pMetal);
+check(metal.includes('#include <metal_stdlib>') &&
+      metal.includes('float4 OCIOMain(float4') && metal.includes('float4x4('),
+      'Metal has metal_stdlib + OCIOMain + float4x4 matrix');
+M._tocw_free_str(pMetal);
 
 M._tocw_free_ops(ops);
 M._tocw_free_config(cfg);

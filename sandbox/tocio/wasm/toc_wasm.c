@@ -79,6 +79,28 @@ TOC_EXPORT char *tocw_emit_glsl(void *ops, int target) {
     return out;
 }
 
+/* Emit a Metal (MSL) shader for macOS/iOS GPU. Returns a malloc'd NUL-terminated
+ * string the caller frees with tocw_free_str, or NULL. */
+TOC_EXPORT char *tocw_emit_metal(void *ops) {
+    toc_shader sh;
+    char *out;
+    size_t n;
+    if (!TOC_OK(toc_emit_metal((toc_op_list *)ops, NULL, &sh))) return NULL;
+    if (!sh.source) return NULL;
+    {
+        const char *s = sh.source;
+        n = 0;
+        while (s[n]) ++n;
+        out = (char *)toc_malloc(toc_default_allocator(), n + 1);
+        if (out) {
+            size_t i;
+            for (i = 0; i <= n; ++i) out[i] = s[i];
+        }
+    }
+    toc_shader_free(&sh);
+    return out;
+}
+
 /* Emit fused C source. Returns malloc'd string or NULL. */
 TOC_EXPORT char *tocw_emit_c(void *ops) {
     char *src = NULL;
