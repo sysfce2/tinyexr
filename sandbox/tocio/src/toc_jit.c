@@ -926,7 +926,8 @@ static void emit_op_arm(codebuf *c, const toc_op *op, int channels) {
     else if (channels == 4 && op->kind == TOC_OP_EXPONENT) emit_exponent_arm(c, op);
     else if (channels == 4 && op->kind == TOC_OP_LOG) emit_log_arm(c, op);
     else if (channels == 4 && op->kind == TOC_OP_EXP_LINEAR) emit_explin_arm(c, op);
-    else if (channels == 4 && op->kind == TOC_OP_CDL) emit_cdl_arm(c, op);
+    else if (channels == 4 && op->kind == TOC_OP_CDL && !op->u.cdl.inverse)
+        emit_cdl_arm(c, op); /* inverse CDL falls back to the kernel call */
     else if (op->kind != TOC_OP_NOOP) emit_helper_call_arm(c, op, channels);
 }
 

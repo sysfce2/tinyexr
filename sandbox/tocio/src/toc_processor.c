@@ -351,9 +351,12 @@ toc_result toc_invert_op(toc_op *op) {
              * low bit selects the inverse (PQ<->lin, HSV<->RGB, glow fwd<->inv). */
             op->u.fixedfunc.style ^= 1;
             return TOC_SUCCESS;
-        case TOC_OP_LUT1D:
-        case TOC_OP_LUT3D:
         case TOC_OP_CDL:
+            /* ASC CDL is analytically invertible (saturation preserves luma). */
+            op->u.cdl.inverse = !op->u.cdl.inverse;
+            return TOC_SUCCESS;
+        case TOC_OP_LUT1D: /* needs a newly-built inverse LUT (owned storage) */
+        case TOC_OP_LUT3D: /* tetrahedral inverse: hard, not implemented */
         default:
             return TOC_ERROR_NONINVERTIBLE;
     }

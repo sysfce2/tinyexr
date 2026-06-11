@@ -300,7 +300,10 @@ void toc_cdl_batch_neon(const toc_op *op, float *rgba, size_t npix, int ch) {
     float lr = op->u.cdl.luma[0], lg = op->u.cdl.luma[1], lb = op->u.cdl.luma[2];
     int clamp = op->u.cdl.clamp, c;
     size_t i;
-    if (ch != 4) { toc_cdl_batch_scalar(op, rgba, npix, ch); return; }
+    if (ch != 4 || op->u.cdl.inverse) { /* inverse: scalar k_cdl path */
+        toc_cdl_batch_scalar(op, rgba, npix, ch);
+        return;
+    }
     if (lr == 0.0f && lg == 0.0f && lb == 0.0f) {
         lr = 0.2126f; lg = 0.7152f; lb = 0.0722f;
     }

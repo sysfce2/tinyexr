@@ -102,19 +102,33 @@ static void k_cdl(const toc_op *op, float *px, int ch) {
     if (lr == 0.0f && lg == 0.0f && lb == 0.0f) {
         lr = 0.2126f; lg = 0.7152f; lb = 0.0722f;
     }
-    /* forward ASC CDL (inverse is decomposed into basic ops at lowering time). */
-    for (c = 0; c < 3; ++c) {
-        float x = px[c] * op->u.cdl.slope[c] + op->u.cdl.offset[c];
-        if (op->u.cdl.clamp) x = clampf(x, 0.0f, 1.0f);
-        if (x >= 0.0f) x = toc_powf(x, op->u.cdl.power[c]);
-        /* else: leave negative as-is when not clamped */
-        v[c] = x;
-    }
-    luma = lr * v[0] + lg * v[1] + lb * v[2];
-    for (c = 0; c < 3; ++c) {
-        float x = luma + op->u.cdl.saturation * (v[c] - luma);
-        if (op->u.cdl.clamp) x = clampf(x, 0.0f, 1.0f);
-        px[c] = x;
+    if (!op->u.cdl.inverse) {
+        /* forward ASC CDL: slope/offset -> power -> saturation about luma. */
+        for (c = 0; c < 3; ++c) {
+            float x = px[c] * op->u.cdl.slope[c] + op->u.cdl.offset[c];
+            if (op->u.cdl.clamp) x = clampf(x, 0.0f, 1.0f);
+            if (x >= 0.0f) x = toc_powf(x, op->u.cdl.power[c]);
+            /* else: leave negative as-is when not clamped */
+            v[c] = x;
+        }
+        luma = lr * v[0] + lg * v[1] + lb * v[2];
+        for (c = 0; c < 3; ++c) {
+            float x = luma + op->u.cdl.saturation * (v[c] - luma);
+            if (op->u.cdl.clamp) x = clampf(x, 0.0f, 1.0f);
+            px[c] = x;
+        }
+    } else {
+        /* inverse: saturation preserves luma, so luma = dot(out); undo in
+         * reverse order (saturation -> power -> slope/offset). */
+        float sat = op->u.cdl.saturation;
+        luma = lr * px[0] + lg * px[1] + lb * px[2];
+        for (c = 0; c < 3; ++c) {
+            float x = luma + (sat != 0.0f ? (px[c] - luma) / sat : 0.0f);
+            float s = op->u.cdl.slope[c];
+            if (op->u.cdl.clamp) x = clampf(x, 0.0f, 1.0f);
+            if (x >= 0.0f) x = toc_powf(x, 1.0f / op->u.cdl.power[c]);
+            px[c] = (x - op->u.cdl.offset[c]) / (s != 0.0f ? s : 1.0f);
+        }
     }
     (void)ch;
 }

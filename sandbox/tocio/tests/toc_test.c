@@ -1479,6 +1479,69 @@ static void test_codegen_aces(void) {
     toc_op_list_free(l);
 }
 
+/* Single-op CDL inverse: toc_invert_op toggles the inverse flag, and the
+ * interpreter + emitted C reproduce it (round-trip and parity). */
+static void test_cdl_op_inverse(void) {
+    toc_op_list *l = newlist();
+    toc_op *o = toc_op_list_push(l, TOC_OP_CDL);
+    char *src = NULL;
+    size_t len = 0;
+    toc_result rc;
+    FILE *f;
+    void *h;
+    apply_fn fn;
+    int i, ok = 1;
+    static const float seed[8][3] = {
+        {0.18f, 0.35f, 0.09f}, {0.5f, 0.5f, 0.5f}, {0.8f, 0.2f, 0.1f},
+        {0.1f, 0.7f, 0.3f}, {0.05f, 0.05f, 0.9f}, {0.6f, 0.6f, 0.2f},
+        {0.3f, 0.45f, 0.55f}, {0.9f, 0.1f, 0.4f}};
+    float buf[24], orig[24];
+    o->u.cdl.slope[0] = 1.5f; o->u.cdl.slope[1] = 1.0f; o->u.cdl.slope[2] = 0.8f;
+    o->u.cdl.offset[0] = 0.05f; o->u.cdl.offset[1] = 0.0f; o->u.cdl.offset[2] = -0.02f;
+    o->u.cdl.power[0] = 0.9f; o->u.cdl.power[1] = 1.1f; o->u.cdl.power[2] = 1.0f;
+    o->u.cdl.saturation = 0.85f;
+    o->u.cdl.clamp = 0; /* no clamp -> exact round-trip */
+    for (i = 0; i < 8; ++i) {
+        orig[i * 3] = buf[i * 3] = seed[i][0];
+        orig[i * 3 + 1] = buf[i * 3 + 1] = seed[i][1];
+        orig[i * 3 + 2] = buf[i * 3 + 2] = seed[i][2];
+    }
+    toc_apply(l, buf, 8, 3);                 /* forward */
+    CHECK(TOC_OK(toc_invert_op(&l->ops[0])), "CDL op invertible");
+    toc_apply(l, buf, 8, 3);                 /* inverse */
+    for (i = 0; i < 24; ++i)
+        if (!approx(buf[i], orig[i], 2e-3f)) ok = 0;
+    CHECK(ok, "single-op CDL forward+inverse round-trip");
+
+    /* l->ops[0] is now an inverse CDL: emitted C must match the interpreter. */
+    rc = toc_emit_c(l, NULL, NULL, &src, &len);
+    if (TOC_OK(rc) && src) {
+        f = fopen("build/toc_gen_cdlinv.c", "w");
+        if (f) { fwrite(src, 1, len, f); fclose(f); }
+        if (system("cc -O2 -fPIC -shared build/toc_gen_cdlinv.c -o build/toc_gen_cdlinv.so") == 0 &&
+            (h = dlopen("./build/toc_gen_cdlinv.so", RTLD_NOW)) != NULL) {
+            fn = (apply_fn)dlsym(h, "tocio_apply");
+            ok = 1;
+            if (fn) {
+                for (i = 0; i < 8; ++i) {
+                    float a[4], b[4];
+                    int c;
+                    for (c = 0; c < 3; ++c) a[c] = b[c] = seed[i][c];
+                    a[3] = b[3] = 1.0f;
+                    toc_apply(l, a, 1, 4);
+                    fn(b, 1);
+                    for (c = 0; c < 3; ++c)
+                        if (!approx(a[c], b[c], 2e-3f)) ok = 0;
+                }
+                CHECK(ok, "interpreter == compiled emitted-C (inverse CDL)");
+            }
+            dlclose(h);
+        }
+        free(src);
+    }
+    toc_op_list_free(l);
+}
+
 /* ---- SIMD parity (scalar vs SSE2 vs AVX2) -------------------------------- */
 static void test_simd_parity(void) {
     enum { NP = 257 };
@@ -2151,6 +2214,7 @@ int main(void) {
     test_codegen_metal();
     test_codegen_exp_linear();
     test_codegen_aces();
+    test_cdl_op_inverse();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();

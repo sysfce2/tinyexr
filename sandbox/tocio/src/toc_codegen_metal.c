@@ -283,6 +283,33 @@ toc_result toc_emit_metal(const toc_op_list *ops, const toc_allocator *a,
                 if (lr == 0 && lg == 0 && lb == 0) {
                     lr = 0.2126f; lg = 0.7152f; lb = 0.0722f;
                 }
+                if (op->u.cdl.inverse) {
+                    float sat = op->u.cdl.saturation;
+                    float p0 = op->u.cdl.power[0], p1 = op->u.cdl.power[1],
+                          p2 = op->u.cdl.power[2];
+                    float s0 = op->u.cdl.slope[0], s1 = op->u.cdl.slope[1],
+                          s2 = op->u.cdl.slope[2];
+                    toc_sb_puts(&sb, "  { float3 c = v.rgb;\n  float L = dot(c, ");
+                    emit_f3(&sb, lr, lg, lb);
+                    toc_sb_puts(&sb, ");\n  c = L + (c - L) * ");
+                    emit_f(&sb, sat != 0.0f ? 1.0f / sat : 0.0f);
+                    toc_sb_puts(&sb, ";\n");
+                    if (op->u.cdl.clamp)
+                        toc_sb_puts(&sb, "  c = clamp(c, 0.0, 1.0);\n");
+                    toc_sb_puts(&sb, "  c = pow(c, ");
+                    emit_f3(&sb, p0 != 0.0f ? 1.0f / p0 : 1.0f,
+                            p1 != 0.0f ? 1.0f / p1 : 1.0f,
+                            p2 != 0.0f ? 1.0f / p2 : 1.0f);
+                    toc_sb_puts(&sb, ");\n  c = (c - ");
+                    emit_f3(&sb, op->u.cdl.offset[0], op->u.cdl.offset[1],
+                            op->u.cdl.offset[2]);
+                    toc_sb_puts(&sb, ") * ");
+                    emit_f3(&sb, s0 != 0.0f ? 1.0f / s0 : 1.0f,
+                            s1 != 0.0f ? 1.0f / s1 : 1.0f,
+                            s2 != 0.0f ? 1.0f / s2 : 1.0f);
+                    toc_sb_puts(&sb, ";\n  v.rgb = c; }\n");
+                    break;
+                }
                 toc_sb_puts(&sb, "  { float3 c = v.rgb * ");
                 emit_f3(&sb, op->u.cdl.slope[0], op->u.cdl.slope[1], op->u.cdl.slope[2]);
                 toc_sb_puts(&sb, " + ");

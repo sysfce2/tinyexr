@@ -149,6 +149,39 @@ static void op_cdl(toc_sb *sb, const toc_op *op) {
     int c;
     static const char *cn[3] = {"r", "g", "b"};
     if (lr == 0 && lg == 0 && lb == 0) { lr = 0.2126f; lg = 0.7152f; lb = 0.0722f; }
+    if (op->u.cdl.inverse) {
+        float sat = op->u.cdl.saturation;
+        toc_sb_puts(sb, "  { float v0,v1,v2,L;\n  L = ");
+        emit_hf(sb, lr); toc_sb_puts(sb, "*r+"); emit_hf(sb, lg);
+        toc_sb_puts(sb, "*g+"); emit_hf(sb, lb); toc_sb_puts(sb, "*b;\n");
+        for (c = 0; c < 3; ++c) {
+            float slope = op->u.cdl.slope[c];
+            float ipow = op->u.cdl.power[c] != 0.0f ? 1.0f / op->u.cdl.power[c]
+                                                    : 1.0f;
+            toc_sb_puts(sb, "  v"); toc_sb_int(sb, c); toc_sb_puts(sb, " = L");
+            if (sat != 0.0f) { /* undo saturation (luma preserved) */
+                toc_sb_puts(sb, "+("); toc_sb_puts(sb, cn[c]);
+                toc_sb_puts(sb, "-L)*"); emit_hf(sb, 1.0f / sat);
+            }
+            toc_sb_putc(sb, ';');
+            if (op->u.cdl.clamp) {
+                toc_sb_puts(sb, " if(v"); toc_sb_int(sb, c);
+                toc_sb_puts(sb, "<0.0f)v"); toc_sb_int(sb, c);
+                toc_sb_puts(sb, "=0.0f; if(v"); toc_sb_int(sb, c);
+                toc_sb_puts(sb, ">1.0f)v"); toc_sb_int(sb, c); toc_sb_puts(sb, "=1.0f;");
+            }
+            toc_sb_puts(sb, " v"); toc_sb_int(sb, c); toc_sb_puts(sb, "=v");
+            toc_sb_int(sb, c); toc_sb_puts(sb, ">=0.0f?tc_powf(v"); toc_sb_int(sb, c);
+            toc_sb_puts(sb, ", "); emit_hf(sb, ipow);
+            toc_sb_puts(sb, "):v"); toc_sb_int(sb, c); toc_sb_puts(sb, ";\n  ");
+            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, " = (v"); toc_sb_int(sb, c);
+            toc_sb_puts(sb, "+"); emit_hf(sb, -op->u.cdl.offset[c]); /* avoid -- */
+            toc_sb_puts(sb, ")*"); emit_hf(sb, slope != 0.0f ? 1.0f / slope : 1.0f);
+            toc_sb_puts(sb, ";\n");
+        }
+        toc_sb_puts(sb, "  }\n");
+        return;
+    }
     toc_sb_puts(sb, "  { float v0,v1,v2,L;\n");
     for (c = 0; c < 3; ++c) {
         toc_sb_puts(sb, "  v"); toc_sb_int(sb, c); toc_sb_puts(sb, " = ");
