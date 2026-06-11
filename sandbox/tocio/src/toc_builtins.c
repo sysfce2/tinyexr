@@ -728,14 +728,18 @@ static float gc_apply(float val, float ach, float thr, float scale,
     return ach - compr * ff_fabsf(ach);
 }
 
-/* Precompute scale factor for gamut compression. */
+/* Gamut-compression scale: chosen so the limit distance maps exactly to the
+ * gamut boundary, f(lim)=1, which gives
+ *   scale = (lim-thr) / ((((lim-thr)/(1-thr))^power) - 1)^(1/power).
+ * The real ACES limits are > 1 (distance from achromatic at the cusp); for a
+ * degenerate lim <= 1 there is nothing outside the gamut to compress. */
 static float gc_scale(float lim, float thr, float power) {
-    if (lim <= thr) return 1.0f;
-    float ip = 1.0f / power;
-    float t = (1.0f - thr) / (lim - thr);
-    float p = toc_powf(t, power);
-    float d = toc_powf(p - 1.0f, ip);
-    return (1.0f - thr) / d;
+    float ip, t, d;
+    if (lim <= 1.0f || thr >= 1.0f) return 1.0f;
+    ip = 1.0f / power;
+    t = (lim - thr) / (1.0f - thr); /* > 1, so t^power - 1 > 0 */
+    d = toc_powf(toc_powf(t, power) - 1.0f, ip);
+    return (d != 0.0f) ? (lim - thr) / d : 1.0f;
 }
 
 /* ---- RGB/HSV conversions ------------------------------------------------- */

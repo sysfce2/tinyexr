@@ -97,13 +97,12 @@ static const char *METAL_ACES_SRC =
     "                tocGcApply(c.b,ach,thr.z,sc.z,power,inv));}\n";
 
 static float metal_gc_scale(float lim, float thr, float power) {
-    float ip, t, p, d;
-    if (lim <= thr) return 1.0f;
+    float ip, t, d;
+    if (lim <= 1.0f || thr >= 1.0f) return 1.0f;
     ip = 1.0f / power;
-    t = (1.0f - thr) / (lim - thr);
-    p = toc_powf(t, power);
-    d = toc_powf(p - 1.0f, ip);
-    return (1.0f - thr) / d;
+    t = (lim - thr) / (1.0f - thr);
+    d = toc_powf(toc_powf(t, power) - 1.0f, ip);
+    return (d != 0.0f) ? (lim - thr) / d : 1.0f;
 }
 
 toc_result toc_emit_metal(const toc_op_list *ops, const toc_allocator *a,

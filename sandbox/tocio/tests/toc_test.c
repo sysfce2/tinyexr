@@ -1404,13 +1404,13 @@ static void test_codegen_exp_linear(void) {
 static void set_gamutcomp(toc_op *o, int inv) {
     o->u.fixedfunc.style = inv ? TOC_FF_ACES_GAMUTCOMP13_INV
                                : TOC_FF_ACES_GAMUTCOMP13;
-    o->u.fixedfunc.params[0] = 0.5f;  /* lim C/M/Y (matches interpreter test) */
-    o->u.fixedfunc.params[1] = 0.5f;
-    o->u.fixedfunc.params[2] = 0.5f;
-    o->u.fixedfunc.params[3] = 0.1f;  /* thr C/M/Y */
-    o->u.fixedfunc.params[4] = 0.1f;
-    o->u.fixedfunc.params[5] = 0.1f;
-    o->u.fixedfunc.params[6] = 0.7f;  /* power */
+    o->u.fixedfunc.params[0] = 1.147f; /* ACES 1.3 limit C/M/Y (> 1) */
+    o->u.fixedfunc.params[1] = 1.264f;
+    o->u.fixedfunc.params[2] = 1.312f;
+    o->u.fixedfunc.params[3] = 0.815f; /* threshold C/M/Y */
+    o->u.fixedfunc.params[4] = 0.803f;
+    o->u.fixedfunc.params[5] = 0.880f;
+    o->u.fixedfunc.params[6] = 1.2f;   /* power */
     o->u.fixedfunc.nparams = 7;
 }
 static void test_codegen_aces(void) {
@@ -1539,6 +1539,22 @@ static void test_cdl_op_inverse(void) {
         }
         free(src);
     }
+    toc_op_list_free(l);
+}
+
+/* The gamut-compression scale must map the limit distance to the gamut
+ * boundary (f(lim)=1): a sample whose distance from achromatic equals the Y
+ * limit compresses to 0. This catches a wrong scale that merely round-trips. */
+static void test_gamutcomp_boundary(void) {
+    toc_op_list *l = newlist();
+    toc_op *o = toc_op_list_push(l, TOC_OP_FIXEDFUNC);
+    float px[3] = {1.0f, 1.0f, 1.0f - 1.312f}; /* blue at the Y limit (1.312) */
+    set_gamutcomp(o, 0);
+    toc_apply(l, px, 1, 3);
+    CHECK(approx(px[0], 1.0f, 1e-4f) && approx(px[1], 1.0f, 1e-4f),
+          "GamutComp leaves achromatic channels unchanged");
+    CHECK(approx(px[2], 0.0f, 3e-3f),
+          "GamutComp maps the limit distance to the gamut boundary");
     toc_op_list_free(l);
 }
 
@@ -1871,7 +1887,8 @@ static void test_fixedfunc_styles(void) {
         {TOC_FF_ACES_RED_MOD_10, TOC_FF_ACES_RED_MOD_10_INV, "RedMod10",
          {0.8f,0.3f,0.2f}, {0}, 0, 2e-3f},
         {TOC_FF_ACES_GAMUTCOMP13, TOC_FF_ACES_GAMUTCOMP13_INV, "GamutComp13",
-         {0.8f,0.3f,0.2f}, {0.5f,0.5f,0.5f,0.1f,0.1f,0.1f,0.7f}, 7, 5e-3f},
+         {1.0f,0.5f,-0.3f}, /* out-of-gamut blue so the real ACES limits engage */
+         {1.147f,1.264f,1.312f,0.815f,0.803f,0.880f,1.2f}, 7, 5e-3f},
         {TOC_FF_RGB_TO_HSV, TOC_FF_HSV_TO_RGB, "RGB->HSV",
          {0.8f,0.3f,0.5f}, {0}, 0, 1e-4f},
         {TOC_FF_XYZ_TO_xyY, TOC_FF_xyY_TO_XYZ, "XYZ<->xyY",
@@ -2215,6 +2232,7 @@ int main(void) {
     test_codegen_exp_linear();
     test_codegen_aces();
     test_cdl_op_inverse();
+    test_gamutcomp_boundary();
     printf("== tocio SIMD parity ==\n");
     test_simd_parity();
     test_simd_parity_transcendentals();
