@@ -1528,6 +1528,43 @@ static void test_jit(void) {
             toc_op_list_free(le);
         }
     }
+    /* inline log: forward + inverse log-affine, JIT vs interpreter. RGB only
+     * (alpha must pass through unchanged). */
+    {
+        int inv;
+        for (inv = 0; inv < 2; ++inv) {
+            toc_op_list *ll = newlist();
+            toc_op *o = toc_op_list_push(ll, TOC_OP_LOG);
+            toc_jit *jl = NULL;
+            int c;
+            o->u.log.base = 10.0f;
+            o->u.log.inverse = inv;
+            for (c = 0; c < 3; ++c) {
+                o->u.log.lin_slope[c] = 0.9f; o->u.log.lin_offset[c] = 0.1f;
+                o->u.log.log_slope[c] = 0.3f; o->u.log.log_offset[c] = 0.6f;
+            }
+            if (TOC_OK(toc_jit_compile(ll, 4, NULL, &jl)) && jl) {
+                int p;
+                ok = 1;
+                for (p = 0; p < 32; ++p) {
+                    float a[4], b[4];
+                    for (c = 0; c < 4; ++c) {
+                        float v = (float)((p * 31 + c * 7) % 100) / 99.0f + 0.05f;
+                        a[c] = b[c] = v;
+                    }
+                    toc_apply(ll, a, 1, 4);
+                    toc_jit_func(jl)(b, 1);
+                    for (c = 0; c < 4; ++c)
+                        if (!approx(a[c], b[c], 1e-5f)) ok = 0;
+                    if (a[3] != b[3]) ok = 0; /* alpha pass-through */
+                }
+                CHECK(ok, inv ? "JIT inline log inverse == interpreter"
+                              : "JIT inline log forward == interpreter");
+                toc_jit_destroy(jl);
+            }
+            toc_op_list_free(ll);
+        }
+    }
     /* AVX 2px path: pure matrix+range pipeline on an ODD pixel count so both
      * the 2-pixel main loop and the 1-pixel SSE tail execute. */
     {

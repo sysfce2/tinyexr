@@ -622,6 +622,9 @@ static void emit_movk_w(codebuf *c, int wd, unsigned imm16, unsigned hw) {
 static void emit_dup_w(codebuf *c, int vd, int wn) { /* DUP Vd.4S, Wn */
     e32(c, 0x4E040C00u | ((unsigned)wn << 5) | (unsigned)vd);
 }
+static void emit_ins_lane3(codebuf *c, int vd, int vn) { /* INS Vd.S[3], Vn.S[3] */
+    e32(c, 0x6E1C6400u | ((unsigned)vn << 5) | (unsigned)vd);
+}
 /* broadcast a 32-bit constant to all lanes of Vd via the scratch w10 (so x9,
  * holding the op address, is preserved across the polynomial unlike the x86
  * path which reloads it after clobbering eax). */
@@ -734,6 +737,39 @@ static void emit_exponent_arm(codebuf *c, const toc_op *op) {
     emit_stur_q(c, 0, 19, 0);
 }
 
+/* LOG (ch==4): log-affine transform on RGB (alpha preserved), inline. Reuses the
+ * hoisted log2/exp2. The per-op log2(base) is materialized into v6 per pixel
+ * (cheap on this ~40-instr op). The forward clamp a>0?a:FLT_MIN is approximated
+ * as fmax(a,FLT_MIN) -- bit-identical for normal inputs, within the test's 1e-6
+ * for the rest. v0 keeps the original pixel for the alpha lane restore. */
+static void emit_log_arm(codebuf *c, const toc_op *op) {
+    int LS = (int)offsetof(toc_op, u.log.lin_slope);
+    int LO = (int)offsetof(toc_op, u.log.lin_offset);
+    int GS = (int)offsetof(toc_op, u.log.log_slope);
+    int GO = (int)offsetof(toc_op, u.log.log_offset);
+    float lb = toc_log2f(op->u.log.base);
+    emit_load_imm64(c, 9, addr_of(op));
+    emit_ldur_q(c, 0, 19, 0);
+    if (!op->u.log.inverse) {
+        emit_ldur_q(c, 2, 9, LS); emit_fmul(c, 1, 0, 2);  /* a = x*lin_slope */
+        emit_ldur_q(c, 2, 9, LO); emit_fadd(c, 1, 1, 2);  /* + lin_offset */
+        emit_fmax(c, 1, 1, K_FLTMIN);                     /* ~ a>0?a:FLT_MIN */
+        emit_log2_neon(c);                                /* v1 = log2(a) */
+        emit_bcast_f(c, 6, lb); emit_fdiv(c, 1, 1, 6);    /* / log2(base) */
+        emit_ldur_q(c, 2, 9, GS); emit_fmul(c, 1, 1, 2);  /* * log_slope */
+        emit_ldur_q(c, 2, 9, GO); emit_fadd(c, 1, 1, 2);  /* + log_offset */
+    } else {
+        emit_ldur_q(c, 2, 9, GO); emit_fsub(c, 1, 0, 2);  /* x - log_offset */
+        emit_ldur_q(c, 2, 9, GS); emit_fdiv(c, 1, 1, 2);  /* / log_slope = e */
+        emit_bcast_f(c, 6, lb); emit_fmul(c, 1, 1, 6);    /* e * log2(base) */
+        emit_exp2_neon(c);                                /* p = base^e */
+        emit_ldur_q(c, 2, 9, LO); emit_fsub(c, 1, 1, 2);  /* p - lin_offset */
+        emit_ldur_q(c, 2, 9, LS); emit_fdiv(c, 1, 1, 2);  /* / lin_slope */
+    }
+    emit_ins_lane3(c, 1, 0);                              /* restore alpha */
+    emit_stur_q(c, 1, 19, 0);
+}
+
 /* MATRIX (ch==4): v = (c0*r + c1*g) + c2*b + c3*a + off, in NEON, matching the
  * NEON interpreter's association exactly. x9 := &op. */
 static void emit_matrix_arm(codebuf *c, const toc_op *op) {
@@ -779,6 +815,7 @@ static void emit_op_arm(codebuf *c, const toc_op *op, int channels) {
     if (channels == 4 && op->kind == TOC_OP_MATRIX) emit_matrix_arm(c, op);
     else if (channels == 4 && op->kind == TOC_OP_RANGE) emit_range_arm(c, op);
     else if (channels == 4 && op->kind == TOC_OP_EXPONENT) emit_exponent_arm(c, op);
+    else if (channels == 4 && op->kind == TOC_OP_LOG) emit_log_arm(c, op);
     else if (op->kind != TOC_OP_NOOP) emit_helper_call_arm(c, op, channels);
 }
 
@@ -805,7 +842,9 @@ toc_result toc_jit_compile(const toc_op_list *ops, int channels,
      * constants into v8..v28 before the loop; v8..v15 are callee-saved (d8..d15)
      * so that path uses a larger frame and saves/restores them. */
     for (k = 0; k < ops->count; ++k)
-        if (channels == 4 && ops->ops[k].kind == TOC_OP_EXPONENT) has_pow = 1;
+        if (channels == 4 && (ops->ops[k].kind == TOC_OP_EXPONENT ||
+                              ops->ops[k].kind == TOC_OP_LOG))
+            has_pow = 1;
 
     if (has_pow) {
         /* 96B frame: x29/x30, x19/x20, d8..d15 (16-aligned). */

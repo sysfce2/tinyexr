@@ -193,6 +193,41 @@ int main(void) {
         }
         toc_op_list_free(l);
     }
+
+    /* JIT pipeline with an inline log (camera-log colorspaces). */
+    {
+        toc_op_list *l = mklist();
+        toc_op *o = toc_op_list_push(l, TOC_OP_LOG);
+        toc_jit *j = NULL;
+        toc_result rc;
+        int c;
+        o->u.log.base = 10.0f;
+        for (c = 0; c < 3; ++c) {
+            o->u.log.lin_slope[c] = 0.9f; o->u.log.lin_offset[c] = 0.1f;
+            o->u.log.log_slope[c] = 0.3f; o->u.log.log_offset[c] = 0.6f;
+        }
+        rc = toc_jit_compile(l, 4, NULL, &j);
+        printf("\n  pipeline: log\n");
+        toc_simd_force(1);
+        printf("  %-18s %12.1f MP/s\n", "interp (NEON)",
+               (double)NP / time_apply(l, buf, src, NP, mc) / 1e6);
+        if (rc == TOC_SUCCESS && j) {
+            toc_jit_fn fn = toc_jit_func(j);
+            double t0 = now_sec(), t;
+            long it = 0;
+            do {
+                memcpy(buf, src, NP * 4 * sizeof(float));
+                fn(buf, NP);
+                ++it;
+            } while (now_sec() - t0 < 0.3);
+            t = (now_sec() - t0) / (double)it - mc;
+            if (t < 1e-12) t = 1e-12;
+            printf("  %-18s %12.1f MP/s  (log inlined)\n", "JIT (native)",
+                   (double)NP / t / 1e6);
+            toc_jit_destroy(j);
+        }
+        toc_op_list_free(l);
+    }
     free(buf);
     free(src);
     return 0;
