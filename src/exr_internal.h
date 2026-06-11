@@ -238,6 +238,10 @@ exr_result jph_inverse_53_vert_i64_avx2(const int64_t *temp, size_t rw,
  * to the scalar extraction loop in jph_decode_block. */
 void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
                                          size_t n, unsigned shift);
+/* Same conversion for the all-HALF/int32 decode path; stores signed int32
+ * coefficients directly, avoiding an int64 codeblock round trip. */
+void jph_extract_signmag_i32_to_i32_avx2(int32_t *out, const uint32_t *buf,
+                                         size_t n, unsigned shift);
 /* AVX2 vertical (column) forward reversible 5/3 (int64), row-wise across all
  * columns; bit-identical to jph_forward_53_vert_i64. data's interleaved rows
  * (stride width) -> subband layout in temp (stride rw): lh low-rows, hh high. */

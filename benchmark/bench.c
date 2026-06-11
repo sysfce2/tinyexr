@@ -153,9 +153,8 @@ static void bench_codecs(const char *path) {
             struct codec_ctx dc, ec;
             int lvl;
 #if defined(EXR_NEON)
-            /* The JPH (HTJ2K) entropy/wavelet kernels have no NEON path yet, so
-             * the codec runs scalar on aarch64 (only the de-interleave/util
-             * helpers are NEON). Report a single representative row. */
+            /* NEON JPH kernels are compile-time selected on aarch64; report a
+             * single representative row rather than synthetic x86 tiers. */
             const char *lv[] = {"neon"};
             const int ntier = 1;
 #else

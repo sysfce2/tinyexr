@@ -506,6 +506,28 @@ void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
     }
 }
 
+EXR_TARGET("avx2")
+void jph_extract_signmag_i32_to_i32_avx2(int32_t *out, const uint32_t *buf,
+                                         size_t n, unsigned shift) {
+    size_t i = 0;
+    const __m256i magmask = _mm256_set1_epi32(0x7fffffff);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m128i sh = _mm_cvtsi32_si128((int)shift);
+    for (; i + 8 <= n; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(buf + i));
+        __m256i mag = _mm256_srl_epi32(_mm256_and_si256(v, magmask), sh);
+        __m256i neg = _mm256_sub_epi32(zero, mag);
+        __m256i smask = _mm256_srai_epi32(v, 31);
+        __m256i r = _mm256_blendv_epi8(mag, neg, smask);
+        _mm256_storeu_si256((__m256i *)(out + i), r);
+    }
+    for (; i < n; ++i) {
+        uint32_t v = buf[i];
+        int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
+        out[i] = (v & 0x80000000u) ? -mag : mag;
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Forward reversible 5/3 1D lifting (int64). Mirrors the scalar
  * jph_forward_53_i64 exactly: deinterleave src into even/odd (ev/od scratch),

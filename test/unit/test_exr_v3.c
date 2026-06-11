@@ -2295,9 +2295,11 @@ static void jph_simd_check(void) {
         uint32_t *src = (uint32_t *)malloc(en * sizeof(uint32_t));
         int64_t *r0 = (int64_t *)malloc(en * sizeof(int64_t));
         int64_t *r1 = (int64_t *)malloc(en * sizeof(int64_t));
+        int32_t *r2 = (int32_t *)malloc(en * sizeof(int32_t));
+        int32_t *r3 = (int32_t *)malloc(en * sizeof(int32_t));
         int eok = 1;
         uint32_t rng = 0x2468aceu;
-        if (src && r0 && r1) {
+        if (src && r0 && r1 && r2 && r3) {
             unsigned shift;
             for (shift = 0u; shift <= 30u && eok; ++shift) {
                 size_t i;
@@ -2309,15 +2311,19 @@ static void jph_simd_check(void) {
                     uint32_t v = src[i];
                     int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
                     r0[i] = (v & 0x80000000u) ? -mag : mag;
+                    r2[i] = (int32_t)r0[i];
                 }
                 memset(r1, 0x5a, en * sizeof(int64_t));
+                memset(r3, 0x5a, en * sizeof(int32_t));
                 jph_extract_signmag_i32_to_i64_avx2(r1, src, en, shift);
+                jph_extract_signmag_i32_to_i32_avx2(r3, src, en, shift);
                 if (memcmp(r0, r1, en * sizeof(int64_t)) != 0) eok = 0;
+                if (memcmp(r2, r3, en * sizeof(int32_t)) != 0) eok = 0;
             }
             CHECK(eok, "JPH sign-mag extract AVX2 == scalar");
             if (eok) printf("  ok: JPH sign-mag extract AVX2 == scalar\n");
         }
-        free(src); free(r0); free(r1);
+        free(src); free(r0); free(r1); free(r2); free(r3);
     }
 
     /* vertical (column) forward 5/3 (int64, encode): AVX2 must match the scalar
