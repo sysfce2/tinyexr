@@ -242,6 +242,23 @@ void exr_spectral_image_free(exr_spectral_image *img) {
     memset(img, 0, sizeof(*img));
 }
 
+/* Read one planar sample as float (any pixel type). */
+static float grid_sample(const void *src, exr_pixel_type pt, size_t idx) {
+    switch (pt) {
+    case EXR_PIXEL_HALF: {
+        uint16_t hv = ((const uint16_t *)src)[idx];
+        float f;
+        exr_half_to_float(&hv, &f, 1);
+        return f;
+    }
+    case EXR_PIXEL_FLOAT:
+        return ((const float *)src)[idx];
+    case EXR_PIXEL_UINT:
+        return (float)((const uint32_t *)src)[idx];
+    }
+    return 0.0f;
+}
+
 /* Fill *out from an already-loaded native image (part 0 only). out must be
  * zeroed by the caller with out->alloc set. */
 static exr_result spectral_fill(const exr_allocator *a, const exr_image *img,
@@ -258,13 +275,6 @@ static exr_result spectral_fill(const exr_allocator *a, const exr_image *img,
     if (!exr_is_spectral(h)) return EXR_ERROR_UNSUPPORTED;
     type = exr_spectrum_type_of(h);
     if (type == EXR_SPECTRUM_NONE) return EXR_ERROR_UNSUPPORTED;
-
-    /* Subsampled spectral channels are not supported. */
-    for (c = 0; c < h->num_channels; ++c) {
-        if (exr_is_spectral_channel(h->channels[c].name) &&
-            (h->channels[c].x_sampling != 1 || h->channels[c].y_sampling != 1))
-            return EXR_ERROR_UNSUPPORTED;
-    }
 
     nwl = exr_spectral_wavelengths(h, NULL, 0);
     if (nwl <= 0) return EXR_ERROR_UNSUPPORTED;
@@ -310,19 +320,46 @@ static exr_result spectral_fill(const exr_allocator *a, const exr_image *img,
         src = part->images[c];
         if (!src) continue;
         dst = out->stokes[st] + (size_t)wi * npix;
-        switch (h->channels[c].pixel_type) {
-        case EXR_PIXEL_HALF:
-            exr_half_to_float((const uint16_t *)src, dst, npix);
-            break;
-        case EXR_PIXEL_FLOAT:
-            memcpy(dst, src, npix * sizeof(float));
-            break;
-        case EXR_PIXEL_UINT: {
-            size_t i;
-            const uint32_t *u = (const uint32_t *)src;
-            for (i = 0; i < npix; ++i) dst[i] = (float)u[i];
-            break;
-        }
+        {
+            int xs = h->channels[c].x_sampling, ys = h->channels[c].y_sampling;
+            exr_pixel_type pt = h->channels[c].pixel_type;
+            if (xs <= 1 && ys <= 1) {
+                /* Full resolution: a direct convert/copy. */
+                switch (pt) {
+                case EXR_PIXEL_HALF:
+                    exr_half_to_float((const uint16_t *)src, dst, npix);
+                    break;
+                case EXR_PIXEL_FLOAT:
+                    memcpy(dst, src, npix * sizeof(float));
+                    break;
+                case EXR_PIXEL_UINT: {
+                    size_t i;
+                    const uint32_t *u = (const uint32_t *)src;
+                    for (i = 0; i < npix; ++i) dst[i] = (float)u[i];
+                    break;
+                }
+                }
+            } else {
+                /* Subsampled: point-expand the stored cw*chh grid to full res. */
+                int minx = h->data_window.min_x, miny = h->data_window.min_y;
+                int maxx = h->data_window.max_x, maxy = h->data_window.max_y;
+                int cw = exr_num_samples(minx, maxx, xs <= 0 ? 1 : xs);
+                int ch_ = exr_num_samples(miny, maxy, ys <= 0 ? 1 : ys);
+                int yy, xx;
+                if (cw <= 0 || ch_ <= 0) continue;
+                for (yy = 0; yy < hgt; ++yy) {
+                    int gy = exr_num_samples(miny, miny + yy, ys <= 0 ? 1 : ys) - 1;
+                    if (gy < 0) gy = 0;
+                    if (gy >= ch_) gy = ch_ - 1;
+                    for (xx = 0; xx < w; ++xx) {
+                        int gx = exr_num_samples(minx, minx + xx, xs <= 0 ? 1 : xs) - 1;
+                        if (gx < 0) gx = 0;
+                        if (gx >= cw) gx = cw - 1;
+                        dst[(size_t)yy * w + xx] =
+                            grid_sample(src, pt, (size_t)gy * cw + gx);
+                    }
+                }
+            }
         }
     }
 

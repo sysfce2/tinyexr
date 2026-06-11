@@ -2775,6 +2775,57 @@ static void spectral_tests(void) {
         free(samples);
         free(blob);
     }
+
+    /* Subsampled spectral channel: make the 550nm plane 2x2-subsampled, save,
+     * reload, and confirm it point-expands to full resolution. */
+    {
+        const int W = 4, H = 4, NWL = 4;
+        float wls[4] = {480.0f, 550.0f, 620.0f, 700.0f};
+        float *samples = (float *)malloc((size_t)NWL * W * H * sizeof(float));
+        exr_image img;
+        void *blob = NULL;
+        size_t blob_size = 0;
+        exr_spectral_image spec;
+        float grid[4]; /* 2x2 subsampled plane for the 550nm channel */
+        int x, y, ok = 1;
+        size_t i;
+
+        for (i = 0; i < (size_t)NWL * W * H; ++i) samples[i] = (float)i;
+        memset(&img, 0, sizeof(img));
+        if (EXR_OK(exr_spectral_setup_emissive(NULL, W, H, NWL, wls, samples,
+                                               "W.m^-2.sr^-1", &img))) {
+            /* channel 1 == 550nm: replace its full plane with a 2x2 grid. */
+            grid[0] = 10.0f; grid[1] = 20.0f; grid[2] = 30.0f; grid[3] = 40.0f;
+            free(img.parts[0].images[1]);
+            img.parts[0].images[1] = malloc(sizeof(grid));
+            memcpy(img.parts[0].images[1], grid, sizeof(grid));
+            img.parts[0].header.channels[1].x_sampling = 2;
+            img.parts[0].header.channels[1].y_sampling = 2;
+
+            CHECK(EXR_OK(exr_save_to_memory(&blob, &blob_size, NULL, &img,
+                                            EXR_COMPRESSION_ZIP)),
+                  "subsampled spectral save");
+            exr_image_free(&img);
+
+            memset(&spec, 0, sizeof(spec));
+            CHECK(EXR_OK(exr_spectral_load_from_memory(blob, blob_size, NULL,
+                                                       &spec)),
+                  "subsampled spectral load (no longer rejected)");
+            for (y = 0; y < H; ++y)
+                for (x = 0; x < W; ++x) {
+                    float got = exr_spectral_sample(&spec, 0, 1, x, y);
+                    float want = grid[(y / 2) * 2 + (x / 2)];
+                    if (got < want - 0.01f || got > want + 0.01f) ok = 0;
+                }
+            CHECK(ok, "subsampled 550nm plane point-expanded to full res");
+            exr_spectral_image_free(&spec);
+            free(blob);
+        } else {
+            CHECK(0, "subsampled spectral setup");
+            exr_image_free(&img);
+        }
+        free(samples);
+    }
 }
 
 /* ============================================================================
