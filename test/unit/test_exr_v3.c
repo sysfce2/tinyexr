@@ -1811,6 +1811,32 @@ static void stream_deep_check(const char *path, exr_compression comp,
                 ok = 0;
         }
     }
+#if defined(EXR_USE_THREADS)
+    /* Re-decode the (1-line-per-block) deep image with 4 workers: the parallel
+     * pass-2 scatter must reproduce the single-threaded decode bit-for-bit. */
+    if (ok) {
+        exr_image b4;
+        memset(&b4, 0, sizeof(b4));
+        exr_set_num_threads(4);
+        if (!EXR_OK(exr_load_from_file(tmp, NULL, &b4))) ok = 0;
+        else {
+            ok = b4.parts[0].deep_total_samples ==
+                     back.parts[0].deep_total_samples &&
+                 memcmp(b4.parts[0].deep_sample_counts,
+                        back.parts[0].deep_sample_counts,
+                        npix * sizeof(int32_t)) == 0;
+            for (c = 0; ok && c < h->num_channels; ++c) {
+                size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+                if (memcmp(b4.parts[0].deep_images[c],
+                           back.parts[0].deep_images[c],
+                           (size_t)back.parts[0].deep_total_samples * ps) != 0)
+                    ok = 0;
+            }
+        }
+        exr_set_num_threads(1);
+        exr_image_free(&b4);
+    }
+#endif
     CHECK(ok, name);
     if (ok) printf("  ok: stream deep %s\n", name);
     exr_image_free(&src);
@@ -3308,9 +3334,41 @@ int main(void) {
         exr_image di;
         memset(&di, 0, sizeof(di));
         if (EXR_OK(exr_load_from_file("data/deep_tiled_sample.exr", NULL, &di))) {
-            CHECK(di.num_parts == 1 && di.parts[0].is_deep &&
-                  di.parts[0].deep_total_samples > 0,
-                  "deep-tiled sample loads (data/deep_tiled_sample.exr)");
+            int ok = di.num_parts == 1 && di.parts[0].is_deep &&
+                     di.parts[0].deep_total_samples > 0;
+            CHECK(ok, "deep-tiled sample loads (data/deep_tiled_sample.exr)");
+#if defined(EXR_USE_THREADS)
+            /* Re-decode the deep tiles with 4 workers: the parallel per-tile
+             * scatter must match the single-threaded decode bit-for-bit. */
+            if (ok) {
+                exr_image d4;
+                int c;
+                size_t npix = (size_t)di.parts[0].width * di.parts[0].height;
+                memset(&d4, 0, sizeof(d4));
+                exr_set_num_threads(4);
+                if (!EXR_OK(exr_load_from_file("data/deep_tiled_sample.exr",
+                                               NULL, &d4)))
+                    ok = 0;
+                else {
+                    ok = d4.parts[0].deep_total_samples ==
+                             di.parts[0].deep_total_samples &&
+                         memcmp(d4.parts[0].deep_sample_counts,
+                                di.parts[0].deep_sample_counts,
+                                npix * sizeof(int32_t)) == 0;
+                    for (c = 0; ok && c < di.parts[0].header.num_channels; ++c) {
+                        size_t ps = (di.parts[0].header.channels[c].pixel_type ==
+                                     EXR_PIXEL_HALF) ? 2 : 4;
+                        if (memcmp(d4.parts[0].deep_images[c],
+                                   di.parts[0].deep_images[c],
+                                   (size_t)di.parts[0].deep_total_samples * ps) != 0)
+                            ok = 0;
+                    }
+                }
+                exr_set_num_threads(1);
+                exr_image_free(&d4);
+                CHECK(ok, "deep-tiled decode parity (1 vs 4 threads)");
+            }
+#endif
             exr_image_free(&di);
         } else {
             CHECK(0, "deep-tiled sample loads (data/deep_tiled_sample.exr)");
