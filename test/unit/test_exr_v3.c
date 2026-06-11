@@ -3370,6 +3370,10 @@ int main(void) {
     deep_tiled_oob_rejects();
     stream_deep_check("data/deepscanline.exr", EXR_COMPRESSION_ZIPS,
                       "deep scanline ZIPS");
+#ifndef EXR_NO_ZSTD
+    stream_deep_check("data/deepscanline.exr", EXR_COMPRESSION_ZSTD,
+                      "deep scanline ZSTD");
+#endif
 #if defined(EXR_USE_THREADS)
     deep_encode_thread_check("data/deepscanline.exr");
 #endif

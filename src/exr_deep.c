@@ -32,8 +32,16 @@ static exr_result deep_decompress(const exr_allocator *a, exr_compression comp,
     case EXR_COMPRESSION_ZIP:
     case EXR_COMPRESSION_ZIPS:
         return exr_zip_decompress(a, src, src_size, dst, unpacked);
+    case EXR_COMPRESSION_ZSTD:
+#ifdef EXR_NO_ZSTD
+        return EXR_ERROR_UNSUPPORTED;
+#else
+        return exr_zstd_decompress(a, src, src_size, dst, unpacked);
+#endif
     default:
-        return EXR_ERROR_UNSUPPORTED; /* deep PIZ/etc. not supported */
+        /* PIZ/PXR24/B44/B44A/DWA are not permitted for deep data by the EXR
+         * spec (lossy / fixed-layout codecs); reject them. */
+        return EXR_ERROR_UNSUPPORTED;
     }
 }
 
@@ -396,6 +404,12 @@ static exr_result deep_compress(const exr_allocator *a, exr_compression comp,
     case EXR_COMPRESSION_ZIP:
     case EXR_COMPRESSION_ZIPS:
         return exr_zip_compress(a, src, n, out, out_size);
+    case EXR_COMPRESSION_ZSTD:
+#ifdef EXR_NO_ZSTD
+        return EXR_ERROR_UNSUPPORTED;
+#else
+        return exr_zstd_compress(a, src, n, out, out_size);
+#endif
     default:
         return EXR_ERROR_UNSUPPORTED;
     }
