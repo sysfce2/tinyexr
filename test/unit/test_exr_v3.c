@@ -2659,6 +2659,48 @@ static void thread_tests(const char *path) {
     exr_set_num_threads(1);
     exr_image_free(&src);
 }
+
+/* Deep encode: the parallel per-block compress must be byte-deterministic, so a
+ * 1-thread and a 4-thread save produce identical bytes, for both the scanline
+ * (emit_deep_scanlines) and tiled (emit_deep_tile_level) writers. */
+static void deep_encode_thread_check(const char *path) {
+    exr_image src;
+    void *a1 = NULL, *a4 = NULL;
+    size_t n1 = 0, n4 = 0;
+    int pass = 1;
+    memset(&src, 0, sizeof(src));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src)) || !src.parts[0].is_deep) {
+        printf("  skip: %s (deep encode threads)\n", path);
+        exr_image_free(&src);
+        return;
+    }
+    exr_set_num_threads(1);
+    (void)exr_save_to_memory(&a1, &n1, NULL, &src, EXR_COMPRESSION_ZIPS);
+    exr_set_num_threads(4);
+    (void)exr_save_to_memory(&a4, &n4, NULL, &src, EXR_COMPRESSION_ZIPS);
+    pass = a1 && a4 && n1 == n4 && n1 > 0 && memcmp(a1, a4, n1) == 0;
+    CHECK(pass, "deep scanline encode deterministic (1 vs 4 threads)");
+    free(a1); free(a4); a1 = a4 = NULL; n1 = n4 = 0;
+
+    /* deep tiled (one level, 32x32 tiles) */
+    src.parts[0].header.tiled = 1;
+    src.parts[0].header.part_type = EXR_PART_DEEP_TILED;
+    src.parts[0].header.tile_x_size = 32;
+    src.parts[0].header.tile_y_size = 32;
+    src.parts[0].header.level_mode = EXR_TILE_ONE_LEVEL;
+    src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    exr_set_num_threads(1);
+    (void)exr_save_to_memory(&a1, &n1, NULL, &src, EXR_COMPRESSION_ZIPS);
+    exr_set_num_threads(4);
+    (void)exr_save_to_memory(&a4, &n4, NULL, &src, EXR_COMPRESSION_ZIPS);
+    pass = a1 && a4 && n1 == n4 && n1 > 0 && memcmp(a1, a4, n1) == 0;
+    CHECK(pass, "deep tiled encode deterministic (1 vs 4 threads)");
+    if (pass)
+        printf("  ok: deep encode 1-vs-4 deterministic (scanline + tiled)\n");
+    free(a1); free(a4);
+    exr_set_num_threads(1);
+    exr_image_free(&src);
+}
 #endif /* EXR_USE_THREADS */
 
 /* Spectral: channel-name helpers, emissive cube round-trip, custom-attribute
@@ -3328,6 +3370,9 @@ int main(void) {
     deep_tiled_oob_rejects();
     stream_deep_check("data/deepscanline.exr", EXR_COMPRESSION_ZIPS,
                       "deep scanline ZIPS");
+#if defined(EXR_USE_THREADS)
+    deep_encode_thread_check("data/deepscanline.exr");
+#endif
     /* Regression: an OpenEXR-authored deep-tiled file (per-row cumulative
      * offset tables) decodes via the high-level loader. */
     {

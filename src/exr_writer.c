@@ -305,7 +305,52 @@ static void gather_level_tile(const exr_header *h, const int *order,
     }
 }
 
-/* Emit every tile of one deep level (lx,ly) to the output buffer. */
+/* One compressed deep block (offset table + sample data) plus its result, so a
+ * worker can produce it while the driver writes earlier blocks in order. */
+typedef struct {
+    uint8_t *poff, *psamp;
+    size_t poff_sz, psamp_sz;
+    uint64_t usamp;
+    exr_result rc;
+} deep_block_out;
+
+static void deep_blocks_free(const exr_allocator *a, deep_block_out *o,
+                             uint32_t n) {
+    uint32_t i;
+    for (i = 0; i < n; ++i) { exr_free(a, o[i].poff); exr_free(a, o[i].psamp); }
+    exr_free(a, o);
+}
+
+/* Parallel tile encode for one deep level. */
+typedef struct {
+    const exr_allocator *a;
+    exr_compression comp;
+    const exr_part *lvl;
+    const uint64_t *lpfx;
+    int tx, ty, nxt;
+    deep_block_out *out;
+} deep_tile_enc_ctx;
+
+static void deep_tile_enc_one(deep_tile_enc_ctx *c, uint32_t idx) {
+    int txi = (int)(idx % (uint32_t)c->nxt), tyi = (int)(idx / (uint32_t)c->nxt);
+    int x0 = txi * c->tx, y0 = tyi * c->ty;
+    int tw = (c->tx < c->lvl->width - x0) ? c->tx : (c->lvl->width - x0);
+    int th = (c->ty < c->lvl->height - y0) ? c->ty : (c->lvl->height - y0);
+    deep_block_out *o = &c->out[idx];
+    uint64_t uoff = 0;
+    o->rc = exr_deep_encode_tile(c->a, c->comp, c->lvl, c->lpfx, x0, y0, tw, th,
+                                 &o->poff, &o->poff_sz, &uoff, &o->psamp,
+                                 &o->psamp_sz, &o->usamp);
+}
+
+static void deep_tile_enc_job(void *vc, int job) {
+    deep_tile_enc_ctx *c = (deep_tile_enc_ctx *)vc;
+    deep_tile_enc_one(c, (uint32_t)job + 1u); /* tile 0 done serially first */
+}
+
+/* Emit every tile of one deep level (lx,ly) to the output buffer. Tiles are
+ * compressed in parallel into a scratch array, then written in row-major order
+ * (the stream layout is byte-deterministic). */
 static exr_result emit_deep_tile_level(obuf *b, const exr_allocator *a,
                                        exr_compression comp, const exr_part *lvl,
                                        const uint64_t *lpfx, int p, int multipart,
@@ -313,36 +358,101 @@ static exr_result emit_deep_tile_level(obuf *b, const exr_allocator *a,
                                        uint32_t *ci) {
     int tx = (int)lvl->header.tile_x_size, ty = (int)lvl->header.tile_y_size;
     int nxt = (lvl->width + tx - 1) / tx, nyt = (lvl->height + ty - 1) / ty;
-    int txi, tyi;
+    uint32_t ntiles = (uint32_t)nxt * (uint32_t)nyt, idx;
+    deep_block_out *out;
+    deep_tile_enc_ctx ec;
     exr_result rc = EXR_SUCCESS;
-    for (tyi = 0; tyi < nyt && EXR_OK(rc); ++tyi) {
-        for (txi = 0; txi < nxt; ++txi) {
-            int x0 = txi * tx, y0 = tyi * ty;
-            int tw = (tx < lvl->width - x0) ? tx : (lvl->width - x0);
-            int th = (ty < lvl->height - y0) ? ty : (lvl->height - y0);
-            uint8_t *poff = NULL, *psamp = NULL;
-            size_t poff_sz = 0, psamp_sz = 0;
-            uint64_t uoff = 0, usamp = 0;
-            rc = exr_deep_encode_tile(a, comp, lvl, lpfx, x0, y0, tw, th, &poff,
-                                      &poff_sz, &uoff, &psamp, &psamp_sz, &usamp);
-            if (!EXR_OK(rc)) break;
-            offtab[(*ci)++] = (uint64_t)b->len;
-            if (multipart) ob_i32(b, p);
-            ob_i32(b, txi);
-            ob_i32(b, tyi);
-            ob_i32(b, lx);
-            ob_i32(b, ly);
-            ob_u64(b, (uint64_t)poff_sz);
-            ob_u64(b, (uint64_t)psamp_sz);
-            ob_u64(b, usamp);
-            ob_bytes(b, poff, poff_sz);
-            ob_bytes(b, psamp, psamp_sz);
-            exr_free(a, poff);
-            exr_free(a, psamp);
-            (void)uoff;
-            if (b->err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
-        }
+    if (ntiles == 0) return EXR_SUCCESS;
+    out = (deep_block_out *)exr_calloc(a, ntiles, sizeof(*out));
+    if (!out) return EXR_ERROR_OUT_OF_MEMORY;
+    ec.a = a; ec.comp = comp; ec.lvl = lvl; ec.lpfx = lpfx;
+    ec.tx = tx; ec.ty = ty; ec.nxt = nxt; ec.out = out;
+    exr_simd_init();
+    deep_tile_enc_one(&ec, 0); /* warm codec lazy init */
+    if (EXR_OK(out[0].rc) && ntiles > 1)
+        exr_parallel_for(exr_get_num_threads(), (int)(ntiles - 1u),
+                         deep_tile_enc_job, &ec);
+    for (idx = 0; idx < ntiles; ++idx) {
+        deep_block_out *o = &out[idx];
+        int txi = (int)(idx % (uint32_t)nxt), tyi = (int)(idx / (uint32_t)nxt);
+        if (!EXR_OK(o->rc)) { rc = o->rc; break; }
+        offtab[(*ci)++] = (uint64_t)b->len;
+        if (multipart) ob_i32(b, p);
+        ob_i32(b, txi);
+        ob_i32(b, tyi);
+        ob_i32(b, lx);
+        ob_i32(b, ly);
+        ob_u64(b, (uint64_t)o->poff_sz);
+        ob_u64(b, (uint64_t)o->psamp_sz);
+        ob_u64(b, o->usamp);
+        ob_bytes(b, o->poff, o->poff_sz);
+        ob_bytes(b, o->psamp, o->psamp_sz);
+        if (b->err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
     }
+    deep_blocks_free(a, out, ntiles);
+    return rc;
+}
+
+/* Parallel scanline-block encode for a deep part. */
+typedef struct {
+    const exr_allocator *a;
+    exr_compression comp;
+    const exr_part *pt;
+    const uint64_t *prefix;
+    int ymin, ymax, lpb;
+    deep_block_out *out;
+} deep_sl_enc_ctx;
+
+static void deep_sl_enc_one(deep_sl_enc_ctx *c, uint32_t ci) {
+    int y0 = c->ymin + (int)ci * c->lpb;
+    int nlines = (y0 + c->lpb - 1 > c->ymax) ? (c->ymax - y0 + 1) : c->lpb;
+    deep_block_out *o = &c->out[ci];
+    uint64_t uoff = 0;
+    o->rc = exr_deep_encode_block(c->a, c->comp, c->pt, c->prefix, y0, nlines,
+                                  &o->poff, &o->poff_sz, &uoff, &o->psamp,
+                                  &o->psamp_sz, &o->usamp);
+}
+
+static void deep_sl_enc_job(void *vc, int job) {
+    deep_sl_enc_ctx *c = (deep_sl_enc_ctx *)vc;
+    deep_sl_enc_one(c, (uint32_t)job + 1u); /* block 0 done serially first */
+}
+
+/* Compress every deep scanline block in parallel, then append them in order. */
+static exr_result emit_deep_scanlines(obuf *b, const exr_allocator *a,
+                                      exr_compression comp, const exr_part *pt,
+                                      const uint64_t *prefix, int ymin, int ymax,
+                                      int lpb, uint32_t nchunks, uint64_t *offtab,
+                                      int p, int multipart) {
+    deep_block_out *out;
+    deep_sl_enc_ctx ec;
+    uint32_t ci;
+    exr_result rc = EXR_SUCCESS;
+    if (nchunks == 0) return EXR_SUCCESS;
+    out = (deep_block_out *)exr_calloc(a, nchunks, sizeof(*out));
+    if (!out) return EXR_ERROR_OUT_OF_MEMORY;
+    ec.a = a; ec.comp = comp; ec.pt = pt; ec.prefix = prefix;
+    ec.ymin = ymin; ec.ymax = ymax; ec.lpb = lpb; ec.out = out;
+    exr_simd_init();
+    deep_sl_enc_one(&ec, 0); /* warm codec lazy init */
+    if (EXR_OK(out[0].rc) && nchunks > 1)
+        exr_parallel_for(exr_get_num_threads(), (int)(nchunks - 1u),
+                         deep_sl_enc_job, &ec);
+    for (ci = 0; ci < nchunks; ++ci) {
+        deep_block_out *o = &out[ci];
+        int y0 = ymin + (int)ci * lpb;
+        if (!EXR_OK(o->rc)) { rc = o->rc; break; }
+        offtab[ci] = (uint64_t)b->len;
+        if (multipart) ob_i32(b, p);
+        ob_i32(b, y0);
+        ob_u64(b, (uint64_t)o->poff_sz);
+        ob_u64(b, (uint64_t)o->psamp_sz);
+        ob_u64(b, o->usamp);
+        ob_bytes(b, o->poff, o->poff_sz);
+        ob_bytes(b, o->psamp, o->psamp_sz);
+        if (b->err) { rc = EXR_ERROR_OUT_OF_MEMORY; break; }
+    }
+    deep_blocks_free(a, out, nchunks);
     return rc;
 }
 
@@ -715,7 +825,6 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
             uint64_t *prefix = NULL;
             size_t npix = (size_t)pt->width * pt->height, i;
             uint64_t acc = 0;
-            uint32_t ci;
             prefix = (uint64_t *)exr_malloc(a, (npix ? npix : 1) * sizeof(uint64_t));
             if (!prefix) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
             for (i = 0; i < npix; ++i) {
@@ -795,30 +904,11 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
                 if (!EXR_OK(rc)) goto done;
                 continue;
             }
-            for (ci = 0; ci < chunk_counts[p]; ++ci) {
-                int y0 = ymin + (int)ci * lpb;
-                int nlines = (y0 + lpb - 1 > ymax) ? (ymax - y0 + 1) : lpb;
-                uint8_t *poff = NULL, *psamp = NULL;
-                size_t poff_sz = 0, psamp_sz = 0;
-                uint64_t uoff = 0, usamp = 0;
-                rc = exr_deep_encode_block(a, comp, pt, prefix, y0, nlines, &poff,
-                                           &poff_sz, &uoff, &psamp, &psamp_sz,
-                                           &usamp);
-                if (!EXR_OK(rc)) { exr_free(a, prefix); goto done; }
-                offset_tables[p][ci] = (uint64_t)b.len;
-                if (multipart) ob_i32(&b, p);
-                ob_i32(&b, y0);
-                ob_u64(&b, (uint64_t)poff_sz);
-                ob_u64(&b, (uint64_t)psamp_sz);
-                ob_u64(&b, usamp);
-                ob_bytes(&b, poff, poff_sz);
-                ob_bytes(&b, psamp, psamp_sz);
-                exr_free(a, poff);
-                exr_free(a, psamp);
-                (void)uoff;
-                if (b.err) { exr_free(a, prefix); rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
-            }
+            rc = emit_deep_scanlines(&b, a, comp, pt, prefix, ymin, ymax, lpb,
+                                     chunk_counts[p], offset_tables[p], p,
+                                     multipart);
             exr_free(a, prefix);
+            if (!EXR_OK(rc)) goto done;
         } else if (h->tiled && h->level_mode == EXR_TILE_MIPMAP_LEVELS) {
             int tx = (int)h->tile_x_size, ty = (int)h->tile_y_size;
             int L, txi, tyi;
