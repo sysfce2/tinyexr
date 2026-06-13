@@ -245,6 +245,9 @@ const toc_node *toc_cfg_cs_transform(const toc_node *cs, int want_to_ref,
                                      int *out_invert);
 /* Find a ViewTransform node by name. */
 const toc_node *toc_cfg_find_view_transform(const toc_config *cfg, const char *name);
+/* The default view transform (config `default_view_transform`, else the first),
+ * used to bridge scene<->display references in colorspace conversions. */
+const toc_node *toc_cfg_default_view_transform(const toc_config *cfg);
 /* Find a Look node by name (from the `looks` top-level seq). */
 const toc_node *toc_cfg_find_look(const toc_config *cfg, const char *name);
 /* Parse a comma-separated `looks` list from a view node. Returns count written

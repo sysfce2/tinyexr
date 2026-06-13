@@ -208,6 +208,23 @@ const toc_node *toc_cfg_find_view_transform(const toc_config *cfg,
     return find_in_seq(vt_seq(cfg), name);
 }
 
+/* The view transform OCIO uses to bridge the scene and display references in a
+ * plain colorspace<->colorspace conversion: the `default_view_transform` by name,
+ * else the first view transform. NULL if there are none. */
+const toc_node *toc_cfg_default_view_transform(const toc_config *cfg) {
+    const toc_node *vts, *name;
+    if (!cfg) return NULL;
+    name = toc_node_map_get(cfg->root, "default_view_transform");
+    if (name) {
+        const char *s = toc_node_scalar(name);
+        const toc_node *vt = s ? toc_cfg_find_view_transform(cfg, s) : NULL;
+        if (vt) return vt;
+    }
+    vts = vt_seq(cfg);
+    return (vts && vts->kind == TOC_NODE_SEQ && vts->n_items) ? vts->items[0]
+                                                              : NULL;
+}
+
 /* ---- look lookup --------------------------------------------------------- */
 const toc_node *toc_cfg_find_look(const toc_config *cfg, const char *name) {
     return find_in_seq(cs_seq(cfg, "looks"), name);

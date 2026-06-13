@@ -721,12 +721,25 @@ toc_result toc_processor_from_colorspaces(const toc_config *cfg, const char *src
         *out = list; /* data colorspace -> identity passthrough */
         return TOC_SUCCESS;
     }
-    if (cs_ref_domain(cfg, src) != cs_ref_domain(cfg, dst)) {
-        /* scene<->display crossing needs a view transform we can't synthesize */
-        toc_op_list_free(list);
-        return TOC_ERROR_UNSUPPORTED;
+    rc = emit_to_ref(cfg, list, src, 0); /* src -> its own (scene or display) ref */
+    if (TOC_OK(rc) && cs_ref_domain(cfg, src) != cs_ref_domain(cfg, dst)) {
+        /* Bridge scene<->display via the config's default view transform, the way
+         * OCIO's getProcessor connects the two reference spaces. */
+        const toc_node *vt = toc_cfg_default_view_transform(cfg);
+        const toc_node *tf = NULL;
+        int vt_inv = (cs_ref_domain(cfg, src) == 1); /* display src -> invert VT */
+        if (vt) {
+            tf = toc_node_map_get(vt, "from_scene_reference");
+            if (!tf) tf = toc_node_map_get(vt, "from_reference");
+            if (!tf) {
+                tf = toc_node_map_get(vt, "to_scene_reference");
+                if (!tf) tf = toc_node_map_get(vt, "to_reference");
+                vt_inv = !vt_inv;
+            }
+        }
+        if (!tf) rc = TOC_ERROR_UNSUPPORTED;
+        else rc = walk(cfg, list, tf, vt_inv);
     }
-    rc = emit_to_ref(cfg, list, src, 0);
     if (TOC_OK(rc)) rc = emit_from_ref(cfg, list, dst, 0);
     if (!TOC_OK(rc)) {
         toc_op_list_free(list);
