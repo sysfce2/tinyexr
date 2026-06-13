@@ -500,6 +500,16 @@ static int push_aces_output(toc_op_list *list, const char *style, int invert,
          225.0f, ACES2_P3D65, "Linear-P3-D65", 0.48f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-300nit-P3-D65_2.0",
          625.0f, ACES2_P3D65, "Linear-P3-D65", 0.48f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-P3-D65_2.0",
+         2000.0f, ACES2_P3D65, "Linear-P3-D65", 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-P3-D65_2.0",
+         4000.0f, ACES2_P3D65, "Linear-P3-D65", 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-REC2020_2.0",
+         500.0f, ACES2_REC2020, "Linear-Rec2020", 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-REC2020_2.0",
+         2000.0f, ACES2_REC2020, "Linear-Rec2020", 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-REC2020_2.0",
+         4000.0f, ACES2_REC2020, "Linear-Rec2020", 1.0f},
     };
     size_t i;
     for (i = 0; i < sizeof(V) / sizeof(V[0]); ++i) {
