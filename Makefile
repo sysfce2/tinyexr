@@ -341,6 +341,29 @@ tocio-test: | build
 	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -ldl -o build/toc_test
 	ASAN_OPTIONS=detect_leaks=0 ./build/toc_test
 
+# Validate tocio against the REAL AcademySoftwareFoundation ACES OCIO configs:
+# parse each config, build every transform, and compare results to golden values
+# captured from PyOpenColorIO (the C++ reference engine). The configs live under
+# sandbox/tocio/ref (fetch them first); the golden TSV is committed.
+#   make tocio-fetch-ref    # download configs + reference repos into ref/
+#   make tocio-gen-golden   # regenerate the golden TSV (needs PyOpenColorIO)
+TOC_REFDIR    = sandbox/tocio/ref/configs
+TOC_GOLDEN    = sandbox/tocio/tests/golden/aces_golden.tsv
+.PHONY: tocio-validate tocio-fetch-ref tocio-gen-golden
+tocio-validate: | build
+	@if [ ! -d "$(TOC_REFDIR)" ]; then \
+	  echo "ref configs missing - run 'make tocio-fetch-ref' first"; exit 2; fi
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O1 -g $(SAN) \
+	  sandbox/tocio/tests/toc_validate.c $(TOC_SRC) -lm -ldl -o build/toc_validate
+	ASAN_OPTIONS=detect_leaks=0 ./build/toc_validate $(TOC_GOLDEN) $(TOC_REFDIR)
+
+tocio-fetch-ref:
+	bash sandbox/tocio/scripts/fetch_ocio_ref.sh
+
+tocio-gen-golden:
+	@sp=$$(echo sandbox/tocio/ref/.pyoracle/lib/python*/site-packages); \
+	  PYTHONPATH="$$sp" python3 sandbox/tocio/scripts/gen_golden.py
+
 # Interpreter throughput benchmark (scalar vs SIMD per op). -O2, no sanitizers.
 .PHONY: tocio-bench
 tocio-bench: | build

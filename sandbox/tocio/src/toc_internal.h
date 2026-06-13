@@ -234,6 +234,9 @@ const char *toc_cfg_resolve_role(const toc_config *cfg, const char *name);
 /* Find a colorspace (or display_colorspace) node by name/alias. */
 const toc_node *toc_cfg_find_colorspace(const toc_config *cfg, const char *name);
 int toc_cfg_is_data(const toc_node *cs);
+/* 1 if `name` is defined in the `display_colorspaces` section (display-referred),
+ * 0 otherwise (scene-referred / not found). Role names are resolved. */
+int toc_cfg_cs_in_display_section(const toc_config *cfg, const char *name);
 /* Pick the transform for converting to/from the reference. `want_to_ref`
  * selects to_reference (1) vs from_reference (0). *out_invert is set when the
  * chosen node must be applied inverted (only the opposite direction existed).

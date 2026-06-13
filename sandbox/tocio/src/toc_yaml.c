@@ -105,7 +105,10 @@ static void flow_skip_ws(const char **p, const char *end) {
 
 static toc_node *parse_flow(yparser *y, const char **pp, const char *end);
 
-/* read a flow scalar token until a delimiter (, } ] :) honoring quotes */
+/* read a flow scalar token until a delimiter (, } ]) or a key-separator ':'
+ * honoring quotes. A ':' only separates when followed by whitespace, a flow
+ * delimiter, or end-of-input; otherwise it is part of a plain scalar (e.g. the
+ * namespaced alias "ocio:lin_ciexyzd65_display"). Mirrors find_colon's rule. */
 static const char *flow_scalar_end(const char *p, const char *end) {
     if (p < end && (*p == '"' || *p == '\'')) {
         char q = *p++;
@@ -116,7 +119,15 @@ static const char *flow_scalar_end(const char *p, const char *end) {
         if (p < end) ++p; /* closing quote */
         return p;
     }
-    while (p < end && *p != ',' && *p != '}' && *p != ']' && *p != ':') ++p;
+    while (p < end && *p != ',' && *p != '}' && *p != ']') {
+        if (*p == ':') {
+            const char *n = p + 1;
+            if (n >= end || *n == ' ' || *n == '\t' || *n == ',' ||
+                *n == '}' || *n == ']')
+                break; /* key/value separator */
+        }
+        ++p;
+    }
     return p;
 }
 
@@ -144,6 +155,7 @@ static toc_node *parse_flow(yparser *y, const char **pp, const char *end) {
             if (p < end && *p == ',') { ++p; continue; }
             if (p < end && *p == '}') { ++p; break; }
             if (p >= end) break;
+            break; /* unexpected char: stop rather than spin (no forward progress) */
         }
         *pp = p;
         return m;
@@ -161,6 +173,7 @@ static toc_node *parse_flow(yparser *y, const char **pp, const char *end) {
             if (p < end && *p == ',') { ++p; continue; }
             if (p < end && *p == ']') { ++p; break; }
             if (p >= end) break;
+            break; /* unexpected char: stop rather than spin (no forward progress) */
         }
         *pp = p;
         return s;
