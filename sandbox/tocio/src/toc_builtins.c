@@ -463,12 +463,50 @@ static int push_display_xform(toc_op_list *list, const char *style,
 }
 
 /* ---- ACES 2.0 output transform expansion -------------------------------- */
-static const float ACES2_REC709[8]  = {0.640f, 0.330f, 0.300f, 0.600f,
-                                       0.150f, 0.060f, 0.3127f, 0.3290f};
-static const float ACES2_P3D65[8]   = {0.680f, 0.320f, 0.265f, 0.690f,
-                                       0.150f, 0.060f, 0.3127f, 0.3290f};
-static const float ACES2_REC2020[8] = {0.708f, 0.292f, 0.170f, 0.797f,
-                                       0.131f, 0.046f, 0.3127f, 0.3290f};
+/* {rx,ry, gx,gy, bx,by, wx,wy}. The D60 variants share the D65 versions'
+ * primaries but adopt the ACES D60 white (0.32168, 0.33767) for "simulating D60
+ * white" output transforms. CIE-XYZ illuminant E (identity primaries, white E)
+ * is an encoding target for the DCDM/XYZ-E outputs. */
+static const float ACES2_REC709[8]      = {0.640f, 0.330f, 0.300f, 0.600f,
+                                           0.150f, 0.060f, 0.3127f, 0.3290f};
+static const float ACES2_P3D65[8]       = {0.680f, 0.320f, 0.265f, 0.690f,
+                                           0.150f, 0.060f, 0.3127f, 0.3290f};
+static const float ACES2_REC2020[8]     = {0.708f, 0.292f, 0.170f, 0.797f,
+                                           0.131f, 0.046f, 0.3127f, 0.3290f};
+static const float ACES2_REC709_D60[8]  = {0.640f, 0.330f, 0.300f, 0.600f,
+                                           0.150f, 0.060f, 0.32168f, 0.33767f};
+static const float ACES2_P3_D60[8]      = {0.680f, 0.320f, 0.265f, 0.690f,
+                                           0.150f, 0.060f, 0.32168f, 0.33767f};
+static const float ACES2_REC2020_D60[8] = {0.708f, 0.292f, 0.170f, 0.797f,
+                                           0.131f, 0.046f, 0.32168f, 0.33767f};
+static const float ACES2_XYZ_E[8]       = {1.0f, 0.0f, 0.0f, 1.0f,
+                                           0.0f, 0.0f, 1.0f/3.0f, 1.0f/3.0f};
+
+/* RGB->XYZ matrix (row-major) for primaries `p`, white = the space's own (no
+ * chromatic adaptation) -- i.e. OCIO build_conversion_matrix_to_XYZ_D65 with
+ * ADAPTATION_NONE. Mirrors OCIO's rgb2xyz_from_xy: each column carries the
+ * primary chromaticity (x, y, z=1-x-y) and per-primary gains are solved from
+ * the white point, so it stays well-conditioned even when a primary has y==0
+ * (CIE-XYZ illuminant-E's blue). */
+static int aces2_rgb2xyz(const float p[8], float M[9]) {
+    float C[9], Cinv[9], W[3], g[3];
+    int i, j;
+    for (i = 0; i < 3; ++i) {
+        C[0 + i] = p[i * 2];                          /* x  (column = primary) */
+        C[3 + i] = p[i * 2 + 1];                      /* y */
+        C[6 + i] = 1.0f - p[i * 2] - p[i * 2 + 1];    /* z = 1 - x - y */
+    }
+    if (!mat3_inv(C, Cinv)) return 0;
+    W[0] = p[6] / p[7];
+    W[1] = 1.0f;
+    W[2] = (1.0f - p[6] - p[7]) / p[7];
+    for (i = 0; i < 3; ++i)
+        g[i] = Cinv[i * 3 + 0] * W[0] + Cinv[i * 3 + 1] * W[1] +
+               Cinv[i * 3 + 2] * W[2];
+    for (j = 0; j < 3; ++j)
+        for (i = 0; i < 3; ++i) M[j * 3 + i] = g[i] * C[j * 3 + i];
+    return 1;
+}
 
 static toc_op *push_range_clamp(toc_op_list *list, float lo, float hi) {
     toc_op *op = toc_op_list_push(list, TOC_OP_RANGE);
@@ -497,42 +535,108 @@ static toc_op *push_scale3(toc_op_list *list, float s) {
     return op;
 }
 
+/* "White point simulation" scale for the D60-sim outputs: OCIO scales RGB by
+ * 1/max(channel) of the limiting white (1,1,1) carried through the limiting->
+ * encoding primaries matrix (no adaptation), so the simulated white lands at or
+ * below the encoding peak. Returns 1 on success (or *rc set on OOM). */
+static int push_scale_white(toc_op_list *list, const float lim[8],
+                            const float enc[8], toc_result *rc) {
+    float Mlim[9], Menc[9], Mencinv[9], wxyz[3], wrgb[3];
+    static const float ones[3] = {1.0f, 1.0f, 1.0f};
+    float mx;
+    if (!aces2_rgb2xyz(lim, Mlim) || !aces2_rgb2xyz(enc, Menc) ||
+        !mat3_inv(Menc, Mencinv)) {
+        *rc = TOC_ERROR_UNSUPPORTED;
+        return 0;
+    }
+    mat3_vec(Mlim, ones, wxyz);   /* limiting white in XYZ */
+    mat3_vec(Mencinv, wxyz, wrgb); /* ... expressed in encoding RGB */
+    mx = wrgb[0] > wrgb[1] ? wrgb[0] : wrgb[1];
+    if (wrgb[2] > mx) mx = wrgb[2];
+    if (!push_scale3(list, 1.0f / mx)) { *rc = TOC_ERROR_OUT_OF_MEMORY; return 0; }
+    return 1;
+}
+
 /* Build the OCIO ACES 2.0 output-transform op chain (ACES2065-1 -> CIE-XYZ-D65)
  * for a known builtin variant. Returns 1 if `style` named a supported variant
  * (op chain built, or *rc set on inverse/OOM), 0 if not an ACES-OUTPUT style. */
 static int push_aces_output(toc_op_list *list, const char *style, int invert,
                             toc_result *rc) {
+    /* lim: limiting primaries (drive both the tonescale/gamut fixed function and
+     * the final RGB->XYZ matrix). enc: encoding primaries used by the D60 white-
+     * point simulation scale, or NULL when there is no white-point scale. */
     static const struct {
         const char *name;
         float peak;
         const float *lim;
-        const char *limname;
+        const float *enc;
         float lscale;
     } V[] = {
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709_2.0",
-         100.0f, ACES2_REC709, "Linear-Rec709", 1.0f},
+         100.0f, ACES2_REC709, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-P3-D65_2.0",
-         100.0f, ACES2_P3D65, "Linear-P3-D65", 1.0f},
+         100.0f, ACES2_P3D65, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-P3-D65_2.0",
-         500.0f, ACES2_P3D65, "Linear-P3-D65", 1.0f},
+         500.0f, ACES2_P3D65, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-P3-D65_2.0",
-         1000.0f, ACES2_P3D65, "Linear-P3-D65", 1.0f},
+         1000.0f, ACES2_P3D65, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-REC2020_2.0",
-         1000.0f, ACES2_REC2020, "Linear-Rec2020", 1.0f},
+         1000.0f, ACES2_REC2020, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-108nit-P3-D65_2.0",
-         225.0f, ACES2_P3D65, "Linear-P3-D65", 0.48f},
+         225.0f, ACES2_P3D65, NULL, 0.48f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-300nit-P3-D65_2.0",
-         625.0f, ACES2_P3D65, "Linear-P3-D65", 0.48f},
+         625.0f, ACES2_P3D65, NULL, 0.48f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-P3-D65_2.0",
-         2000.0f, ACES2_P3D65, "Linear-P3-D65", 1.0f},
+         2000.0f, ACES2_P3D65, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-P3-D65_2.0",
-         4000.0f, ACES2_P3D65, "Linear-P3-D65", 1.0f},
+         4000.0f, ACES2_P3D65, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-REC2020_2.0",
-         500.0f, ACES2_REC2020, "Linear-Rec2020", 1.0f},
+         500.0f, ACES2_REC2020, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-REC2020_2.0",
-         2000.0f, ACES2_REC2020, "Linear-Rec2020", 1.0f},
+         2000.0f, ACES2_REC2020, NULL, 1.0f},
         {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-REC2020_2.0",
-         4000.0f, ACES2_REC2020, "Linear-Rec2020", 1.0f},
+         4000.0f, ACES2_REC2020, NULL, 1.0f},
+        /* D60 white-point simulation: limiting primaries adopt the D60 white and
+         * the simulated white is scaled into the encoding gamut (scale_white). */
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709-D60-in-REC709-D65_2.0",
+         100.0f, ACES2_REC709_D60, ACES2_REC709, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709-D60-in-P3-D65_2.0",
+         100.0f, ACES2_REC709_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709-D60-in-REC2020-D65_2.0",
+         100.0f, ACES2_REC709_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-P3-D60-in-P3-D65_2.0",
+         100.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        /* XYZ-E encoding: no white-point scale for the 100 nit SDR variant. */
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-P3-D60-in-XYZ-E_2.0",
+         100.0f, ACES2_P3_D60, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-108nit-P3-D60-in-P3-D65_2.0",
+         225.0f, ACES2_P3_D60, ACES2_P3D65, 0.48f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-300nit-P3-D60-in-XYZ-E_2.0",
+         625.0f, ACES2_P3_D60, ACES2_XYZ_E, 0.48f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-P3-D60-in-P3-D65_2.0",
+         500.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-P3-D60-in-P3-D65_2.0",
+         1000.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-P3-D60-in-P3-D65_2.0",
+         2000.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-P3-D60-in-P3-D65_2.0",
+         4000.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-P3-D60-in-REC2020-D65_2.0",
+         500.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-P3-D60-in-REC2020-D65_2.0",
+         1000.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-P3-D60-in-REC2020-D65_2.0",
+         2000.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-P3-D60-in-REC2020-D65_2.0",
+         4000.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-REC2020-D60-in-REC2020-D65_2.0",
+         500.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-REC2020-D60-in-REC2020-D65_2.0",
+         1000.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-REC2020-D60-in-REC2020-D65_2.0",
+         2000.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-REC2020-D60-in-REC2020-D65_2.0",
+         4000.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
     };
     size_t i;
     for (i = 0; i < sizeof(V) / sizeof(V[0]); ++i) {
@@ -563,11 +667,19 @@ static int push_aces_output(toc_op_list *list, const char *style, int invert,
             *rc = TOC_ERROR_OUT_OF_MEMORY;
             return 1;
         }
+        if (V[i].enc && !push_scale_white(list, V[i].lim, V[i].enc, rc))
+            return 1;
         if (V[i].lscale != 1.0f && !push_scale3(list, V[i].lscale)) {
             *rc = TOC_ERROR_OUT_OF_MEMORY;
             return 1;
         }
-        push_cspace_named(list, V[i].limname, "CIE-XYZ-D65", rc);
+        /* matrixToXYZ = limiting primaries -> CIE-XYZ-D65 with no adaptation
+         * (so a D60-sim's limiting white stays unadapted -- the simulation). */
+        {
+            float M[9];
+            if (!aces2_rgb2xyz(V[i].lim, M) || !push_mat3(list, M))
+                *rc = TOC_ERROR_OUT_OF_MEMORY;
+        }
         return 1;
     }
     return 0;
