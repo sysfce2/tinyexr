@@ -30,6 +30,13 @@ on the deflate family:
 
 ![Encode throughput: tinyexr libdeflate on/off vs OpenEXR](doc/perf-libdeflate-htj2k-encode.png)
 
+On **ARM64 (Apple M1 / NEON)**, single-thread in-tree throughput — same shape:
+TinyEXR leads the cheap codecs (none / rle / b44) and is near parity on HTJ2K:
+
+![Decode throughput, single thread (Apple M1 / NEON)](doc/perf-arm-decode.png)
+
+![Encode throughput, single thread (Apple M1 / NEON)](doc/perf-arm-encode.png)
+
 See [Performance vs OpenEXR](#performance-vs-openexr) below and
 [`doc/performance-vs-openexr.md`](doc/performance-vs-openexr.md) for the full
 codec-by-codec and multi-threaded numbers.

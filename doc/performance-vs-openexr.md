@@ -214,6 +214,13 @@ NLT 8.2×, predictor 1.9×) and the full HTJ2K kernel list are in
 | htj2k256 | 18.3 | 21.6 | 28.5 | 30.3 |
 | htj2k32  | 17.8 | 20.9 | 26.7 | 29.4 |
 
+![Decode throughput, single thread (Apple M1 / NEON)](perf-arm-decode.svg)
+
+![Encode throughput, single thread (Apple M1 / NEON)](perf-arm-encode.svg)
+
+(`none` is off the chart on purpose, as on x64: **decode 2456 vs 859 MP/s**
+(~2.9×), encode 1080 vs 423 (~2.6×) — it would flatten every other bar.)
+
 Same shape as x64: TinyEXR wins the cheap codecs (**none ~2.9×**, **rle ~1.8×**,
 **b44 dec ~1.5×**); OpenEXR leads the DEFLATE family / PIZ via its libdeflate
 inflate and tuned PIZ. With **`LIBDEFLATE=1`** the deflate family comes to
@@ -264,5 +271,6 @@ path); thread the streaming APIs; sweep larger images and channel counts.
 
 *Charts: `doc/perf-decode.svg`, `perf-encode.svg`, `perf-libdeflate-decode.svg`,
 `perf-libdeflate-htj2k-decode.png`, `perf-libdeflate-htj2k-encode.png`,
-`perf-mt-scaling.svg`, `perf-mt-compare.svg`. Harness:
+`perf-mt-scaling.svg`, `perf-mt-compare.svg`; ARM64/NEON:
+`perf-arm-decode.svg`/`.png`, `perf-arm-encode.svg`/`.png`. Harness:
 `benchmark/bench_compare.cpp` (`make bench-compare [THREADS=1] [LIBDEFLATE=1]`).*
