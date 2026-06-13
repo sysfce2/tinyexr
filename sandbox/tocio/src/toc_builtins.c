@@ -497,6 +497,25 @@ static int push_aces_output(toc_op_list *list, const char *style, int invert,
     return 0;
 }
 
+/* ACEScc is a pure affine log2 (no linear toe; the 2^-16 toe only affects
+ * lin < 2^-15, treated as extended-domain). Same slope/offset as ACEScct but
+ * with no linear-segment break, so a plain LOG op suffices and inverts by flag.
+ * log_to_lin=1: ACEScc->linear (decode); 0: linear->ACEScc (encode). */
+static toc_op *push_acescc_log(toc_op_list *list, int log_to_lin) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_LOG);
+    int i;
+    if (!op) return NULL;
+    op->u.log.base = 2.0f;
+    for (i = 0; i < 3; ++i) {
+        op->u.log.log_slope[i] = 1.0f / 17.52f;
+        op->u.log.log_offset[i] = 9.72f / 17.52f;
+        op->u.log.lin_slope[i] = 1.0f;
+        op->u.log.lin_offset[i] = 0.0f;
+    }
+    op->u.log.inverse = log_to_lin ? 1 : 0;
+    return op;
+}
+
 static toc_result reverse_invert(toc_op_list *list, size_t start) {
     size_t i, j;
     for (i = start, j = list->count; i < j; ++i, --j) {
@@ -528,6 +547,37 @@ toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert) 
     } else if (strcmp(style, "ACES2065-1_to_ACEScct") == 0) {
         if (!push_mat3(list, AP0_TO_AP1) || !push_acescct_log(list, 0))
             rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (strcmp(style, "ACEScc_to_ACES2065-1") == 0) {
+        /* Clamp the ACEScc input to its minimum ACEScc(0)=(log2(2^-16)+9.72)/
+         * 17.52. Forward this is a no-op for valid codes; when this builtin is
+         * inverted (lin->ACEScc, the config's ACEScg->ACEScc path) the clamp
+         * reverses to floor the encode output, matching OCIO for black/negatives.
+         * Exact for lin >= 2^-15; only the tiny toe (lin < 2^-15) differs. */
+        if (!push_range_clamp(list, (-16.0f + 9.72f) / 17.52f, 1e30f) ||
+            !push_acescc_log(list, 1) || !push_mat3(list, AP1_TO_AP0))
+            rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (strcmp(style, "ACES2065-1_to_ACEScc") == 0) {
+        if (!push_mat3(list, AP0_TO_AP1) || !push_acescc_log(list, 0) ||
+            !push_range_clamp(list, (-16.0f + 9.72f) / 17.52f, 1e30f))
+            rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (strcmp(style, "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD") == 0) {
+        /* AP0 (D60) -> CIE-XYZ with Bradford adaptation to D65. */
+        push_cspace_named(list, "Linear-AP0", "CIE-XYZ-D65", &rc);
+    } else if (strcmp(style, "ACES-LMT - ACES 1.3 Reference Gamut Compression") == 0) {
+        /* AP0->AP1, ACES 1.3 gamut compress, AP1->AP0. */
+        toc_op *ff;
+        if (!push_mat3(list, AP0_TO_AP1)) { rc = TOC_ERROR_OUT_OF_MEMORY; }
+        else if (!(ff = toc_op_list_push(list, TOC_OP_FIXEDFUNC))) {
+            rc = TOC_ERROR_OUT_OF_MEMORY;
+        } else {
+            static const float p[7] = {1.147f, 1.264f, 1.312f,
+                                       0.815f, 0.803f, 0.880f, 1.2f};
+            int k;
+            ff->u.fixedfunc.style = TOC_FF_ACES_GAMUTCOMP13;
+            for (k = 0; k < 7; ++k) ff->u.fixedfunc.params[k] = p[k];
+            ff->u.fixedfunc.nparams = 7;
+            if (!push_mat3(list, AP1_TO_AP0)) rc = TOC_ERROR_OUT_OF_MEMORY;
+        }
     } else if (push_display_xform(list, style, &rc)) {
         /* handled: a composed CIE-XYZ-D65 -> display output transform */
     } else if (push_cspace_convert(list, style, &rc)) {
