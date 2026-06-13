@@ -392,6 +392,8 @@ static int ends_with(const char *s, const char *suf) {
     return ls >= lf && memcmp(s + ls - lf, suf, lf) == 0;
 }
 
+static toc_op *push_scale3(toc_op_list *list, float s); /* defined below */
+
 /* Try a composed display output transform. Accepts the OCIO v2 builtin names
  * ("DISPLAY - CIE-XYZ-D65_to_<display>[ - MIRROR NEGS]") and the bare
  * "CIE-XYZ-D65_to_<display>" form: a primaries matrix then the display transfer
@@ -400,22 +402,27 @@ static int ends_with(const char *s, const char *suf) {
 static int push_display_xform(toc_op_list *list, const char *style,
                               toc_result *rc) {
     /* amir=1: OCIO encodes this display with MONCURVE_MIRROR even without the
-     * "- MIRROR NEGS" suffix (Display-P3). */
+     * "- MIRROR NEGS" suffix (Display-P3). kind 4 = scale(48/52.37)+gamma 2.6 over
+     * XYZ (DCDM); kind 5 = PQ over XYZ (ST2084-DCDM); both keep XYZ (identity). */
     static const struct {
         const char *name, *prim; int kind; float g, off; int amir;
     } d[] = {
-        {"CIE-XYZ-D65_to_sRGB",             "Linear-sRGB",       0, 2.4f, 0.055f, 0},
-        {"CIE-XYZ-D65_to_DisplayP3",        "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
-        {"CIE-XYZ-D65_to_Display-P3",       "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
-        {"CIE-XYZ-D65_to_G2.2-REC.709",     "Linear-Rec709",     1, 2.2f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_G2.6-P3-D65",      "Linear-P3-D65",     1, 2.6f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_DCI-P3",           "Linear-DCI-P3",     1, 2.6f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_REC.1886-REC.709", "Linear-Rec709",     1, 2.4f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_Rec.1886-Rec.709", "Linear-Rec709",     1, 2.4f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_REC.2100-PQ",      "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_Rec.2100-PQ",      "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_ST2084-P3-D65",    "Linear-P3-D65",     2, 0.0f, 0.0f, 0},
-        {"CIE-XYZ-D65_to_Rec.2100-HLG",     "Linear-Rec2020",    3, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_sRGB",              "Linear-sRGB",       0, 2.4f, 0.055f, 0},
+        {"CIE-XYZ-D65_to_DisplayP3",         "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_Display-P3",        "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_DisplayP3-HDR",     "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_G2.2-REC.709",      "Linear-Rec709",     1, 2.2f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_G2.6-P3-D65",       "Linear-P3-D65",     1, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_DCI-P3",            "Linear-DCI-P3",     1, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.1886-REC.709",  "Linear-Rec709",     1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.1886-Rec.709",  "Linear-Rec709",     1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.1886-REC.2020", "Linear-Rec2020",    1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.2100-PQ",       "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.2100-PQ",       "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_ST2084-P3-D65",     "Linear-P3-D65",     2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.2100-HLG",      "Linear-Rec2020",    3, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_DCDM-D65",          "CIE-XYZ-D65",       4, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_ST2084-DCDM-D65",   "CIE-XYZ-D65",       5, 0.0f, 0.0f, 0},
     };
     char buf[128];
     const char *inner = style;
@@ -443,6 +450,13 @@ static int push_display_xform(toc_op_list *list, const char *style,
             *rc = TOC_ERROR_OUT_OF_MEMORY;
         else if (d[i].kind == 3 && !push_ff_style(list, TOC_FF_LIN_TO_HLG))
             *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 4) { /* DCDM: scale(48/52.37) + gamma 2.6 over XYZ */
+            if (!push_scale3(list, 48.0f / 52.37f) ||
+                !push_gamma(list, d[i].g, 1, 0))
+                *rc = TOC_ERROR_OUT_OF_MEMORY;
+        } else if (d[i].kind == 5 && !push_ff_style(list, TOC_FF_LIN_TO_PQ)) {
+            *rc = TOC_ERROR_OUT_OF_MEMORY; /* ST2084-DCDM: PQ over XYZ */
+        }
         return 1;
     }
     return 0;
