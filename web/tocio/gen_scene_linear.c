@@ -67,7 +67,8 @@ int main(int argc, char **argv) {
                 /* 4x3 swatch grid */
                 int col = (int)(u * 4.0f), row = (int)(((v - 0.18f) / 0.54f) * 3.0f);
                 int idx = row * 4 + col;
-                if (idx < 0) idx = 0; if (idx > 11) idx = 11;
+                if (idx < 0) idx = 0;
+                if (idx > 11) idx = 11;
                 set_px(plane, x, y, SW[idx][0], SW[idx][1], SW[idx][2], 1.0f);
             } else {
                 /* per-channel horizontal gradients, scaled to a small HDR range */
@@ -82,8 +83,8 @@ int main(int argc, char **argv) {
     /* a bright specular highlight blob (top-right) to drive the tonescale roll-off */
     for (y = 0; y < H / 5; ++y)
         for (x = W - W / 5; x < W; ++x) {
-            float cx = (float)(x - (W - W / 10)) / (W / 10);
-            float cy = (float)(y - (H / 10)) / (H / 10);
+            float cx = (float)(x - (W - W / 10)) / (W / 10.0f);
+            float cy = (float)(y - (H / 10)) / (H / 10.0f);
             float d = cx * cx + cy * cy;
             float s = 16.0f * (1.0f - d);
             if (s > 0.0f) set_px(plane, x, y, s, s, s * 0.95f, 1.0f);
