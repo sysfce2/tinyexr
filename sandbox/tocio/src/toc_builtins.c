@@ -263,6 +263,49 @@ static const toc_cspace *cspace_lookup(const char *name, size_t len) {
     return NULL;
 }
 
+/* von Kries chromatic adaptation ws(xy)->wd(xy) with cone-response matrix C. */
+static void vk_cat(const float C[9], float wsx, float wsy, float wdx, float wdy,
+                   float M[9]) {
+    float Cinv[9], Ws[3], Wd[3], cs[3], cd[3], D[9], t[9];
+    int i;
+    mat3_inv(C, Cinv);
+    xy_to_xyz(wsx, wsy, Ws);
+    xy_to_xyz(wdx, wdy, Wd);
+    mat3_vec(C, Ws, cs);
+    mat3_vec(C, Wd, cd);
+    for (i = 0; i < 9; ++i) D[i] = 0.0f;
+    D[0] = cd[0] / cs[0];
+    D[4] = cd[1] / cs[1];
+    D[8] = cd[2] / cs[2];
+    mat3_mul(D, C, t);
+    mat3_mul(Cinv, t, M); /* Cinv * D * C */
+}
+
+/* Camera-gamut RGB -> ACES AP0 matrix (row-major), adapting the camera white to
+ * AP0's D60 with CAT02 (cat02=1) or Bradford (cat02=0), matching OCIO's
+ * build_conversion_matrix(camera, AP0, ADAPTATION_*). */
+static int cam_to_ap0(const float cam[8], int cat02, float M[9]) {
+    static const float BRAD[9] = {0.8951f,  0.2664f,  -0.1614f,
+                                  -0.7502f, 1.7135f,  0.0367f,
+                                  0.0389f,  -0.0685f, 1.0296f};
+    static const float CAT02[9] = {0.7328f,  0.4296f, -0.1624f,
+                                   -0.7036f, 1.6975f, 0.0061f,
+                                   0.0030f,  0.0136f, 0.9834f};
+    toc_cspace c;
+    const toc_cspace *ap0 = cspace_lookup("Linear-AP0", 10);
+    float Mc[9], Map0[9], Mai[9], cat[9], a[9];
+    if (!ap0) return 0;
+    c.rx = cam[0]; c.ry = cam[1]; c.gx = cam[2]; c.gy = cam[3];
+    c.bx = cam[4]; c.by = cam[5]; c.wx = cam[6]; c.wy = cam[7];
+    c.is_xyz = 0;
+    if (!cspace_npm(&c, Mc) || !cspace_npm(ap0, Map0) || !mat3_inv(Map0, Mai))
+        return 0;
+    vk_cat(cat02 ? CAT02 : BRAD, c.wx, c.wy, ap0->wx, ap0->wy, cat);
+    mat3_mul(cat, Mc, a);  /* adapt camera XYZ to AP0 white */
+    mat3_mul(Mai, a, M);   /* XYZ(AP0 white) -> AP0 RGB */
+    return 1;
+}
+
 /* Try "<A>_to_<B>" as a linear color-space conversion; push a matrix op. Returns
  * 1 if handled (matrix pushed or OOM via *rc), 0 if the names are unknown. */
 static const char *find_to(const char *s) { /* locate "_to_" (no libc strstr) */
@@ -516,6 +559,106 @@ static toc_op *push_acescc_log(toc_op_list *list, int log_to_lin) {
     return op;
 }
 
+/* Push a camera LogCamera curve as log->lin (decode), computing the linear
+ * segment for C0 continuity exactly like toc_lower_transform's LogCamera path. */
+static toc_op *push_camera_logcam(toc_op_list *list, float base, float ls,
+                                  float lo, float ns, float no, float brk,
+                                  int has_lslope, float lslope) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_LOG_CAMERA);
+    float lnb = toc_log2f(base) * 0.6931471805599453f; /* ln(base) */
+    float xb = ns * brk + no;
+    float yb = ls * (toc_log2f(xb > 0.0f ? xb : 1e-30f) / toc_log2f(base)) + lo;
+    float lsl = has_lslope ? lslope
+                           : (ls * ns / ((xb != 0.0f ? xb : 1e-30f) * lnb));
+    int i;
+    if (!op) return NULL;
+    op->u.logcam.base = base;
+    for (i = 0; i < 3; ++i) {
+        op->u.logcam.log_slope[i] = ls;
+        op->u.logcam.log_offset[i] = lo;
+        op->u.logcam.lin_slope[i] = ns;
+        op->u.logcam.lin_offset[i] = no;
+        op->u.logcam.lin_break[i] = brk;
+        op->u.logcam.linear_slope[i] = lsl;
+        op->u.logcam.linear_offset[i] = yb - lsl * brk;
+    }
+    op->u.logcam.inverse = 1; /* log -> lin */
+    return op;
+}
+
+/* Camera "<X>_to_ACES2065-1" builtins: LogCamera decode + gamut->AP0 matrix.
+ * (Canon/Apple use baked LUTs upstream and are not covered here.) Returns 1 if
+ * `style` named a supported camera builtin, 0 otherwise. */
+static int push_camera(toc_op_list *list, const char *style, toc_result *rc) {
+    /* Sony Venice gamuts use OCIO's explicit camera->AP0 matrices (row-major). */
+    static const float SVEN[9] = {
+        0.7933297411f, 0.0890786256f, 0.1175916333f,
+        0.0155810585f, 1.0327123069f, -0.0482933654f,
+        -0.0188647478f, 0.0127694121f, 1.0060953358f};
+    static const float SVENC[9] = {
+        0.6742570921f, 0.2205717359f, 0.1051711720f,
+        -0.0093136061f, 1.1059588614f, -0.0966452553f,
+        -0.0382090673f, -0.0179383766f, 1.0561474439f};
+    static const struct {
+        const char *name;
+        float prim[8];
+        const float *mat; /* explicit matrix, or NULL to derive from prim */
+        int cat02;        /* when deriving: 1 = CAT02, 0 = Bradford */
+        float base, ls, lo, ns, no, brk;
+        int has_lslope;
+        float lslope;
+    } C[] = {
+        {"ARRI_ALEXA-LOGC-EI800-AWG_to_ACES2065-1",
+         {0.684f, 0.313f, 0.221f, 0.848f, 0.0861f, -0.102f, 0.3127f, 0.329f},
+         NULL, 1, 10.0f, 0.2471896383f, 0.3855369987f, 1.0f / 0.18f,
+         0.0522722750f, 0.0105909905f, 0, 0.0f},
+        {"ARRI_LOGC4_to_ACES2065-1",
+         {0.7347f, 0.2653f, 0.1424f, 0.8576f, 0.0991f, -0.0308f, 0.3127f, 0.329f},
+         NULL, 1, 2.0f, 0.0647954196341293f, -0.295908392682586f,
+         2231.82630906769f, 64.0f, -0.0180569961199113f, 0, 0.0f},
+        {"SONY_SLOG3-SGAMUT3_to_ACES2065-1",
+         {0.730f, 0.280f, 0.140f, 0.855f, 0.100f, -0.050f, 0.3127f, 0.329f},
+         NULL, 1, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"SONY_SLOG3-SGAMUT3.CINE_to_ACES2065-1",
+         {0.766f, 0.275f, 0.225f, 0.800f, 0.089f, -0.087f, 0.3127f, 0.329f},
+         NULL, 1, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"SONY_SLOG3-SGAMUT3-VENICE_to_ACES2065-1",
+         {0}, SVEN, 0, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"SONY_SLOG3-SGAMUT3.CINE-VENICE_to_ACES2065-1",
+         {0}, SVENC, 0, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"RED_LOG3G10-RWG_to_ACES2065-1",
+         {0.780308f, 0.304253f, 0.121595f, 1.493994f, 0.095612f, -0.084589f,
+          0.3127f, 0.329f},
+         NULL, 0, 10.0f, 0.224282f, 0.0f, 155.975327f,
+         0.01f * 155.975327f + 1.0f, -0.01f, 0, 0.0f},
+        {"PANASONIC_VLOG-VGAMUT_to_ACES2065-1",
+         {0.730f, 0.280f, 0.165f, 0.840f, 0.100f, -0.030f, 0.3127f, 0.329f},
+         NULL, 0, 10.0f, 0.241514f, 0.598206f, 1.0f, 0.00873f, 0.01f, 0, 0.0f},
+    };
+    size_t i;
+    for (i = 0; i < sizeof(C) / sizeof(C[0]); ++i) {
+        if (strcmp(style, C[i].name) != 0) continue;
+        if (!push_camera_logcam(list, C[i].base, C[i].ls, C[i].lo, C[i].ns,
+                                C[i].no, C[i].brk, C[i].has_lslope, C[i].lslope)) {
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+            return 1;
+        }
+        if (C[i].mat) {
+            if (!push_mat3(list, C[i].mat)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+        } else {
+            float M[9];
+            if (!cam_to_ap0(C[i].prim, C[i].cat02, M) || !push_mat3(list, M))
+                *rc = TOC_ERROR_OUT_OF_MEMORY;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static toc_result reverse_invert(toc_op_list *list, size_t start) {
     size_t i, j;
     for (i = start, j = list->count; i < j; ++i, --j) {
@@ -578,6 +721,8 @@ toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert) 
             ff->u.fixedfunc.nparams = 7;
             if (!push_mat3(list, AP1_TO_AP0)) rc = TOC_ERROR_OUT_OF_MEMORY;
         }
+    } else if (push_camera(list, style, &rc)) {
+        /* handled: a camera-log "<X>_to_ACES2065-1" builtin */
     } else if (push_display_xform(list, style, &rc)) {
         /* handled: a composed CIE-XYZ-D65 -> display output transform */
     } else if (push_cspace_convert(list, style, &rc)) {
