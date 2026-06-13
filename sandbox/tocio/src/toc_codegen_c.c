@@ -72,15 +72,22 @@ static void op_range(toc_sb *sb, const toc_op *op) {
 
 static void op_exponent(toc_sb *sb, const toc_op *op) {
     static const char *cn[4] = {"r", "g", "b", "a"};
-    int c;
+    int c, mir = op->u.exponent.mirror;
     for (c = 0; c < 4; ++c) {
-        toc_sb_puts(sb, "  ");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, " = tc_powf(");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, ">0.0f?");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, ":0.0f, ");
+        const char *v = cn[c];
+        toc_sb_puts(sb, "  "); toc_sb_puts(sb, v); toc_sb_puts(sb, " = ");
+        if (mir) {
+            /* sign(v)*tc_powf(|v|, e) */
+            toc_sb_puts(sb, "("); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, "<0.0f?-1.0f:1.0f)*tc_powf(");
+            toc_sb_puts(sb, v); toc_sb_puts(sb, "<0.0f?-");
+            toc_sb_puts(sb, v); toc_sb_puts(sb, ":"); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, ", ");
+        } else {
+            toc_sb_puts(sb, "tc_powf("); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, ">0.0f?"); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, ":0.0f, ");
+        }
         emit_hf(sb, op->u.exponent.e[c]);
         toc_sb_puts(sb, ");\n");
     }
@@ -88,30 +95,40 @@ static void op_exponent(toc_sb *sb, const toc_op *op) {
 
 static void op_exp_linear(toc_sb *sb, const toc_op *op) {
     static const char *cn[3] = {"r", "g", "b"};
-    int c;
+    int c, mir = op->u.exp_linear.mirror;
     for (c = 0; c < 3; ++c) {
         float scale = op->u.exp_linear.scale[c], off = op->u.exp_linear.offset[c];
         float g = op->u.exp_linear.gamma[c], brk = op->u.exp_linear.breakpoint[c];
         float slope = op->u.exp_linear.slope[c];
+        const char *v = cn[c];
+        const char *iv = mir ? "_a" : v; /* input the curve reads */
         toc_sb_puts(sb, "  ");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, " = (");
+        if (mir) {
+            /* {float _s=sign(v),_a=|v|; v = _s*(curve(_a));} */
+            toc_sb_puts(sb, "{float _s="); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, "<0.0f?-1.0f:1.0f,_a="); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, "<0.0f?-"); toc_sb_puts(sb, v); toc_sb_puts(sb, ":");
+            toc_sb_puts(sb, v); toc_sb_puts(sb, ";"); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, " = _s*((");
+        } else {
+            toc_sb_puts(sb, v); toc_sb_puts(sb, " = (");
+        }
         if (!op->u.exp_linear.inverse) {
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, ">");
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, ">");
             emit_hf(sb, brk); toc_sb_puts(sb, ") ? tc_powf(");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, "*"); emit_hf(sb, scale);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, "*"); emit_hf(sb, scale);
             toc_sb_puts(sb, "+"); emit_hf(sb, off); toc_sb_puts(sb, ", ");
             emit_hf(sb, g); toc_sb_puts(sb, ") : ");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, "*"); emit_hf(sb, slope);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, "*"); emit_hf(sb, slope);
         } else {
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, ">");
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, ">");
             emit_hf(sb, brk * slope); toc_sb_puts(sb, ") ? (tc_powf(");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, ", "); emit_hf(sb, 1.0f / g);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, ", "); emit_hf(sb, 1.0f / g);
             toc_sb_puts(sb, ")-"); emit_hf(sb, off); toc_sb_puts(sb, ")/");
             emit_hf(sb, scale); toc_sb_puts(sb, " : ");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, "/"); emit_hf(sb, slope);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, "/"); emit_hf(sb, slope);
         }
-        toc_sb_puts(sb, ";\n");
+        toc_sb_puts(sb, mir ? ");}\n" : ";\n");
     }
 }
 

@@ -355,7 +355,9 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                 break;
             }
             case TOC_OP_EXPONENT:
-                toc_sb_puts(&sb, "  v.rgb = pow(max(v.rgb, vec3(0.0)), ");
+                toc_sb_puts(&sb, op->u.exponent.mirror
+                                     ? "  v.rgb = sign(v.rgb) * pow(abs(v.rgb), "
+                                     : "  v.rgb = pow(max(v.rgb, vec3(0.0)), ");
                 emit_vec3(&sb, op->u.exponent.e[0], op->u.exponent.e[1],
                           op->u.exponent.e[2]);
                 toc_sb_puts(&sb, ");\n");
@@ -401,6 +403,8 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                 const float *sc = op->u.exp_linear.scale, *of = op->u.exp_linear.offset;
                 const float *gm = op->u.exp_linear.gamma, *bk = op->u.exp_linear.breakpoint;
                 const float *sl = op->u.exp_linear.slope;
+                int mir = op->u.exp_linear.mirror;
+                if (mir) toc_sb_puts(&sb, "  { vec3 _s = sign(v.rgb); v.rgb = abs(v.rgb);\n");
                 if (!op->u.exp_linear.inverse) {
                     toc_sb_puts(&sb, "  v.rgb = mix(v.rgb * ");
                     emit_vec3(&sb, sl[0], sl[1], sl[2]);
@@ -426,6 +430,7 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                     emit_vec3(&sb, bk[0] * sl[0], bk[1] * sl[1], bk[2] * sl[2]);
                     toc_sb_puts(&sb, "));\n");
                 }
+                if (mir) toc_sb_puts(&sb, "  v.rgb *= _s; }\n");
                 break;
             }
             case TOC_OP_CDL: {

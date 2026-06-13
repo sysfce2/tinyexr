@@ -344,7 +344,7 @@ static int push_cspace_convert(toc_op_list *list, const char *style,
  * EOTF (encoded->linear); encode=1 emits the inverse (linear->encoded). Matches
  * sRGB / Display-P3 display encodings (gamma 2.4, offset 0.055). */
 static toc_op *push_moncurve(toc_op_list *list, float gamma, float offset,
-                             int encode) {
+                             int encode, int mirror) {
     toc_op *op = toc_op_list_push(list, TOC_OP_EXP_LINEAR);
     double G = gamma < 1.000001f ? 1.000001 : (double)gamma;
     double O = offset < 1e-6f ? 1e-6 : (double)offset;
@@ -364,16 +364,18 @@ static toc_op *push_moncurve(toc_op_list *list, float gamma, float offset,
         op->u.exp_linear.slope[i] = slope;
     }
     op->u.exp_linear.inverse = encode ? 1 : 0;
+    op->u.exp_linear.mirror = mirror;
     return op;
 }
 /* Pure-power EOTF (gamma): forward op = display->linear (pow(x,g)); encode emits
  * linear->display (pow(x,1/g)). Alpha unchanged. */
-static toc_op *push_gamma(toc_op_list *list, float g, int encode) {
+static toc_op *push_gamma(toc_op_list *list, float g, int encode, int mirror) {
     toc_op *op = toc_op_list_push(list, TOC_OP_EXPONENT);
     int i;
     float e = encode ? 1.0f / g : g;
     if (!op) return NULL;
     for (i = 0; i < 4; ++i) op->u.exponent.e[i] = (i < 3) ? e : 1.0f;
+    op->u.exponent.mirror = mirror;
     return op;
 }
 static toc_op *push_ff_style(toc_op_list *list, int style) {
@@ -397,38 +399,45 @@ static int ends_with(const char *s, const char *suf) {
  * kind: 0=MonCurve(g,off), 1=pure gamma(g), 2=PQ, 3=HLG. */
 static int push_display_xform(toc_op_list *list, const char *style,
                               toc_result *rc) {
-    static const struct { const char *name, *prim; int kind; float g, off; } d[] = {
-        {"CIE-XYZ-D65_to_sRGB",             "Linear-sRGB",       0, 2.4f, 0.055f},
-        {"CIE-XYZ-D65_to_DisplayP3",        "Linear-Display-P3", 0, 2.4f, 0.055f},
-        {"CIE-XYZ-D65_to_Display-P3",       "Linear-Display-P3", 0, 2.4f, 0.055f},
-        {"CIE-XYZ-D65_to_G2.2-REC.709",     "Linear-Rec709",     1, 2.2f, 0.0f},
-        {"CIE-XYZ-D65_to_G2.6-P3-D65",      "Linear-P3-D65",     1, 2.6f, 0.0f},
-        {"CIE-XYZ-D65_to_DCI-P3",           "Linear-DCI-P3",     1, 2.6f, 0.0f},
-        {"CIE-XYZ-D65_to_REC.1886-REC.709", "Linear-Rec709",     1, 2.4f, 0.0f},
-        {"CIE-XYZ-D65_to_Rec.1886-Rec.709", "Linear-Rec709",     1, 2.4f, 0.0f},
-        {"CIE-XYZ-D65_to_REC.2100-PQ",      "Linear-Rec2020",    2, 0.0f, 0.0f},
-        {"CIE-XYZ-D65_to_Rec.2100-PQ",      "Linear-Rec2020",    2, 0.0f, 0.0f},
-        {"CIE-XYZ-D65_to_ST2084-P3-D65",    "Linear-P3-D65",     2, 0.0f, 0.0f},
-        {"CIE-XYZ-D65_to_Rec.2100-HLG",     "Linear-Rec2020",    3, 0.0f, 0.0f},
+    /* amir=1: OCIO encodes this display with MONCURVE_MIRROR even without the
+     * "- MIRROR NEGS" suffix (Display-P3). */
+    static const struct {
+        const char *name, *prim; int kind; float g, off; int amir;
+    } d[] = {
+        {"CIE-XYZ-D65_to_sRGB",             "Linear-sRGB",       0, 2.4f, 0.055f, 0},
+        {"CIE-XYZ-D65_to_DisplayP3",        "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_Display-P3",       "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_G2.2-REC.709",     "Linear-Rec709",     1, 2.2f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_G2.6-P3-D65",      "Linear-P3-D65",     1, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_DCI-P3",           "Linear-DCI-P3",     1, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.1886-REC.709", "Linear-Rec709",     1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.1886-Rec.709", "Linear-Rec709",     1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.2100-PQ",      "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.2100-PQ",      "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_ST2084-P3-D65",    "Linear-P3-D65",     2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.2100-HLG",     "Linear-Rec2020",    3, 0.0f, 0.0f, 0},
     };
     char buf[128];
     const char *inner = style;
     size_t i, n;
+    int mir = 0; /* "- MIRROR NEGS": odd-extend the encode for negatives */
     /* strip optional "DISPLAY - " prefix and " - MIRROR NEGS" suffix */
     if (strlen(style) >= 10 && memcmp(style, "DISPLAY - ", 10) == 0)
         inner = style + 10;
     n = strlen(inner);
     if (n < sizeof(buf)) {
         memcpy(buf, inner, n + 1);
-        if (ends_with(buf, " - MIRROR NEGS")) buf[n - 14] = '\0';
+        if (ends_with(buf, " - MIRROR NEGS")) { buf[n - 14] = '\0'; mir = 1; }
         inner = buf;
     }
     for (i = 0; i < sizeof(d) / sizeof(d[0]); ++i) {
+        int m;
         if (strcmp(inner, d[i].name) != 0) continue;
+        m = mir || d[i].amir;
         if (!push_cspace_named(list, "CIE-XYZ-D65", d[i].prim, rc)) return 1;
-        if (d[i].kind == 0 && !push_moncurve(list, d[i].g, d[i].off, 1))
+        if (d[i].kind == 0 && !push_moncurve(list, d[i].g, d[i].off, 1, m))
             *rc = TOC_ERROR_OUT_OF_MEMORY;
-        else if (d[i].kind == 1 && !push_gamma(list, d[i].g, 1))
+        else if (d[i].kind == 1 && !push_gamma(list, d[i].g, 1, m))
             *rc = TOC_ERROR_OUT_OF_MEMORY;
         else if (d[i].kind == 2 && !push_ff_style(list, TOC_FF_LIN_TO_PQ))
             *rc = TOC_ERROR_OUT_OF_MEMORY;

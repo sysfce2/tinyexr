@@ -48,28 +48,34 @@ static void k_range(const toc_op *op, float *px, int ch) {
 }
 
 static void k_exponent(const toc_op *op, float *px, int ch) {
-    int c;
+    int c, mir = op->u.exponent.mirror;
     for (c = 0; c < ch; ++c) {
         float x = px[c];
-        px[c] = toc_powf(x > 0.0f ? x : 0.0f, op->u.exponent.e[c]);
+        if (mir) {
+            float s = x < 0.0f ? -1.0f : 1.0f;
+            px[c] = s * toc_powf(x < 0.0f ? -x : x, op->u.exponent.e[c]);
+        } else {
+            px[c] = toc_powf(x > 0.0f ? x : 0.0f, op->u.exponent.e[c]);
+        }
     }
 }
 
 static void k_exp_linear(const toc_op *op, float *px, int ch) {
-    int c, n = ch < 3 ? ch : 3;
+    int c, n = ch < 3 ? ch : 3, mir = op->u.exp_linear.mirror;
     for (c = 0; c < n; ++c) {
-        float x = px[c];
+        float x = px[c], s = 1.0f;
         float scale = op->u.exp_linear.scale[c];
         float off = op->u.exp_linear.offset[c];
         float g = op->u.exp_linear.gamma[c];
         float brk = op->u.exp_linear.breakpoint[c];
         float slope = op->u.exp_linear.slope[c];
+        if (mir && x < 0.0f) { s = -1.0f; x = -x; } /* odd extension for x<0 */
         if (!op->u.exp_linear.inverse) {
-            px[c] = (x > brk) ? toc_powf(x * scale + off, g) : x * slope;
+            px[c] = s * ((x > brk) ? toc_powf(x * scale + off, g) : x * slope);
         } else {
             float ybrk = brk * slope; /* y at the breakpoint */
-            px[c] = (x > ybrk) ? (toc_powf(x, 1.0f / g) - off) / scale
-                               : x / slope;
+            px[c] = s * ((x > ybrk) ? (toc_powf(x, 1.0f / g) - off) / scale
+                                    : x / slope);
         }
     }
 }
@@ -308,10 +314,16 @@ static void batch_op(const toc_op *op, float *rgba, size_t npix, int ch) {
                            op->u.range.clamp_lo, op->u.range.clamp_hi, rgba,
                            npix, ch);
             return;
-        case TOC_OP_EXPONENT: toc_simd.exponent(op, rgba, npix, ch); return;
+        /* mirror (odd-extension) exponent/MonCurve isn't in the SIMD kernels;
+         * fall through to the per-pixel scalar path below. */
+        case TOC_OP_EXPONENT:
+            if (op->u.exponent.mirror) break;
+            toc_simd.exponent(op, rgba, npix, ch); return;
         case TOC_OP_LOG: toc_simd.log_(op, rgba, npix, ch); return;
         case TOC_OP_LOG_CAMERA: toc_simd.log_camera(op, rgba, npix, ch); return;
-        case TOC_OP_EXP_LINEAR: toc_simd.exp_linear(op, rgba, npix, ch); return;
+        case TOC_OP_EXP_LINEAR:
+            if (op->u.exp_linear.mirror) break;
+            toc_simd.exp_linear(op, rgba, npix, ch); return;
         case TOC_OP_CDL: toc_simd.cdl(op, rgba, npix, ch); return;
         default: break;
     }
@@ -322,6 +334,8 @@ static void batch_op(const toc_op *op, float *rgba, size_t npix, int ch) {
             case TOC_OP_LUT3D: toc_lut3d_apply_pixel(op, px, ch); break;
             case TOC_OP_FIXEDFUNC: toc_fixedfunc_apply_pixel(op, px, ch); break;
             case TOC_OP_ACES_OUTPUT: toc_aces2_apply_pixel(op, px, ch); break;
+            case TOC_OP_EXPONENT: k_exponent(op, px, ch); break; /* mirror path */
+            case TOC_OP_EXP_LINEAR: k_exp_linear(op, px, ch); break;
             case TOC_OP_NOOP:
             default: break;
         }
