@@ -557,8 +557,11 @@ EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
     /* Fallbacks for parts without conventional R/G/B so they render instead of
      * showing black — luminance, multiview, depth, motion vectors, etc.
      * NOTE: luminance-chroma (Y + subsampled RY/BY, e.g. CrissyField.exr) is
-     * shown as grayscale Y only; full-color YCbCr reconstruction is blocked by
-     * the v3 core mis-decoding subsampled channels (RY/BY come back wrong). */
+     * shown here as grayscale Y. The core can now reconstruct true color via
+     * exr_part_yc_to_rgba_float() (see exr_part_is_luminance_chroma), but this
+     * viewer's streaming block-scatter path skips subsampled channels and has no
+     * whole-part hook; routing YC parts through the reconstruction helper is a
+     * separate follow-up. The simpler examples/wasm binding already does it. */
     if (s->rmap[0] < 0 && s->rmap[1] < 0 && s->rmap[2] < 0) {
         int y = find_channel(hd, "Y");
         if (y >= 0) {

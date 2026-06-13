@@ -231,8 +231,11 @@ Contribution is welcome!
 
 - [ ] Parallelize the deep and mipmap/ripmap paths (encode/decode are
   single-threaded there; flat scanline + single-level tiled already parallelize).
-- [ ] Full luminance-chroma color: subsampled `Y` + `RY`/`BY` decode currently
-  mis-handles the chroma planes, so such images render as grayscale `Y` only.
+- [ ] Full luminance-chroma color in the browser **viewer**: the core now
+  reconstructs subsampled `Y` + `RY`/`BY` to RGBA
+  (`exr_part_yc_to_rgba_float`, used by the `examples/wasm` binding), but the
+  streaming `web/viewer/` still renders such images as grayscale `Y` pending a
+  whole-part hook through the reconstruction helper.
 - [ ] ARM/NEON throughput benchmarks (NEON kernels are correctness-verified under
   qemu but not yet benchmarked).
 - [ ] Larger-image / higher-channel-count performance sweeps.

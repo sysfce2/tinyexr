@@ -524,8 +524,9 @@ function buildViews(p) {
   if (R >= 0 && G >= 0 && B >= 0)
     primary.push({ label: A >= 0 ? "RGBA" : "RGB", c: [R, G, B, A] });
   const Y = idx("Y");
-  // Luminance-chroma (Y + RY/BY) is shown as grayscale Y; full-color YCbCr
-  // reconstruction is pending a v3-core fix for subsampled-channel decode.
+  // Luminance-chroma (Y + RY/BY) is shown here as grayscale Y. The v3 core can
+  // reconstruct full color (exr_part_yc_to_rgba_float); wiring this streaming
+  // viewer through it is a separate follow-up (see exr_viewer_wasm.c).
 
   // Named layers: group channels by the prefix before the last '.'.
   const layers = new Map();

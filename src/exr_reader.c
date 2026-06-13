@@ -293,6 +293,16 @@ static exr_result interpret_header(exr_reader *r, exr_int_part *part) {
     at = exr_attr_find(h->attrs, "screenWindowWidth");
     if (at && at->size >= 4) h->screen_window_width = exr_rd_f32(at->data);
 
+    /* chromaticities: 8 floats (red/green/blue/white xy). Used to derive
+     * luminance weights for luminance-chroma (Y/RY/BY) reconstruction. */
+    at = exr_attr_find(h->attrs, "chromaticities");
+    if (at && at->size >= 32) {
+        int i;
+        for (i = 0; i < 8; ++i)
+            h->chromaticities[i] = exr_rd_f32(at->data + (uint32_t)i * 4);
+        h->has_chromaticities = 1;
+    }
+
     /* tiles */
     at = exr_attr_find(h->attrs, "tiles");
     if (at && at->size >= 9) {

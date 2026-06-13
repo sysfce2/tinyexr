@@ -226,6 +226,48 @@ exr_result exr_color_matrix(exr_colorspace from, exr_colorspace to,
 }
 
 /* ============================================================================
+ * Luminance weights from CIE chromaticities (for Y/RY/BY reconstruction)
+ * ========================================================================== */
+/* Rec.709 / sRGB luminance weights (used when no chromaticities are present). */
+static const float g_yw_rec709[3] = {0.2126f, 0.7152f, 0.0722f};
+
+exr_result exr_luminance_weights(const float chroma[8], int present,
+                                 float yw[3]) {
+    /* Port of OpenEXR ImfChromaticities computeYw(): the Y (luminance) row of
+     * the chromaticity-derived RGB->XYZ matrix (with Y(white)=1), normalised so
+     * the three weights sum to 1. Falls back to Rec.709 when chromaticities are
+     * absent or degenerate. Pure arithmetic, libm-free. */
+    float rx, ry, gx, gy, bx, by, wx, wy;
+    float X, Z, d, Sr, Sg, Sb, sum;
+    if (!yw) return EXR_ERROR_INVALID_ARGUMENT;
+    if (!present || !chroma) {
+        yw[0] = g_yw_rec709[0]; yw[1] = g_yw_rec709[1]; yw[2] = g_yw_rec709[2];
+        return EXR_SUCCESS;
+    }
+    rx = chroma[0]; ry = chroma[1];
+    gx = chroma[2]; gy = chroma[3];
+    bx = chroma[4]; by = chroma[5];
+    wx = chroma[6]; wy = chroma[7];
+    d = rx * (by - gy) + bx * (gy - ry) + gx * (ry - by);
+    if (wy == 0.0f || d == 0.0f) {
+        yw[0] = g_yw_rec709[0]; yw[1] = g_yw_rec709[1]; yw[2] = g_yw_rec709[2];
+        return EXR_SUCCESS;
+    }
+    X = wx / wy;                  /* white X, with Y == 1 */
+    Z = (1.0f - wx - wy) / wy;    /* white Z */
+    Sr = (X * (by - gy) - gx * ((by - 1.0f) + by * (X + Z)) +
+          bx * ((gy - 1.0f) + gy * (X + Z))) / d;
+    Sg = (X * (ry - by) + rx * ((by - 1.0f) + by * (X + Z)) -
+          bx * ((ry - 1.0f) + ry * (X + Z))) / d;
+    Sb = (X * (gy - ry) - rx * ((gy - 1.0f) + gy * (X + Z)) +
+          gx * ((ry - 1.0f) + ry * (X + Z))) / d;
+    yw[0] = Sr * ry; yw[1] = Sg * gy; yw[2] = Sb * by;
+    sum = yw[0] + yw[1] + yw[2];
+    if (sum != 0.0f) { yw[0] /= sum; yw[1] /= sum; yw[2] /= sum; }
+    return EXR_SUCCESS;
+}
+
+/* ============================================================================
  * Transfer functions
  * ========================================================================== */
 static float nonneg(float x) { return (x > 0.0f) ? x : 0.0f; }

@@ -73,6 +73,21 @@ EXRW_EXPORT float *exrw_decode_rgba(const uint8_t *data, int size, int *w,
     p = &img.parts[0];
     if (p->is_deep || !p->images) { exr_image_free(&img); return NULL; }
 
+    /* Luminance-chroma (Y + subsampled RY/BY): reconstruct true color instead
+     * of leaving it as grayscale Y. The buffer is malloc'd (default allocator),
+     * so the JS side frees it with exrw_free just like the generic path. */
+    if (exr_part_is_luminance_chroma(p)) {
+        float *yc = NULL;
+        int yw = 0, yh = 0;
+        if (EXR_OK(exr_part_yc_to_rgba_float(NULL, p, &yc, &yw, &yh))) {
+            if (w) *w = yw;
+            if (h) *h = yh;
+            exr_image_free(&img);
+            return yc;
+        }
+        /* fall through to the generic R/G/B/A path on failure */
+    }
+
     for (k = 0; k < 4; ++k) ci[k] = find_channel(p, names[k]);
     n = (size_t)p->width * (size_t)p->height;
     rgba = (float *)malloc((n ? n : 1) * 4 * sizeof(float));

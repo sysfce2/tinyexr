@@ -3319,6 +3319,183 @@ static void util_tests(void) {
     util_lut_tests();
 }
 
+/* ---- Luminance-chroma (Y/RY/BY) reconstruction ----------------------------
+ *
+ * Builds a synthetic Y/RY/BY part with 2x2-subsampled chroma and checks that
+ * exr_part_yc_to_rgba_float() reconstructs the original RGB. Using a
+ * constant-chroma intensity gradient (fixed R:G:B ratio, varying brightness)
+ * makes RY/BY spatially constant, so subsampling + upsampling are lossless and
+ * the reconstruction is exact to float precision — isolating the conversion
+ * math and luminance weighting. A second varying-chroma image checks that the
+ * even (stored) chroma sites reconstruct exactly and interpolation stays bounded.
+ */
+static void luminance_chroma_tests(void) {
+    float yw[3];
+
+    printf("== luminance-chroma (Y/RY/BY) ==\n");
+
+    /* Weights: default == Rec.709; Rec.2020 primaries differ as expected. */
+    exr_luminance_weights(NULL, 0, yw);
+    CHECK(fabsf(yw[0] - 0.2126f) < 1e-4f && fabsf(yw[1] - 0.7152f) < 1e-4f &&
+              fabsf(yw[2] - 0.0722f) < 1e-4f,
+          "default luminance weights are Rec.709");
+    {
+        /* Rec.709 primaries + D65 white -> the same weights as the default. */
+        const float rec709[8] = {0.6400f, 0.3300f, 0.3000f, 0.6000f,
+                                 0.1500f, 0.0600f, 0.3127f, 0.3290f};
+        float w709[3];
+        exr_luminance_weights(rec709, 1, w709);
+        CHECK(fabsf(w709[0] - yw[0]) < 2e-3f && fabsf(w709[1] - yw[1]) < 2e-3f &&
+                  fabsf(w709[2] - yw[2]) < 2e-3f,
+              "Rec.709 chromaticities reproduce Rec.709 weights");
+    }
+    {
+        /* Rec.2020 primaries -> weights ~ (0.2627, 0.6780, 0.0593). */
+        const float rec2020[8] = {0.7080f, 0.2920f, 0.1700f, 0.7970f,
+                                  0.1310f, 0.0460f, 0.3127f, 0.3290f};
+        float w2020[3];
+        exr_luminance_weights(rec2020, 1, w2020);
+        CHECK(fabsf(w2020[0] - 0.2627f) < 3e-3f &&
+                  fabsf(w2020[1] - 0.6780f) < 3e-3f &&
+                  fabsf(w2020[2] - 0.0593f) < 3e-3f,
+              "Rec.2020 chromaticities give Rec.2020 weights");
+    }
+
+    /* Build a 16x16 constant-chroma intensity gradient and reconstruct it. */
+    {
+        const int w = 16, h = 16;
+        const int cw = exr_num_samples(0, w - 1, 2);
+        const int chh = exr_num_samples(0, h - 1, 2);
+        const float kr = 0.80f, kg = 0.50f, kb = 0.20f; /* fixed R:G:B ratio */
+        exr_channel chans[4];
+        void *planes[4];
+        float *yp, *ryp, *byp, *ap;
+        float *rgba = NULL;
+        exr_part part;
+        int x, y, ow = 0, oh = 0, ci, ok = 1;
+        exr_result rc;
+
+        yp = (float *)malloc((size_t)w * h * sizeof(float));
+        ryp = (float *)malloc((size_t)cw * chh * sizeof(float));
+        byp = (float *)malloc((size_t)cw * chh * sizeof(float));
+        ap = (float *)malloc((size_t)w * h * sizeof(float));
+        if (!yp || !ryp || !byp || !ap) {
+            CHECK(0, "YC test allocation");
+            free(yp); free(ryp); free(byp); free(ap);
+            return;
+        }
+
+        /* Y (full res) + A ramp. Intensity t in [0.25, 1.0]. */
+        for (y = 0; y < h; ++y)
+            for (x = 0; x < w; ++x) {
+                float t = 0.25f + 0.75f * ((float)(x + y) / (float)(w + h - 2));
+                float r = kr * t, g = kg * t, b = kb * t;
+                yp[y * w + x] = r * yw[0] + g * yw[1] + b * yw[2];
+                ap[y * w + x] = 0.5f;
+            }
+        /* RY/BY sampled at the even (stored) chroma sites: (cx*2, cy*2). */
+        for (y = 0; y < chh; ++y)
+            for (x = 0; x < cw; ++x) {
+                int px = x * 2, py = y * 2;
+                float t = 0.25f + 0.75f * ((float)(px + py) / (float)(w + h - 2));
+                float r = kr * t, b = kb * t;
+                float Y = (kr * yw[0] + kg * yw[1] + kb * yw[2]) * t;
+                ryp[y * cw + x] = (r - Y) / Y;
+                byp[y * cw + x] = (b - Y) / Y;
+            }
+
+        memset(chans, 0, sizeof(chans));
+        memcpy(chans[0].name, "Y", 2);
+        memcpy(chans[1].name, "RY", 3);
+        memcpy(chans[2].name, "BY", 3);
+        memcpy(chans[3].name, "A", 2);
+        for (ci = 0; ci < 4; ++ci) chans[ci].pixel_type = EXR_PIXEL_FLOAT;
+        chans[0].x_sampling = chans[0].y_sampling = 1;
+        chans[1].x_sampling = chans[1].y_sampling = 2;
+        chans[2].x_sampling = chans[2].y_sampling = 2;
+        chans[3].x_sampling = chans[3].y_sampling = 1;
+        planes[0] = yp; planes[1] = ryp; planes[2] = byp; planes[3] = ap;
+
+        memset(&part, 0, sizeof(part));
+        part.width = w;
+        part.height = h;
+        part.header.num_channels = 4;
+        part.header.channels = chans;
+        part.images = planes;
+
+        CHECK(exr_part_is_luminance_chroma(&part) == 1,
+              "Y/RY/BY part detected as luminance-chroma");
+
+        rc = exr_part_yc_to_rgba_float(NULL, &part, &rgba, &ow, &oh);
+        CHECK(EXR_OK(rc) && rgba && ow == w && oh == h,
+              "exr_part_yc_to_rgba_float succeeds");
+        if (EXR_OK(rc) && rgba) {
+            for (y = 0; y < h && ok; ++y)
+                for (x = 0; x < w; ++x) {
+                    float t =
+                        0.25f + 0.75f * ((float)(x + y) / (float)(w + h - 2));
+                    size_t p = ((size_t)y * w + x) * 4;
+                    if (fabsf(rgba[p + 0] - kr * t) > 1e-3f ||
+                        fabsf(rgba[p + 1] - kg * t) > 1e-3f ||
+                        fabsf(rgba[p + 2] - kb * t) > 1e-3f ||
+                        fabsf(rgba[p + 3] - 0.5f) > 1e-6f) {
+                        ok = 0;
+                        break;
+                    }
+                }
+            CHECK(ok, "constant-chroma gradient reconstructs to original RGBA");
+        }
+        free(rgba);
+        free(yp); free(ryp); free(byp); free(ap);
+    }
+
+    /* Detection negative: a plain RGB part is not luminance-chroma. */
+    {
+        exr_image img;
+        memset(&img, 0, sizeof(img));
+        if (EXR_OK(exr_load_from_file("test/unit/regression/2by2.exr", NULL,
+                                      &img))) {
+            CHECK(exr_part_is_luminance_chroma(&img.parts[0]) == 0,
+                  "plain RGBA part is not luminance-chroma");
+            exr_image_free(&img);
+        }
+    }
+
+    /* Opportunistic: a real luminance-chroma file must decode to actual color
+     * (some pixel with R != G != B), not grayscale. Skipped if absent. */
+    {
+        exr_image img;
+        memset(&img, 0, sizeof(img));
+        if (EXR_OK(exr_load_from_file(
+                "openexr-images/Chromaticities/CrissyField.exr", NULL, &img))) {
+            if (img.num_parts > 0 &&
+                exr_part_is_luminance_chroma(&img.parts[0])) {
+                float *rgba = NULL;
+                int ow = 0, oh = 0, colored = 0;
+                if (EXR_OK(exr_part_yc_to_rgba_float(NULL, &img.parts[0], &rgba,
+                                                     &ow, &oh)) &&
+                    rgba) {
+                    size_t i, n = (size_t)ow * (size_t)oh;
+                    for (i = 0; i < n; ++i) {
+                        float r = rgba[i * 4], g = rgba[i * 4 + 1],
+                              b = rgba[i * 4 + 2];
+                        if (fabsf(r - g) > 1e-3f || fabsf(g - b) > 1e-3f) {
+                            colored = 1;
+                            break;
+                        }
+                    }
+                    free(rgba);
+                }
+                CHECK(colored, "CrissyField.exr reconstructs to color");
+            }
+            exr_image_free(&img);
+        } else {
+            printf("  (skip: openexr-images/Chromaticities/CrissyField.exr "
+                   "not present)\n");
+        }
+    }
+}
+
 int main(void) {
     static const char *poc[] = {
         "test/unit/regression/poc-1383755b301e5f505b2198dc0508918b537fdf48bbfc6deeffe268822e6f6cd6",
@@ -3567,6 +3744,8 @@ int main(void) {
 
     printf("== util module ==\n");
     util_tests();
+
+    luminance_chroma_tests();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
