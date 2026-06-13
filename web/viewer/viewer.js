@@ -435,8 +435,19 @@ async function selectAndDecode(part, lx, ly, doFit, viewIdx) {
   document.getElementById("channelSel").value = String(viewIdx);
 
   const v = views[viewIdx];
-  const total = M._exrv_select_channels(handle, part, lx, ly,
-    v.c[0], v.c[1], v.c[2], v.c[3]);
+  // Reconstructed luminance-chroma color goes through a dedicated entry point
+  // (whole-part decode); if it can't reconstruct, fall back to the grayscale-Y
+  // channel mapping in v.c.
+  let total;
+  if (v.ycc) {
+    total = M._exrv_select_ycc(handle, part, lx, ly);
+    if (total < 0)
+      total = M._exrv_select_channels(handle, part, lx, ly,
+        v.c[0], v.c[1], v.c[2], v.c[3]);
+  } else {
+    total = M._exrv_select_channels(handle, part, lx, ly,
+      v.c[0], v.c[1], v.c[2], v.c[3]);
+  }
   if (total < 0) {
     setProgress(-1);
     img = null; render();
@@ -524,9 +535,13 @@ function buildViews(p) {
   if (R >= 0 && G >= 0 && B >= 0)
     primary.push({ label: A >= 0 ? "RGBA" : "RGB", c: [R, G, B, A] });
   const Y = idx("Y");
-  // Luminance-chroma (Y + RY/BY) is shown here as grayscale Y. The v3 core can
-  // reconstruct full color (exr_part_yc_to_rgba_float); wiring this streaming
-  // viewer through it is a separate follow-up (see exr_viewer_wasm.c).
+  // Luminance-chroma (Y + subsampled RY/BY): offer a reconstructed full-color
+  // view. ycc:true routes through _exrv_select_ycc (whole-part decode +
+  // exr_part_yc_to_rgba_float) instead of the per-channel scatter. The c array
+  // is the grayscale-Y fallback used if reconstruction is unavailable.
+  const RY = idx("RY"), BY = idx("BY");
+  if (Y >= 0 && RY >= 0 && BY >= 0 && R < 0 && G < 0 && B < 0)
+    primary.push({ label: "Color (Y/RY/BY)", c: [Y, Y, Y, A], ycc: true });
 
   // Named layers: group channels by the prefix before the last '.'.
   const layers = new Map();

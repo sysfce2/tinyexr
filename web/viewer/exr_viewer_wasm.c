@@ -54,6 +54,7 @@ typedef struct exrv_session {
     int nblocks;
     int rmap[4]; /* header channel index for R,G,B,A or -1 */
     float *rgba; /* lw*lh*4 accumulation buffer (RGBA float) */
+    int ycc_filled; /* 1 if rgba already holds whole-part luminance-chroma color */
 
     /* deep point cloud: 6 floats per sample (x, y, z, r, g, b) */
     float *deep_pts;
@@ -80,6 +81,7 @@ static void session_reset_selection(exrv_session *s) {
     free(s->rgba);
     s->rgba = NULL;
     s->lw = s->lh = 0;
+    s->ycc_filled = 0;
     s->sel_part = -1;
 }
 
@@ -536,6 +538,47 @@ static int finish_selection(exrv_session *s, int part, int level_x, int level_y)
     return count;
 }
 
+/* Luminance-chroma (Y + subsampled RY/BY) reconstruction. The streaming
+ * per-block scatter can't combine + upsample chroma, so decode the whole part
+ * once and reconstruct it to RGBA via the core helper, writing straight into
+ * s->rgba. finish_selection() set lw/lh and allocated rgba; at level 0 those
+ * dimensions equal the part's data window, which is what the helper returns.
+ * Returns the block count (>= 0) with s->ycc_filled = 1 on success, or -1 if the
+ * part isn't luminance-chroma / not level 0 / the decode failed (the caller then
+ * resets and falls back to the grayscale-Y path). */
+static int select_luminance_chroma(exrv_session *s, int part, int lx, int ly) {
+    const exr_header *hd = exr_reader_part_header(s->r, part);
+    exr_image img;
+    float *rgba = NULL;
+    int ow = 0, oh = 0, count;
+    if (!hd) return -1;
+    if (lx != 0 || ly != 0) return -1; /* reconstruct full-res level 0 only */
+    if (find_channel(hd, "Y") < 0 || find_channel(hd, "RY") < 0 ||
+        find_channel(hd, "BY") < 0 || find_channel(hd, "R") >= 0 ||
+        find_channel(hd, "G") >= 0 || find_channel(hd, "B") >= 0)
+        return -1;
+
+    count = finish_selection(s, part, lx, ly);
+    if (count < 0) return -1;
+
+    memset(&img, 0, sizeof img);
+    if (EXR_OK(exr_load_from_memory(s->data, s->size, NULL, &img)) &&
+        part < img.num_parts &&
+        exr_part_is_luminance_chroma(&img.parts[part]) &&
+        EXR_OK(exr_part_yc_to_rgba_float(NULL, &img.parts[part], &rgba, &ow,
+                                         &oh)) &&
+        rgba && ow == s->lw && oh == s->lh) {
+        memcpy(s->rgba, rgba, (size_t)ow * (size_t)oh * 4 * sizeof(float));
+        s->ycc_filled = 1;
+        free(rgba);
+        exr_image_free(&img);
+        return count;
+    }
+    free(rgba);
+    exr_image_free(&img);
+    return -1;
+}
+
 /* Auto-detect a sensible channel mapping for a part (conventional R/G/B/A,
  * luminance-chroma Y/RY/BY, or a generic fallback) and select it. */
 EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
@@ -555,15 +598,18 @@ EXRV_EXPORT int exrv_select(int h, int part, int level_x, int level_y) {
     for (k = 0; k < 4; ++k) s->rmap[k] = find_channel(hd, names[k]);
 
     /* Fallbacks for parts without conventional R/G/B so they render instead of
-     * showing black — luminance, multiview, depth, motion vectors, etc.
-     * NOTE: luminance-chroma (Y + subsampled RY/BY, e.g. CrissyField.exr) is
-     * shown here as grayscale Y. The core can now reconstruct true color via
-     * exr_part_yc_to_rgba_float() (see exr_part_is_luminance_chroma), but this
-     * viewer's streaming block-scatter path skips subsampled channels and has no
-     * whole-part hook; routing YC parts through the reconstruction helper is a
-     * separate follow-up. The simpler examples/wasm binding already does it. */
+     * showing black — luminance, multiview, depth, motion vectors, etc. */
     if (s->rmap[0] < 0 && s->rmap[1] < 0 && s->rmap[2] < 0) {
-        int y = find_channel(hd, "Y");
+        int y;
+        /* Luminance-chroma (Y + subsampled RY/BY, e.g. CrissyField.exr): decode
+         * the whole part and reconstruct true color. Falls through to grayscale
+         * Y if reconstruction isn't applicable (other level, decode failure). */
+        int yc = select_luminance_chroma(s, part, level_x, level_y);
+        if (yc >= 0) return yc;
+        session_reset_selection(s);
+        for (k = 0; k < 4; ++k) s->rmap[k] = find_channel(hd, names[k]);
+
+        y = find_channel(hd, "Y");
         if (y >= 0) {
             s->rmap[0] = s->rmap[1] = s->rmap[2] = y; /* luminance -> grayscale */
         } else if (hd->num_channels == 1) {
@@ -596,6 +642,29 @@ EXRV_EXPORT int exrv_select_channels(int h, int part, int level_x, int level_y,
     session_reset_selection(s);
     s->rmap[0] = c0; s->rmap[1] = c1; s->rmap[2] = c2; s->rmap[3] = c3;
     return finish_selection(s, part, level_x, level_y);
+}
+
+/* Select the luminance-chroma "Color" view: reconstruct full color from a
+ * Y/RY/BY part. Returns the block count (>= 0) or -1 if the part is not
+ * luminance-chroma / not at level 0 / could not be decoded (the UI then falls
+ * back to the grayscale-Y channel view). */
+EXRV_EXPORT int exrv_select_ycc(int h, int part, int level_x, int level_y) {
+    exrv_session *s = session_from_handle(h);
+    const exr_header *hd;
+    int yc;
+    if (!s) return -1;
+    if (part < 0 || part >= s->num_parts) return -1;
+    hd = exr_reader_part_header(s->r, part);
+    if (!hd) return -1;
+    if (hd->part_type == EXR_PART_DEEP_SCANLINE ||
+        hd->part_type == EXR_PART_DEEP_TILED)
+        return -1;
+
+    session_reset_selection(s);
+    yc = select_luminance_chroma(s, part, level_x, level_y);
+    if (yc >= 0) return yc;
+    session_reset_selection(s);
+    return -1;
 }
 
 EXRV_EXPORT int exrv_level_width(int h) {
@@ -668,6 +737,9 @@ EXRV_EXPORT int exrv_decode_block(int h, int i) {
 
     if (!s || !s->rgba || !s->blocks) return -1;
     if (i < 0 || i >= s->nblocks) return 0;
+    /* Luminance-chroma color was reconstructed whole-part at select time; the
+     * per-block scatter would overwrite it, so the loop is a no-op here. */
+    if (s->ycc_filled) return 1;
     hd = exr_reader_part_header(s->r, s->sel_part);
     if (!hd) return -1;
 
