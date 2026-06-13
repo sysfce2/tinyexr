@@ -853,8 +853,21 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
             if (!tf) tf = toc_node_map_get(vt, "to_reference");
             vt_inv = 1;
         }
-        if (!tf) { rc = TOC_ERROR_UNSUPPORTED; goto fail; }
-        rc = walk(cfg, list, tf, vt_inv);
+        if (tf) {
+            rc = walk(cfg, list, tf, vt_inv);
+        } else {
+            /* This VT operates from the display reference (e.g. "Video
+             * (colorimetric)"); bridge scene->display via the default VT, then
+             * apply this VT's display-reference op. */
+            const toc_node *dtf = toc_node_map_get(vt, "from_display_reference");
+            const toc_node *dvt = toc_cfg_default_view_transform(cfg);
+            const toc_node *btf = dvt ? toc_node_map_get(dvt, "from_scene_reference")
+                                      : NULL;
+            if (btf == NULL && dvt) btf = toc_node_map_get(dvt, "from_reference");
+            if (!dtf || !btf) { rc = TOC_ERROR_UNSUPPORTED; goto fail; }
+            rc = walk(cfg, list, btf, 0);             /* scene ref -> display ref */
+            if (TOC_OK(rc)) rc = walk(cfg, list, dtf, 0); /* this VT (display ref) */
+        }
         if (!TOC_OK(rc)) goto fail;
     }
     /* 4. display colorspace (view_cs for simple, display_colorspace for VT views).
