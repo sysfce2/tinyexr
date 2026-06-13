@@ -17,6 +17,10 @@ embed into your application. It comes in two flavours:
 > Spectral EXRs get a wavelength scrubber + **CIE→sRGB color** preview, deep images a 3D
 > point cloud, and the whole UI is **mobile/touch-friendly** with a fullscreen mode.
 
+> 🎨 **Live demo (tocio):** [**tocio OCIO + ACES 2.0 viewer**](https://syoyo.github.io/tinyexr/tocio/) — decode an
+> EXR and apply an **OpenColorIO** transform (incl. the **ACES 2.0** output transforms) on **WebGL2**, with a
+> live, editable OCIO config that **JIT-compiles to a GLSL shader**. See [tocio](#tocio--tiny-pure-c11-opencolorio-engine) below.
+
 **Performance (v3) at a glance** — single-thread decode/encode vs the reference
 OpenEXR library, with the optional **libdeflate** backend on/off (and HTJ2K,
 which has no deflate path). With the same backend TinyEXR meets or beats OpenEXR
@@ -235,6 +239,49 @@ Contribution is welcome!
 - **zstd** (`deps/zstd/`, optional, on by default) — BSD-3-Clause, Facebook.
 - **libdeflate** (vendored, optional ZIP/ZIPS/PXR24 backend, off by default) —
   MIT.
+
+---
+
+# tocio — tiny pure-C11 OpenColorIO engine
+
+Alongside the EXR codec, this repo ships **tocio** (`sandbox/tocio/`): a tiny,
+self-contained, **pure-C11** [OpenColorIO](https://opencolorio.org) config engine
+and code generator. It parses an OCIO config (a YAML subset), resolves a colour
+transform into a flat op list, and runs it on the CPU, ahead-of-time as
+C / GLSL / Metal source, or through a small JIT — with first-class **ACES 2.0**
+support.
+
+> 🎨 **Live demo:** [**tocio OCIO + ACES 2.0 viewer**](https://syoyo.github.io/tinyexr/tocio/)
+> — decode an EXR and apply an OCIO transform on **WebGL2**, with a live, editable
+> OCIO config that **JIT-compiles to a GLSL shader**.
+
+Highlights:
+
+| Area | Support |
+|---|---|
+| **Language** | Pure C11, freestanding-capable (no libc/libm beyond `stdint`/`stddef`; all heap via an allocator hook), zero external dependencies |
+| **Config** | OCIO YAML-subset parser: colorspaces, roles, displays/views, view transforms, looks, scene↔display reference bridging; Iridas `.cube`, Sony `.spi1d`/`.spi3d`, and ACES **CLF** LUT files |
+| **Execution** | CPU interpreter (scalar + **SSE2/AVX2**, **NEON**), AOT **C** source, **GLSL** (WebGL2 / Vulkan) and **Metal** shader generators, and a **JIT** (x86-64 SSE2/AVX + AArch64 NEON machine code; emits GLSL under WASM) |
+| **ACES** | **ACES 2.0** output transforms (CAM16 *JMh* tonescale + chroma / gamut compression) — SDR, HDR, and **D60-simulation** variants; ACEScc / ACEScct / ACEScg / ACES2065-1, the 1.3 RGC gamut-compress LMT, ARRI / Sony / RED / Panasonic camera-log inputs, and sRGB / Rec.1886 / PQ / DCDM / Display-P3 display encodings |
+| **Ops** | Matrix, range, exponent / MonCurve, log / log-camera, fixed-function, 1D/3D LUT — invertible where the math allows |
+
+**Validated against the real configs.** `make tocio-validate` parses the
+AcademySoftwareFoundation ACES OCIO configs and compares every transform tocio
+builds against PyOpenColorIO (the C++ reference engine) on fixed samples —
+currently **350 / 377 transforms verified, 0 mismatches** on in-range samples.
+
+Build & test:
+
+```sh
+make tocio-lib         # build/libtocio.a
+make tocio-test        # unit tests
+make tocio-fetch-ref   # fetch the ACES OCIO configs (once)
+make tocio-validate    # numerical validation vs PyOpenColorIO
+make wasm-tocio-demo   # web/tocio/ browser demo (needs Emscripten)
+```
+
+See [`sandbox/tocio/`](sandbox/tocio/) for the engine and
+[`web/tocio/`](web/tocio/) for the demo.
 
 ---
 

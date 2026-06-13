@@ -1,16 +1,19 @@
 name: Deploy WASM viewer to GitHub Pages
 
-# Publishes web/viewer (the pure-C11 v3 WASM EXR viewer) as a static site.
-# The generated exr_viewer.mjs / exr_viewer.wasm and a small sample.exr are
-# committed to the repo, so no Emscripten build runs here — we just upload the
-# directory as the Pages artifact.
+# Publishes two static WASM demos as the Pages site:
+#   /        web/viewer  — the pure-C11 v3 WASM EXR viewer
+#   /tocio/  web/tocio   — the tocio OCIO (ACES 2.0) + WebGL2 demo
+# All generated *.mjs / *.wasm and the bundled sample images are committed to
+# the repo, so no Emscripten build runs here — we just stage the two directories
+# into one tree and upload it as the Pages artifact.
 
 on:
-  # Deploy on every push to the release branch that touches the viewer.
+  # Deploy on every push to the release branch that touches either demo.
   push:
     branches: ["release"]
     paths:
       - "web/viewer/**"
+      - "web/tocio/**"
       - ".github/workflows/gh-pages.yml"
   # Allow manual deploys from the Actions tab.
   workflow_dispatch:
@@ -40,10 +43,17 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v6
 
-      - name: Upload viewer as Pages artifact
+      - name: Stage site (viewer at root, tocio demo under /tocio)
+        run: |
+          mkdir -p _site
+          cp -r web/viewer/. _site/
+          mkdir -p _site/tocio
+          cp -r web/tocio/. _site/tocio/
+
+      - name: Upload site as Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: web/viewer
+          path: _site
 
       - name: Deploy to GitHub Pages
         id: deployment
