@@ -343,11 +343,11 @@ static const char *FIXEDFUNC_SRC_XYZ =
 static const char *FIXEDFUNC_SRC_HDR =
     "static float tc_pq_enc(float L){float m1=0.1593017578125f,m2=78.84375f,"
     "c1=0.8359375f,c2=18.8515625f,c3=18.6875f,Lm;if(L<=0.0f)return 0.0f;"
-    "Lm=tc_powf(L,m1);return tc_powf((c1+c2*Lm)/(1.0f+c3*Lm),m2);}\n"
+    "Lm=tc_powf(L*0.01f,m1);return tc_powf((c1+c2*Lm)/(1.0f+c3*Lm),m2);}\n"
     "static float tc_pq_dec(float N){float m1=0.1593017578125f,m2=78.84375f,"
     "c1=0.8359375f,c2=18.8515625f,c3=18.6875f,Np,nu,de;if(N<=0.0f)return 0.0f;"
     "Np=tc_powf(N,1.0f/m2);nu=Np-c1;if(nu<0.0f)nu=0.0f;de=c2-c3*Np;"
-    "if(de<=0.0f)return 0.0f;return tc_powf(nu/de,1.0f/m1);}\n"
+    "if(de<=0.0f)return 0.0f;return tc_powf(nu/de,1.0f/m1)*100.0f;}\n"
     "static float tc_hlg_enc(float E){float a=0.17883277f,b=0.28466892f,"
     "c=0.55991073f;if(E<=0.0f)return 0.0f;if(E<=1.0f/12.0f)return "
     "tc_exp2f(0.5f*tc_log2f(3.0f*E));return a*(tc_log2f(12.0f*E-b)*"

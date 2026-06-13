@@ -289,6 +289,7 @@ void toc_apply_op_pixel(const toc_op *op, float *px, int ch) {
         case TOC_OP_LUT1D: toc_lut1d_apply_pixel(op, px, ch); break;
         case TOC_OP_LUT3D: toc_lut3d_apply_pixel(op, px, ch); break;
         case TOC_OP_FIXEDFUNC: toc_fixedfunc_apply_pixel(op, px, ch); break;
+        case TOC_OP_ACES_OUTPUT: toc_aces2_apply_pixel(op, px, ch); break;
         case TOC_OP_NOOP:
         default: break;
     }
@@ -320,6 +321,7 @@ static void batch_op(const toc_op *op, float *rgba, size_t npix, int ch) {
             case TOC_OP_LUT1D: toc_lut1d_apply_pixel(op, px, ch); break;
             case TOC_OP_LUT3D: toc_lut3d_apply_pixel(op, px, ch); break;
             case TOC_OP_FIXEDFUNC: toc_fixedfunc_apply_pixel(op, px, ch); break;
+            case TOC_OP_ACES_OUTPUT: toc_aces2_apply_pixel(op, px, ch); break;
             case TOC_OP_NOOP:
             default: break;
         }

@@ -1164,8 +1164,16 @@ static void test_codegen_c_hdr(void) {
                 for (c = 0; c < 4; ++c) { a[c] = b[c] = v; }
                 toc_apply(l, a, 1, 4);
                 fn(b, 1);
-                for (c = 0; c < 3; ++c)
-                    if (!approx(a[c], b[c], 2e-3f)) ok = 0;
+                /* This chains PQ<->HLG, which the OCIO nits/100 PQ convention
+                 * can drive out of range to +/-inf at high inputs; only require
+                 * interp == emitted-C where both are finite (they use identical
+                 * math, so they go non-finite together). */
+                for (c = 0; c < 3; ++c) {
+                    int fa = a[c] == a[c] && a[c] < 1e30f && a[c] > -1e30f;
+                    int fb = b[c] == b[c] && b[c] < 1e30f && b[c] > -1e30f;
+                    if (fa != fb) ok = 0;
+                    else if (fa && !approx(a[c], b[c], 2e-3f)) ok = 0;
+                }
             }
             CHECK(ok, "interpreter == compiled emitted-C (PQ/HLG)");
         }
@@ -1273,6 +1281,48 @@ static void test_codegen_glsl_hdr(void) {
         toc_shader_free(&sh);
     }
     toc_op_list_free(l);
+}
+
+/* ---- ACES 2.0 output transform GLSL emission ----------------------------- */
+static int str_contains(const char *h, const char *n) {
+    size_t hl = strlen(h), nl = strlen(n), i;
+    if (nl > hl) return 0;
+    for (i = 0; i + nl <= hl; ++i)
+        if (memcmp(h + i, n, nl) == 0) return 1;
+    return 0;
+}
+static void test_codegen_glsl_aces2(void) {
+    static const char *cfg_txt =
+        "ocio_profile_version: 2\n"
+        "colorspaces:\n"
+        "  - !<ColorSpace>\n    name: ap0\n    isdata: false\n"
+        "  - !<ColorSpace>\n    name: xyz\n    isdata: false\n"
+        "    from_reference: !<BuiltinTransform> {style: ACES-OUTPUT - "
+        "ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709_2.0}\n";
+    toc_config *cfg = NULL;
+    toc_op_list *ops = NULL;
+    toc_shader sh;
+    toc_result rc = toc_config_parse(cfg_txt, strlen(cfg_txt), NULL, &cfg);
+    CHECK(TOC_OK(rc), "ACES2 GLSL config parse");
+    if (!TOC_OK(rc)) return;
+    rc = toc_processor_from_colorspaces(cfg, "ap0", "xyz", NULL, &ops);
+    CHECK(TOC_OK(rc) && ops, "ACES2 GLSL processor build");
+    if (TOC_OK(rc)) {
+        rc = toc_emit_glsl(ops, TOC_GLSL_ES30, NULL, &sh);
+        CHECK(TOC_OK(rc) && sh.source, "ACES2 emit GLSL");
+        if (TOC_OK(rc)) {
+            /* must emit the driver, the scalar helpers, and the baked tables -
+             * never silently skip the op. */
+            CHECK(str_contains(sh.source, "tocAces2_") &&
+                      str_contains(sh.source, "a2cf(") &&
+                      str_contains(sh.source, "a2reach_") &&
+                      str_contains(sh.source, "a2cG_"),
+                  "ACES2 GLSL contains driver + helpers + tables");
+            toc_shader_free(&sh);
+        }
+        toc_op_list_free(ops);
+    }
+    toc_config_free(cfg);
 }
 
 /* ---- Metal (MSL) codegen ------------------------------------------------- */
@@ -1951,15 +2001,18 @@ static void test_display_transfer(void) {
             toc_op_list_free(l);
         }
     }
-    /* PQ maps [0,1] -> [0,1] (0->0, peak 1->1). */
+    /* PQ uses the OCIO/ACES nits/100 convention: input 100.0 (= 10000 nits) ->
+     * 1.0 (peak), 0 -> 0, and 1.0 (= 100 nits) -> ~0.508. */
     {
         toc_op_list *l = newlist();
-        float a[3] = {1, 1, 1}, z[3] = {0, 0, 0};
+        float pk[3] = {100, 100, 100}, mid[3] = {1, 1, 1}, z[3] = {0, 0, 0};
         push_ff_raw(l, TOC_FF_LIN_TO_PQ);
-        toc_apply(l, a, 1, 3);
+        toc_apply(l, pk, 1, 3);
+        toc_apply(l, mid, 1, 3);
         toc_apply(l, z, 1, 3);
-        CHECK(approx(a[0], 1.0f, 1e-3f) && approx(z[0], 0.0f, 1e-4f),
-              "PQ maps [0,1] -> [0,1]");
+        CHECK(approx(pk[0], 1.0f, 1e-3f) && approx(z[0], 0.0f, 1e-4f) &&
+                  mid[0] > 0.45f && mid[0] < 0.55f,
+              "PQ nits/100: 100->1, 0->0, 1->~0.5");
         toc_op_list_free(l);
     }
     /* Composed output transforms: display value -> XYZ (invert) -> display
@@ -2353,6 +2406,7 @@ int main(void) {
     printf("== tocio GLSL codegen ==\n");
     test_codegen_glsl();
     test_codegen_glsl_hdr();
+    test_codegen_glsl_aces2();
     test_codegen_metal();
     test_codegen_exp_linear();
     test_codegen_aces();

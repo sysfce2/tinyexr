@@ -110,6 +110,142 @@ static float glsl_gc_scale(float lim, float thr, float power) {
     return (d != 0.0f) ? (lim - thr) / d : 1.0f;
 }
 
+/* ---- ACES 2.0 output transform: scalar helpers (emitted once) ----------- */
+static const char *GLSL_ACES2_FUNCS =
+    "float a2cf(float v){float a=abs(v),F=pow(a,0.42);return sign(v)*F/(27.13+F);}\n"
+    "float a2ci(float v){float a=min(abs(v),0.99);float F=27.13*a/(1.0-a);"
+    "return sign(v)*pow(F,1.0/0.42);}\n"
+    "float a2cfa(float Rc){float F=pow(max(Rc,0.0),0.42);return F/(27.13+F);}\n"
+    "float a2cia(float Ra){float a=min(Ra,0.99);float F=27.13*a/(1.0-a);"
+    "return pow(max(F,0.0),1.0/0.42);}\n"
+    "float a2toe(float x,float lim,float k1i,float k2i){if(x>lim)return x;"
+    "float k2=max(k2i,0.001),k1=sqrt(k1i*k1i+k2*k2),k3=(lim+k1)/(lim+k2);"
+    "float mb=k3*x-k1,mac=k2*k3*x;return 0.5*(mb+sqrt(mb*mb+4.0*mac));}\n"
+    "float a2ccn(float c1,float s1,float sc){float c2=2.0*c1*c1-1.0,s2=2.0*c1*s1,"
+    "c3=4.0*c1*c1*c1-3.0*c1,s3=3.0*s1-4.0*s1*s1*s1;"
+    "return (11.34072*c1+16.46899*c2+7.8838*c3+14.66441*s1-6.37224*s2+9.19364*s3"
+    "+77.12896)*sc;}\n"
+    "float a2fg(float J,float at,float lj,float fd){float g=lj*fd;if(J>at){"
+    "float ad=log2((lj-at)/max(0.0001,lj-J))*0.30102999566;g=g*(ad*ad+1.0);}return g;}\n"
+    "float a2sj(float J,float M,float fJ,float mJ,float sg){float Ms=M/sg,a=Ms/fJ;"
+    "if(J<fJ){float b=1.0-Ms,c=-J,d=b*b-4.0*a*c;return -2.0*c/(b+sqrt(d));}"
+    "float b=-(1.0+Ms+mJ*a),c=mJ*Ms+J,d=b*b-4.0*a*c;return -2.0*c/(b-sqrt(d));}\n"
+    "float a2smin(float a,float b,float sr){float ss=0.12*sr;"
+    "float h=max(ss-abs(a-b),0.0)/ss;return min(a,b)-h*h*h*ss*(1.0/6.0);}\n"
+    "float a2sl(float iJ,float fJ,float mJ,float sg){float ds=(iJ<fJ)?iJ:(mJ-iJ);"
+    "return ds*(iJ-fJ)/(fJ*sg);}\n"
+    "float a2eM(float Ja,float sl,float ig,float Jm,float Mm,float Jr){"
+    "float nJ=Ja/Jr;return Jr*pow(nJ,ig)*Mm/(Jm-sl*Mm);}\n"
+    "float a2bd(vec2 cp,float Jm,float gt,float gb,float Jis,float sl,float Jic){"
+    "float Ml=a2eM(Jis,sl,gb,cp.x,cp.y,Jic);float Mu=a2eM(Jm-Jis,-sl,gt,Jm-cp.x,cp.y,Jm-Jic);"
+    "return a2smin(Ml,Mu,cp.y);}\n"
+    "float a2rm(float M,float gb,float rb){float pr=max(gb/rb,0.75),th=pr*gb;"
+    "if(M<=th||pr>=1.0)return M;float mo=M-th,go=gb-th,ro=rb-th;"
+    "float s=ro/((ro/go)-1.0),nd=mo/s;return th+s*nd/(1.0+nd);}\n";
+
+/* emit `const float <pfx><idx>[363]=float[](...);` */
+static void emit_farr(toc_sb *sb, const char *pfx, int idx, const float *v, int n) {
+    int i;
+    toc_sb_puts(sb, "const float ");
+    toc_sb_puts(sb, pfx);
+    toc_sb_int(sb, idx);
+    toc_sb_putc(sb, '[');
+    toc_sb_int(sb, n);
+    toc_sb_puts(sb, "]=float[](");
+    for (i = 0; i < n; ++i) {
+        if (i) toc_sb_putc(sb, ',');
+        emit_f(sb, v[i]);
+    }
+    toc_sb_puts(sb, ");\n");
+}
+/* emit a row-major 3x3 as a GLSL column-major mat3 usable as `mat3(...) * v`. */
+static void emit_mat3(toc_sb *sb, const float m[9]) {
+    int o[9] = {0, 3, 6, 1, 4, 7, 2, 5, 8}, i;
+    toc_sb_puts(sb, "mat3(");
+    for (i = 0; i < 9; ++i) { if (i) toc_sb_putc(sb, ','); emit_f(sb, m[o[i]]); }
+    toc_sb_putc(sb, ')');
+}
+
+/* Emit the per-op ACES 2.0 tables + driver function tocAces2_<idx>. */
+static void emit_aces2(toc_sb *sb, const toc_aces2 *a, int idx) {
+    emit_farr(sb, "a2reach_", idx, a->reach_m, TOC_ACES2_TSIZE);
+    emit_farr(sb, "a2hue_", idx, a->hue_table, TOC_ACES2_TSIZE);
+    emit_farr(sb, "a2cJ_", idx, a->cusp_J, TOC_ACES2_TSIZE);
+    emit_farr(sb, "a2cM_", idx, a->cusp_M, TOC_ACES2_TSIZE);
+    emit_farr(sb, "a2cG_", idx, a->cusp_g, TOC_ACES2_TSIZE);
+    toc_sb_puts(sb, "vec3 tocAces2_"); toc_sb_int(sb, idx);
+    toc_sb_puts(sb, "(vec3 rgb){\n  vec3 m=");
+    emit_mat3(sb, a->in.rgb_to_cam);
+    toc_sb_puts(sb, "*rgb;\n  vec3 ra=vec3(a2cf(m.x),a2cf(m.y),a2cf(m.z));\n  vec3 Aab=");
+    emit_mat3(sb, a->in.cone_to_aab);
+    toc_sb_puts(sb, "*ra;\n");
+    toc_sb_puts(sb, "  float J=Aab.x<=0.0?0.0:100.0*pow(Aab.x,");
+    emit_f(sb, a->in.cz);
+    toc_sb_puts(sb, ");\n  float Mm=Aab.x<=0.0?0.0:sqrt(Aab.y*Aab.y+Aab.z*Aab.z);\n");
+    toc_sb_puts(sb, "  float h=0.0; if(Aab.x>0.0){h=degrees(atan(Aab.z,Aab.y)); if(h<0.0)h+=360.0;}\n");
+    toc_sb_puts(sb, "  int rl=int(h)+1; float rt=h-float(int(h));\n  float rmaxM=mix(a2reach_");
+    toc_sb_int(sb, idx); toc_sb_puts(sb, "[rl],a2reach_"); toc_sb_int(sb, idx);
+    toc_sb_puts(sb, "[rl+1],rt);\n  float hr=radians(h),c1=cos(hr),s1=sin(hr);\n  float Mn=a2ccn(c1,s1,");
+    emit_f(sb, a->cc_scale);
+    toc_sb_puts(sb, ");\n");
+    /* tonescale A->J */
+    toc_sb_puts(sb, "  float Yin=a2cia("); emit_f(sb, a->in.A_w_J);
+    toc_sb_puts(sb, "*Aab.x)/"); emit_f(sb, a->in.F_L_n);
+    toc_sb_puts(sb, ";\n  float f="); emit_f(sb, a->ts_m_2);
+    toc_sb_puts(sb, "*pow(Yin/(Yin+"); emit_f(sb, a->ts_s_2);
+    toc_sb_puts(sb, "),"); emit_f(sb, a->ts_g);
+    toc_sb_puts(sb, ");\n  float Yo=max(0.0,f*f/(f+"); emit_f(sb, a->ts_t_1);
+    toc_sb_puts(sb, "))*"); emit_f(sb, a->ts_n_r);
+    toc_sb_puts(sb, ";\n  float Ra2=a2cfa(abs(Yo)*"); emit_f(sb, a->in.F_L_n);
+    toc_sb_puts(sb, ");\n  float Jt=sign(Aab.x)*100.0*pow(Ra2*"); emit_f(sb, a->in.inv_A_w_J);
+    toc_sb_puts(sb, ","); emit_f(sb, a->in.cz); toc_sb_puts(sb, ");\n");
+    /* chroma compress */
+    toc_sb_puts(sb, "  float Mcp=Mm;\n  if(Mm!=0.0){float nJ=Jt/"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ";float snJ=max(0.0,1.0-nJ);\n  float lim=pow(nJ,"); emit_f(sb, a->model_gamma_inv);
+    toc_sb_puts(sb, ")*rmaxM/Mn;\n  Mcp=Mm*pow(Jt/J,"); emit_f(sb, a->model_gamma_inv);
+    toc_sb_puts(sb, ")/Mn;\n  Mcp=lim-a2toe(lim-Mcp,lim-0.001,snJ*"); emit_f(sb, a->cc_sat);
+    toc_sb_puts(sb, ",sqrt(nJ*nJ+"); emit_f(sb, a->cc_sat_thr);
+    toc_sb_puts(sb, "));\n  Mcp=a2toe(Mcp,lim,nJ*"); emit_f(sb, a->cc_compr);
+    toc_sb_puts(sb, ",snJ)*Mn;}\n");
+    /* gamut compress */
+    toc_sb_puts(sb, "  float Jc=Jt,Mc=0.0;\n  if(Jt>0.0&&Mcp>0.0&&Jt<="); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, "){\n  int i="); toc_sb_int(sb, 1); toc_sb_puts(sb, "+int(h);\n");
+    toc_sb_puts(sb, "  int ilo=max(0,i+("); toc_sb_int(sb, a->hue_search_lo);
+    toc_sb_puts(sb, ")),ihi=min("); toc_sb_int(sb, TOC_ACES2_NOMINAL + 1);
+    toc_sb_puts(sb, ",i+("); toc_sb_int(sb, a->hue_search_hi); toc_sb_puts(sb, "));\n");
+    toc_sb_puts(sb, "  for(int it=0;it<16;it++){if(ilo+1>=ihi)break; if(h>a2hue_");
+    toc_sb_int(sb, idx); toc_sb_puts(sb, "[i])ilo=i;else ihi=i; i=(ilo+ihi)/2;}\n");
+    toc_sb_puts(sb, "  if(ihi<1)ihi=1;\n  float t=(h-a2hue_"); toc_sb_int(sb, idx);
+    toc_sb_puts(sb, "[ihi-1])/(a2hue_"); toc_sb_int(sb, idx); toc_sb_puts(sb, "[ihi]-a2hue_");
+    toc_sb_int(sb, idx); toc_sb_puts(sb, "[ihi-1]);\n");
+    toc_sb_puts(sb, "  vec2 cp=vec2(mix(a2cJ_"); toc_sb_int(sb, idx); toc_sb_puts(sb, "[ihi-1],a2cJ_");
+    toc_sb_int(sb, idx); toc_sb_puts(sb, "[ihi],t),mix(a2cM_"); toc_sb_int(sb, idx);
+    toc_sb_puts(sb, "[ihi-1],a2cM_"); toc_sb_int(sb, idx); toc_sb_puts(sb, "[ihi],t));\n");
+    toc_sb_puts(sb, "  float gt=mix(a2cG_"); toc_sb_int(sb, idx); toc_sb_puts(sb, "[ihi-1],a2cG_");
+    toc_sb_int(sb, idx); toc_sb_puts(sb, "[ihi],t);\n");
+    toc_sb_puts(sb, "  float fJ=mix(cp.x,"); emit_f(sb, a->mid_J);
+    toc_sb_puts(sb, ",min(1.0,1.3-(cp.x/"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ")));\n  float at=mix(cp.x,"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ",0.3);\n  float sg=a2fg(Jt,at,"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ","); emit_f(sb, a->focus_dist);
+    toc_sb_puts(sb, ");\n  float Jis=a2sj(Jt,Mcp,fJ,"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ",sg);\n  float sl=a2sl(Jis,fJ,"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ",sg);\n  float Jic=a2sj(cp.x,cp.y,fJ,"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ",sg);\n  float gb=a2bd(cp,"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ",gt,"); emit_f(sb, a->lower_hull_gamma_inv);
+    toc_sb_puts(sb, ",Jis,sl,Jic);\n  if(gb>0.0){float rb=a2eM(Jis,sl,");
+    emit_f(sb, a->model_gamma_inv); toc_sb_puts(sb, ","); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ",rmaxM,"); emit_f(sb, a->limit_J_max);
+    toc_sb_puts(sb, ");\n  float rM=a2rm(Mcp,gb,rb); Jc=Jis+rM*sl; Mc=rM;}}\n");
+    /* JMh -> Aab(out) -> RGB(out) */
+    toc_sb_puts(sb, "  float Ao=pow(Jc*0.01,"); emit_f(sb, a->out.inv_cz);
+    toc_sb_puts(sb, ");\n  vec3 Aabo=vec3(Ao,Mc*c1,Mc*s1);\n  vec3 rao=");
+    emit_mat3(sb, a->out.aab_to_cone);
+    toc_sb_puts(sb, "*Aabo;\n  vec3 mo=vec3(a2ci(rao.x),a2ci(rao.y),a2ci(rao.z));\n  return ");
+    emit_mat3(sb, a->out.cam_to_rgb);
+    toc_sb_puts(sb, "*mo;\n}\n");
+}
+
 toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                          const toc_allocator *a, toc_shader *out) {
     toc_sb sb;
@@ -162,6 +298,19 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
              s == TOC_FF_ACES_GAMUTCOMP13 || s == TOC_FF_ACES_GAMUTCOMP13_INV)) {
             toc_sb_puts(&sb, GLSL_ACES_SRC);
             break;
+        }
+    }
+
+    /* ACES 2.0 output transform: scalar helpers (once) + per-op tables+driver. */
+    {
+        int any_aces2 = 0;
+        for (k = 0; k < ops->count; ++k)
+            if (ops->ops[k].kind == TOC_OP_ACES_OUTPUT) { any_aces2 = 1; break; }
+        if (any_aces2) {
+            toc_sb_puts(&sb, GLSL_ACES2_FUNCS);
+            for (k = 0; k < ops->count; ++k)
+                if (ops->ops[k].kind == TOC_OP_ACES_OUTPUT)
+                    emit_aces2(&sb, (const toc_aces2 *)ops->ops[k].u.aces.t, (int)k);
         }
     }
 
@@ -500,13 +649,13 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                                      "  v=vec4(9.0*Y*u*dd,Y,Y*(12.0-3.0*u-20.0*vv)*dd,v.a);}\n");
                 } else if (s == TOC_FF_LIN_TO_PQ) {
                     toc_sb_puts(&sb,
-                        "  { vec3 Lm=pow(max(v.rgb,0.0),vec3(0.1593017578125));\n"
+                        "  { vec3 Lm=pow(max(v.rgb,0.0)*0.01,vec3(0.1593017578125));\n"
                         "  v.rgb=pow((0.8359375+18.8515625*Lm)/(1.0+18.6875*Lm),vec3(78.84375)); }\n");
                 } else if (s == TOC_FF_PQ_TO_LIN) {
                     toc_sb_puts(&sb,
                         "  { vec3 Np=pow(max(v.rgb,0.0),vec3(0.012683313));\n"
                         "  vec3 nu=max(Np-0.8359375,0.0),de=max(18.8515625-18.6875*Np,1e-10);\n"
-                        "  v.rgb=pow(nu/de,vec3(6.2773438)); }\n");
+                        "  v.rgb=pow(nu/de,vec3(6.2773438))*100.0; }\n");
                 } else if (s == TOC_FF_LIN_TO_HLG) {
                     toc_sb_puts(&sb,
                         "  { vec3 e=max(v.rgb,0.0);\n"
@@ -519,6 +668,11 @@ toc_result toc_emit_glsl(const toc_op_list *ops, toc_glsl_target target,
                 }
                 break;
             }
+            case TOC_OP_ACES_OUTPUT:
+                toc_sb_puts(&sb, "  v.rgb = tocAces2_");
+                toc_sb_int(&sb, (int)k);
+                toc_sb_puts(&sb, "(v.rgb);\n");
+                break;
             default: break;
         }
     }

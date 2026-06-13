@@ -753,10 +753,32 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
     views = d ? toc_node_map_get(d, display) : NULL;
     if (!views || views->kind != TOC_NODE_SEQ) return TOC_ERROR_NOT_FOUND;
     vnode = NULL;
-    for (i = 0; i < views->n_items; ++i) {
-        const char *vn = toc_node_scalar(toc_node_map_get(views->items[i],
-                                                          "name"));
-        if (vn && strcmp(vn, view) == 0) { vnode = views->items[i]; break; }
+    for (i = 0; i < views->n_items && !vnode; ++i) {
+        const toc_node *it = views->items[i];
+        if (it->kind == TOC_NODE_SEQ) {
+            /* `!<Views> [name, ...]` references views defined in shared_views. */
+            size_t j;
+            for (j = 0; j < it->n_items; ++j) {
+                const char *nm = toc_node_scalar(it->items[j]);
+                if (nm && strcmp(nm, view) == 0) {
+                    const toc_node *sv = toc_node_map_get(cfg->root, "shared_views");
+                    size_t k;
+                    if (sv && sv->kind == TOC_NODE_SEQ)
+                        for (k = 0; k < sv->n_items; ++k) {
+                            const char *svn = toc_node_scalar(
+                                toc_node_map_get(sv->items[k], "name"));
+                            if (svn && strcmp(svn, view) == 0) {
+                                vnode = sv->items[k];
+                                break;
+                            }
+                        }
+                    break;
+                }
+            }
+        } else {
+            const char *vn = toc_node_scalar(toc_node_map_get(it, "name"));
+            if (vn && strcmp(vn, view) == 0) vnode = it;
+        }
     }
     if (!vnode) return TOC_ERROR_NOT_FOUND;
     /* Determine view type, build pipeline.
@@ -803,19 +825,30 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
             if (tf) { rc = walk(cfg, list, tf, 0); if (!TOC_OK(rc)) goto fail; }
         }
     }
-    /* 3. apply view_transform (if present) */
+    /* 3. apply view_transform (if present). OCIO v2 ViewTransforms convert the
+     * scene reference to the display reference via from_scene_reference (or the
+     * inverse of to_scene_reference); accept the legacy *_reference too. */
     if (view_vt) {
         const toc_node *vt = toc_cfg_find_view_transform(cfg, view_vt);
         const toc_node *tf;
+        int vt_inv = 0;
         if (!vt) { rc = TOC_ERROR_NOT_FOUND; goto fail; }
-        tf = toc_node_map_get(vt, "from_reference");
+        tf = toc_node_map_get(vt, "from_scene_reference");
+        if (!tf) tf = toc_node_map_get(vt, "from_reference");
+        if (!tf) {
+            tf = toc_node_map_get(vt, "to_scene_reference");
+            if (!tf) tf = toc_node_map_get(vt, "to_reference");
+            vt_inv = 1;
+        }
         if (!tf) { rc = TOC_ERROR_UNSUPPORTED; goto fail; }
-        rc = walk(cfg, list, tf, 0);
+        rc = walk(cfg, list, tf, vt_inv);
         if (!TOC_OK(rc)) goto fail;
     }
-    /* 4. display colorspace (view_cs for simple, display_colorspace for VT views) */
+    /* 4. display colorspace (view_cs for simple, display_colorspace for VT views).
+     * The token <USE_DISPLAY_NAME> means "the display's own colorspace". */
     view_dc = view_cs ? view_cs
                       : toc_node_scalar(toc_node_map_get(vnode, "display_colorspace"));
+    if (view_dc && strcmp(view_dc, "<USE_DISPLAY_NAME>") == 0) view_dc = display;
     if (view_dc) {
         rc = emit_from_ref(cfg, list, view_dc, 0);
         if (!TOC_OK(rc)) goto fail;

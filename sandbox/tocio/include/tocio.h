@@ -70,6 +70,7 @@ typedef enum toc_op_kind {
     TOC_OP_LUT1D,      /* per-channel 1D interpolation over a domain */
     TOC_OP_LUT3D,      /* trilinear/tetrahedral over an NxNxN cube */
     TOC_OP_FIXEDFUNC,  /* ACES fixed function (style id + params) */
+    TOC_OP_ACES_OUTPUT,/* ACES 2.0 output transform (CAM16 JMh tonescale+gamut) */
     TOC_OP_NOOP
 } toc_op_kind;
 
@@ -169,6 +170,9 @@ typedef struct toc_op {
         toc_lut1d lut1d;
         toc_lut3d lut3d;
         struct { int style; float params[8]; int nparams; } fixedfunc;
+        /* ACES 2.0 output transform. `t` points at a precomputed parameter+table
+         * blob owned by the op list (toc_aces2, defined in toc_internal.h). */
+        struct { const void *t; int inverse; } aces;
     } u;
 } toc_op;
 

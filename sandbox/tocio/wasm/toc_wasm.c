@@ -120,3 +120,32 @@ TOC_EXPORT int tocw_num_colorspaces(void *cfg) {
 TOC_EXPORT const char *tocw_colorspace_name(void *cfg, int i) {
     return toc_config_colorspace_name((toc_config *)cfg, i);
 }
+TOC_EXPORT int tocw_num_displays(void *cfg) {
+    return toc_config_num_displays((toc_config *)cfg);
+}
+TOC_EXPORT const char *tocw_display_name(void *cfg, int i) {
+    return toc_config_display_name((toc_config *)cfg, i);
+}
+TOC_EXPORT int tocw_num_views(void *cfg, const char *display) {
+    return toc_config_num_views((toc_config *)cfg, display);
+}
+TOC_EXPORT const char *tocw_view_name(void *cfg, const char *display, int i) {
+    return toc_config_view_name((toc_config *)cfg, display, i);
+}
+TOC_EXPORT const char *tocw_role(void *cfg, const char *role) {
+    return toc_config_role((toc_config *)cfg, role);
+}
+
+/* "JIT compile". A real machine-code JIT (toc_jit) needs executable memory,
+ * which WASM/the browser does not provide, so toc_jit_compile reports
+ * TOC_ERROR_UNSUPPORTED here; the JIT's web output is therefore a GPU shader.
+ * Returns a malloc'd GLSL (ES3.0) string the caller frees with tocw_free_str. */
+TOC_EXPORT char *tocw_jit_glsl(void *ops) {
+    toc_jit *j = NULL;
+    /* Exercise the (inert, included-for-completeness) machine-code JIT so the
+     * symbol is linked; under WASM this returns UNSUPPORTED and we emit GLSL. */
+    if (TOC_OK(toc_jit_compile((toc_op_list *)ops, 4, NULL, &j)) && j) {
+        toc_jit_destroy(j); /* never reached on WASM */
+    }
+    return tocw_emit_glsl(ops, 0);
+}

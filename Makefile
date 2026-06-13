@@ -383,12 +383,14 @@ tocio-arm-test: | build
 	$(ARM_QEMU) ./build/toc_test_arm
 
 # ---- tocio WASM (Emscripten ES6 module for the web viewer) -----------------
-TOCW_EXPORTS = ['_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_emit_metal','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_malloc','_free']
+TOCW_EXPORTS = ['_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_jit_glsl','_tocw_emit_metal','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_malloc','_free']
 TOCW_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','UTF8ToString','stringToUTF8','lengthBytesUTF8']
 .PHONY: wasm-tocio wasm-tocio-test
+# toc_wasm.c references the JIT (tocw_jit_glsl); include toc_jit.c (inert stub
+# under wasm32) so the module links.
 wasm-tocio: | build
 	$(EMCC) -O3 $(TOC_INC) -w \
-	  $(TOC_CORE_SRC) sandbox/tocio/wasm/toc_wasm.c \
+	  $(TOC_CORE_SRC) sandbox/tocio/src/toc_jit.c sandbox/tocio/wasm/toc_wasm.c \
 	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
 	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
 	  -s "EXPORTED_FUNCTIONS=$(TOCW_EXPORTS)" \
@@ -398,6 +400,25 @@ wasm-tocio: | build
 
 wasm-tocio-test: wasm-tocio
 	node sandbox/tocio/wasm/test.mjs
+
+# ---- tocio web demo: ONE module with EXR decode + tocio + JIT(->GLSL) -------
+# Combines the v3 EXR decoder (exrw_decode_rgba) and the tocio engine (incl.
+# toc_jit.c, which compiles to its inert stub under wasm32 -> "JIT outputs GLSL")
+# into build/tocio_demo.mjs for web/tocio/. toc_stdio.c is excluded (no FS).
+TOCDEMO_SRC = $(TOC_CORE_SRC) sandbox/tocio/src/toc_jit.c sandbox/tocio/wasm/toc_wasm.c
+TOCDEMO_EXPORTS = ['_exrw_decode_rgba','_exrw_free','_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_jit_glsl','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_tocw_num_displays','_tocw_display_name','_tocw_num_views','_tocw_view_name','_tocw_role','_malloc','_free']
+TOCDEMO_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','UTF8ToString','stringToUTF8','lengthBytesUTF8']
+.PHONY: wasm-tocio-demo
+wasm-tocio-demo: | build
+	$(EMCC) -O3 $(V3_INC) $(TOC_INC) -w \
+	  $(V3_CORE_SRC) $(ZSTD_SRC) examples/wasm/exr_wasm.c \
+	  $(TOCDEMO_SRC) \
+	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
+	  -s "EXPORTED_FUNCTIONS=$(TOCDEMO_EXPORTS)" \
+	  -s "EXPORTED_RUNTIME_METHODS=$(TOCDEMO_RUNTIME)" \
+	  -o web/tocio/tocio_demo.mjs
+	@echo "built web/tocio/tocio_demo.mjs + .wasm"
 
 clean:
 	rm -rf $(TARGET) miniz.o build $(PARSE_HARNESS)
