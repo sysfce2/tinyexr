@@ -310,8 +310,9 @@ exr_result exr_part_yc_to_rgba_float(const exr_allocator *a,
                           part->header.has_chromaticities, yw);
     if (yw[1] == 0.0f) return EXR_ERROR_CORRUPT; /* would divide by zero */
 
-    npx = (size_t)w * (size_t)h;
-    if (exr_mul_ovf(npx, sizeof(float) * 4, &total)) return EXR_ERROR_CORRUPT;
+    if (exr_mul_ovf((size_t)w, (size_t)h, &npx) ||
+        exr_mul_ovf(npx, sizeof(float) * 4, &total))
+        return EXR_ERROR_CORRUPT; /* guards npx (and npx*4 for the chroma planes) */
     buf = (float *)exr_malloc(a, total);
     ry_full = (float *)exr_malloc(a, npx * sizeof(float));
     by_full = (float *)exr_malloc(a, npx * sizeof(float));
