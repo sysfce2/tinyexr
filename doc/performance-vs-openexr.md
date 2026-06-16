@@ -195,6 +195,87 @@ EXR_THREADS=16 ./build/bench_compare                 # 16 threads, both libs
 make bench-compare THREADS=1 LIBDEFLATE=1            # + libdeflate backend
 ```
 
+## GPU offload (CUDA backend)
+
+> **Setup & method**
+> - **GPU:** NVIDIA GeForce RTX 5060 Ti; **CPU:** same Ryzen 9 3950X as above.
+> - **Path:** the optional CUDA backend (`make CUDA=1`, runtime-loaded via cuew +
+>   NVRTC). Whole-image `exr_gpu_load_from_memory` / `exr_gpu_save_to_memory` vs
+>   the CPU `exr_load_from_memory` / `exr_save_to_memory`, fully in memory.
+> - **What runs on GPU:** the *parallel* reconstruction passes — predictor +
+>   even/odd deinterleave (ZIP/ZIPS/RLE), channel split, half↔float — plus the
+>   HTJ2K **HT block coder** (one thread per 128×32 code-block, bit-exact). The
+>   **bit-serial entropy stages stay on the CPU by necessity**: DEFLATE inflate
+>   (ZIP/ZIPS/PXR24), zstd, RLE expand, PIZ Huffman+wavelet, and the HTJ2K
+>   transform/packet assembly. So every block pays a CPU↔GPU round-trip around an
+>   inherently serial core.
+> - Output is bit-identical / pixel-identical to the CPU path; the GPU path falls
+>   back to CPU for deep parts and unsupported cases.
+> - Throughput is **MP/s** (higher is better); one-time NVRTC compile and lazy
+>   device-buffer init are warmed up and excluded. `make bench-gpu-jph`.
+
+**Headline: the hybrid GPU path is correctness-complete but does *not* beat CPU.**
+Only `htj2k256` decode edges above parity, and only on large images. This is a
+real, measured property of the design, not a tuning gap — see the analysis below.
+
+Whole-image throughput, large image (synthetic 4096², 4× HALF, 16.78 MP — the
+best case for the GPU, where there are the most blocks to amortize the launch):
+
+| codec | dec CPU | dec GPU | dec ratio | enc CPU | enc GPU | enc ratio |
+|-------|--------:|--------:|:---------:|--------:|--------:|:---------:|
+| none     | 189.3 |  70.8 | 0.37× |  76.8 |  57.4 | 0.75× |
+| rle      | 137.0 |  15.8 | 0.12× |  93.9 |  63.5 | 0.68× |
+| zips     | 100.6 |  15.1 | 0.15× |  59.9 |  45.2 | 0.75× |
+| zip      | 139.4 |  93.2 | 0.67× |  60.1 |  52.1 | 0.87× |
+| piz      |  31.5 |  29.3 | 0.93× |  34.7 |  34.5 | 0.99× |
+| pxr24    | 131.7 | 102.3 | 0.78× |  66.1 |  58.6 | 0.89× |
+| b44      |  76.5 |  65.8 | 0.86× |  50.8 |  45.8 | 0.90× |
+| zstd     | 209.8 | 151.9 | 0.72× | 565.6 | 246.6 | 0.44× |
+| htj2k256 |  33.2 | **36.9** | **1.11×** |  30.8 |  19.4 | 0.63× |
+| htj2k32  |  39.0 |  35.5 | 0.91× |  31.1 |  30.2 | 0.97× |
+
+(MP/s. On the small `asakusa` (0.29 MP) every ratio is *worse* — e.g. `none`
+decode 2437 → 19 MP/s (0.01×), `rle` decode 0.01×, `htj2k256` decode 0.80× — the
+launch + H2D/D2H overhead dwarfs the per-block work when there are few blocks.)
+
+Why the GPU loses despite a 200+ GB/s card, codec by codec:
+
+- **`none` / `rle` decode collapse (0.01–0.37×).** The CPU path here is essentially
+  a `memcpy` + deinterleave at 130–2400 MP/s; there is no compute to offload, so a
+  device round-trip is pure loss. These codecs should always stay on CPU.
+- **DEFLATE family (zip/zips/pxr24) and zstd reach 0.4–0.9×.** The entropy decode
+  (inflate / zstd) is bit-serial and *cannot* move to the GPU; the GPU only takes
+  the predictor + deinterleave + channel-split passes — which are already SSE2/AVX2
+  vectorized and memory-bandwidth-bound on the CPU. The H2D/D2H copy costs more
+  than those cheap passes save, so it nets out below 1.0×.
+- **PIZ ≈ parity (0.93–0.99×).** PIZ reconstruction is entirely CPU (the GPU does
+  only channel split + widen), so the GPU path is "CPU work + a near-free
+  round-trip" ⇒ parity, never a win.
+- **HTJ2K is the only genuinely GPU-amenable codec** — its HT block coder is heavy
+  *and* embarrassingly parallel across code-blocks. `htj2k256` decode crosses to
+  **1.11×** at 16.8 MP. Encode stays behind (0.63×): the block coder is only ~37 %
+  of encode time ([the serial MagSgn floor](htj2k-encode-bottleneck.md)), and the
+  GPU gain on that slice doesn't pay for the round-trip plus the still-CPU
+  transform + bitstream assembly.
+
+**Takeaway.** With the entropy stage pinned to the CPU and the reconstruction
+passes already cheap there, single-image hybrid offload is round-trip-bound and
+at best reaches parity. The GPU backend earns its keep in two places it is *not*
+penalised by the round-trip: (1) **HTJ2K large-image decode**, the one codec heavy
+enough to win; and (2) **chained processing** (resize / color / tonemap / transfer
+/ LUT) where the image stays resident on-device across many ops and the per-call
+copy amortizes. A whole-pipeline HTJ2K win additionally needs the transforms moved
+on-device ([GPU transform kernels](htj2k-gpu-port.md), a deferred follow-up) to
+remove the per-image coefficient copy.
+
+Reproduce (all codecs, CPU vs GPU):
+
+```sh
+make bench-gpu-jph                                   # asakusa (0.29 MP)
+EXR_BENCH_IMG=path/to/img.exr make bench-gpu-jph     # any image
+./build/bench_gpu_jph synth:4096x4096                # synthetic NxN probe
+```
+
 ## ARM64 / NEON (Apple Silicon)
 
 The same comparison on **Apple M1** (4 P-core + 4 E-core, macOS 26, Apple

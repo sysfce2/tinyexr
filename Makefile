@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
 
 all: $(TARGET)
 
@@ -228,6 +228,20 @@ bench: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) benchmark/bench.c | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O3 \
 	  benchmark/bench.c $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(THREAD_LIBS) -lm -o build/bench
 	./build/bench
+
+# ---- HTJ2K GPU vs CPU throughput (CUDA backend) ---------------------------
+# Builds a CUDA lib and times whole-image HTJ2K decode/encode CPU vs GPU.
+# Exit 77 = skipped (no CUDA device). Override the image with EXR_BENCH_IMG=...
+EXR_BENCH_IMG ?= asakusa.exr
+bench-gpu-jph:
+	$(MAKE) clean
+	$(MAKE) CUDA=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_CUDA -Iinclude -Isrc -Ideps/zstd \
+	  -Ithird_party/cuew -O3 benchmark/bench_gpu_jph.c build/libtinyexr3.a \
+	  -ldl -lm -o build/bench_gpu_jph
+	./build/bench_gpu_jph "$(EXR_BENCH_IMG)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "bench-gpu-jph: SKIPPED (no CUDA device)"; exit 0; \
+	  else exit $$rc; fi
 
 # ---- tinyexr-vs-OpenEXR comparison (needs a built OpenEXR) -----------------
 # Override OPENEXR_ROOT / OPENEXR_BUILD if your tree lives elsewhere. Extra
