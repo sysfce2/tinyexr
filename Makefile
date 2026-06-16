@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test
 
 all: $(TARGET)
 
@@ -43,7 +43,7 @@ V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
 # helpers (hosted-only convenience), and the (freestanding-only) mem/str impls.
-V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c src/exr_gpu_cuda.c,$(V3_SRC))
+V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c src/exr_gpu_cuda.c src/exr_vk_vulkan.c,$(V3_SRC))
 ZSTD_SRC = deps/zstd/tinyexr_zstd.c
 ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
@@ -100,6 +100,23 @@ ifeq ($(CUDA),1)
   CUDA_LIBS = -ldl
 endif
 
+# ---- optional Vulkan GPU backend (default OFF; runtime dlopen via vkew) -----
+# Build any target with VULKAN=1 to compile the Vulkan compute backend
+# (src/exr_vk_vulkan.c + third_party/vkew). libvulkan is resolved at runtime via
+# vkew (dlopen) so NO Vulkan SDK is needed at build time and we link only -ldl
+# (never -lvulkan). Compute shaders are precompiled SPIR-V embedded in
+# src/exr_vk_shaders.spv.inc. Without VULKAN=1 the backend compiles as inert
+# stubs. NOTE: run `make clean` when toggling VULKAN (object flags not tracked).
+VULKAN ?= 0
+VKEW_OBJ =
+VULKAN_LIBS =
+ifeq ($(VULKAN),1)
+  V3_DEFS += -DEXR_USE_VULKAN
+  V3_INC  += -Ithird_party/vkew
+  VKEW_OBJ    = build/vkew.o
+  VULKAN_LIBS = -ldl
+endif
+
 build:
 	@mkdir -p build
 
@@ -107,9 +124,18 @@ build:
 build/cuew.o: third_party/cuew/cuew.c third_party/cuew/cuew.h | build
 	$(CC) -Ithird_party/cuew -O2 -g -w -c $< -o $@
 
+# vkew (Vulkan loader, third-party style: warnings off).
+build/vkew.o: third_party/vkew/vkew.c third_party/vkew/vkew.h | build
+	$(CC) -Ithird_party/vkew -O2 -g -w -c $< -o $@
+
 # GPU backend TU: extra prereqs (public header, kernels, cuew) so edits rebuild.
 build/exr_gpu_cuda.o: src/exr_gpu_cuda.c include/exr_gpu.h include/exr.h \
                       src/exr_internal.h src/exr_gpu_kernels.cuh.inc | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
+
+# Vulkan backend TU: extra prereqs (public header, embedded SPIR-V, vkew).
+build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
+                       src/exr_internal.h src/exr_vk_shaders.spv.inc | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
 
 build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
@@ -127,8 +153,8 @@ build/test-libdeflate/%.o: deps/libdeflate/%.c | build
 	@mkdir -p $(dir $@)
 	$(CC) -Ideps/libdeflate -O1 -g $(SAN) -w -c $< -o $@
 
-lib: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ)
-	$(AR) rcs build/libtinyexr3.a $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ)
+lib: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ) $(VKEW_OBJ)
+	$(AR) rcs build/libtinyexr3.a $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ) $(VKEW_OBJ)
 
 # GPU backend test (requires CUDA=1; skips at runtime with exit 77 if no device).
 EXR_IMAGES ?= $(HOME)/work/openexr-images
@@ -140,6 +166,17 @@ gpu-test:
 	  -o build/test_exr_gpu
 	./build/test_exr_gpu "$(EXR_IMAGES)"; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "gpu-test: SKIPPED (no CUDA device)"; exit 0; \
+	  else exit $$rc; fi
+
+# Vulkan backend test (requires VULKAN=1; skips at runtime with exit 77 if no device).
+vk-test:
+	$(MAKE) clean            # VULKAN flag is not object-tracked; rebuild from clean
+	$(MAKE) VULKAN=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_VULKAN -Iinclude -Ithird_party/vkew \
+	  -O2 -g test/vk/test_exr_vk.c build/libtinyexr3.a -ldl -lm \
+	  -o build/test_exr_vk
+	./build/test_exr_vk "$(EXR_IMAGES)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "vk-test: SKIPPED (no Vulkan device)"; exit 0; \
 	  else exit $$rc; fi
 
 # Strict pure-C11 gate: the rewrite must never require a C++ compiler.
@@ -311,8 +348,8 @@ build/fs-%.o: src/%.c include/exr.h src/exr_internal.h | build
 	$(CC) $(FS_FLAGS) -c $< -o $@
 
 freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
-	@echo "  scan: only exr_stdio.c may include <stdio.h> (exr_gpu_cuda.c is hosted-only)"
-	@bad=`grep -rl '<stdio.h>' src/ | grep -vE 'src/(exr_stdio|exr_gpu_cuda)\.c' || true`; \
+	@echo "  scan: only exr_stdio.c may include <stdio.h> (GPU backends are hosted-only)"
+	@bad=`grep -rl '<stdio.h>' src/ | grep -vE 'src/(exr_stdio|exr_gpu_cuda|exr_vk_vulkan)\.c' || true`; \
 	  if [ -n "$$bad" ]; then echo "  FAIL: stdio leaked into: $$bad"; exit 1; fi
 	@echo "  scan: no forbidden libc symbols referenced by the freestanding core"
 	@for o in $(FS_OBJ); do \
