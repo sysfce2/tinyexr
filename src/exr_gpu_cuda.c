@@ -65,6 +65,18 @@ exr_result exr_gpu_save_to_memory(exr_gpu_context *ctx, void **out_data,
     return exr_save_to_memory(out_data, out_size, alloc, img, comp);
 }
 
+exr_result exr_gpu_jph_decode_plan(exr_gpu_context *ctx,
+                                   const struct exr_jph_cb_plan *plan,
+                                   const size_t *tile_offsets, size_t out_count,
+                                   int32_t *out_coeffs) {
+    (void)ctx;
+    (void)plan;
+    (void)tile_offsets;
+    (void)out_count;
+    (void)out_coeffs;
+    return EXR_ERROR_UNSUPPORTED;
+}
+
 exr_result exr_gpu_resize_float(exr_gpu_context *ctx, const float *src, int sw,
                                 int sh, size_t ss, float *dst, int dw, int dh,
                                 size_t ds, int ch, exr_resize_filter f,
@@ -131,6 +143,7 @@ exr_result exr_gpu_rgba_float_to_part(exr_gpu_context *ctx, const exr_allocator 
 #include <string.h>
 
 #include "exr_gpu_kernels.cuh.inc"
+#include "exr_gpu_jph_kernels.cuh.inc"
 
 #define EXR_GPU_MAX_STREAMS 4
 
@@ -148,6 +161,9 @@ struct exr_gpu_context {
     CUfunction k_gather_f32, k_scatter_f32, k_convert;
     CUfunction k_color_matrix, k_transfer, k_tonemap, k_lut3d;
     CUfunction k_resize_h, k_resize_v, k_premult;
+    /* HTJ2K HT block coder (separate NVRTC module) */
+    CUmodule jph_mod;
+    CUfunction k_jph_decode;
 };
 
 /* ---- one-time availability probe ---------------------------------------- */
@@ -193,12 +209,12 @@ exr_result exr_gpu_device_name(int device, char *buf, size_t buf_size) {
 }
 
 /* ---- NVRTC compile + module load ---------------------------------------- */
-static exr_result compile_module(exr_gpu_context *c) {
+static exr_result compile_src_to_module(exr_gpu_context *c, const char *src,
+                                        const char *name, CUmodule *out_mod) {
     int major = 0, minor = 0;
     char arch[64];
     const char *opts[2];
     nvrtcProgram prog;
-    nvrtcResult nr;
     size_t ptx_size = 0;
     char *ptx = NULL;
     CUresult cr;
@@ -211,11 +227,9 @@ static exr_result compile_module(exr_gpu_context *c) {
     opts[0] = arch;
     opts[1] = "--std=c++11";
 
-    if (nvrtcCreateProgram(&prog, EXR_GPU_KERNEL_SRC, "exr_gpu_kernels.cu", 0,
-                           NULL, NULL) != NVRTC_SUCCESS)
+    if (nvrtcCreateProgram(&prog, src, name, 0, NULL, NULL) != NVRTC_SUCCESS)
         return EXR_ERROR_IO;
-    nr = nvrtcCompileProgram(prog, 2, opts);
-    if (nr != NVRTC_SUCCESS) {
+    if (nvrtcCompileProgram(prog, 2, opts) != NVRTC_SUCCESS) {
         if (c->verbose) {
             size_t ls = 0;
             char *log;
@@ -224,7 +238,8 @@ static exr_result compile_module(exr_gpu_context *c) {
             if (log) {
                 nvrtcGetProgramLog(prog, log);
                 log[ls] = '\0';
-                fprintf(stderr, "[exr_gpu] NVRTC compile failed:\n%s\n", log);
+                fprintf(stderr, "[exr_gpu] NVRTC compile failed (%s):\n%s\n",
+                        name, log);
                 free(log);
             }
         }
@@ -242,10 +257,21 @@ static exr_result compile_module(exr_gpu_context *c) {
     }
     nvrtcGetPTX(prog, ptx);
     nvrtcDestroyProgram(&prog);
-
-    cr = cuModuleLoadDataEx(&c->mod, ptx, 0, NULL, NULL);
+    cr = cuModuleLoadDataEx(out_mod, ptx, 0, NULL, NULL);
     free(ptx);
-    if (cr != CUDA_SUCCESS) return EXR_ERROR_IO;
+    return cr == CUDA_SUCCESS ? EXR_SUCCESS : EXR_ERROR_IO;
+}
+
+static exr_result compile_module(exr_gpu_context *c) {
+    exr_result rc = compile_src_to_module(c, EXR_GPU_KERNEL_SRC,
+                                          "exr_gpu_kernels.cu", &c->mod);
+    if (!EXR_OK(rc)) return rc;
+    rc = compile_src_to_module(c, EXR_GPU_JPH_KERNEL_SRC,
+                               "exr_gpu_jph_kernels.cu", &c->jph_mod);
+    if (!EXR_OK(rc)) return rc;
+    if (cuModuleGetFunction(&c->k_jph_decode, c->jph_mod,
+                            "exrg_jph_decode_blocks") != CUDA_SUCCESS)
+        return EXR_ERROR_IO;
 
 #define GETFN(field, name)                                                     \
     if (cuModuleGetFunction(&c->field, c->mod, name) != CUDA_SUCCESS)          \
@@ -320,6 +346,7 @@ void exr_gpu_context_destroy(exr_gpu_context *c) {
     a = c->alloc;
     cuCtxSetCurrent(c->cuctx);
     cuStreamSynchronize(c->stream);
+    if (c->jph_mod) cuModuleUnload(c->jph_mod);
     if (c->mod) cuModuleUnload(c->mod);
     if (c->stream) cuStreamDestroy(c->stream);
     if (c->cuctx) cuCtxDestroy(c->cuctx);
@@ -358,6 +385,128 @@ static exr_result launch1d(exr_gpu_context *c, CUfunction f, long n,
 static exr_result sync(exr_gpu_context *c) {
     return cuStreamSynchronize(c->stream) == CUDA_SUCCESS ? EXR_SUCCESS
                                                           : EXR_ERROR_IO;
+}
+
+/* ---- HTJ2K HT block coder: decode a collected plan on the GPU ----------- */
+/* Host mirror of the kernel's JphGpuRec (must match field order/alignment). */
+typedef struct {
+    uint32_t width, height, missing_msbs, active_passes;
+    uint32_t length0, length1, kmax;
+    uint64_t data_offset;
+    uint64_t out_offset;
+    uint32_t out_stride;
+    uint32_t eligible;
+} JphGpuRecH;
+
+/* Worst-case per-thread scratch element counts for a 128x32 code-block. */
+#define JPH_GPU_SSTR_MAX 136u                       /* ((128+2)+7)&~7 */
+#define JPH_GPU_SCRATCH_STRIDE (JPH_GPU_SSTR_MAX * 17u)   /* sstr*((32+1)/2+1) */
+#define JPH_GPU_BUF_STRIDE (JPH_GPU_SSTR_MAX * 32u)
+#define JPH_GPU_VN_STRIDE 516u
+
+exr_result exr_gpu_jph_decode_plan(exr_gpu_context *c,
+                                   const struct exr_jph_cb_plan *plan,
+                                   const size_t *tile_offsets, size_t out_count,
+                                   int32_t *out_coeffs) {
+    size_t n, i, nelig = 0;
+    JphGpuRecH *hrecs = NULL;
+    const uint16_t *vlc0, *vlc1, *uvlc0, *uvlc1;
+    uint32_t magsgn_stride = 4u, sigprop_stride = 4u;
+    uint32_t scratch_stride = JPH_GPU_SCRATCH_STRIDE;
+    uint32_t buf_stride = JPH_GPU_BUF_STRIDE;
+    uint32_t vn_stride = JPH_GPU_VN_STRIDE;
+    CUdeviceptr d_data = 0, d_recs = 0, d_out = 0;
+    CUdeviceptr d_vlc0 = 0, d_vlc1 = 0, d_uvlc0 = 0, d_uvlc1 = 0;
+    CUdeviceptr d_scratch = 0, d_buf = 0, d_vn = 0, d_magsgn = 0, d_sigprop = 0;
+    exr_result rc;
+    int ni;
+
+    if (!c || !plan || !out_coeffs) return EXR_ERROR_INVALID_ARGUMENT;
+    cuCtxSetCurrent(c->cuctx);
+    n = plan->num_records;
+    if (n == 0) return EXR_SUCCESS;
+
+    rc = exr_jph_ht_tables(&vlc0, &vlc1, &uvlc0, &uvlc1);
+    if (!EXR_OK(rc)) return rc;
+
+    hrecs = (JphGpuRecH *)exr_malloc(&c->alloc, n * sizeof(*hrecs));
+    if (!hrecs) return EXR_ERROR_OUT_OF_MEMORY;
+    for (i = 0; i < n; ++i) {
+        const exr_jph_cb_record *r = &plan->records[i];
+        uint32_t ms_words = (uint32_t)(r->data_size / 8u + 3u);
+        uint32_t sp_words = (uint32_t)(r->length1 / 8u + 3u);
+        hrecs[i].width = r->width;
+        hrecs[i].height = r->height;
+        hrecs[i].missing_msbs = r->missing_msbs;
+        hrecs[i].active_passes = r->active_passes;
+        hrecs[i].length0 = r->length0;
+        hrecs[i].length1 = r->length1;
+        hrecs[i].kmax = r->kmax;
+        hrecs[i].data_offset = (uint64_t)r->data_offset;
+        hrecs[i].eligible = r->i32_eligible ? 1u : 0u;
+        if (r->i32_eligible) {
+            hrecs[i].out_stride = (r->width + 7u) & ~7u;
+            hrecs[i].out_offset = (uint64_t)tile_offsets[i];
+            if (ms_words > magsgn_stride) magsgn_stride = ms_words;
+            if (sp_words > sigprop_stride) sigprop_stride = sp_words;
+            ++nelig;
+        } else {
+            hrecs[i].out_stride = 0u;
+            hrecs[i].out_offset = 0u;
+        }
+    }
+    if (nelig == 0) { exr_free(&c->alloc, hrecs); return EXR_SUCCESS; }
+
+    rc = d_alloc(&d_data, plan->data_size ? plan->data_size : 1u); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_recs, n * sizeof(JphGpuRecH)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_out, out_count * sizeof(int32_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_vlc0, 1024u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_vlc1, 1024u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_uvlc0, 320u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_uvlc1, 256u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_scratch, n * scratch_stride * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_buf, n * buf_stride * sizeof(uint32_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_vn, n * vn_stride * sizeof(uint32_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_magsgn, n * magsgn_stride * sizeof(uint64_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_sigprop, n * sigprop_stride * sizeof(uint64_t)); if (!EXR_OK(rc)) goto done;
+
+    /* Match the CPU reference's calloc'd scratch/buf/v_n (zero borders). */
+    cuMemsetD8Async(d_scratch, 0, n * scratch_stride * sizeof(uint16_t), c->stream);
+    cuMemsetD8Async(d_buf, 0, n * buf_stride * sizeof(uint32_t), c->stream);
+    cuMemsetD8Async(d_vn, 0, n * vn_stride * sizeof(uint32_t), c->stream);
+
+    rc = h2d(c, d_data, plan->data, plan->data_size); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_recs, hrecs, n * sizeof(JphGpuRecH)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_vlc0, vlc0, 1024u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_vlc1, vlc1, 1024u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_uvlc0, uvlc0, 320u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_uvlc1, uvlc1, 256u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+
+    ni = (int)n;
+    {
+        void *params[18];
+        params[0] = &d_data; params[1] = &d_recs; params[2] = &ni;
+        params[3] = &d_vlc0; params[4] = &d_vlc1; params[5] = &d_uvlc0;
+        params[6] = &d_uvlc1; params[7] = &d_out;
+        params[8] = &d_scratch; params[9] = &scratch_stride;
+        params[10] = &d_buf; params[11] = &buf_stride;
+        params[12] = &d_vn; params[13] = &vn_stride;
+        params[14] = &d_magsgn; params[15] = &magsgn_stride;
+        params[16] = &d_sigprop; params[17] = &sigprop_stride;
+        rc = launch1d(c, c->k_jph_decode, (long)n, params);
+        if (!EXR_OK(rc)) goto done;
+    }
+    rc = d2h(c, out_coeffs, d_out, out_count * sizeof(int32_t));
+    if (!EXR_OK(rc)) goto done;
+    rc = sync(c);
+
+done:
+    d_free(d_data); d_free(d_recs); d_free(d_out);
+    d_free(d_vlc0); d_free(d_vlc1); d_free(d_uvlc0); d_free(d_uvlc1);
+    d_free(d_scratch); d_free(d_buf); d_free(d_vn);
+    d_free(d_magsgn); d_free(d_sigprop);
+    exr_free(&c->alloc, hrecs);
+    return rc;
 }
 
 /* GPU byte predictor decode over [0,n): 3-pass segmented prefix sum (mod 256). */

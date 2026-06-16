@@ -736,6 +736,53 @@ exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
                                size_t src_size, uint8_t *dst, size_t dst_size);
 exr_result exr_jph_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size);
+
+/* ---- GPU HTJ2K seam ------------------------------------------------------
+ * The HT block coder is bit-serial within a code-block but embarrassingly
+ * parallel across code-blocks, so the GPU backend collects every code-block of
+ * a chunk into a flat plan, decodes them all in one kernel launch (one thread
+ * per block), then the CPU scatters + runs the inverse transforms. These
+ * read-only seams expose the plan, the (runtime-built) HT tables, and a single
+ * reference/fallback block decode, without leaking the file-local jph structs.
+ */
+typedef struct exr_jph_cb_record {
+    uint32_t width, height;       /* code-block dims (<=128 x <=32) */
+    uint32_t missing_msbs, active_passes;
+    uint32_t length0, length1;    /* lcup, len2 */
+    uint32_t kmax;
+    uint32_t comp, res, band, x0, y0;
+    uint32_t dst_row, dst_col;    /* origin in the component plane */
+    uint32_t plane_w, plane_h;    /* component plane dims */
+    size_t   data_offset;         /* byte offset into plan->data */
+    size_t   data_size;
+    int      i32_eligible;        /* missing_msbs<30 && kmax<=30 (else CPU) */
+} exr_jph_cb_record;
+
+typedef struct exr_jph_cb_plan {
+    exr_jph_cb_record *records;
+    size_t num_records;
+    uint8_t *data;                /* contiguous copy of the tile codestream */
+    size_t data_size;
+    int num_components;
+} exr_jph_cb_plan;
+
+/* Parse an HTJ2K chunk and collect its code-block plan (no decode). */
+exr_result exr_jph_collect_codeblocks(const exr_codec_ctx *ctx,
+                                      const uint8_t *src, size_t src_size,
+                                      exr_jph_cb_plan *out);
+void exr_jph_cb_plan_free(const exr_allocator *a, exr_jph_cb_plan *plan);
+
+/* The runtime-built HT VLC tables (opaque to the backend; layout: four arrays
+ * vlc_tbl0[1024], vlc_tbl1[1024], uvlc_tbl0[320], uvlc_tbl1[256], all uint16).
+ * Returns pointers + element counts so the backend can upload them verbatim. */
+exr_result exr_jph_ht_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                             const uint16_t **uvlc0, const uint16_t **uvlc1);
+
+/* Reference/fallback: decode one code-block (i32 path) into out[stride*h]. */
+exr_result exr_jph_decode_one_block_i32(const exr_jph_cb_record *rec,
+                                        const uint8_t *data, int32_t *out,
+                                        uint32_t out_stride);
+
 exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
                                   const int32_t *high, size_t high_count,
                                   int32_t *out, size_t out_count);

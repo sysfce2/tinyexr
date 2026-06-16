@@ -4475,6 +4475,77 @@ static exr_result jph_decode_codeblock(void *user,
     return EXR_SUCCESS;
 }
 
+/* ---- GPU seam: code-block plan collector (no decode) -------------------- */
+typedef struct {
+    const exr_allocator *a;
+    const JphProfile *jp;
+    JphPlaneD *planes;
+    uint16_t num_planes;
+    const uint8_t *tile_base;
+    exr_jph_cb_record *records;
+    size_t count;
+    size_t cap;
+} JphCollectState;
+
+static exr_result jph_collect_codeblock(void *user,
+                                        const JphCodeblockSeg *seg) {
+    JphCollectState *st = (JphCollectState *)user;
+    JphBandGeom bands[4];
+    JphPlaneD *plane;
+    uint32_t row_off, col_off, kmax;
+    exr_jph_cb_record *rec;
+    exr_result rc;
+    if (!st || !seg || !seg->data || seg->data_size == 0)
+        return EXR_ERROR_CORRUPT;
+    if (seg->comp >= st->num_planes) return EXR_ERROR_CORRUPT;
+    if (seg->width == 0u || seg->height == 0u ||
+        seg->width > 128u || seg->height > 32u)
+        return EXR_ERROR_CORRUPT;
+    plane = &st->planes[seg->comp];
+    rc = jph_build_band_geoms(st->jp, seg->comp, seg->res, bands, NULL);
+    if (rc != EXR_SUCCESS) return rc;
+    if (seg->band >= 4u || !bands[seg->band].exists) return EXR_ERROR_CORRUPT;
+    kmax = bands[seg->band].kmax;
+    rc = jph_subband_origin(seg, &bands[seg->band], plane,
+                            st->jp->num_decomps, &row_off, &col_off);
+    if (rc != EXR_SUCCESS) return rc;
+
+    if (st->count == st->cap) {
+        size_t ncap = st->cap ? st->cap * 2u : 256u;
+        exr_jph_cb_record *nr = (exr_jph_cb_record *)exr_malloc(
+            st->a, ncap * sizeof(*nr));
+        if (!nr) return EXR_ERROR_OUT_OF_MEMORY;
+        if (st->records) {
+            memcpy(nr, st->records, st->count * sizeof(*nr));
+            exr_free(st->a, st->records);
+        }
+        st->records = nr;
+        st->cap = ncap;
+    }
+    rec = &st->records[st->count++];
+    rec->width = seg->width;
+    rec->height = seg->height;
+    rec->missing_msbs = seg->missing_msbs;
+    rec->active_passes = seg->active_passes;
+    rec->length0 = seg->length0;
+    rec->length1 = seg->length1;
+    rec->kmax = kmax;
+    rec->comp = seg->comp;
+    rec->res = seg->res;
+    rec->band = seg->band;
+    rec->x0 = seg->x0;
+    rec->y0 = seg->y0;
+    rec->dst_row = row_off + seg->y0;
+    rec->dst_col = col_off + seg->x0;
+    rec->plane_w = plane->w;
+    rec->plane_h = plane->h;
+    rec->data_offset = (size_t)(seg->data - st->tile_base);
+    rec->data_size = seg->data_size;
+    rec->i32_eligible =
+        (plane->d32 != NULL && seg->missing_msbs < 30u && kmax <= 30u) ? 1 : 0;
+    return EXR_SUCCESS;
+}
+
 static exr_result jph_parse_tile_packets(const exr_codec_ctx *ctx,
                                          const JphProfile *jp,
                                          size_t *out_codeblocks,
@@ -4549,7 +4620,8 @@ done:
 static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
                                           const JphProfile *jp,
                                           const uint16_t *map,
-                                          uint8_t *dst, size_t dst_size) {
+                                          uint8_t *dst, size_t dst_size,
+                                          JphCollectState *collect) {
     size_t expected = 0;
     size_t codeblocks = 0;
     JphDecodeState decode_state;
@@ -4562,7 +4634,7 @@ static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
                                      ctx->y, ctx->width, ctx->num_lines,
                                      &expected);
     if (rc != EXR_SUCCESS) return rc;
-    if (expected != dst_size) return EXR_ERROR_CORRUPT;
+    if (!collect && expected != dst_size) return EXR_ERROR_CORRUPT;
     if (jp->mc_trans != 0u && ctx->num_channels < 3) return EXR_ERROR_CORRUPT;
     decode_state.a = ctx->alloc ? ctx->alloc : exr_default_allocator();
     decode_state.jp = jp;
@@ -4583,6 +4655,17 @@ static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
     rc = jph_alloc_component_planes(decode_state.a, jp, decode_state.use_i32,
                                     &decode_state.planes);
     if (rc != EXR_SUCCESS) return rc;
+    if (collect) {
+        /* GPU seam: walk the packets recording a code-block plan, then stop
+         * before postprocess/store (the GPU backend decodes + transforms). */
+        collect->jp = jp;
+        collect->planes = decode_state.planes;
+        collect->num_planes = decode_state.num_planes;
+        collect->tile_base = jp->tile_data;
+        rc = jph_parse_tile_packets(ctx, jp, &codeblocks, jph_collect_codeblock,
+                                    collect);
+        goto done;
+    }
     rc = jph_parse_tile_packets(ctx, jp, &codeblocks, jph_decode_codeblock,
                                 &decode_state);
     if (rc != EXR_SUCCESS) goto done;
@@ -4612,7 +4695,8 @@ done:
 static exr_result jph_validate_profile(const exr_codec_ctx *ctx,
                                        const uint16_t *map,
                                        const uint8_t *src, size_t src_size,
-                                       uint8_t *dst, size_t dst_size) {
+                                       uint8_t *dst, size_t dst_size,
+                                       JphCollectState *collect) {
     const exr_allocator *a = ctx->alloc ? ctx->alloc : exr_default_allocator();
     JphReader r;
     JphProfile jp;
@@ -4746,7 +4830,7 @@ static exr_result jph_validate_profile(const exr_codec_ctx *ctx,
         rc = jph_validate_siz_component(ctx, &jp, map, c);
         if (rc != EXR_SUCCESS) goto done;
     }
-    rc = jph_decode_tile_payload(ctx, &jp, map, dst, dst_size);
+    rc = jph_decode_tile_payload(ctx, &jp, map, dst, dst_size, collect);
 
 done:
     exr_free(a, jp.ssiz);
@@ -4823,9 +4907,108 @@ exr_result exr_jph_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
         return EXR_ERROR_CORRUPT;
     }
     rc = jph_validate_profile(ctx, map, src + codestream_off,
-                              src_size - codestream_off, dst, dst_size);
+                              src_size - codestream_off, dst, dst_size, NULL);
     exr_free(ctx->alloc ? ctx->alloc : exr_default_allocator(), map);
     return rc;
+}
+
+/* ---- GPU seam: public-internal entry points ----------------------------- */
+exr_result exr_jph_collect_codeblocks(const exr_codec_ctx *ctx,
+                                      const uint8_t *src, size_t src_size,
+                                      exr_jph_cb_plan *out) {
+    const exr_allocator *a;
+    uint16_t *map = NULL;
+    size_t codestream_off = 0;
+    JphCollectState cs;
+    exr_result rc;
+
+    if (!ctx || !src || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    memset(out, 0, sizeof(*out));
+    memset(&cs, 0, sizeof(cs));
+    cs.a = a;
+
+    rc = jph_parse_ht_header(ctx, src, src_size, &map, &codestream_off);
+    if (rc != EXR_SUCCESS) return rc;
+    if (codestream_off >= src_size) {
+        exr_free(a, map);
+        return EXR_ERROR_CORRUPT;
+    }
+    /* jph_validate_profile -> jph_decode_tile_payload(collect) records the plan
+     * (and leaves cs.tile_base pointing into the validated codestream). */
+    rc = jph_validate_profile(ctx, map, src + codestream_off,
+                              src_size - codestream_off, NULL, 0, &cs);
+    exr_free(a, map);
+    if (rc != EXR_SUCCESS) {
+        exr_free(a, cs.records);
+        return rc;
+    }
+    /* Copy the tile codestream so record data_offsets stay valid after the
+     * caller frees src. tile_base points within [src, src+src_size). */
+    if (cs.count > 0 && cs.tile_base) {
+        size_t base_off = (size_t)(cs.tile_base - src);
+        size_t copy_size = src_size - base_off;
+        out->data = (uint8_t *)exr_malloc(a, copy_size ? copy_size : 1u);
+        if (!out->data) {
+            exr_free(a, cs.records);
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+        memcpy(out->data, cs.tile_base, copy_size);
+        out->data_size = copy_size;
+    }
+    out->records = cs.records;
+    out->num_records = cs.count;
+    out->num_components = ctx->num_channels;
+    return EXR_SUCCESS;
+}
+
+void exr_jph_cb_plan_free(const exr_allocator *a, exr_jph_cb_plan *plan) {
+    if (!plan) return;
+    if (!a) a = exr_default_allocator();
+    exr_free(a, plan->records);
+    exr_free(a, plan->data);
+    memset(plan, 0, sizeof(*plan));
+}
+
+exr_result exr_jph_ht_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                             const uint16_t **uvlc0, const uint16_t **uvlc1) {
+    JphHtTables *t = NULL;
+    exr_result rc = jph_ht_ensure_tables(&t);
+    if (rc != EXR_SUCCESS) return rc;
+    if (vlc0) *vlc0 = t->vlc_tbl0;
+    if (vlc1) *vlc1 = t->vlc_tbl1;
+    if (uvlc0) *uvlc0 = t->uvlc_tbl0;
+    if (uvlc1) *uvlc1 = t->uvlc_tbl1;
+    return EXR_SUCCESS;
+}
+
+exr_result exr_jph_decode_one_block_i32(const exr_jph_cb_record *rec,
+                                        const uint8_t *data, int32_t *out,
+                                        uint32_t out_stride) {
+    JphCodeblockSeg seg;
+    JphHtTables *htab = NULL;
+    exr_result rc;
+    if (!rec || !data || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = jph_ht_ensure_tables(&htab);
+    if (rc != EXR_SUCCESS) return rc;
+    memset(&seg, 0, sizeof(seg));
+    seg.comp = rec->comp;
+    seg.res = rec->res;
+    seg.band = rec->band;
+    seg.x0 = rec->x0;
+    seg.y0 = rec->y0;
+    seg.missing_msbs = rec->missing_msbs;
+    seg.active_passes = rec->active_passes;
+    seg.length0 = rec->length0;
+    seg.length1 = rec->length1;
+    seg.width = rec->width;
+    seg.height = rec->height;
+    seg.data = data + rec->data_offset;
+    seg.data_size = rec->data_size;
+    /* Scalar reference (use_avx2=0): bit-identical to the SIMD path and to the
+     * GPU port, which mirrors the scalar reader/coder. */
+    return jph_decode_block_i32(&seg, htab, out, out_stride, rec->kmax,
+                                exr_default_allocator(), NULL, 0);
 }
 
 /* ----------------------------------------------------------------------------

@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test
 
 all: $(TARGET)
 
@@ -130,7 +130,8 @@ build/vkew.o: third_party/vkew/vkew.c third_party/vkew/vkew.h | build
 
 # GPU backend TU: extra prereqs (public header, kernels, cuew) so edits rebuild.
 build/exr_gpu_cuda.o: src/exr_gpu_cuda.c include/exr_gpu.h include/exr.h \
-                      src/exr_internal.h src/exr_gpu_kernels.cuh.inc | build
+                      src/exr_internal.h src/exr_gpu_kernels.cuh.inc \
+                      src/exr_gpu_jph_kernels.cuh.inc | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
 
 # Vulkan backend TU: extra prereqs (public header, embedded SPIR-V, vkew).
@@ -166,6 +167,17 @@ gpu-test:
 	  -o build/test_exr_gpu
 	./build/test_exr_gpu "$(EXR_IMAGES)"; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "gpu-test: SKIPPED (no CUDA device)"; exit 0; \
+	  else exit $$rc; fi
+
+# HTJ2K GPU block-coder bit-exactness test (CUDA=1; exit 77 = skip, no device).
+jph-gpu-test:
+	$(MAKE) clean
+	$(MAKE) CUDA=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_CUDA -Iinclude -Isrc -Ideps/zstd \
+	  -Ithird_party/cuew -O2 -g test/gpu/test_exr_jph_gpu.c build/libtinyexr3.a \
+	  -ldl -lm -o build/test_exr_jph_gpu
+	./build/test_exr_jph_gpu "$(EXR_IMAGES)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "jph-gpu-test: SKIPPED (no CUDA device)"; exit 0; \
 	  else exit $$rc; fi
 
 # Vulkan backend test (requires VULKAN=1; skips at runtime with exit 77 if no device).

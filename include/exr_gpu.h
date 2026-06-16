@@ -147,6 +147,19 @@ exr_result exr_gpu_rgba_float_to_part(exr_gpu_context *ctx,
                                       int width, int height, int channels,
                                       exr_pixel_type dst_type, exr_part *out);
 
+/* ---- HTJ2K HT block coder on GPU ----------------------------------------
+ * Decode every i32-eligible code-block of a collected plan (exr_jph_cb_plan,
+ * defined in the internal header) in one kernel launch — one GPU thread per
+ * code-block. out_coeffs is a host buffer of out_count int32 sign/magnitude
+ * coefficients; eligible record i writes its tile at tile_offsets[i] with row
+ * stride (width+7)&~7. Mainly for the hybrid HTJ2K decode path and bit-exact
+ * testing against the CPU coder. Returns EXR_ERROR_UNSUPPORTED without CUDA. */
+struct exr_jph_cb_plan;
+exr_result exr_gpu_jph_decode_plan(exr_gpu_context *ctx,
+                                   const struct exr_jph_cb_plan *plan,
+                                   const size_t *tile_offsets, size_t out_count,
+                                   int32_t *out_coeffs);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
