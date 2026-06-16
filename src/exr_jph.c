@@ -7294,6 +7294,98 @@ static void jph_encoded_cb_free_all(const exr_allocator *a,
     exr_free(a, items);
 }
 
+/* ---- GPU encode seam: collect code-block coefficient tiles -------------- */
+typedef struct {
+    const exr_allocator *a;
+    exr_jph_enc_record *records;
+    size_t count, cap;
+    int32_t *coeffs;
+    size_t coeff_count, coeff_cap;
+    int err;
+} JphEncCollect;
+
+static int jph_enc_collect_block(JphEncCollect *ec, const JphPlane64 *pl,
+                                 uint32_t cb_x0, uint32_t cb_y0,
+                                 uint32_t cb_w, uint32_t cb_h, uint32_t kmax) {
+    exr_jph_enc_record *rec;
+    size_t tile = (size_t)cb_w * cb_h, y, x;
+    if (ec->count == ec->cap) {
+        size_t ncap = ec->cap ? ec->cap * 2u : 256u;
+        exr_jph_enc_record *nr =
+            (exr_jph_enc_record *)exr_malloc(ec->a, ncap * sizeof(*nr));
+        if (!nr) { ec->err = 1; return 0; }
+        if (ec->records) {
+            memcpy(nr, ec->records, ec->count * sizeof(*nr));
+            exr_free(ec->a, ec->records);
+        }
+        ec->records = nr;
+        ec->cap = ncap;
+    }
+    if (ec->coeff_count + tile > ec->coeff_cap) {
+        size_t ncap = ec->coeff_cap ? ec->coeff_cap * 2u : 65536u;
+        int32_t *nc;
+        while (ncap < ec->coeff_count + tile) ncap *= 2u;
+        nc = (int32_t *)exr_malloc(ec->a, ncap * sizeof(*nc));
+        if (!nc) { ec->err = 1; return 0; }
+        if (ec->coeffs) {
+            memcpy(nc, ec->coeffs, ec->coeff_count * sizeof(*nc));
+            exr_free(ec->a, ec->coeffs);
+        }
+        ec->coeffs = nc;
+        ec->coeff_cap = ncap;
+    }
+    rec = &ec->records[ec->count++];
+    rec->width = cb_w;
+    rec->height = cb_h;
+    rec->kmax = kmax;
+    rec->plane_is_i32 = pl->data32 ? 1 : 0;
+    rec->coeff_offset = ec->coeff_count;
+    /* Copy the tile (stride cb_w). The GPU path handles only i32 planes; for
+     * int64 planes record a narrowed copy (used only as a CPU-side fallback). */
+    for (y = 0; y < cb_h; ++y) {
+        for (x = 0; x < cb_w; ++x) {
+            int64_t v = pl->data32
+                ? (int64_t)pl->data32[(size_t)(cb_y0 + y) * pl->w + (cb_x0 + x)]
+                : pl->data[(size_t)(cb_y0 + y) * pl->w + (cb_x0 + x)];
+            ec->coeffs[ec->coeff_count + y * cb_w + x] = (int32_t)v;
+        }
+    }
+    ec->coeff_count += tile;
+    return 1;
+}
+
+static exr_result jph_collect_packet_blocks(const JphPlane64 *pl,
+                                            JphSize comp_size, uint32_t res,
+                                            uint32_t num_decomps, uint32_t kmax,
+                                            JphEncCollect *ec) {
+    JphBandGeom bands[4];
+    int first_band, last_band, b;
+    jph_build_band_geoms_from_size(comp_size, num_decomps, res, bands, NULL);
+    first_band = (res == 0u) ? 0 : 1;
+    last_band = (res == 0u) ? 0 : 3;
+    for (b = first_band; b <= last_band; ++b) {
+        uint32_t cbw, cbh, row_off = 0u, col_off = 0u, y, x;
+        if (!bands[b].exists) continue;
+        cbw = jph_divceil_u32(bands[b].w, 128u);
+        cbh = jph_divceil_u32(bands[b].h, 32u);
+        if (cbw == 0u || cbh == 0u) continue;
+        jph_band_offsets(comp_size, num_decomps, res, (uint32_t)b, &row_off,
+                         &col_off);
+        for (y = 0u; y < cbh; ++y) {
+            for (x = 0u; x < cbw; ++x) {
+                uint32_t bx0 = x * 128u, by0 = y * 32u;
+                uint32_t bwid = bands[b].w - bx0, bhgt = bands[b].h - by0;
+                if (bwid > 128u) bwid = 128u;
+                if (bhgt > 32u) bhgt = 32u;
+                if (!jph_enc_collect_block(ec, pl, col_off + bx0, row_off + by0,
+                                           bwid, bhgt, kmax))
+                    return EXR_ERROR_OUT_OF_MEMORY;
+            }
+        }
+    }
+    return EXR_SUCCESS;
+}
+
 static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                                                      uint8_t **p,
                                                      uint8_t *end,
@@ -7499,8 +7591,10 @@ done:
  * exr_jph_compress - main entry point.
  * ------------------------------------------------------------------------- */
 
-exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
-                            size_t n, uint8_t **out_data, size_t *out_size) {
+static exr_result jph_compress_impl(const exr_codec_ctx *ctx,
+                                    const uint8_t *block, size_t n,
+                                    uint8_t **out_data, size_t *out_size,
+                                    JphEncCollect *collect) {
     const exr_allocator *a = ctx->alloc ? ctx->alloc : exr_default_allocator();
     JphPlane64 *planes = NULL;
     uint8_t *buf = NULL;
@@ -7514,8 +7608,8 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
 
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
-    if (!ctx || !block || !out_data || !out_size)
-        return EXR_ERROR_INVALID_ARGUMENT;
+    if (!ctx || !block) return EXR_ERROR_INVALID_ARGUMENT;
+    if (!collect && (!out_data || !out_size)) return EXR_ERROR_INVALID_ARGUMENT;
 
     for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
         const exr_channel *ch = &ctx->channels[c];
@@ -7732,6 +7826,23 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
         }
     }
 
+    /* GPU encode seam: collect each code-block's coefficient tile + dims, then
+     * stop (no entropy coding / codestream emission). */
+    if (collect) {
+        for (uint32_t res = 0u; res <= 5u; ++res) {
+            for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
+                JphPlane64 *pl = &planes[cs2f[c]];
+                JphSize cs;
+                cs.w = pl->w;
+                cs.h = pl->h;
+                rc = jph_collect_packet_blocks(pl, cs, res, 5u, kmax, collect);
+                if (rc != EXR_SUCCESS) goto done;
+            }
+        }
+        rc = EXR_SUCCESS;
+        goto done;
+    }
+
     /* Estimate output buffer size */
     if (exr_mul_ovf(n ? n : 1u, 3u, &buf_cap) ||
         exr_add_ovf(buf_cap, 65536u, &buf_cap)) {
@@ -7789,10 +7900,10 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
     }
 
 done:
-    if (rc != EXR_SUCCESS) {
+    if (rc != EXR_SUCCESS && out_data) {
         exr_free(a, *out_data);
         *out_data = NULL;
-        *out_size = 0;
+        if (out_size) *out_size = 0;
     }
     exr_free(a, buf);
     exr_free(a, cs2f);
@@ -7803,6 +7914,82 @@ done:
         }
         exr_free(a, planes);
     }
-    if (rc != EXR_SUCCESS) { *out_data = NULL; *out_size = 0; }
+    if (rc != EXR_SUCCESS && out_data) { *out_data = NULL; if (out_size) *out_size = 0; }
+    return rc;
+}
+
+exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                            size_t n, uint8_t **out_data, size_t *out_size) {
+    return jph_compress_impl(ctx, block, n, out_data, out_size, NULL);
+}
+
+/* ---- GPU encode seam: public-internal entry points ---------------------- */
+exr_result exr_jph_collect_encode_blocks(const exr_codec_ctx *ctx,
+                                         const uint8_t *block, size_t n,
+                                         exr_jph_enc_plan *out) {
+    JphEncCollect ec;
+    exr_result rc;
+    if (!ctx || !block || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+    memset(&ec, 0, sizeof(ec));
+    ec.a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    rc = jph_compress_impl(ctx, block, n, NULL, NULL, &ec);
+    if (rc != EXR_SUCCESS || ec.err) {
+        exr_free(ec.a, ec.records);
+        exr_free(ec.a, ec.coeffs);
+        return ec.err ? EXR_ERROR_OUT_OF_MEMORY : rc;
+    }
+    out->records = ec.records;
+    out->num_records = ec.count;
+    out->coeffs = ec.coeffs;
+    out->coeff_count = ec.coeff_count;
+    return EXR_SUCCESS;
+}
+
+void exr_jph_enc_plan_free(const exr_allocator *a, exr_jph_enc_plan *plan) {
+    if (!plan) return;
+    if (!a) a = exr_default_allocator();
+    exr_free(a, plan->records);
+    exr_free(a, plan->coeffs);
+    memset(plan, 0, sizeof(*plan));
+}
+
+exr_result exr_jph_ht_enc_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                                 const uint8_t **uvlc_packed) {
+    static uint8_t packed[75 * 6];
+    static int packed_ready = 0;
+    int i;
+    exr_jph_warmup_encode_tables();
+    if (!packed_ready) {
+        for (i = 0; i < 75; ++i) {
+            packed[i * 6 + 0] = g_uvlc_enc_tbl[i].pre;
+            packed[i * 6 + 1] = g_uvlc_enc_tbl[i].pre_len;
+            packed[i * 6 + 2] = g_uvlc_enc_tbl[i].suf;
+            packed[i * 6 + 3] = g_uvlc_enc_tbl[i].suf_len;
+            packed[i * 6 + 4] = g_uvlc_enc_tbl[i].ext;
+            packed[i * 6 + 5] = g_uvlc_enc_tbl[i].ext_len;
+        }
+        packed_ready = 1;
+    }
+    if (vlc0) *vlc0 = g_vlc_enc_tbl0;
+    if (vlc1) *vlc1 = g_vlc_enc_tbl1;
+    if (uvlc_packed) *uvlc_packed = packed;
+    return EXR_SUCCESS;
+}
+
+exr_result exr_jph_encode_one_block_i32(const exr_jph_enc_record *rec,
+                                        const int32_t *coeffs, uint8_t *out,
+                                        size_t out_cap, uint32_t *out_missing,
+                                        uint32_t *out_len0, size_t *out_size) {
+    uint32_t lengths[2] = {0u, 0u};
+    uint32_t missing = rec ? rec->kmax : 0u;
+    exr_result rc;
+    if (!rec || !coeffs || !out || !out_size) return EXR_ERROR_INVALID_ARGUMENT;
+    exr_jph_warmup_encode_tables();
+    rc = jph_encode_block(NULL, coeffs, rec->width, 0u, 0u, rec->width,
+                          rec->height, rec->kmax, &missing, lengths, out,
+                          out_cap, out_size);
+    if (out_missing) *out_missing = missing;
+    if (out_len0) *out_len0 = lengths[0];
     return rc;
 }

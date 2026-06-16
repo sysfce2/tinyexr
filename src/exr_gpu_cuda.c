@@ -77,6 +77,18 @@ exr_result exr_gpu_jph_decode_plan(exr_gpu_context *ctx,
     return EXR_ERROR_UNSUPPORTED;
 }
 
+exr_result exr_gpu_jph_encode_plan(exr_gpu_context *ctx,
+                                   const struct exr_jph_enc_plan *plan,
+                                   unsigned char *out_bytes,
+                                   unsigned int out_stride,
+                                   unsigned int *out_missing,
+                                   unsigned int *out_len0,
+                                   unsigned int *out_size) {
+    (void)ctx; (void)plan; (void)out_bytes; (void)out_stride;
+    (void)out_missing; (void)out_len0; (void)out_size;
+    return EXR_ERROR_UNSUPPORTED;
+}
+
 exr_result exr_gpu_resize_float(exr_gpu_context *ctx, const float *src, int sw,
                                 int sh, size_t ss, float *dst, int dw, int dh,
                                 size_t ds, int ch, exr_resize_filter f,
@@ -163,7 +175,7 @@ struct exr_gpu_context {
     CUfunction k_resize_h, k_resize_v, k_premult;
     /* HTJ2K HT block coder (separate NVRTC module) */
     CUmodule jph_mod;
-    CUfunction k_jph_decode;
+    CUfunction k_jph_decode, k_jph_encode;
 };
 
 /* ---- one-time availability probe ---------------------------------------- */
@@ -271,6 +283,9 @@ static exr_result compile_module(exr_gpu_context *c) {
     if (!EXR_OK(rc)) return rc;
     if (cuModuleGetFunction(&c->k_jph_decode, c->jph_mod,
                             "exrg_jph_decode_blocks") != CUDA_SUCCESS)
+        return EXR_ERROR_IO;
+    if (cuModuleGetFunction(&c->k_jph_encode, c->jph_mod,
+                            "exrg_jph_encode_blocks") != CUDA_SUCCESS)
         return EXR_ERROR_IO;
 
 #define GETFN(field, name)                                                     \
@@ -506,6 +521,110 @@ done:
     d_free(d_scratch); d_free(d_buf); d_free(d_vn);
     d_free(d_magsgn); d_free(d_sigprop);
     exr_free(&c->alloc, hrecs);
+    return rc;
+}
+
+/* Host mirror of the kernel's JphGpuEncRec / JphGpuEncOut (match layout). */
+typedef struct {
+    uint32_t width, height, kmax, eligible;
+    uint64_t coeff_offset;
+    uint64_t out_offset;
+} JphGpuEncRecH;
+typedef struct { uint32_t missing, len0, size, pad; } JphGpuEncOutH;
+
+#define JPH_GPU_ENC_MS_STRIDE 16384u
+#define JPH_GPU_ENC_MEL_STRIDE 256u
+#define JPH_GPU_ENC_VLC_STRIDE 3072u
+
+exr_result exr_gpu_jph_encode_plan(exr_gpu_context *c,
+                                   const struct exr_jph_enc_plan *plan,
+                                   unsigned char *out_bytes,
+                                   unsigned int out_stride,
+                                   unsigned int *out_missing,
+                                   unsigned int *out_len0,
+                                   unsigned int *out_size) {
+    size_t n, i;
+    JphGpuEncRecH *hrecs = NULL;
+    JphGpuEncOutH *houts = NULL;
+    const uint16_t *venc0, *venc1;
+    const uint8_t *uenc;
+    uint32_t ms_stride = JPH_GPU_ENC_MS_STRIDE, mel_stride = JPH_GPU_ENC_MEL_STRIDE;
+    uint32_t vlc_stride = JPH_GPU_ENC_VLC_STRIDE;
+    CUdeviceptr d_coeffs = 0, d_recs = 0, d_outbytes = 0, d_outs = 0;
+    CUdeviceptr d_venc0 = 0, d_venc1 = 0, d_uenc = 0;
+    CUdeviceptr d_ms = 0, d_mel = 0, d_vlc = 0;
+    exr_result rc;
+    int ni;
+
+    if (!c || !plan || !out_bytes) return EXR_ERROR_INVALID_ARGUMENT;
+    if (out_stride < 2u) return EXR_ERROR_INVALID_ARGUMENT;
+    cuCtxSetCurrent(c->cuctx);
+    n = plan->num_records;
+    if (n == 0) return EXR_SUCCESS;
+
+    rc = exr_jph_ht_enc_tables(&venc0, &venc1, &uenc);
+    if (!EXR_OK(rc)) return rc;
+
+    hrecs = (JphGpuEncRecH *)exr_malloc(&c->alloc, n * sizeof(*hrecs));
+    houts = (JphGpuEncOutH *)exr_malloc(&c->alloc, n * sizeof(*houts));
+    if (!hrecs || !houts) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+    for (i = 0; i < n; ++i) {
+        const exr_jph_enc_record *r = &plan->records[i];
+        hrecs[i].width = r->width;
+        hrecs[i].height = r->height;
+        hrecs[i].kmax = r->kmax;
+        hrecs[i].eligible =
+            (r->plane_is_i32 && r->kmax >= 1u && r->kmax <= 30u) ? 1u : 0u;
+        hrecs[i].coeff_offset = (uint64_t)r->coeff_offset;
+        hrecs[i].out_offset = 0u;
+    }
+
+    rc = d_alloc(&d_coeffs, (plan->coeff_count ? plan->coeff_count : 1u) * sizeof(int32_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_recs, n * sizeof(JphGpuEncRecH)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_outbytes, n * out_stride); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_outs, n * sizeof(JphGpuEncOutH)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_venc0, 2048u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_venc1, 2048u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_uenc, 75u * 6u); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_ms, n * ms_stride); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_mel, n * mel_stride); if (!EXR_OK(rc)) goto done;
+    rc = d_alloc(&d_vlc, n * vlc_stride); if (!EXR_OK(rc)) goto done;
+
+    rc = h2d(c, d_coeffs, plan->coeffs, plan->coeff_count * sizeof(int32_t)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_recs, hrecs, n * sizeof(JphGpuEncRecH)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_venc0, venc0, 2048u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_venc1, venc1, 2048u * sizeof(uint16_t)); if (!EXR_OK(rc)) goto done;
+    rc = h2d(c, d_uenc, uenc, 75u * 6u); if (!EXR_OK(rc)) goto done;
+
+    ni = (int)n;
+    {
+        void *params[16];
+        params[0] = &d_coeffs; params[1] = &d_recs; params[2] = &ni;
+        params[3] = &d_venc0; params[4] = &d_venc1; params[5] = &d_uenc;
+        params[6] = &d_outbytes; params[7] = &out_stride; params[8] = &d_outs;
+        params[9] = &d_ms; params[10] = &ms_stride;
+        params[11] = &d_mel; params[12] = &mel_stride;
+        params[13] = &d_vlc; params[14] = &vlc_stride;
+        params[15] = NULL;
+        rc = launch1d(c, c->k_jph_encode, (long)n, params);
+        if (!EXR_OK(rc)) goto done;
+    }
+    rc = d2h(c, out_bytes, d_outbytes, n * out_stride); if (!EXR_OK(rc)) goto done;
+    rc = d2h(c, houts, d_outs, n * sizeof(JphGpuEncOutH)); if (!EXR_OK(rc)) goto done;
+    rc = sync(c);
+    if (!EXR_OK(rc)) goto done;
+    for (i = 0; i < n; ++i) {
+        if (out_missing) out_missing[i] = houts[i].missing;
+        if (out_len0) out_len0[i] = houts[i].len0;
+        if (out_size) out_size[i] = houts[i].size;
+    }
+
+done:
+    d_free(d_coeffs); d_free(d_recs); d_free(d_outbytes); d_free(d_outs);
+    d_free(d_venc0); d_free(d_venc1); d_free(d_uenc);
+    d_free(d_ms); d_free(d_mel); d_free(d_vlc);
+    exr_free(&c->alloc, hrecs);
+    exr_free(&c->alloc, houts);
     return rc;
 }
 

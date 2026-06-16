@@ -783,6 +783,41 @@ exr_result exr_jph_decode_one_block_i32(const exr_jph_cb_record *rec,
                                         const uint8_t *data, int32_t *out,
                                         uint32_t out_stride);
 
+/* ---- GPU HTJ2K encode seam ----------------------------------------------
+ * Symmetric to the decode plan: collect every code-block's (post-transform)
+ * int32 coefficient tile + dims/kmax so the GPU can encode them all in one
+ * launch, then the CPU assembles the codestream. */
+typedef struct exr_jph_enc_record {
+    uint32_t width, height, kmax;
+    int      plane_is_i32;        /* all-HALF i32 plane (GPU-eligible path) */
+    size_t   coeff_offset;        /* int32 element offset into plan->coeffs */
+} exr_jph_enc_record;
+
+typedef struct exr_jph_enc_plan {
+    exr_jph_enc_record *records;
+    size_t num_records;
+    int32_t *coeffs;              /* concatenated cb_w*cb_h tiles, stride=cb_w */
+    size_t coeff_count;
+} exr_jph_enc_plan;
+
+/* Run the forward transforms for one EXR block and collect its code-block
+ * encode plan (no entropy coding / codestream emission). */
+exr_result exr_jph_collect_encode_blocks(const exr_codec_ctx *ctx,
+                                         const uint8_t *block, size_t n,
+                                         exr_jph_enc_plan *out);
+void exr_jph_enc_plan_free(const exr_allocator *a, exr_jph_enc_plan *plan);
+
+/* Runtime-built HT encode tables: g_vlc_enc_tbl0/1 (uint16[2048] each) and the
+ * uvlc table packed as uint8[75*6] = {pre,pre_len,suf,suf_len,ext,ext_len}. */
+exr_result exr_jph_ht_enc_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                                 const uint8_t **uvlc_packed);
+
+/* Reference/fallback: encode one i32 code-block (cleanup pass) from its tile. */
+exr_result exr_jph_encode_one_block_i32(const exr_jph_enc_record *rec,
+                                        const int32_t *coeffs, uint8_t *out,
+                                        size_t out_cap, uint32_t *out_missing,
+                                        uint32_t *out_len0, size_t *out_size);
+
 exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
                                   const int32_t *high, size_t high_count,
                                   int32_t *out, size_t out_count);

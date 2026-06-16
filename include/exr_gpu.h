@@ -160,6 +160,19 @@ exr_result exr_gpu_jph_decode_plan(exr_gpu_context *ctx,
                                    const size_t *tile_offsets, size_t out_count,
                                    int32_t *out_coeffs);
 
+/* Encode every i32-eligible code-block of an encode plan (exr_jph_enc_plan) in
+ * one launch (one thread per block). Block i writes its cleanup-pass bytes at
+ * out_bytes + i*out_stride; per-block missing_msbs / length0 / size land in the
+ * out arrays (size 0 => all-zero/empty block). EXR_ERROR_UNSUPPORTED w/o CUDA. */
+struct exr_jph_enc_plan;
+exr_result exr_gpu_jph_encode_plan(exr_gpu_context *ctx,
+                                   const struct exr_jph_enc_plan *plan,
+                                   unsigned char *out_bytes,
+                                   unsigned int out_stride,
+                                   unsigned int *out_missing,
+                                   unsigned int *out_len0,
+                                   unsigned int *out_size);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
