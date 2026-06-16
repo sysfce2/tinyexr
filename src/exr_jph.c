@@ -4475,7 +4475,7 @@ static exr_result jph_decode_codeblock(void *user,
     return EXR_SUCCESS;
 }
 
-/* ---- GPU seam: code-block plan collector (no decode) -------------------- */
+/* ---- GPU seam: code-block plan collector -------------------------------- */
 typedef struct {
     const exr_allocator *a;
     const JphProfile *jp;
@@ -4485,6 +4485,11 @@ typedef struct {
     exr_jph_cb_record *records;
     size_t count;
     size_t cap;
+    /* When gpu_fn is set, jph_decode_tile_payload decodes the collected blocks
+     * on the GPU and continues to scatter + inverse transform + store, instead
+     * of returning the plan to the caller. */
+    exr_jph_gpu_block_decode_fn gpu_fn;
+    void *gpu_user;
 } JphCollectState;
 
 static exr_result jph_collect_codeblock(void *user,
@@ -4656,14 +4661,74 @@ static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
                                     &decode_state.planes);
     if (rc != EXR_SUCCESS) return rc;
     if (collect) {
-        /* GPU seam: walk the packets recording a code-block plan, then stop
-         * before postprocess/store (the GPU backend decodes + transforms). */
+        /* GPU seam: walk the packets recording a code-block plan. */
         collect->jp = jp;
         collect->planes = decode_state.planes;
         collect->num_planes = decode_state.num_planes;
         collect->tile_base = jp->tile_data;
         rc = jph_parse_tile_packets(ctx, jp, &codeblocks, jph_collect_codeblock,
                                     collect);
+        if (rc != EXR_SUCCESS) goto done;
+        if (!collect->gpu_fn) goto done; /* pure-collect: hand plan to caller */
+
+        /* Whole-image GPU decode: decode all blocks on the device, scatter the
+         * tiles into the component planes, then inverse-transform + store. */
+        {
+            exr_jph_cb_plan plan;
+            size_t *offs = NULL, total = 0, i;
+            int32_t *coeffs = NULL;
+            int all_elig = 1;
+            for (i = 0; i < collect->count; ++i)
+                if (!collect->records[i].i32_eligible) { all_elig = 0; break; }
+            if (!all_elig) { rc = EXR_ERROR_UNSUPPORTED; goto done; }
+
+            offs = (size_t *)exr_malloc(decode_state.a,
+                                        (collect->count ? collect->count : 1u) *
+                                            sizeof(size_t));
+            if (!offs) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+            for (i = 0; i < collect->count; ++i) {
+                uint32_t st = (collect->records[i].width + 7u) & ~7u;
+                offs[i] = total;
+                total += (size_t)st * collect->records[i].height;
+            }
+            coeffs = (int32_t *)exr_calloc(decode_state.a, total ? total : 1u,
+                                           sizeof(int32_t));
+            if (!coeffs) { exr_free(decode_state.a, offs); rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+
+            memset(&plan, 0, sizeof(plan));
+            plan.records = collect->records;
+            plan.num_records = collect->count;
+            plan.data = (uint8_t *)(uintptr_t)jp->tile_data;
+            plan.data_size = jp->tile_data_size;
+            plan.num_components = (int)jp->csiz;
+            rc = collect->gpu_fn(collect->gpu_user, &plan, offs, total, coeffs);
+            if (rc != EXR_SUCCESS) { exr_free(decode_state.a, offs); exr_free(decode_state.a, coeffs); goto done; }
+
+            /* scatter each tile into its component plane (int32 path) */
+            for (i = 0; i < collect->count; ++i) {
+                const exr_jph_cb_record *rcd = &collect->records[i];
+                uint32_t st = (rcd->width + 7u) & ~7u, yy, xx;
+                JphPlaneD *pl = &decode_state.planes[rcd->comp];
+                const int32_t *tile = coeffs + offs[i];
+                if (!pl->d32) { rc = EXR_ERROR_UNSUPPORTED; break; }
+                for (yy = 0; yy < rcd->height; ++yy) {
+                    int32_t *drow = pl->d32 +
+                        (size_t)(rcd->dst_row + yy) * pl->w + rcd->dst_col;
+                    const int32_t *srow = tile + (size_t)yy * st;
+                    for (xx = 0; xx < rcd->width; ++xx) drow[xx] = srow[xx];
+                }
+            }
+            exr_free(decode_state.a, offs);
+            exr_free(decode_state.a, coeffs);
+            if (rc != EXR_SUCCESS) goto done;
+        }
+        rc = jph_postprocess_component_planes(decode_state.a, jp,
+                                              decode_state.planes,
+                                              &decode_state.ws);
+        if (rc != EXR_SUCCESS) goto done;
+        rc = jph_store_component_planes_to_block(ctx, jp, map,
+                                                 decode_state.planes, dst,
+                                                 dst_size);
         goto done;
     }
     rc = jph_parse_tile_packets(ctx, jp, &codeblocks, jph_decode_codeblock,
@@ -4968,6 +5033,30 @@ void exr_jph_cb_plan_free(const exr_allocator *a, exr_jph_cb_plan *plan) {
     exr_free(a, plan->records);
     exr_free(a, plan->data);
     memset(plan, 0, sizeof(*plan));
+}
+
+exr_result exr_jph_decompress_gpu(const exr_codec_ctx *ctx, const uint8_t *src,
+                                  size_t src_size, uint8_t *dst, size_t dst_size,
+                                  exr_jph_gpu_block_decode_fn fn, void *user) {
+    const exr_allocator *a;
+    uint16_t *map = NULL;
+    size_t codestream_off = 0;
+    JphCollectState cs;
+    exr_result rc;
+    if (!ctx || !src || !dst || !fn) return EXR_ERROR_INVALID_ARGUMENT;
+    a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    memset(&cs, 0, sizeof(cs));
+    cs.a = a;
+    cs.gpu_fn = fn;
+    cs.gpu_user = user;
+    rc = jph_parse_ht_header(ctx, src, src_size, &map, &codestream_off);
+    if (rc != EXR_SUCCESS) return rc;
+    if (codestream_off >= src_size) { exr_free(a, map); return EXR_ERROR_CORRUPT; }
+    rc = jph_validate_profile(ctx, map, src + codestream_off,
+                              src_size - codestream_off, dst, dst_size, &cs);
+    exr_free(a, map);
+    exr_free(a, cs.records);
+    return rc;
 }
 
 exr_result exr_jph_ht_tables(const uint16_t **vlc0, const uint16_t **vlc1,
@@ -7302,7 +7391,22 @@ typedef struct {
     int32_t *coeffs;
     size_t coeff_count, coeff_cap;
     int err;
+    /* When gpu_enc_fn is set, jph_compress_impl collects the plan, encodes all
+     * blocks on the GPU, then assembles the codestream from those outputs. */
+    exr_jph_gpu_block_encode_fn gpu_enc_fn;
+    void *gpu_enc_user;
 } JphEncCollect;
+
+/* Precomputed per-code-block GPU encode outputs, consumed in code-block order
+ * (res->comp->band->y->x) by jph_write_packet_for_component_res. */
+typedef struct {
+    const uint8_t *bytes;
+    uint32_t out_stride;
+    const uint32_t *missing;
+    const uint32_t *len0;
+    const uint32_t *size;
+    size_t cursor;
+} JphGpuEncOutputs;
 
 static int jph_enc_collect_block(JphEncCollect *ec, const JphPlane64 *pl,
                                  uint32_t cb_x0, uint32_t cb_y0,
@@ -7393,7 +7497,8 @@ static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                                                      JphSize comp_size,
                                                      uint32_t res,
                                                      uint32_t num_decomps,
-                                                     uint32_t kmax) {
+                                                     uint32_t kmax,
+                                                     JphGpuEncOutputs *gpu_out) {
     JphPacketWriter bw;
     JphEncodedCb *body = NULL;
     size_t body_count = 0u, body_cap = 0u;
@@ -7466,11 +7571,25 @@ static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                         rc = EXR_ERROR_OUT_OF_MEMORY;
                         goto band_done;
                     }
-                    rc = jph_encode_block(pl->data32 ? NULL : pl->data,
-                                          pl->data32, pl->w, col_off + bx0,
-                                          row_off + by0, bwid, bhgt, kmax,
-                                          &missing, lengths, coded,
-                                          coded_cap, &out_sz);
+                    if (gpu_out) {
+                        /* Consume the next precomputed GPU block output (same
+                         * code-block enumeration order as collection). */
+                        size_t cur = gpu_out->cursor++;
+                        out_sz = gpu_out->size[cur];
+                        missing = gpu_out->missing[cur];
+                        lengths[0] = gpu_out->len0[cur];
+                        lengths[1] = 0u;
+                        if (out_sz > coded_cap) { exr_free(a, coded); rc = EXR_ERROR_CORRUPT; goto band_done; }
+                        if (out_sz)
+                            memcpy(coded, gpu_out->bytes + cur * gpu_out->out_stride, out_sz);
+                        rc = EXR_SUCCESS;
+                    } else {
+                        rc = jph_encode_block(pl->data32 ? NULL : pl->data,
+                                              pl->data32, pl->w, col_off + bx0,
+                                              row_off + by0, bwid, bhgt, kmax,
+                                              &missing, lengths, coded,
+                                              coded_cap, &out_sz);
+                    }
                     if (rc != EXR_SUCCESS) {
                         exr_free(a, coded);
                         goto band_done;
@@ -7605,6 +7724,10 @@ static exr_result jph_compress_impl(const exr_codec_ctx *ctx,
     uint32_t kmax = 20u;
     uint16_t *cs2f = NULL;
     int is_rgb = 0;
+    JphGpuEncOutputs gpu_out_storage;
+    JphGpuEncOutputs *gpu_out_ptr = NULL;
+    uint8_t *gpu_enc_bytes = NULL;
+    uint32_t *gpu_enc_missing = NULL, *gpu_enc_len0 = NULL, *gpu_enc_size = NULL;
 
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
@@ -7826,8 +7949,8 @@ static exr_result jph_compress_impl(const exr_codec_ctx *ctx,
         }
     }
 
-    /* GPU encode seam: collect each code-block's coefficient tile + dims, then
-     * stop (no entropy coding / codestream emission). */
+    /* GPU encode seam: collect each code-block's coefficient tile + dims (in
+     * res->comp->band->y->x order, matching the packet writer). */
     if (collect) {
         for (uint32_t res = 0u; res <= 5u; ++res) {
             for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
@@ -7839,8 +7962,48 @@ static exr_result jph_compress_impl(const exr_codec_ctx *ctx,
                 if (rc != EXR_SUCCESS) goto done;
             }
         }
-        rc = EXR_SUCCESS;
-        goto done;
+        if (collect->err) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        if (!collect->gpu_enc_fn) { rc = EXR_SUCCESS; goto done; } /* pure collect */
+
+        /* Whole-image GPU encode: encode all blocks on the device, then fall
+         * through to assemble the codestream from those outputs. Fall back to
+         * the CPU codec if any block is not i32-eligible. */
+        {
+            const uint32_t ENC_STRIDE = 20480u;
+            size_t i, nrec = collect->count;
+            exr_jph_enc_plan plan;
+            for (i = 0; i < nrec; ++i)
+                if (!collect->records[i].plane_is_i32 ||
+                    collect->records[i].kmax < 1u ||
+                    collect->records[i].kmax > 30u) {
+                    rc = EXR_ERROR_UNSUPPORTED;
+                    goto done;
+                }
+            gpu_enc_bytes = (uint8_t *)exr_malloc(a, (nrec ? nrec : 1u) * ENC_STRIDE);
+            gpu_enc_missing = (uint32_t *)exr_malloc(a, (nrec ? nrec : 1u) * sizeof(uint32_t));
+            gpu_enc_len0 = (uint32_t *)exr_malloc(a, (nrec ? nrec : 1u) * sizeof(uint32_t));
+            gpu_enc_size = (uint32_t *)exr_malloc(a, (nrec ? nrec : 1u) * sizeof(uint32_t));
+            if (!gpu_enc_bytes || !gpu_enc_missing || !gpu_enc_len0 || !gpu_enc_size) {
+                rc = EXR_ERROR_OUT_OF_MEMORY;
+                goto done;
+            }
+            memset(&plan, 0, sizeof(plan));
+            plan.records = collect->records;
+            plan.num_records = nrec;
+            plan.coeffs = collect->coeffs;
+            plan.coeff_count = collect->coeff_count;
+            rc = collect->gpu_enc_fn(collect->gpu_enc_user, &plan, gpu_enc_bytes,
+                                     ENC_STRIDE, gpu_enc_missing, gpu_enc_len0,
+                                     gpu_enc_size);
+            if (rc != EXR_SUCCESS) goto done;
+            gpu_out_storage.bytes = gpu_enc_bytes;
+            gpu_out_storage.out_stride = ENC_STRIDE;
+            gpu_out_storage.missing = gpu_enc_missing;
+            gpu_out_storage.len0 = gpu_enc_len0;
+            gpu_out_storage.size = gpu_enc_size;
+            gpu_out_storage.cursor = 0;
+            gpu_out_ptr = &gpu_out_storage;
+        }
     }
 
     /* Estimate output buffer size */
@@ -7869,7 +8032,8 @@ static exr_result jph_compress_impl(const exr_codec_ctx *ctx,
                 cs.w = pl->w;
                 cs.h = pl->h;
                 rc = jph_write_packet_for_component_res(a, &p, end, pl, cs,
-                                                        res, 5u, kmax);
+                                                        res, 5u, kmax,
+                                                        gpu_out_ptr);
                 if (rc != EXR_SUCCESS) goto done;
             }
         }
@@ -7907,6 +8071,10 @@ done:
     }
     exr_free(a, buf);
     exr_free(a, cs2f);
+    exr_free(a, gpu_enc_bytes);
+    exr_free(a, gpu_enc_missing);
+    exr_free(a, gpu_enc_len0);
+    exr_free(a, gpu_enc_size);
     if (planes) {
         for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
             exr_free(a, planes[c].data);
@@ -7921,6 +8089,23 @@ done:
 exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size) {
     return jph_compress_impl(ctx, block, n, out_data, out_size, NULL);
+}
+
+exr_result exr_jph_compress_gpu(const exr_codec_ctx *ctx, const uint8_t *block,
+                                size_t n, uint8_t **out_data, size_t *out_size,
+                                exr_jph_gpu_block_encode_fn fn, void *user) {
+    JphEncCollect ec;
+    exr_result rc;
+    if (!ctx || !block || !out_data || !out_size || !fn)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    memset(&ec, 0, sizeof(ec));
+    ec.a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    ec.gpu_enc_fn = fn;
+    ec.gpu_enc_user = user;
+    rc = jph_compress_impl(ctx, block, n, out_data, out_size, &ec);
+    exr_free(ec.a, ec.records);
+    exr_free(ec.a, ec.coeffs);
+    return rc;
 }
 
 /* ---- GPU encode seam: public-internal entry points ---------------------- */

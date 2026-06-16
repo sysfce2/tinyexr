@@ -704,6 +704,20 @@ exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
                                                  size_t block_size);
 const int *exr_writer_sorted_order(exr_writer *w, int32_t part);
 
+/* Install a GPU HTJ2K block-encode hook; exr_writer_write_scanline_block_canon
+ * then routes HTJ2K parts through it (falling back to the CPU coder per-chunk
+ * for non-i32-eligible blocks). Declared after exr_jph_gpu_block_encode_fn. */
+struct exr_jph_enc_plan;
+typedef exr_result (*exr_jph_gpu_block_encode_fn)(void *user,
+                                                  const struct exr_jph_enc_plan *plan,
+                                                  unsigned char *out_bytes,
+                                                  unsigned int out_stride,
+                                                  unsigned int *out_missing,
+                                                  unsigned int *out_len0,
+                                                  unsigned int *out_size);
+void exr_writer_set_gpu_jph_encoder(exr_writer *w,
+                                    exr_jph_gpu_block_encode_fn fn, void *user);
+
 /* Uncompressed byte size of one scanline block / tile region. */
 exr_result exr_block_uncompressed_size(const exr_channel *channels,
                                        int32_t num_channels, int32_t x,
@@ -772,6 +786,21 @@ exr_result exr_jph_collect_codeblocks(const exr_codec_ctx *ctx,
                                       exr_jph_cb_plan *out);
 void exr_jph_cb_plan_free(const exr_allocator *a, exr_jph_cb_plan *plan);
 
+/* Whole-image GPU decode: the backend supplies a batch block-decode callback
+ * (decodes every i32-eligible record of `plan` into `coeffs` at tile_offsets[i],
+ * stride (width+7)&~7). exr_jph_decompress_gpu collects the chunk's plan, calls
+ * the hook, scatters the tiles into the component planes, then runs the inverse
+ * transforms + store on the CPU. Returns EXR_ERROR_UNSUPPORTED (so the caller
+ * falls back to exr_jph_decompress) when any code-block is not i32-eligible. */
+typedef exr_result (*exr_jph_gpu_block_decode_fn)(void *user,
+                                                  const exr_jph_cb_plan *plan,
+                                                  const size_t *tile_offsets,
+                                                  size_t coeff_count,
+                                                  int32_t *coeffs);
+exr_result exr_jph_decompress_gpu(const exr_codec_ctx *ctx, const uint8_t *src,
+                                  size_t src_size, uint8_t *dst, size_t dst_size,
+                                  exr_jph_gpu_block_decode_fn fn, void *user);
+
 /* The runtime-built HT VLC tables (opaque to the backend; layout: four arrays
  * vlc_tbl0[1024], vlc_tbl1[1024], uvlc_tbl0[320], uvlc_tbl1[256], all uint16).
  * Returns pointers + element counts so the backend can upload them verbatim. */
@@ -817,6 +846,18 @@ exr_result exr_jph_encode_one_block_i32(const exr_jph_enc_record *rec,
                                         const int32_t *coeffs, uint8_t *out,
                                         size_t out_cap, uint32_t *out_missing,
                                         uint32_t *out_len0, size_t *out_size);
+
+/* Whole-image GPU encode: the backend supplies a batch block-encode callback
+ * (encodes every i32-eligible record of `plan`; block i's cleanup bytes land at
+ * out_bytes + i*out_stride, with per-block missing/len0/size in the out arrays).
+ * exr_jph_compress_gpu builds the planes + plan, calls the hook, then assembles
+ * the codestream from the GPU block outputs on the CPU. Returns
+ * EXR_ERROR_UNSUPPORTED (caller falls back to exr_jph_compress) when any
+ * code-block is not i32-eligible. (exr_jph_gpu_block_encode_fn is declared
+ * above, near exr_writer_set_gpu_jph_encoder.) */
+exr_result exr_jph_compress_gpu(const exr_codec_ctx *ctx, const uint8_t *block,
+                                size_t n, uint8_t **out_data, size_t *out_size,
+                                exr_jph_gpu_block_encode_fn fn, void *user);
 
 exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
                                   const int32_t *high, size_t high_count,

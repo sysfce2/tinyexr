@@ -672,6 +672,25 @@ static int part_gpu_eligible(const exr_header *h) {
     return 1;
 }
 
+/* GPU HTJ2K block-decode hook handed to exr_jph_decompress_gpu (user = ctx). */
+static exr_result gpu_jph_decode_hook(void *user, const exr_jph_cb_plan *plan,
+                                      const size_t *tile_offsets,
+                                      size_t coeff_count, int32_t *coeffs) {
+    return exr_gpu_jph_decode_plan((exr_gpu_context *)user, plan, tile_offsets,
+                                   coeff_count, coeffs);
+}
+
+/* GPU HTJ2K block-encode hook handed to the writer (user = ctx). */
+static exr_result gpu_jph_encode_hook(void *user, const struct exr_jph_enc_plan *plan,
+                                      unsigned char *out_bytes,
+                                      unsigned int out_stride,
+                                      unsigned int *out_missing,
+                                      unsigned int *out_len0,
+                                      unsigned int *out_size) {
+    return exr_gpu_jph_encode_plan((exr_gpu_context *)user, plan, out_bytes,
+                                   out_stride, out_missing, out_len0, out_size);
+}
+
 /* Decode all scanline blocks of one eligible part into out->images on the GPU. */
 static exr_result gpu_decode_part(exr_gpu_context *c, exr_reader *r, int32_t part,
                                   exr_part *out) {
@@ -750,6 +769,17 @@ static exr_result gpu_decode_part(exr_gpu_context *c, exr_reader *r, int32_t par
             { void *pp[3]; pp[0] = &d_b; pp[1] = &n_i; pp[2] = &d_a;
               rc = launch1d(c, c->k_deinterleave, n_i, pp); if (!EXR_OK(rc)) goto done; }
             /* canonical block now in d_a */
+        } else if (ctx.compression == EXR_COMPRESSION_HTJ2K256 ||
+                   ctx.compression == EXR_COMPRESSION_HTJ2K32) {
+            /* HTJ2K: GPU HT block decode + CPU scatter/inverse-transform/store
+             * produces the canonical block. Falls back to the CPU codec for
+             * chunks with non-i32-eligible code-blocks (float/uint, hi-bitdepth). */
+            rc = exr_jph_decompress_gpu(&ctx, cdata, csize, host_canon, unc,
+                                        gpu_jph_decode_hook, c);
+            if (rc == EXR_ERROR_UNSUPPORTED)
+                rc = exr_decompress_block(&ctx, cdata, csize, host_canon, unc);
+            if (!EXR_OK(rc)) goto done;
+            rc = h2d(c, d_a, host_canon, unc); if (!EXR_OK(rc)) goto done;
         } else {
             /* canonical bytes via CPU (verbatim/NONE = copy; others decompress) */
             if (csize == unc || ctx.compression == EXR_COMPRESSION_NONE) {
@@ -1060,6 +1090,7 @@ exr_result exr_gpu_save_to_memory(exr_gpu_context *c, void **out_data,
     }
     rc = exr_writer_begin_stream(w, &sink, comp);
     if (!EXR_OK(rc)) goto done;
+    exr_writer_set_gpu_jph_encoder(w, gpu_jph_encode_hook, c);
     rc = gpu_encode_parts(c, w, img, comp);
     if (!EXR_OK(rc)) goto done;
     rc = exr_writer_end_stream(w);
@@ -1094,6 +1125,7 @@ exr_result exr_gpu_save_to_file(exr_gpu_context *c, const char *path,
     }
     rc = exr_writer_begin_stream_file(w, path, comp);
     if (!EXR_OK(rc)) { exr_writer_destroy(w); return rc; }
+    exr_writer_set_gpu_jph_encoder(w, gpu_jph_encode_hook, c);
     rc = gpu_encode_parts(c, w, img, comp);
     if (EXR_OK(rc)) rc = exr_writer_end_stream(w);
     exr_writer_destroy(w);

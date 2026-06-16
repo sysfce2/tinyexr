@@ -1249,7 +1249,18 @@ struct exr_writer {
     uint64_t *soff_pos;    /* [part] file offset of the reserved offset table */
     uint64_t *smax_pos;    /* [part] file offset of maxSamplesPerPixel value (deep) */
     int32_t *smax;         /* [part] running max sample count (deep) */
+    /* Optional GPU HTJ2K block-encode hook (set by the GPU backend); used by
+     * exr_writer_write_scanline_block_canon for HTJ2K parts. */
+    exr_jph_gpu_block_encode_fn gpu_jph_fn;
+    void *gpu_jph_user;
 };
+
+void exr_writer_set_gpu_jph_encoder(exr_writer *w,
+                                    exr_jph_gpu_block_encode_fn fn, void *user) {
+    if (!w) return;
+    w->gpu_jph_fn = fn;
+    w->gpu_jph_user = user;
+}
 
 /* Internal: the allocator a writer was created with (used by exr_stdio.c to free
  * buffers returned by exr_writer_finalize_to_memory). */
@@ -1783,7 +1794,15 @@ exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
     cx.y = y0;
     cx.width = pt->width;
     cx.num_lines = nlines;
-    rc = exr_compress_block(&cx, block, blk_size, &payload, &payload_size);
+    rc = EXR_ERROR_UNSUPPORTED;
+    if (w->gpu_jph_fn &&
+        (w->scomp == EXR_COMPRESSION_HTJ2K256 ||
+         w->scomp == EXR_COMPRESSION_HTJ2K32)) {
+        rc = exr_jph_compress_gpu(&cx, block, blk_size, &payload, &payload_size,
+                                  w->gpu_jph_fn, w->gpu_jph_user);
+    }
+    if (rc == EXR_ERROR_UNSUPPORTED) /* not HTJ2K, or a non-i32 block: CPU path */
+        rc = exr_compress_block(&cx, block, blk_size, &payload, &payload_size);
     if (!EXR_OK(rc)) return rc;
     rc = stream_emit_flat(w, part, ci, 0, 0, 0, 0, 0, y0, payload, payload_size);
     exr_free(a, payload);

@@ -246,6 +246,76 @@ cleanup:
     exr_image_free(&img);
 }
 
+/* Whole-image GPU HTJ2K decode: CPU-encode to HTJ2K256, then compare
+ * exr_gpu_load_from_memory (full GPU path) against exr_load_from_memory. */
+static int img_equal(const exr_image *a, const exr_image *b) {
+    int p, c;
+    if (a->num_parts != b->num_parts) return 0;
+    for (p = 0; p < a->num_parts; ++p) {
+        const exr_part *pa = &a->parts[p], *pb = &b->parts[p];
+        if (pa->width != pb->width || pa->height != pb->height) return 0;
+        if (pa->header.num_channels != pb->header.num_channels) return 0;
+        for (c = 0; c < pa->header.num_channels; ++c) {
+            size_t ps = pix_size(pa->header.channels[c].pixel_type);
+            if (memcmp(pa->images[c], pb->images[c],
+                       (size_t)pa->width * pa->height * ps) != 0)
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static void test_decode_image(exr_gpu_context *ctx, const char *rel) {
+    char *path = path_of(rel);
+    exr_image src, cpu, gpu;
+    void *blob = NULL;
+    size_t blob_size = 0;
+    exr_result rc;
+    if (!file_exists(path)) { ++g_skip; printf("  skip  dec %s (missing)\n", rel); return; }
+    memset(&src, 0, sizeof(src)); memset(&cpu, 0, sizeof(cpu)); memset(&gpu, 0, sizeof(gpu));
+    if (exr_load_from_file(path, NULL, &src) != EXR_SUCCESS) { ++g_skip; printf("  skip  dec %s (load)\n", rel); return; }
+    rc = exr_save_to_memory(&blob, &blob_size, NULL, &src, EXR_COMPRESSION_HTJ2K256);
+    exr_image_free(&src);
+    if (rc != EXR_SUCCESS) { ++g_skip; printf("  skip  dec %s (htj2k enc)\n", rel); return; }
+    if (exr_load_from_memory(blob, blob_size, NULL, &cpu) != EXR_SUCCESS) { ++g_skip; free(blob); printf("  skip  dec %s (cpu reload)\n", rel); return; }
+    rc = exr_gpu_load_from_memory(ctx, blob, blob_size, NULL, &gpu);
+    free(blob);
+    if (rc != EXR_SUCCESS) { printf("  FAIL dec %s: gpu load %s\n", rel, exr_result_string(rc)); ++g_fail; exr_image_free(&cpu); return; }
+    if (img_equal(&cpu, &gpu)) { ++g_pass; printf("  PASS  dec %s (whole-image GPU == CPU)\n", rel); }
+    else { ++g_fail; printf("  FAIL dec %s: pixels differ\n", rel); }
+    exr_image_free(&cpu); exr_image_free(&gpu);
+}
+
+/* Whole-image GPU HTJ2K encode: compare exr_gpu_save_to_memory (GPU block
+ * encode + CPU assembly) against exr_save_to_memory byte-for-byte, and verify
+ * the GPU-produced blob round-trips. */
+static void test_encode_roundtrip(exr_gpu_context *ctx, const char *rel) {
+    char *path = path_of(rel);
+    exr_image src, rt;
+    void *cpu_blob = NULL, *gpu_blob = NULL;
+    size_t cpu_size = 0, gpu_size = 0;
+    exr_result rc;
+    if (!file_exists(path)) { ++g_skip; printf("  skip  save %s (missing)\n", rel); return; }
+    memset(&src, 0, sizeof(src)); memset(&rt, 0, sizeof(rt));
+    if (exr_load_from_file(path, NULL, &src) != EXR_SUCCESS) { ++g_skip; printf("  skip  save %s (load)\n", rel); return; }
+    rc = exr_save_to_memory(&cpu_blob, &cpu_size, NULL, &src, EXR_COMPRESSION_HTJ2K256);
+    if (rc != EXR_SUCCESS) { ++g_skip; exr_image_free(&src); printf("  skip  save %s (cpu enc)\n", rel); return; }
+    rc = exr_gpu_save_to_memory(ctx, &gpu_blob, &gpu_size, NULL, &src, EXR_COMPRESSION_HTJ2K256);
+    if (rc != EXR_SUCCESS) { printf("  FAIL save %s: gpu save %s\n", rel, exr_result_string(rc)); ++g_fail; goto cleanup; }
+    if (cpu_size != gpu_size || memcmp(cpu_blob, gpu_blob, cpu_size) != 0) {
+        /* Not byte-identical: still accept if it round-trips to the same pixels. */
+        if (exr_load_from_memory(gpu_blob, gpu_size, NULL, &rt) == EXR_SUCCESS &&
+            img_equal(&src, &rt)) {
+            ++g_pass; printf("  PASS  save %s (roundtrip ok; %zu vs cpu %zu bytes)\n", rel, gpu_size, cpu_size);
+        } else { ++g_fail; printf("  FAIL save %s: differs from CPU and roundtrip mismatch\n", rel); }
+    } else {
+        ++g_pass; printf("  PASS  save %s (byte-identical to CPU, %zu bytes)\n", rel, gpu_size);
+    }
+cleanup:
+    free(cpu_blob); free(gpu_blob);
+    exr_image_free(&src); exr_image_free(&rt);
+}
+
 int main(int argc, char **argv) {
     exr_gpu_context *ctx = NULL;
     exr_result rc;
@@ -271,6 +341,12 @@ int main(int argc, char **argv) {
     test_image(ctx, "TestImages/GrayRampsHorizontal.exr");
     test_image(ctx, "TestImages/SquaresSwirls.exr");
 
+    printf("\n[HTJ2K whole-image GPU decode == CPU]\n");
+    test_decode_image(ctx, "ScanLines/Desk.exr");
+    test_decode_image(ctx, "ScanLines/Carrots.exr");
+    test_decode_image(ctx, "ScanLines/Tree.exr");
+    test_decode_image(ctx, "TestImages/AllHalfValues.exr");
+
     printf("\n[HTJ2K GPU block-coder ENCODE parity]\n");
     test_encode_image(ctx, "ScanLines/Desk.exr");
     test_encode_image(ctx, "ScanLines/Carrots.exr");
@@ -278,6 +354,11 @@ int main(int argc, char **argv) {
     test_encode_image(ctx, "TestImages/AllHalfValues.exr");
     test_encode_image(ctx, "TestImages/GrayRampsHorizontal.exr");
     test_encode_image(ctx, "TestImages/SquaresSwirls.exr");
+
+    printf("\n[HTJ2K whole-image GPU encode (save) == CPU]\n");
+    test_encode_roundtrip(ctx, "ScanLines/Desk.exr");
+    test_encode_roundtrip(ctx, "ScanLines/Carrots.exr");
+    test_encode_roundtrip(ctx, "TestImages/AllHalfValues.exr");
 
     exr_gpu_context_destroy(ctx);
     printf("\n=== %d passed, %d failed, %d skipped ===\n", g_pass, g_fail, g_skip);
