@@ -689,6 +689,21 @@ typedef struct exr_codec_ctx {
 exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
                                 size_t src_size, uint8_t *dst, size_t dst_size);
 
+/* Fetch the raw compressed chunk bytes + codec ctx for block `idx` without
+ * decompressing (used by the GPU backend for device-side reconstruction). The
+ * returned pointer is valid until the next reader fetch. */
+exr_result exr_reader_block_raw(exr_reader *r, int32_t part, uint32_t idx,
+                                exr_block_info *out_bi, const uint8_t **out_cdata,
+                                size_t *out_csize, exr_codec_ctx *out_ctx);
+
+/* Streaming encode seam for the GPU backend: write one scanline block from a
+ * pre-gathered canonical buffer (the device does the planar->canonical gather),
+ * and query the writer's sorted channel order. Declared in exr_writer.c. */
+exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
+                                                 int32_t y0, const uint8_t *block,
+                                                 size_t block_size);
+const int *exr_writer_sorted_order(exr_writer *w, int32_t part);
+
 /* Uncompressed byte size of one scanline block / tile region. */
 exr_result exr_block_uncompressed_size(const exr_channel *channels,
                                        int32_t num_channels, int32_t x,
@@ -701,6 +716,15 @@ exr_result exr_rle_decompress(const exr_allocator *a, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size);
 exr_result exr_zip_decompress(const exr_allocator *a, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size);
+
+/* Entropy-decode only: produce the pre-reconstruction buffer (after inflate /
+ * RLE-expand, BEFORE the byte predictor + even/odd deinterleave). `dst` must be
+ * dst_size bytes. The GPU backend uses these so the reconstruction passes can
+ * run as kernels; the CPU path keeps doing predictor+interleave on the host. */
+exr_result exr_zip_inflate_only(const uint8_t *src, size_t src_size,
+                                uint8_t *dst, size_t dst_size);
+exr_result exr_rle_expand_only(const uint8_t *src, size_t src_size,
+                               uint8_t *dst, size_t dst_size);
 exr_result exr_pxr24_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
                                 size_t src_size, uint8_t *dst, size_t dst_size);
 exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,

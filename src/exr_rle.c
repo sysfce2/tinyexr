@@ -12,53 +12,50 @@
 
 #include "exr_internal.h"
 
-exr_result exr_rle_decompress(const exr_allocator *a, const uint8_t *src,
-                              size_t src_size, uint8_t *dst, size_t dst_size) {
-    uint8_t *tmp;
+/* RLE-expand into dst (the pre-reconstruction buffer); no predictor/interleave. */
+exr_result exr_rle_expand_only(const uint8_t *src, size_t src_size,
+                               uint8_t *dst, size_t dst_size) {
     const signed char *in = (const signed char *)src;
     const signed char *in_end = in + src_size;
-    uint8_t *out, *out_end;
-    size_t uncomp;
-    exr_result rc = EXR_SUCCESS;
-
-    tmp = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
-    if (!tmp) return EXR_ERROR_OUT_OF_MEMORY;
-    out = tmp;
-    out_end = tmp + dst_size;
+    uint8_t *out = dst;
+    uint8_t *out_end = dst + dst_size;
 
     while (in < in_end && out < out_end) {
         int count = *in++;
         if (count < 0) {
             size_t len = (size_t)(-count);
-            if ((size_t)(in_end - in) < len || (size_t)(out_end - out) < len) {
-                rc = EXR_ERROR_CORRUPT;
-                goto done;
-            }
+            if ((size_t)(in_end - in) < len || (size_t)(out_end - out) < len)
+                return EXR_ERROR_CORRUPT;
             memcpy(out, in, len);
             out += len;
             in += len;
         } else {
             size_t len = (size_t)count + 1;
             uint8_t val;
-            if (in >= in_end || (size_t)(out_end - out) < len) {
-                rc = EXR_ERROR_CORRUPT;
-                goto done;
-            }
+            if (in >= in_end || (size_t)(out_end - out) < len)
+                return EXR_ERROR_CORRUPT;
             val = (uint8_t)*in++;
             memset(out, val, len);
             out += len;
         }
     }
+    if ((size_t)(out - dst) != dst_size) return EXR_ERROR_CORRUPT;
+    return EXR_SUCCESS;
+}
 
-    uncomp = (size_t)(out - tmp);
-    if (uncomp != dst_size) {
-        rc = EXR_ERROR_CORRUPT;
-        goto done;
+exr_result exr_rle_decompress(const exr_allocator *a, const uint8_t *src,
+                              size_t src_size, uint8_t *dst, size_t dst_size) {
+    uint8_t *tmp;
+    exr_result rc;
+
+    tmp = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+    if (!tmp) return EXR_ERROR_OUT_OF_MEMORY;
+
+    rc = exr_rle_expand_only(src, src_size, tmp, dst_size);
+    if (EXR_OK(rc)) {
+        exr_predictor_decode(tmp, dst_size);
+        exr_interleave_decode(tmp, dst, dst_size);
     }
-    exr_predictor_decode(tmp, uncomp);
-    exr_interleave_decode(tmp, dst, uncomp);
-
-done:
     exr_free(a, tmp);
     return rc;
 }

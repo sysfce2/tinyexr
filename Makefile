@@ -43,7 +43,7 @@ V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
 # helpers (hosted-only convenience), and the (freestanding-only) mem/str impls.
-V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c,$(V3_SRC))
+V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c src/exr_gpu_cuda.c,$(V3_SRC))
 ZSTD_SRC = deps/zstd/tinyexr_zstd.c
 ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
@@ -84,8 +84,33 @@ ifeq ($(THREADS),1)
   THREAD_LIBS = -pthread          # C11 threads need pthreads on glibc < 2.34
 endif
 
+# ---- optional CUDA GPU backend (default OFF; runtime dlopen via cuew) -------
+# Build any target with CUDA=1 to compile the GPU backend (src/exr_gpu_cuda.c +
+# third_party/cuew). The CUDA driver and NVRTC are resolved at runtime via cuew
+# (dlopen) so NO CUDA SDK is needed at build time and we link only -ldl (never
+# -lcuda/-lnvrtc). Without CUDA=1 the backend compiles as inert stubs.
+# NOTE: run `make clean` when toggling CUDA (object flags are not tracked).
+CUDA ?= 0
+CUEW_OBJ =
+CUDA_LIBS =
+ifeq ($(CUDA),1)
+  V3_DEFS += -DEXR_USE_CUDA
+  V3_INC  += -Ithird_party/cuew
+  CUEW_OBJ  = build/cuew.o
+  CUDA_LIBS = -ldl
+endif
+
 build:
 	@mkdir -p build
+
+# cuew (Apache-2.0, third-party: warnings off).
+build/cuew.o: third_party/cuew/cuew.c third_party/cuew/cuew.h | build
+	$(CC) -Ithird_party/cuew -O2 -g -w -c $< -o $@
+
+# GPU backend TU: extra prereqs (public header, kernels, cuew) so edits rebuild.
+build/exr_gpu_cuda.o: src/exr_gpu_cuda.c include/exr_gpu.h include/exr.h \
+                      src/exr_internal.h src/exr_gpu_kernels.cuh.inc | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
 
 build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
@@ -102,8 +127,20 @@ build/test-libdeflate/%.o: deps/libdeflate/%.c | build
 	@mkdir -p $(dir $@)
 	$(CC) -Ideps/libdeflate -O1 -g $(SAN) -w -c $< -o $@
 
-lib: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ)
-	$(AR) rcs build/libtinyexr3.a $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ)
+lib: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ)
+	$(AR) rcs build/libtinyexr3.a $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ)
+
+# GPU backend test (requires CUDA=1; skips at runtime with exit 77 if no device).
+EXR_IMAGES ?= $(HOME)/work/openexr-images
+gpu-test:
+	$(MAKE) clean            # CUDA flag is not object-tracked; rebuild from clean
+	$(MAKE) CUDA=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_CUDA -Iinclude -Ithird_party/cuew \
+	  -O2 -g test/gpu/test_exr_gpu.c build/libtinyexr3.a -ldl -lm \
+	  -o build/test_exr_gpu
+	./build/test_exr_gpu "$(EXR_IMAGES)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "gpu-test: SKIPPED (no CUDA device)"; exit 0; \
+	  else exit $$rc; fi
 
 # Strict pure-C11 gate: the rewrite must never require a C++ compiler.
 c11-gate: | build
@@ -274,8 +311,8 @@ build/fs-%.o: src/%.c include/exr.h src/exr_internal.h | build
 	$(CC) $(FS_FLAGS) -c $< -o $@
 
 freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
-	@echo "  scan: only exr_stdio.c may include <stdio.h>"
-	@bad=`grep -rl '<stdio.h>' src/ | grep -v 'src/exr_stdio.c' || true`; \
+	@echo "  scan: only exr_stdio.c may include <stdio.h> (exr_gpu_cuda.c is hosted-only)"
+	@bad=`grep -rl '<stdio.h>' src/ | grep -vE 'src/(exr_stdio|exr_gpu_cuda)\.c' || true`; \
 	  if [ -n "$$bad" ]; then echo "  FAIL: stdio leaked into: $$bad"; exit 1; fi
 	@echo "  scan: no forbidden libc symbols referenced by the freestanding core"
 	@for o in $(FS_OBJ); do \

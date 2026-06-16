@@ -1540,8 +1540,14 @@ exr_result exr_reader_block_info(exr_reader *r, int32_t part, uint32_t idx,
     return rc;
 }
 
-exr_result exr_reader_decode_block(exr_reader *r, int32_t part, uint32_t idx,
-                                   void *dst, size_t dst_size) {
+/* Internal: locate + fetch the raw compressed chunk bytes for block `idx`
+ * (zero-copy for the memory reader; the returned pointer is valid until the next
+ * reader fetch) and fill its codec context, WITHOUT decompressing. The GPU
+ * backend uses this to run the reconstruction passes (predictor/deinterleave)
+ * on the device for ZIP/ZIPS/RLE. May return EXR_WOULD_BLOCK in streaming mode. */
+exr_result exr_reader_block_raw(exr_reader *r, int32_t part, uint32_t idx,
+                                exr_block_info *out_bi, const uint8_t **out_cdata,
+                                size_t *out_csize, exr_codec_ctx *out_ctx) {
     exr_int_part *p;
     const exr_header *h;
     const exr_allocator *a;
@@ -1553,7 +1559,8 @@ exr_result exr_reader_decode_block(exr_reader *r, int32_t part, uint32_t idx,
     int32_t data_size;
     exr_codec_ctx ctx;
 
-    if (!r || !dst) return EXR_ERROR_INVALID_ARGUMENT;
+    if (!r || !out_bi || !out_cdata || !out_csize || !out_ctx)
+        return EXR_ERROR_INVALID_ARGUMENT;
     rc = exr_reader_parse_header(r);
     if (rc != EXR_SUCCESS) return rc;
     if (part < 0 || part >= r->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
@@ -1565,7 +1572,6 @@ exr_result exr_reader_decode_block(exr_reader *r, int32_t part, uint32_t idx,
         return EXR_ERROR_INVALID_ARGUMENT; /* use the deep block API */
     rc = block_geometry(p, idx, &bi);
     if (!EXR_OK(rc)) return rc;
-    if (dst_size < bi.uncompressed_size) return EXR_ERROR_INVALID_ARGUMENT;
 
     off = p->offsets[idx];
     if (h->tiled) {
@@ -1605,7 +1611,27 @@ exr_result exr_reader_decode_block(exr_reader *r, int32_t part, uint32_t idx,
     ctx.y = bi.y0;
     ctx.width = bi.width;
     ctx.num_lines = bi.height;
-    return exr_decompress_block(&ctx, cdata, (size_t)data_size, (uint8_t *)dst,
+
+    *out_bi = bi;
+    *out_cdata = cdata;
+    *out_csize = (size_t)data_size;
+    *out_ctx = ctx;
+    return EXR_SUCCESS;
+}
+
+exr_result exr_reader_decode_block(exr_reader *r, int32_t part, uint32_t idx,
+                                   void *dst, size_t dst_size) {
+    exr_block_info bi;
+    const uint8_t *cdata;
+    size_t csize;
+    exr_codec_ctx ctx;
+    exr_result rc;
+
+    if (!r || !dst) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = exr_reader_block_raw(r, part, idx, &bi, &cdata, &csize, &ctx);
+    if (rc != EXR_SUCCESS) return rc; /* incl. EXR_WOULD_BLOCK (which is EXR_OK) */
+    if (dst_size < bi.uncompressed_size) return EXR_ERROR_INVALID_ARGUMENT;
+    return exr_decompress_block(&ctx, cdata, csize, (uint8_t *)dst,
                                 bi.uncompressed_size);
 }
 

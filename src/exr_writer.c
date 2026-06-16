@@ -1737,6 +1737,67 @@ exr_result exr_writer_write_scanline_block(exr_writer *w, int32_t part,
     return rc;
 }
 
+/* Internal: stream one scanline block from an already-gathered canonical block
+ * (per-scanline, then per-channel in sorted order). Used by the GPU backend,
+ * which performs the planar->canonical gather on the device. `block` must be
+ * exactly the size exr_block_uncompressed_size() reports for this block. */
+exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
+                                                 int32_t y0, const uint8_t *block,
+                                                 size_t block_size) {
+    const exr_part *pt;
+    const exr_header *h;
+    const exr_allocator *a;
+    int ymin, ymax, lpb, nlines;
+    uint32_t ci;
+    size_t blk_size, payload_size = 0;
+    uint8_t *payload = NULL;
+    exr_codec_ctx cx;
+    exr_result rc;
+
+    if (!w || !block || !w->streaming) return EXR_ERROR_INVALID_ARGUMENT;
+    if (part < 0 || part >= w->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    pt = &w->parts[part];
+    h = &pt->header;
+    a = &w->alloc;
+    if (h->tiled || header_is_deep(h)) return EXR_ERROR_INVALID_ARGUMENT;
+    ymin = h->data_window.min_y;
+    ymax = h->data_window.max_y;
+    lpb = exr_lines_per_block(w->scomp);
+    if (y0 < ymin || y0 > ymax || ((y0 - ymin) % lpb) != 0)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    ci = (uint32_t)((y0 - ymin) / lpb);
+    if (ci >= w->schunk[part]) return EXR_ERROR_INVALID_ARGUMENT;
+    nlines = lpb;
+    if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
+
+    rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                     h->data_window.min_x, y0, pt->width, nlines,
+                                     &blk_size);
+    if (!EXR_OK(rc)) return rc;
+    if (block_size != blk_size) return EXR_ERROR_INVALID_ARGUMENT;
+    cx.alloc = a;
+    cx.compression = w->scomp;
+    cx.channels = w->ssorted[part];
+    cx.num_channels = h->num_channels;
+    cx.x = h->data_window.min_x;
+    cx.y = y0;
+    cx.width = pt->width;
+    cx.num_lines = nlines;
+    rc = exr_compress_block(&cx, block, blk_size, &payload, &payload_size);
+    if (!EXR_OK(rc)) return rc;
+    rc = stream_emit_flat(w, part, ci, 0, 0, 0, 0, 0, y0, payload, payload_size);
+    exr_free(a, payload);
+    return rc;
+}
+
+/* Internal: the sorted channel order the writer uses for `part` (maps sorted
+ * output position -> header.channels index), so the GPU gather can build the
+ * canonical block in the same order. Returns NULL if part is out of range. */
+const int *exr_writer_sorted_order(exr_writer *w, int32_t part) {
+    if (!w || part < 0 || part >= w->num_parts) return NULL;
+    return w->sorder ? w->sorder[part] : NULL;
+}
+
 exr_result exr_writer_write_tile(exr_writer *w, int32_t part, int32_t tile_x,
                                  int32_t tile_y, int32_t level_x, int32_t level_y,
                                  const void *const *channel_data) {

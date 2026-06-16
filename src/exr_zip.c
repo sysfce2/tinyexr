@@ -7,23 +7,27 @@
 
 #include "exr_internal.h"
 
+/* Inflate into dst (the pre-reconstruction buffer); no predictor/interleave. */
+exr_result exr_zip_inflate_only(const uint8_t *src, size_t src_size,
+                                uint8_t *dst, size_t dst_size) {
+    size_t out_size = 0;
+    exr_result rc = EXR_INFLATE_ZLIB(src, src_size, dst, dst_size, &out_size);
+    if (EXR_OK(rc) && out_size != dst_size) rc = EXR_ERROR_CORRUPT;
+    return rc;
+}
+
 exr_result exr_zip_decompress(const exr_allocator *a, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size) {
     uint8_t *tmp;
-    size_t out_size = 0;
     exr_result rc;
 
     tmp = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
     if (!tmp) return EXR_ERROR_OUT_OF_MEMORY;
 
-    rc = EXR_INFLATE_ZLIB(src, src_size, tmp, dst_size, &out_size);
+    rc = exr_zip_inflate_only(src, src_size, tmp, dst_size);
     if (EXR_OK(rc)) {
-        if (out_size != dst_size) {
-            rc = EXR_ERROR_CORRUPT;
-        } else {
-            exr_predictor_decode(tmp, out_size);
-            exr_interleave_decode(tmp, dst, out_size);
-        }
+        exr_predictor_decode(tmp, dst_size);
+        exr_interleave_decode(tmp, dst, dst_size);
     }
     exr_free(a, tmp);
     return rc;
