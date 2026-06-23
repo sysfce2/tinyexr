@@ -9,8 +9,8 @@ embed into your application. It comes in two flavours:
 
 - **[v3 — pure-C11 rewrite (main)](#v3--pure-c11-rewrite-recommended).** The
   current main development line and the recommended version going forward.
-- **[v1 — single-header C++ (old, stable)](#v1--single-header-c-stable).** The
-  original `tinyexr.h`; still a solid, battle-tested choice today.
+- **[v1 — single-header C++ (old, deprecated)](#v1--single-header-c-stable).** The
+  original `tinyexr.h`; still a solid, but sunsetting.
 
 > 🌐 **Live demo (v3):** [**TinyEXR v3 WASM viewer**](https://syoyo.github.io/tinyexr/) — decode and view `.exr`
 > entirely in the browser (drag-and-drop; all v3 codecs: ZIP / PIZ / PXR24 / B44 / ZSTD / HTJ2K).
