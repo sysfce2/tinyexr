@@ -55,6 +55,24 @@ Prints a per-codec throughput table and a PASS/XFAIL/FAIL summary, and writes a
 markdown report to `benchmark/alab/last-report.md` (corpus stats, throughput
 table, and the named failure list). See that file for the latest run.
 
+## ZIP vs libdeflate comparison
+
+`zip_vs_libdeflate.py` builds two `bench_decode` binaries from the same tree -
+one with the in-tree pure-C inflate (default) and one routing ZIP through the
+vendored libdeflate (`make ... LIBDEFLATE=1`) - decodes the same random 20-file
+sample through each, and reports the in-tree / libdeflate speedup.
+
+```sh
+benchmark/alab/zip_vs_libdeflate.py            # 20-file sample, 5 reps
+benchmark/alab/zip_vs_libdeflate.py --sample 40 --reps 7
+```
+
+It `make clean`s and rebuilds `build/` (toggling LIBDEFLATE is not object-flag
+tracked) and restores the in-tree build at the end. Exit status is non-zero if
+the in-tree decoder is slower than libdeflate. As of the lazy-fixed-table fix in
+`src/exr_deflate.c`, the in-tree inflate runs ~8% faster than libdeflate on this
+all-ZIP corpus (decoded output is byte-identical between the two backends).
+
 ## Notes
 
 - Throughput is **single-threaded** decode (from `bench_decode`); the

@@ -403,12 +403,15 @@ static int inflate_raw(const uint8_t *src, size_t src_len, uint8_t *dst,
                        size_t *dst_len) {
     dfl_br reader;
     dfl_huff fixed_litlen, fixed_dist;
+    int fixed_ready = 0;
     uint8_t *out = dst, *out_end = dst + *dst_len;
     int final_block = 0;
 
     br_init(&reader, src, src_len);
-    ht_fixed_litlen(&fixed_litlen);
-    ht_fixed_dist(&fixed_dist);
+    /* The fixed Huffman tables are built lazily: zlib emits dynamic-Huffman
+     * blocks almost exclusively, so building these on every call (and every
+     * block) was pure overhead. Construct them only when a BTYPE=1 block is
+     * actually encountered, then reuse for the rest of the stream. */
 
     while (!final_block) {
         int block_type;
@@ -431,6 +434,11 @@ static int inflate_raw(const uint8_t *src, size_t src_len, uint8_t *dst,
                 *out++ = (uint8_t)br_read(&reader, 8);
             }
         } else if (block_type == 1) {
+            if (!fixed_ready) {
+                ht_fixed_litlen(&fixed_litlen);
+                ht_fixed_dist(&fixed_dist);
+                fixed_ready = 1;
+            }
             if (!decode_block(&reader, &fixed_litlen, &fixed_dist, &out, dst,
                               out_end))
                 return 0;
