@@ -3393,31 +3393,34 @@ static void zlib_backend_parity_tests(void) {
         }
     }
 
-    /* Cross-backend: a stream written by one backend decodes under the other. */
+    /* Cross-backend: a stream written by one backend decodes under the other,
+     * reproducing every channel. Free the decoded image unconditionally so a
+     * detected mismatch does not leak under LSan. */
     if (have_ld) {
         exr_image dec;
+        int match;
         exr_zlib_set_backend(EXR_ZLIB_INTREE);
         rc = exr_save_to_memory(&bufA, &szA, NULL, &img, EXR_COMPRESSION_ZIP);
         exr_zlib_set_backend(EXR_ZLIB_LIBDEFLATE);
-        if (EXR_OK(rc)) {
-            memset(&dec, 0, sizeof(dec));
-            if (!EXR_OK(exr_load_from_memory(bufA, szA, NULL, &dec)) ||
-                memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) != 0)
-                ok = 0;
-            else
-                exr_image_free(&dec);
-        } else ok = 0;
+        memset(&dec, 0, sizeof(dec));
+        match = EXR_OK(rc) && EXR_OK(exr_load_from_memory(bufA, szA, NULL, &dec));
+        if (match) {
+            match = memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) == 0 &&
+                    memcmp(dec.parts[0].images[1], px[1], sizeof(px[1])) == 0;
+            exr_image_free(&dec);
+        }
+        if (!match) ok = 0;
 
         rc = exr_save_to_memory(&bufB, &szB, NULL, &img, EXR_COMPRESSION_ZIP);
         exr_zlib_set_backend(EXR_ZLIB_INTREE);
-        if (EXR_OK(rc)) {
-            memset(&dec, 0, sizeof(dec));
-            if (!EXR_OK(exr_load_from_memory(bufB, szB, NULL, &dec)) ||
-                memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) != 0)
-                ok = 0;
-            else
-                exr_image_free(&dec);
-        } else ok = 0;
+        memset(&dec, 0, sizeof(dec));
+        match = EXR_OK(rc) && EXR_OK(exr_load_from_memory(bufB, szB, NULL, &dec));
+        if (match) {
+            match = memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) == 0 &&
+                    memcmp(dec.parts[0].images[1], px[1], sizeof(px[1])) == 0;
+            exr_image_free(&dec);
+        }
+        if (!match) ok = 0;
         free(bufA);
         free(bufB);
     }

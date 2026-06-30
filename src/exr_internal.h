@@ -1034,8 +1034,13 @@ typedef exr_result (*exr_zlib_inflate_fn)(const uint8_t *src, size_t src_size,
 typedef exr_result (*exr_zlib_deflate_fn)(const exr_allocator *a,
                                           const uint8_t *src, size_t n,
                                           uint8_t **out_data, size_t *out_size);
-extern exr_zlib_inflate_fn exr_zlib_inflate;
-extern exr_zlib_deflate_fn exr_zlib_deflate;
+/* _Atomic so a write in exr_zlib_set_backend() races defined-behaviour-ly with
+ * reads in the codec functions: a concurrent reader sees old-or-new, never a
+ * torn value. (The documented contract is still "set before decoding"; this is
+ * belt-and-suspenders.) Pointer-sized atomics are lock-free and lower to plain
+ * loads/stores, so this adds no libcall and stays freestanding-clean. */
+extern _Atomic exr_zlib_inflate_fn exr_zlib_inflate;
+extern _Atomic exr_zlib_deflate_fn exr_zlib_deflate;
 
 /* fpnge-derived literal DEFLATE encoder with a PSHUFB Huffman-table lookup.
  * The PSHUFB-friendly table: symbols 0-15 and 240-255 are looked up by low
