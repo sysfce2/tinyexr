@@ -182,3 +182,19 @@ jobs:
 
       - name: Replay regression corpus under ASan/UBSan/LSan
         run: make fuzz-corpus
+
+  freestanding:
+    name: linux-x64-freestanding-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Freestanding core gate (no libc, custom allocator)
+        run: make freestanding-gate
+
+      - name: Freestanding gate with opt-in zstd decode
+        run: make freestanding-zstd-gate
