@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
 
 all: $(TARGET)
 
@@ -387,16 +387,42 @@ host-smoke: test/v3/neon_smoke.c | build
 # ---- freestanding gate ----------------------------------------------------
 # Compile the core with only stdint/stddef/limits, prove there are no forbidden
 # libc dependencies (nm scan), and run a functional memory round-trip.
-FS_FLAGS = -DEXR_FREESTANDING -DEXR_NO_ZSTD -ffreestanding -fno-builtin \
+# Opt-in zstd DECODE in the freestanding build (default off). Adds the vendored
+# zstd amalgamation (~hundreds of KB) and routes decode through zstd's no-malloc
+# static-DCtx API with malloc/calloc/free stubbed out, so the forbidden-symbol
+# scan still passes. Decode-only: zstd ENCODE stays UNSUPPORTED in freestanding.
+EXR_FREESTANDING_ZSTD ?= 0
+ifeq ($(EXR_FREESTANDING_ZSTD),1)
+  FS_ZSTD_CFG  = -DEXR_ZSTD_DECODE_ONLY
+  FS_ZSTD_SKIP =
+  FS_ZSTD_OBJ  = build/fs-tinyexr_zstd.o
+  FS_SMOKE_CFG = -DEXR_FREESTANDING_ZSTD -Itest/v3
+else
+  FS_ZSTD_CFG  = -DEXR_NO_ZSTD
+  FS_ZSTD_SKIP = src/exr_zstd.c
+  FS_ZSTD_OBJ  =
+  FS_SMOKE_CFG =
+endif
+FS_FLAGS = -DEXR_FREESTANDING $(FS_ZSTD_CFG) -ffreestanding -fno-builtin \
            -fno-stack-protector $(V3_CSTD) $(V3_WARN) $(V3_INC) -O2 -g
-# Freestanding excludes the zstd glue (EXR_NO_ZSTD); the codec dispatch returns
-# UNSUPPORTED, so the vendored allocator/amalgamation is never pulled in.
-FS_CORE_SRC = $(filter-out src/exr_zstd.c,$(V3_CORE_SRC))
-FS_OBJ = $(patsubst src/%.c,build/fs-%.o,$(FS_CORE_SRC)) build/fs-exr_freestanding.o
+# Default: exclude the zstd glue (EXR_NO_ZSTD), dispatch returns UNSUPPORTED, no
+# amalgamation pulled in. EXR_FREESTANDING_ZSTD=1 includes both (decode path).
+FS_CORE_SRC = $(filter-out $(FS_ZSTD_SKIP),$(V3_CORE_SRC))
+FS_OBJ = $(patsubst src/%.c,build/fs-%.o,$(FS_CORE_SRC)) build/fs-exr_freestanding.o \
+         $(FS_ZSTD_OBJ)
 FS_FORBIDDEN = fopen|fread|fwrite|fseek|ftell|fclose|fprintf|printf|snprintf|malloc|calloc|realloc|free|abort|exit|qsort|exp|log|pow
 
 build/fs-%.o: src/%.c include/exr.h src/exr_internal.h | build
 	$(CC) $(FS_FLAGS) -c $< -o $@
+
+# Freestanding zstd amalgamation: no-malloc (static-DCtx) build with the libc
+# allocator entry points stubbed to NULL/no-op (the static decode path never
+# calls them), so the object carries no forbidden symbols.
+build/fs-tinyexr_zstd.o: deps/zstd/tinyexr_zstd.c deps/zstd/tinyexr_zstd.h | build
+	$(CC) -DEXR_FREESTANDING -ffreestanding -fno-builtin -fno-stack-protector \
+	  -DNDEBUG -DZSTD_DEPS_MALLOC -D'ZSTD_malloc(s)=((void*)0)' \
+	  -D'ZSTD_calloc(n,s)=((void*)0)' -D'ZSTD_free(p)=((void)0)' \
+	  -Ideps/zstd $(V3_CSTD) -O2 -g -w -c $< -o $@
 
 freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
 	@echo "  scan: only exr_stdio.c may include <stdio.h> (GPU backends are hosted-only)"
@@ -408,10 +434,15 @@ freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
 	  if [ -n "$$hit" ]; then echo "  FAIL: $$o references:" $$hit; exit 1; fi; \
 	done
 	@echo "  run: freestanding-compiled core + custom-allocator round-trip"
-	$(CC) $(V3_CSTD) -Wall -Wextra -Iinclude -Isrc -O2 \
+	$(CC) $(V3_CSTD) -Wall -Wextra $(FS_SMOKE_CFG) -Iinclude -Isrc -O2 \
 	  test/v3/freestanding_smoke.c $(FS_OBJ) -o build/fs_smoke
 	./build/fs_smoke
 	@echo "freestanding gate: OK"
+
+# Freestanding gate with the opt-in zstd DECODE path enabled (proves the
+# stubbed-malloc amalgamation stays forbidden-symbol-clean and decodes).
+freestanding-zstd-gate:
+	$(MAKE) freestanding-gate EXR_FREESTANDING_ZSTD=1
 
 # ---- tocio (sandbox: tiny OpenColorIO config engine + codegen) ------------
 # Pure-C11, freestanding, no external deps. Lives outside src/ so it has its own

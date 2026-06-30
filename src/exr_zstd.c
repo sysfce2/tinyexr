@@ -13,9 +13,27 @@
 exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
                                size_t src_size, uint8_t *dst, size_t dst_size) {
     size_t n;
-    (void)a;
 
+#ifdef EXR_FREESTANDING
+    /* Freestanding: zstd's internal malloc is stubbed out (see the Makefile's
+     * EXR_FREESTANDING_ZSTD object), so drive the no-malloc static-DCtx path
+     * over a workspace from the caller's allocator. The DCtx state is small and
+     * constant (one-shot decode reads back-references straight from dst). */
+    void *ws;
+    size_t wsize;
+    ZSTD_DCtx *dctx;
+
+    wsize = tinyexr_zstd_ZSTD_estimateDCtxSize();
+    ws = exr_malloc(a, wsize ? wsize : 1);
+    if (!ws) return EXR_ERROR_OUT_OF_MEMORY;
+    dctx = tinyexr_zstd_ZSTD_initStaticDCtx(ws, wsize);
+    if (!dctx) { exr_free(a, ws); return EXR_ERROR_CORRUPT; }
+    n = tinyexr_zstd_ZSTD_decompressDCtx(dctx, dst, dst_size, src, src_size);
+    exr_free(a, ws);
+#else
+    (void)a;
     n = tinyexr_zstd_decompress(dst, dst_size, src, src_size);
+#endif
     if (tinyexr_zstd_is_error(n) || n != dst_size) return EXR_ERROR_CORRUPT;
     return EXR_SUCCESS;
 }
@@ -24,6 +42,16 @@ exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
                              size_t n, uint8_t **out_data, size_t *out_size) {
     size_t bound, clen;
     uint8_t *comp;
+#ifdef EXR_ZSTD_DECODE_ONLY
+    /* Decode-only build (freestanding): zstd encode is not available - the
+     * amalgamation's compressor is stubbed out. Report it cleanly so every
+     * caller (codec dispatch and the deep path) gets UNSUPPORTED, not a silent
+     * store-raw fallback. */
+    (void)a; (void)src; (void)n; (void)bound; (void)clen; (void)comp;
+    *out_data = NULL;
+    *out_size = 0;
+    return EXR_ERROR_UNSUPPORTED;
+#else
 
     *out_data = NULL;
     *out_size = 0;
@@ -52,4 +80,5 @@ exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
     *out_data = comp;
     *out_size = clen;
     return EXR_SUCCESS;
+#endif /* EXR_ZSTD_DECODE_ONLY */
 }
