@@ -441,7 +441,10 @@ freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
 
 # Freestanding gate with the opt-in zstd DECODE path enabled (proves the
 # stubbed-malloc amalgamation stays forbidden-symbol-clean and decodes).
+# The fs-*.o objects are not flag-tracked, so remove any built with different
+# zstd flags (e.g. a prior `make freestanding-gate`) to force a correct rebuild.
 freestanding-zstd-gate:
+	rm -f build/fs-*.o build/fs_smoke
 	$(MAKE) freestanding-gate EXR_FREESTANDING_ZSTD=1
 
 # ---- tocio (sandbox: tiny OpenColorIO config engine + codegen) ------------
