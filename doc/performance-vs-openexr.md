@@ -24,8 +24,10 @@ multi-threaded.
   same-machine OpenJPH baseline (≈1.30× decode gap).
 - **Single-thread encode:** TinyEXR ties or wins on RLE/PIZ/B44; OpenEXR is
   ≈1.5× on ZIP/ZIPS, ≈1.8× on PXR24, and ≈3× on HTJ2K.
-- **libdeflate (opt-in):** with the same backend, TinyEXR **matches or beats**
-  OpenEXR on the deflate family — e.g. **ZIP decode 1.4×** single-thread.
+- **libdeflate (default on hosted, `DEFLATE=auto`):** with the same backend
+  TinyEXR **matches or beats** OpenEXR on the deflate family — e.g. **ZIP decode
+  1.4×** single-thread — and beats its own in-tree codec by **+55–73%** on
+  natural images. Runtime-switchable via `exr_zlib_set_backend()`.
 - **Multi-threaded:** TinyEXR's opt-in parallel path scales ~5–9× to 16 threads;
   at 16T it **out-decodes OpenEXR on RLE/ZIP/ZIPS/B44** (in-tree), and with
   libdeflate it leads the whole deflate family by a wide margin.
@@ -84,14 +86,17 @@ and HTJ2K differ, from encoder *tuning* (not format):
 | zip  | 1155 | 1070 | | htj2k32  | 1160 | 1042 |
 | piz  |  742 |  742 | | | | |
 
-### Optional: the libdeflate backend
+### The libdeflate backend (default on hosted)
 
 OpenEXR's deflate speed comes from libdeflate. TinyEXR vendors **libdeflate 1.25**
-(MIT) as an **optional, off-by-default** backend for ZIP/ZIPS/PXR24 (the in-tree
-codec stays the default and the only freestanding path):
+(MIT) for ZIP/ZIPS/PXR24 and, as of `DEFLATE=auto`, makes it the **default on
+hosted builds**. Both codecs are linked; pick at runtime with the public
+`exr_zlib_set_backend()`. The in-tree pure-C codec remains the default for
+`DEFLATE=intree` and the only path for freestanding/WASM.
 
 ```sh
-make bench-compare LIBDEFLATE=1     # -DEXR_USE_LIBDEFLATE, level 4 (= OpenEXR)
+make bench-compare                  # DEFLATE=auto (libdeflate, level 4 = OpenEXR)
+make bench-compare DEFLATE=intree   # in-tree pure-C codec
 ```
 
 ![Decode with libdeflate backend, single thread](perf-libdeflate-decode.svg)
@@ -102,10 +107,26 @@ parity. Encode reaches parity too (ZIP 15.3 vs 14.0, PXR24 16.4 vs 15.8). Both
 call libdeflate's inflate; TinyEXR's edge is its SSE2/AVX2 predictor and lower
 per-block overhead.
 
+**Why it's the default.** Over the in-tree codec the lift is large on natural
+photographic data: on the `openexr-images` corpus, decode rises **ZIP 226→391
+(+73%), ZIPS 171→278 (+63%), PXR24 309→479 (+55%) Mpix/s**. The gap is
+data-dependent — the in-tree inflate is *symbol-decode-bound* and trails
+libdeflate on high-entropy natural images, but on smooth, highly-compressible
+data (long LZ matches; e.g. the ALab 4K texture pack) it is *copy-bound* and
+actually edges libdeflate by ~8%. libdeflate is the safer default for the
+diverse real-world case; the in-tree codec stays best for tiny/freestanding
+builds.
+
+**PIZ decode** got a separate ~**+14%** (≈80→92 Mpix/s on the corpus) from
+inlining the Huffman literal store and restricting the canonical-code-table
+scan to the live symbol range. **ZSTD** decode (vendored upstream, already
+SIMD-dispatched) runs ~**410–420 Mpix/s** here — faster than the libdeflate
+ZIP path; there is no second zstd backend to dispatch against.
+
 The two charts below put **libdeflate on/off vs OpenEXR** side by side across the
 deflate family **and HTJ2K** (which has no deflate path, so only the in-tree and
-OpenEXR bars apply). The in-tree TinyEXR bars are the freestanding default; the
-green bars are the same `-DEXR_USE_LIBDEFLATE` build:
+OpenEXR bars apply). The in-tree TinyEXR bars are the `DEFLATE=intree` /
+freestanding codec; the green bars are the `DEFLATE=auto` (libdeflate) default:
 
 ![Decode: tinyexr libdeflate on/off vs OpenEXR, incl. htj2k](perf-libdeflate-htj2k-decode.png)
 
