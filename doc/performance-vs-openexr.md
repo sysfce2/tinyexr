@@ -117,6 +117,10 @@ actually edges libdeflate by ~8%. libdeflate is the safer default for the
 diverse real-world case; the in-tree codec stays best for tiny/freestanding
 builds.
 
+![Decode: in-tree vs libdeflate on the natural-image corpus](perf-libdeflate-corpus-decode.svg)
+
+*(`doc/gen_perf_charts.py` regenerates the data-bearing SVGs.)*
+
 **PIZ decode** got a separate ~**+14%** (≈80→92 Mpix/s on the corpus) from
 inlining the Huffman literal store and restricting the canonical-code-table
 scan to the live symbol range. **ZSTD** decode (vendored upstream, already
