@@ -871,6 +871,11 @@ static exr_result jph_inverse_53_2d_i32_ws(const exr_allocator *a, int32_t *data
                                            int bounded) {
     unsigned level;
     int use_simd = 0;
+#if !defined(EXR_X86)
+    /* `bounded` selects the int32 vs int64-intermediate AVX2 variant; the NEON
+     * and scalar paths use a single (always-safe) implementation. */
+    (void)bounded;
+#endif
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
@@ -3466,7 +3471,9 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
     exr_jph_mel_reader mel;
     JphVlcRev vlc;
     JphMagSgn magsgn = {0};
-    JphFrwdAvx2 magsgn_frwd;
+#if defined(EXR_X86)
+    JphFrwdAvx2 magsgn_frwd; /* AVX2 forward-magsgn fast path only */
+#endif
     uint32_t run, vlc_val, c_q;
     uint16_t *sp;
     uint32_t *dp;
@@ -3510,6 +3517,11 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
 #if defined(EXR_X86) && defined(EXR_JPH_ENABLE_AVX2_FOUR_QUAD16) && \
     EXR_JPH_ENABLE_AVX2_FOUR_QUAD16
     use_four16 = !use_frwd16 && use_avx2 && mmsbp2 < 16u;
+#endif
+#if !defined(EXR_X86)
+    /* The AVX2 forward-magsgn fast paths these gate are compiled out off x86. */
+    (void)use_frwd16;
+    (void)use_four16;
 #endif
 
     sstr = ((width + 2u) + 7u) & ~7u;
@@ -3583,9 +3595,12 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
     exr_jph_mel_init(&mel, seg->data + lcup - scup, (size_t)scup - 1u);
     rc = jph_vlc_rev_init(&vlc, seg->data, lcup, scup);
     if (rc != EXR_SUCCESS) goto done;
+#if defined(EXR_X86)
     if (use_frwd16 || use_frwd32) {
         jph_frwd_init_ff_avx2(&magsgn_frwd, seg->data, (int)(lcup - scup));
-    } else {
+    } else
+#endif
+    {
         rc = jph_magsgn_init(&magsgn, seg->data, lcup - scup, magsgn_bits);
         if (rc != EXR_SUCCESS) goto done;
     }
@@ -3762,6 +3777,7 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
         prev_v_n = 0;
         sp = scratch;
         dp = buf;
+#if defined(EXR_X86)
         if (use_frwd32) {
             while (x < width) {
                 uint32_t u_q[2];
@@ -3833,6 +3849,7 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
                 sp += 8u;
             }
         }
+#endif /* EXR_X86 */
         while (x < width) {
             uint32_t inf = sp[0];
             uint32_t U_q = sp[1];
@@ -3884,6 +3901,7 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
             prev_v_n = 0;
             sp = scratch + (y >> 1u) * sstr;
             dp = buf + y * sstr;
+#if defined(EXR_X86)
             if (use_frwd32) {
                 while (x < width) {
                     uint32_t u_q[2];
@@ -3977,6 +3995,7 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
                     sp += 8u;
                 }
             }
+#endif /* EXR_X86 */
             while (x < width) {
                 uint32_t inf = sp[0];
                 uint32_t u_q = sp[1];
