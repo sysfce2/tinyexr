@@ -17,6 +17,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef EXR_FREESTANDING_ZSTD
+#include "fs_zstd_blob.inc" /* fs_zstd_exr[] : 4x4 BGR FLOAT, ZSTD, R[i]==i */
+#endif
+
 /* exported by the core (declared in the internal header); the freestanding
  * build returns NULL here. */
 const exr_allocator *exr_default_allocator(void);
@@ -105,5 +109,34 @@ int main(void) {
 
     printf("%s: freestanding memory round-trip (%dx%d, zip, %zu bytes)\n",
            ok ? "ok" : "FAIL", W, H, sz);
+
+#ifdef EXR_FREESTANDING_ZSTD
+    /* Decode-only zstd: load a canned ZSTD-compressed EXR via the no-malloc
+     * static-DCtx path (the freestanding build cannot encode zstd). */
+    {
+        exr_image z;
+        int zok;
+        memset(&z, 0, sizeof(z));
+        zok = EXR_OK(exr_load_from_memory(fs_zstd_exr, fs_zstd_exr_len, &al, &z));
+        if (zok) {
+            const exr_part *p = &z.parts[0];
+            int rc = -1;
+            zok = z.num_parts == 1 && p->width == W && p->height == H;
+            for (c = 0; c < p->header.num_channels; ++c)
+                if (strcmp(p->header.channels[c].name, "R") == 0) rc = c;
+            if (rc < 0) zok = 0;
+            else {
+                const float *rr = (const float *)p->images[rc];
+                for (i = 0; i < (size_t)(W * H); ++i)
+                    if (rr[i] != (float)i) { zok = 0; break; }
+            }
+            exr_image_free(&z);
+        }
+        printf("%s: freestanding zstd decode (%dx%d, %u bytes)\n",
+               zok ? "ok" : "FAIL", W, H, fs_zstd_exr_len);
+        ok = ok && zok;
+    }
+#endif
+
     return ok ? 0 : 1;
 }
