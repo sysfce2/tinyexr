@@ -11,7 +11,7 @@
 exr_result exr_zip_inflate_only(const uint8_t *src, size_t src_size,
                                 uint8_t *dst, size_t dst_size) {
     size_t out_size = 0;
-    exr_result rc = EXR_INFLATE_ZLIB(src, src_size, dst, dst_size, &out_size);
+    exr_result rc = exr_zlib_inflate(src, src_size, dst, dst_size, &out_size);
     if (EXR_OK(rc) && out_size != dst_size) rc = EXR_ERROR_CORRUPT;
     return rc;
 }
@@ -50,7 +50,7 @@ exr_result exr_zip_compress(const exr_allocator *a, const uint8_t *src, size_t n
     exr_interleave_encode(src, tmp, n);
     exr_predictor_encode(tmp, n);
 
-    rc = EXR_DEFLATE_ZLIB(a, tmp, n, &comp, &clen);
+    rc = exr_zlib_deflate(a, tmp, n, &comp, &clen);
     exr_free(a, tmp);
 
     if (!EXR_OK(rc) || clen >= n) { /* store original canonical block raw */

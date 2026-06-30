@@ -71,6 +71,14 @@ exr_result exr_ld_inflate_zlib(const uint8_t *src, size_t src_size, uint8_t *dst
     size_t actual = 0;
 
     if (out_size) *out_size = 0;
+    /* Allocate per block rather than caching a per-thread decompressor. The
+     * decompressor is a fixed-size struct whose decode tables are (re)built
+     * inside libdeflate_zlib_decompress, so the alloc is a single malloc that
+     * is negligible next to the decode: measured identical throughput vs a
+     * reused _Thread_local decompressor, both single-threaded and 8-way (the
+     * 128-512 KB per-block decode dwarfs the alloc, and glibc's per-thread
+     * arenas absorb it). Per-call keeps this trivially thread-safe and leak
+     * free under exr_parallel_for's spawn/join workers. */
     d = libdeflate_alloc_decompressor();
     if (!d) return EXR_ERROR_OUT_OF_MEMORY;
     r = libdeflate_zlib_decompress(d, src, src_size, dst, dst_cap, &actual);

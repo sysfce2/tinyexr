@@ -166,18 +166,21 @@ static uint64_t hgetbits(int nb, uint64_t *c, int *lc, const uint8_t **in,
     return (*c >> *lc) & ((UINT64_C(1) << nb) - 1u);
 }
 
-static void canonical_code_table(int64_t *hcode) {
+/* Only hcode[im..iM] can be non-zero (symbols outside that span have length 0);
+ * the length-0 count n[0] is never used, so restricting both full-table scans to
+ * [im..iM] is equivalent and avoids walking all 65537 slots per block. */
+static void canonical_code_table(int64_t *hcode, int im, int iM) {
     int64_t n[59];
     int i;
     int64_t c = 0;
     for (i = 0; i <= 58; ++i) n[i] = 0;
-    for (i = 0; i < PIZ_HUF_ENCSIZE; ++i) n[hcode[i]]++;
+    for (i = im; i <= iM; ++i) n[hcode[i]]++;
     for (i = 58; i > 0; --i) {
         int64_t nc = ((c + n[i]) >> 1);
         n[i] = c;
         c = nc;
     }
-    for (i = 0; i < PIZ_HUF_ENCSIZE; ++i) {
+    for (i = im; i <= iM; ++i) {
         int l = (int)hcode[i];
         if (l > 0) hcode[i] = l | (n[l]++ << 6);
     }
@@ -189,6 +192,7 @@ static int unpack_enc_table(const uint8_t **pcode, int ni, int im, int iM,
     const uint8_t *end = *pcode + ni;
     uint64_t c = 0;
     int lc = 0;
+    int im0 = im;
     memset(hcode, 0, sizeof(int64_t) * PIZ_HUF_ENCSIZE);
     for (; im <= iM; im++) {
         int64_t l;
@@ -210,7 +214,7 @@ static int unpack_enc_table(const uint8_t **pcode, int ni, int im, int iM,
         }
     }
     *pcode = p;
-    canonical_code_table(hcode);
+    canonical_code_table(hcode, im0, iM);
     return 1;
 }
 
@@ -354,9 +358,17 @@ static int huf_uncompress(const exr_allocator *a, const uint8_t *in,
             const HufDec *pl = &hdecod[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
             if (pl->len) {
                 lc -= (int)pl->len;
-                if (!get_code((int)pl->lit, rlc, &c, &lc, &ptr, ie, &outp, outb,
-                              oe))
+                /* Hot path: most symbols are plain literals (not the run-length
+                 * code), which get_code() would emit as a single store. Inline
+                 * that case to avoid a 9-argument call per decoded symbol; only
+                 * the actual RLE marker falls through to get_code(). */
+                if ((int)pl->lit != rlc) {
+                    if (outp >= oe) goto cleanup;
+                    *outp++ = (uint16_t)pl->lit;
+                } else if (!get_code((int)pl->lit, rlc, &c, &lc, &ptr, ie, &outp,
+                                     outb, oe)) {
                     goto cleanup;
+                }
             } else {
                 uint32_t j;
                 if (!pl->p) goto cleanup;
@@ -714,7 +726,7 @@ static int huf_build_enc_table(const exr_allocator *a, int64_t *frq, int *pim,
         }
     }
 
-    canonical_code_table(scode);
+    canonical_code_table(scode, im, iM);
     memcpy(frq, scode, sizeof(int64_t) * PIZ_HUF_ENCSIZE);
     *pim = im;
     *piM = iM;

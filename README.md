@@ -22,7 +22,7 @@ embed into your application. It comes in two flavours:
 > live, editable OCIO config that **JIT-compiles to a GLSL shader**. See [tocio](#tocio--tiny-pure-c11-opencolorio-engine) below.
 
 **Performance (v3) at a glance** — single-thread decode/encode vs the reference
-OpenEXR library, with the optional **libdeflate** backend on/off (and HTJ2K,
+OpenEXR library, with the vendored **libdeflate** backend on/off (and HTJ2K,
 which has no deflate path). With the same backend TinyEXR meets or beats OpenEXR
 on the deflate family:
 
@@ -60,7 +60,7 @@ codec-by-codec and multi-threaded numbers.
 | WASM | ✅ core + browser viewer | loader only (experimental/js) |
 | SIMD | SSE2 / SSE4.1 / AVX2 / F16C / NEON | — |
 | Threading | C11 threads (opt-in) | C++11 thread / OpenMP |
-| Dependencies | none in core (optional zstd / libdeflate) | miniz (bundled) + optional zfp |
+| Dependencies | none in core; vendored zstd + libdeflate (libdeflate default on hosted, dropped in freestanding/WASM) | miniz (bundled) + optional zfp |
 
 ---
 
@@ -87,6 +87,12 @@ Build: `make lib` (`build/libtinyexr3.a`), `make test-c`, `make c11-gate`.
 Unit tests live in `test/unit/test_exr_v3.c` (run under ASan/UBSan via `make
 test-c`); `make fuzz-corpus` replays the fuzzer corpus.
 
+The zlib backend for ZIP/ZIPS/PXR24 is selected with `DEFLATE=auto|libdeflate|intree`
+(default `auto` → vendored **libdeflate**, faster on natural-image data). `intree`
+builds the dependency-free pure-C codec only; freestanding and WASM builds always
+use it. Both codecs link under `auto`, so you can switch at runtime with
+`exr_zlib_set_backend()` (e.g. for testing or to honor a custom allocator).
+
 ## Performance vs OpenEXR
 
 Benchmarked against the reference **OpenEXR** library (4.0-dev) on an idle AMD
@@ -94,16 +100,17 @@ Ryzen 9 3950X (Zen2), `asakusa.exr` 660×440, fully in-memory, both pinned to th
 same thread count. Throughput in megapixels/s. Full writeup + charts:
 [`doc/performance-vs-openexr.md`](doc/performance-vs-openexr.md).
 
-- **Single thread, default (dependency-free) decode:** TinyEXR is faster on the
-  cheap codecs — **uncompressed ~3.4×** (2699 vs 789) and **RLE ~2.5×**
-  (230 vs 93). OpenEXR leads the compressed codecs (ZIP ~1.2×, PXR24 ~1.8×,
-  ZIPS ~2.1×, PIZ ~2.7×, HTJ2K ~2.5–3×), thanks to its libdeflate / tuned
-  PIZ / OpenJPH backends.
+- **Single thread, dependency-free decode** (`DEFLATE=intree`): TinyEXR is faster
+  on the cheap codecs — **uncompressed ~3.4×** (2699 vs 789) and **RLE ~2.5×**
+  (230 vs 93). With the pure-C deflate codec OpenEXR leads the compressed family
+  (ZIP ~1.2×, PXR24 ~1.8×, ZIPS ~2.1×, PIZ ~2.7×, HTJ2K ~2.5–3×), thanks to its
+  libdeflate / tuned PIZ / OpenJPH backends.
 - **Single-thread encode:** ties/wins on RLE/PIZ/B44; OpenEXR is ~1.5× on
   ZIP/ZIPS, ~1.8× on PXR24, ~4× on HTJ2K.
-- **Optional libdeflate backend** (`make … LIBDEFLATE=1`, off by default): with
-  the same backend TinyEXR **matches or beats** OpenEXR on the deflate family —
-  e.g. ZIP decode **1.37×** (80.8 vs 58.8), sizes byte-identical.
+- **Default decode uses libdeflate** (`DEFLATE=auto`): with the same backend
+  TinyEXR **matches or beats** OpenEXR on the deflate family — ZIP decode
+  **1.37×** (80.8 vs 58.8), sizes byte-identical. On a broad natural-image corpus
+  this is a large lift over the in-tree codec (ZIP ~+73%, ZIPS ~+63%, PXR24 ~+55%).
 - **Multi-threaded** (opt-in C11 threads, `make … THREADS=1` +
   `exr_set_num_threads(n)`): per-block parallel encode/decode scales **~5×
   (ZIP) to ~8.8× (ZIPS)** to 16 threads. At 16 threads TinyEXR **out-decodes
@@ -247,7 +254,8 @@ Contribution is welcome!
 - **Core** — 3-clause BSD, dependency-free. The HTJ2K/JPH and DEFLATE/PIZ/B44
   codec implementations are original in-tree code.
 - **zstd** (`deps/zstd/`, optional, on by default) — BSD-3-Clause, Facebook.
-- **libdeflate** (vendored, optional ZIP/ZIPS/PXR24 backend, off by default) —
+- **libdeflate** (vendored ZIP/ZIPS/PXR24 backend, default on hosted builds via
+  `DEFLATE=auto`; `DEFLATE=intree` and freestanding/WASM use the pure-C codec) —
   MIT.
 
 ---
