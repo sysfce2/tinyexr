@@ -439,6 +439,13 @@ freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
 	./build/fs_smoke
 	@echo "freestanding gate: OK"
 
+# Regenerate the freestanding zstd decode fixture (test/v3/fs_zstd_blob.inc).
+gen-fs-zstd-blob: lib
+	$(CC) $(V3_CSTD) -Iinclude -O2 test/v3/gen_fs_zstd_blob.c build/libtinyexr3.a \
+	  -lm -o build/gen_fs_zstd_blob
+	./build/gen_fs_zstd_blob > test/v3/fs_zstd_blob.inc
+	@echo "regenerated test/v3/fs_zstd_blob.inc"
+
 # Freestanding gate with the opt-in zstd DECODE path enabled (proves the
 # stubbed-malloc amalgamation stays forbidden-symbol-clean and decodes).
 # The fs-*.o objects are not flag-tracked, so remove any built with different

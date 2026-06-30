@@ -8,6 +8,14 @@
 #include "exr_internal.h"
 #include "tinyexr_zstd.h"
 
+/* The freestanding decode path and the disabled encoder must travel together:
+ * a freestanding build links the malloc-stubbed amalgamation, so encode cannot
+ * work and decode must use the static-DCtx path. Enforce it (the Makefile sets
+ * both via EXR_FREESTANDING_ZSTD=1). */
+#if defined(EXR_FREESTANDING) && !defined(EXR_ZSTD_DECODE_ONLY)
+#error "Freestanding zstd must be decode-only; build with EXR_FREESTANDING_ZSTD=1"
+#endif
+
 #define EXR_ZSTD_LEVEL 3
 
 exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
@@ -18,18 +26,23 @@ exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
     /* Freestanding: zstd's internal malloc is stubbed out (see the Makefile's
      * EXR_FREESTANDING_ZSTD object), so drive the no-malloc static-DCtx path
      * over a workspace from the caller's allocator. The DCtx state is small and
-     * constant (one-shot decode reads back-references straight from dst). */
-    void *ws;
+     * constant (one-shot decode reads back-references straight from dst).
+     * ZSTD_initStaticDCtx requires an 8-byte-aligned workspace, which a custom
+     * allocator is not obliged to provide, so over-allocate and align it. */
+    void *base;
+    uint8_t *ws;
     size_t wsize;
     ZSTD_DCtx *dctx;
 
     wsize = tinyexr_zstd_ZSTD_estimateDCtxSize();
-    ws = exr_malloc(a, wsize ? wsize : 1);
-    if (!ws) return EXR_ERROR_OUT_OF_MEMORY;
+    if (wsize == 0) return EXR_ERROR_CORRUPT; /* defensive: never happens */
+    base = exr_malloc(a, wsize + 7u);
+    if (!base) return EXR_ERROR_OUT_OF_MEMORY;
+    ws = (uint8_t *)(((uintptr_t)base + 7u) & ~(uintptr_t)7u);
     dctx = tinyexr_zstd_ZSTD_initStaticDCtx(ws, wsize);
-    if (!dctx) { exr_free(a, ws); return EXR_ERROR_CORRUPT; }
+    if (!dctx) { exr_free(a, base); return EXR_ERROR_CORRUPT; }
     n = tinyexr_zstd_ZSTD_decompressDCtx(dctx, dst, dst_size, src, src_size);
-    exr_free(a, ws);
+    exr_free(a, base);
 #else
     (void)a;
     n = tinyexr_zstd_decompress(dst, dst_size, src, src_size);
@@ -40,18 +53,18 @@ exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
 
 exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
                              size_t n, uint8_t **out_data, size_t *out_size) {
-    size_t bound, clen;
-    uint8_t *comp;
 #ifdef EXR_ZSTD_DECODE_ONLY
     /* Decode-only build (freestanding): zstd encode is not available - the
      * amalgamation's compressor is stubbed out. Report it cleanly so every
      * caller (codec dispatch and the deep path) gets UNSUPPORTED, not a silent
      * store-raw fallback. */
-    (void)a; (void)src; (void)n; (void)bound; (void)clen; (void)comp;
+    (void)a; (void)src; (void)n;
     *out_data = NULL;
     *out_size = 0;
     return EXR_ERROR_UNSUPPORTED;
 #else
+    size_t bound, clen;
+    uint8_t *comp;
 
     *out_data = NULL;
     *out_size = 0;
