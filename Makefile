@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
 
 all: $(TARGET)
 
@@ -49,15 +49,27 @@ ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
 SAN      = -fsanitize=address,undefined
 
-# ---- optional libdeflate backend (default OFF; in-tree codec is the default)
-# Build any target with LIBDEFLATE=1 to route ZIP/ZIPS/PXR24 deflate through the
-# vendored libdeflate (deps/libdeflate, MIT - see deps/libdeflate/COPYING).
-# NOTE: run `make clean` when toggling LIBDEFLATE (object flags are not tracked).
-LIBDEFLATE ?= 0
+# ---- zlib (DEFLATE) backend for ZIP/ZIPS/PXR24 ----------------------------
+# DEFLATE = auto | libdeflate | intree    (default: auto)
+#   auto / libdeflate : compile the vendored libdeflate (deps/libdeflate, MIT -
+#                       see deps/libdeflate/COPYING) AND make it the runtime
+#                       default - it is faster on natural-image data. Both
+#                       codecs are linked; switch at runtime with the public
+#                       exr_zlib_set_backend(). EXR_ZLIB_DEFAULT_LIBDEFLATE=1
+#                       seeds the static default (see src/exr_codec.c).
+#   intree            : in-tree pure-C codec only, no external dependency.
+# The freestanding and wasm targets never define EXR_USE_LIBDEFLATE (their flag
+# sets / V3_CORE_SRC omit it), so they always use the in-tree codec regardless.
+# Legacy: LIBDEFLATE=1 is kept as an alias for DEFLATE=libdeflate.
+# NOTE: run `make clean` when changing DEFLATE (object flags are not tracked).
+DEFLATE ?= auto
+ifeq ($(LIBDEFLATE),1)
+  DEFLATE = libdeflate
+endif
 LD_OBJ =
 LD_TEST_OBJ =
-ifeq ($(LIBDEFLATE),1)
-  V3_DEFS += -DEXR_USE_LIBDEFLATE
+ifneq ($(DEFLATE),intree)
+  V3_DEFS += -DEXR_USE_LIBDEFLATE -DEXR_ZLIB_DEFAULT_LIBDEFLATE=1
   V3_INC  += -Ideps/libdeflate
   # Just the zlib (DEFLATE) path: no crc32/gzip. The x86/arm cpu_features files
   # self-guard by arch, so compiling both is safe everywhere.
@@ -277,6 +289,19 @@ fuzz: test/fuzzer/fuzz_v3.c | build
 	clang $(V3_CSTD) $(V3_INC) -O1 -g -w -fsanitize=fuzzer,address,undefined \
 	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_v3
 	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -max_total_time=60 test/unit/regression"
+
+# Same fuzzer but with libdeflate as the default zlib backend, so the shipped
+# DEFLATE=auto decode path (ZIP/ZIPS/PXR24 -> libdeflate) is fuzzed too.
+fuzz-libdeflate: test/fuzzer/fuzz_v3.c | build
+	clang $(V3_CSTD) -DEXR_USE_LIBDEFLATE -DEXR_ZLIB_DEFAULT_LIBDEFLATE=1 \
+	  $(V3_INC) -Ideps/libdeflate -O1 -g -w -fsanitize=fuzzer,address,undefined \
+	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) \
+	  deps/libdeflate/lib/adler32.c deps/libdeflate/lib/deflate_compress.c \
+	  deps/libdeflate/lib/deflate_decompress.c deps/libdeflate/lib/zlib_compress.c \
+	  deps/libdeflate/lib/zlib_decompress.c deps/libdeflate/lib/utils.c \
+	  deps/libdeflate/lib/x86/cpu_features.c deps/libdeflate/lib/arm/cpu_features.c \
+	  -lm -o build/fuzz_v3_libdeflate
+	@echo "built build/fuzz_v3_libdeflate (libdeflate default backend)"
 
 # HTJ2K (JPH) encode+decode+round-trip fuzzer.
 #   ./build/fuzz_jph -max_total_time=600 test/fuzzer/corpus_jph
@@ -542,8 +567,10 @@ help:
 	@echo "make arm-smoke - cross-build (aarch64) + run NEON SIMD smoke under qemu"
 	@echo "make host-smoke - build + run the SIMD smoke test natively"
 	@echo ""
-	@echo "Add LIBDEFLATE=1 to any target to use the optional vendored libdeflate"
-	@echo "  backend for ZIP/ZIPS/PXR24 (default: in-tree codec). Run 'make clean'"
-	@echo "  when toggling. e.g. make bench-compare LIBDEFLATE=1"
+	@echo "DEFLATE=auto|libdeflate|intree selects the ZIP/ZIPS/PXR24 zlib backend"
+	@echo "  (default: auto = vendored libdeflate, faster on natural images; both"
+	@echo "  codecs link, switch at runtime via exr_zlib_set_backend). intree =="
+	@echo "  in-tree pure-C only. Run 'make clean' when changing. LIBDEFLATE=1 is a"
+	@echo "  legacy alias for DEFLATE=libdeflate. freestanding/wasm stay in-tree."
 	@echo "Add THREADS=1 to any target for C11-threads parallel encode/decode"
 	@echo "  (default: single-threaded). Set count via exr_set_num_threads()."

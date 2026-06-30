@@ -7,6 +7,57 @@
 
 #include "exr_internal.h"
 
+/* ---- runtime zlib backend selection (ZIP/ZIPS/PXR24) ---------------------
+ * Statically initialised to the build default: libdeflate when it is compiled
+ * in and chosen as the default (DEFLATE=auto|libdeflate), otherwise the in-tree
+ * pure-C codec. exr_zlib_set_backend() overrides at runtime for tests/bench. */
+#if defined(EXR_USE_LIBDEFLATE) && EXR_ZLIB_DEFAULT_LIBDEFLATE
+exr_zlib_inflate_fn exr_zlib_inflate = exr_ld_inflate_zlib;
+exr_zlib_deflate_fn exr_zlib_deflate = exr_ld_deflate_zlib;
+#else
+exr_zlib_inflate_fn exr_zlib_inflate = exr_inflate_zlib;
+exr_zlib_deflate_fn exr_zlib_deflate = exr_deflate_zlib;
+#endif
+
+exr_result exr_zlib_set_backend(exr_zlib_backend backend) {
+#if defined(EXR_USE_LIBDEFLATE)
+    switch (backend) {
+    case EXR_ZLIB_INTREE:
+        exr_zlib_inflate = exr_inflate_zlib;
+        exr_zlib_deflate = exr_deflate_zlib;
+        return EXR_SUCCESS;
+    case EXR_ZLIB_LIBDEFLATE:
+        exr_zlib_inflate = exr_ld_inflate_zlib;
+        exr_zlib_deflate = exr_ld_deflate_zlib;
+        return EXR_SUCCESS;
+    case EXR_ZLIB_AUTO:
+    default:
+#if EXR_ZLIB_DEFAULT_LIBDEFLATE
+        exr_zlib_inflate = exr_ld_inflate_zlib;
+        exr_zlib_deflate = exr_ld_deflate_zlib;
+#else
+        exr_zlib_inflate = exr_inflate_zlib;
+        exr_zlib_deflate = exr_deflate_zlib;
+#endif
+        return EXR_SUCCESS;
+    }
+#else
+    /* Only the in-tree codec is linked; libdeflate cannot be selected. */
+    if (backend == EXR_ZLIB_LIBDEFLATE) return EXR_ERROR_UNSUPPORTED;
+    exr_zlib_inflate = exr_inflate_zlib;
+    exr_zlib_deflate = exr_deflate_zlib;
+    return EXR_SUCCESS;
+#endif
+}
+
+const char *exr_zlib_backend_name(void) {
+#if defined(EXR_USE_LIBDEFLATE)
+    return exr_zlib_inflate == exr_ld_inflate_zlib ? "libdeflate" : "in-tree";
+#else
+    return "in-tree";
+#endif
+}
+
 /*
  * Decompress one chunk's compressed payload into the canonical uncompressed
  * block layout (per scanline, then per channel: sample data).

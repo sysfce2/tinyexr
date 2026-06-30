@@ -1004,21 +1004,38 @@ exr_result exr_deflate_zlib(const exr_allocator *a, const uint8_t *src,
 /* Adler-32 (zlib trailer). */
 uint32_t exr_adler32(const uint8_t *data, size_t n, uint32_t adler);
 
-/* Optional libdeflate backend for ZIP/ZIPS/PXR24 (gated by EXR_USE_LIBDEFLATE,
- * default off). The in-tree encoder/inflate above stay the default and remain
- * the only path for freestanding builds. ZIP/PXR24 call these via the
- * EXR_DEFLATE_ZLIB / EXR_INFLATE_ZLIB macros so the choice is a build flag. */
+/* libdeflate backend for ZIP/ZIPS/PXR24 (compiled in for DEFLATE=auto|libdeflate
+ * via EXR_USE_LIBDEFLATE). The in-tree encoder/inflate above remain the only
+ * path for freestanding and WASM builds. ZIP/PXR24 reach whichever backend is
+ * active through the exr_zlib_inflate / exr_zlib_deflate pointers below. */
 #ifdef EXR_USE_LIBDEFLATE
 exr_result exr_ld_deflate_zlib(const exr_allocator *a, const uint8_t *src,
                                size_t n, uint8_t **out_data, size_t *out_size);
 exr_result exr_ld_inflate_zlib(const uint8_t *src, size_t src_size, uint8_t *dst,
                                size_t dst_cap, size_t *out_size);
-#define EXR_DEFLATE_ZLIB exr_ld_deflate_zlib
-#define EXR_INFLATE_ZLIB exr_ld_inflate_zlib
-#else
-#define EXR_DEFLATE_ZLIB exr_deflate_zlib
-#define EXR_INFLATE_ZLIB exr_inflate_zlib
 #endif
+
+/* Build-time default for the runtime backend when both are compiled in. The
+ * Makefile sets this to 1 for DEFLATE=auto|libdeflate. Freestanding and WASM
+ * builds never define EXR_USE_LIBDEFLATE, so only the in-tree path is linked
+ * and the pointers below resolve to it regardless of this value. */
+#ifndef EXR_ZLIB_DEFAULT_LIBDEFLATE
+#define EXR_ZLIB_DEFAULT_LIBDEFLATE 0
+#endif
+
+/* Runtime-selectable zlib backend. ZIP/ZIPS/PXR24 call through these pointers
+ * (defined in exr_codec.c, statically initialised to the build default). When
+ * libdeflate is not compiled in they can only ever point at the in-tree codec.
+ * Override with exr_zlib_set_backend() (public, exr.h) before decoding; the
+ * pointers are read-only during decode, so do not flip them mid-run. */
+typedef exr_result (*exr_zlib_inflate_fn)(const uint8_t *src, size_t src_size,
+                                          uint8_t *dst, size_t dst_cap,
+                                          size_t *out_size);
+typedef exr_result (*exr_zlib_deflate_fn)(const exr_allocator *a,
+                                          const uint8_t *src, size_t n,
+                                          uint8_t **out_data, size_t *out_size);
+extern exr_zlib_inflate_fn exr_zlib_inflate;
+extern exr_zlib_deflate_fn exr_zlib_deflate;
 
 /* fpnge-derived literal DEFLATE encoder with a PSHUFB Huffman-table lookup.
  * The PSHUFB-friendly table: symbols 0-15 and 240-255 are looked up by low

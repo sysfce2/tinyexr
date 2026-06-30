@@ -3323,6 +3323,111 @@ static void simd_zip_kernel_parity_tests(void) {
     free(seed); free(ref); free(got); free(dref); free(dgot);
 }
 
+/* The in-tree and libdeflate zlib backends must be losslessly interchangeable:
+ * every available backend reproduces the original ZIP-encoded pixels exactly,
+ * and a stream written by one backend decodes correctly under the other. When
+ * libdeflate is not compiled in, exr_zlib_set_backend(LIBDEFLATE) reports
+ * UNSUPPORTED and only the in-tree round-trip runs. */
+static void zlib_backend_parity_tests(void) {
+    enum { W = 96, H = 64, NC = 2, NPX = W * H };
+    static uint16_t px[NC][NPX];
+    exr_image img;
+    exr_part part;
+    exr_channel ch[NC];
+    void *images[NC];
+    uint32_t rng = 0x2468ACEu;
+    int c, i, ok = 1, ran = 0;
+    void *bufA = NULL, *bufB = NULL;
+    size_t szA = 0, szB = 0;
+    exr_result rc;
+    int have_ld;
+
+    for (c = 0; c < NC; c++)
+        for (i = 0; i < NPX; i++) {
+            rng = rng * 1664525u + 1013904223u;
+            px[c][i] = (uint16_t)((rng >> 13) & 0x3fffu); /* mildly compressible */
+        }
+    memset(&img, 0, sizeof(img));
+    memset(&part, 0, sizeof(part));
+    memset(ch, 0, sizeof(ch));
+    img.num_parts = 1;
+    img.parts = &part;
+    part.header.num_channels = NC;
+    part.header.channels = ch;
+    ch[0] = (exr_channel){"A", EXR_PIXEL_HALF, 1, 1, 0};
+    ch[1] = (exr_channel){"B", EXR_PIXEL_HALF, 1, 1, 0};
+    part.header.data_window.max_x = W - 1;
+    part.header.data_window.max_y = H - 1;
+    part.header.display_window = part.header.data_window;
+    part.width = W;
+    part.height = H;
+    part.images = images;
+    images[0] = px[0];
+    images[1] = px[1];
+
+    have_ld = (exr_zlib_set_backend(EXR_ZLIB_LIBDEFLATE) == EXR_SUCCESS);
+    exr_zlib_set_backend(EXR_ZLIB_AUTO);
+
+    /* Each available backend must encode+decode ZIP losslessly. */
+    {
+        const exr_zlib_backend tiers[2] = {EXR_ZLIB_INTREE, EXR_ZLIB_LIBDEFLATE};
+        int t;
+        for (t = 0; t < 2; t++) {
+            void *buf = NULL;
+            size_t sz = 0;
+            exr_image dec;
+            if (exr_zlib_set_backend(tiers[t]) != EXR_SUCCESS) continue;
+            if (!EXR_OK(exr_save_to_memory(&buf, &sz, NULL, &img,
+                                           EXR_COMPRESSION_ZIP))) { ok = 0; continue; }
+            memset(&dec, 0, sizeof(dec));
+            if (!EXR_OK(exr_load_from_memory(buf, sz, NULL, &dec))) {
+                ok = 0; free(buf); continue;
+            }
+            if (dec.num_parts != 1 ||
+                memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) != 0 ||
+                memcmp(dec.parts[0].images[1], px[1], sizeof(px[1])) != 0)
+                ok = 0;
+            ran++;
+            exr_image_free(&dec);
+            free(buf);
+        }
+    }
+
+    /* Cross-backend: a stream written by one backend decodes under the other. */
+    if (have_ld) {
+        exr_image dec;
+        exr_zlib_set_backend(EXR_ZLIB_INTREE);
+        rc = exr_save_to_memory(&bufA, &szA, NULL, &img, EXR_COMPRESSION_ZIP);
+        exr_zlib_set_backend(EXR_ZLIB_LIBDEFLATE);
+        if (EXR_OK(rc)) {
+            memset(&dec, 0, sizeof(dec));
+            if (!EXR_OK(exr_load_from_memory(bufA, szA, NULL, &dec)) ||
+                memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) != 0)
+                ok = 0;
+            else
+                exr_image_free(&dec);
+        } else ok = 0;
+
+        rc = exr_save_to_memory(&bufB, &szB, NULL, &img, EXR_COMPRESSION_ZIP);
+        exr_zlib_set_backend(EXR_ZLIB_INTREE);
+        if (EXR_OK(rc)) {
+            memset(&dec, 0, sizeof(dec));
+            if (!EXR_OK(exr_load_from_memory(bufB, szB, NULL, &dec)) ||
+                memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) != 0)
+                ok = 0;
+            else
+                exr_image_free(&dec);
+        } else ok = 0;
+        free(bufA);
+        free(bufB);
+    }
+
+    exr_zlib_set_backend(EXR_ZLIB_AUTO);
+    CHECK(ok && ran >= 1, "zlib backends round-trip ZIP losslessly + interop");
+    printf("  ok: zlib backend = %s (libdeflate %s)\n", exr_zlib_backend_name(),
+           have_ld ? "compiled in" : "not compiled");
+}
+
 static void util_resize_tests(void) {
     const exr_allocator *a = NULL;
     int w = 8, h = 6, i;
@@ -3548,6 +3653,7 @@ static void util_tests(void) {
     printf("== util: SIMD parity ==\n");
     util_simd_parity_tests();
     simd_zip_kernel_parity_tests();
+    zlib_backend_parity_tests();
     printf("== util: resize ==\n");
     util_resize_tests();
     printf("== util: tonemap ==\n");

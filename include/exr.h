@@ -629,6 +629,25 @@ typedef enum exr_simd_caps {
 uint32_t exr_simd_capabilities(void);
 const char *exr_simd_info(void);
 
+/* zlib (DEFLATE) backend used by ZIP/ZIPS/PXR24. The in-tree pure-C codec is
+ * always available; the vendored libdeflate is compiled in for hosted builds
+ * (DEFLATE=auto|libdeflate) and is faster on natural-image data. Freestanding
+ * and WASM builds only ever have the in-tree codec. */
+typedef enum exr_zlib_backend {
+    EXR_ZLIB_AUTO = 0,    /* the build-time default backend */
+    EXR_ZLIB_INTREE,      /* force the in-tree pure-C codec */
+    EXR_ZLIB_LIBDEFLATE   /* force libdeflate (else EXR_ERROR_UNSUPPORTED) */
+} exr_zlib_backend;
+
+/* Select the zlib backend for subsequent (de)compression. Not thread-safe with
+ * concurrent decoding: call before kicking off a decode, not during one.
+ * Returns EXR_ERROR_UNSUPPORTED if libdeflate is requested but not compiled in
+ * (the backend is left unchanged). */
+exr_result exr_zlib_set_backend(exr_zlib_backend backend);
+
+/* Name of the active zlib backend ("in-tree" or "libdeflate"). */
+const char *exr_zlib_backend_name(void);
+
 /* Pixel-format conversion (runtime SIMD-dispatched). */
 void exr_half_to_float(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half(const float *src, uint16_t *dst, size_t count);
