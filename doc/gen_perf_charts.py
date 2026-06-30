@@ -16,7 +16,8 @@ import os
 W, H = 620, 400
 X0, X1 = 60.0, 602.0          # plot x-range
 Y0, YTOP = 328.0, 64.0        # y of value 0 and of y-max
-CY = {"intree": "#2563eb", "libdeflate": "#16a34a", "openexr": "#f59e0b"}
+CY = {"intree": "#2563eb", "libdeflate": "#16a34a", "openexr": "#f59e0b",
+      "before": "#9ca3af", "zstd": "#7c3aed"}
 
 
 def _fmt(v):
@@ -97,6 +98,30 @@ def main():
         [("tinyexr (in-tree)", CY["intree"], [226, 171, 309]),
          ("tinyexr (libdeflate)", CY["libdeflate"], [391, 278, 479])],
         ymax=500, ytick=100,
+    )
+
+    # PIZ decode before/after the in-tree optimization (best-of-8 on the 36
+    # openexr-images PIZ files; inline Huffman literal + tighter canonical scan).
+    chart(
+        os.path.join(here, "perf-piz-decode.svg"),
+        "PIZ decode - in-tree optimization (+14%)",
+        "openexr-images; inline Huffman literal store + tighter canonical scan.",
+        ["piz decode"],
+        [("before", CY["before"], [80.2]),
+         ("after", CY["intree"], [91.6])],
+        ymax=100, ytick=20,
+    )
+
+    # ZSTD vs ZIP decode on identical images (6 openexr-images ScanLines files
+    # re-encoded to each; both decoded with the default hosted build).
+    chart(
+        os.path.join(here, "perf-zstd-decode.svg"),
+        "ZSTD vs ZIP decode - identical images",
+        "6 openexr-images ScanLines files re-encoded to each codec.",
+        ["decode"],
+        [("zstd (vendored)", CY["zstd"], [410]),
+         ("zip (libdeflate)", CY["libdeflate"], [272])],
+        ymax=450, ytick=90,
     )
 
 

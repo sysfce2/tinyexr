@@ -123,9 +123,15 @@ builds.
 
 **PIZ decode** got a separate ~**+14%** (≈80→92 Mpix/s on the corpus) from
 inlining the Huffman literal store and restricting the canonical-code-table
-scan to the live symbol range. **ZSTD** decode (vendored upstream, already
-SIMD-dispatched) runs ~**410–420 Mpix/s** here — faster than the libdeflate
-ZIP path; there is no second zstd backend to dispatch against.
+scan to the live symbol range.
+
+![PIZ decode before/after the in-tree optimization](perf-piz-decode.svg)
+
+**ZSTD** decode (vendored upstream, already SIMD-dispatched) runs ~**410–420
+Mpix/s** here — faster than the libdeflate ZIP path on identical content; there
+is no second zstd backend to dispatch against.
+
+![ZSTD vs ZIP decode on identical images](perf-zstd-decode.svg)
 
 The two charts below put **libdeflate on/off vs OpenEXR** side by side across the
 deflate family **and HTJ2K** (which has no deflate path, so only the in-tree and
