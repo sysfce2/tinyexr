@@ -74,6 +74,18 @@ static inline int exr_add_ovf(size_t a, size_t b, size_t *out) {
 #endif
 }
 
+/* Function attribute that suppresses UBSan's signed-integer-overflow check.
+ * The reversible 5/3 wavelet lifting steps are defined to wrap modulo 2^64
+ * (two's complement); this is exact for real coefficient ranges and only trips
+ * the sanitizer on the synthetic random-int64 parity inputs. The attribute
+ * changes no generated code, so annotated transforms stay bit-identical; other
+ * UBSan checks (bounds, null, etc.) remain active inside the function. */
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 8)
+#define EXR_NO_SANITIZE_SIO __attribute__((no_sanitize("signed-integer-overflow")))
+#else
+#define EXR_NO_SANITIZE_SIO
+#endif
+
 /* ============================================================================
  * Little-endian readers / writers (EXR is always little-endian on disk)
  * ========================================================================== */

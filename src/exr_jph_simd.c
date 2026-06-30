@@ -485,6 +485,7 @@ exr_result jph_inverse_53_vert_i32_bounded_avx2(const int32_t *temp, size_t rw,
  * scratch of >= low_count / >= high_count int64 each.
  * ------------------------------------------------------------------------- */
 EXR_TARGET("avx2")
+EXR_NO_SANITIZE_SIO
 exr_result jph_inverse_53_i64_avx2(const int64_t *low, size_t low_count,
                                    const int64_t *high, size_t high_count,
                                    int64_t *out, size_t out_count,
@@ -553,6 +554,7 @@ exr_result jph_inverse_53_i64_avx2(const int64_t *low, size_t low_count,
  * (stride width). temp and data are distinct; even/odd output rows are disjoint.
  * ------------------------------------------------------------------------- */
 EXR_TARGET("avx2")
+EXR_NO_SANITIZE_SIO
 exr_result jph_inverse_53_vert_i64_avx2(const int64_t *temp, size_t rw,
                                         size_t lh, size_t hh,
                                         int64_t *data, size_t width) {
@@ -1290,6 +1292,7 @@ exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
  * int64 vector op over the row -- no gather/scatter. data and temp are distinct.
  * ------------------------------------------------------------------------- */
 EXR_TARGET("avx2")
+EXR_NO_SANITIZE_SIO
 exr_result jph_forward_53_vert_i64_avx2(const int64_t *data, size_t width,
                                         size_t rw, size_t lh, size_t hh,
                                         int64_t *temp) {

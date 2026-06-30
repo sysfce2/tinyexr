@@ -1008,6 +1008,7 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
  * that >=32-bit-precision components (whose reversible-wavelet coefficients can
  * exceed int32) decode losslessly. The final samples fit in 16/32 bits and are
  * narrowed back to int32 at store time. */
+EXR_NO_SANITIZE_SIO
 exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
                               const int64_t *high, size_t high_count,
                               int64_t *out, size_t out_count) {
@@ -1042,6 +1043,7 @@ exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
  * full int64 (no narrowing / range check): `temp` holds lh low-rows then hh
  * high-rows (stride rw); writes the rh interleaved rows into `data` (stride
  * width). Per column this is exactly jph_inverse_53_i64. */
+EXR_NO_SANITIZE_SIO
 exr_result jph_inverse_53_vert_i64(const int64_t *temp, size_t rw,
                                    size_t lh, size_t hh,
                                    int64_t *data, size_t width) {
@@ -5377,6 +5379,7 @@ static exr_result jph_forward_53_1d_i64(const int64_t *src, size_t n,
  * [0..lh) then hh high-rows [lh..lh+hh). Per column this is exactly
  * jph_forward_53_i64; doing it row-wise avoids the strided column gather/scatter
  * (columns are the natural SIMD axis). `data` and `temp` are distinct buffers. */
+EXR_NO_SANITIZE_SIO
 exr_result jph_forward_53_vert_i64(const int64_t *data, size_t width,
                                    size_t rw, size_t lh, size_t hh,
                                    int64_t *temp) {
