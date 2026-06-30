@@ -3271,6 +3271,58 @@ static void util_simd_parity_tests(void) {
     exr_simd_force(2);
 }
 
+/* The ZIP/ZIPS byte predictor (delta prefix-sum) and even/odd interleave run on
+ * every DEFLATE block decode and have scalar / SSE2 / AVX2 (and NEON) variants.
+ * Verify every available tier is bit-identical to the scalar reference, across
+ * sizes that exercise the vector tails (non-multiples of 16/32). */
+static void simd_zip_kernel_parity_tests(void) {
+    static const size_t sizes[] = {0, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33,
+                                   63, 64, 65, 255, 256, 1000, 4096, 4097};
+    const size_t maxn = 4097;
+    uint8_t *seed = (uint8_t *)malloc(maxn);
+    uint8_t *ref = (uint8_t *)malloc(maxn);
+    uint8_t *got = (uint8_t *)malloc(maxn);
+    uint8_t *dref = (uint8_t *)malloc(maxn);
+    uint8_t *dgot = (uint8_t *)malloc(maxn);
+    uint32_t rng = 0xC0FFEEu;
+    int pred_ok = 1, intl_ok = 1, max_tier, tier;
+    size_t si, i;
+
+    for (i = 0; i < maxn; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        seed[i] = (uint8_t)(rng >> 17);
+    }
+    /* Highest forceable tier on this build/host: 2 (AVX2) on x86, 1 on NEON. */
+#if defined(EXR_X86)
+    max_tier = 2;
+#elif defined(EXR_NEON)
+    max_tier = 1;
+#else
+    max_tier = 0;
+#endif
+
+    for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); ++si) {
+        size_t n = sizes[si];
+        exr_simd_force(0);
+        memcpy(ref, seed, n);
+        exr_simd.predictor_decode(ref, n);
+        exr_simd.interleave(seed, dref, n);
+        for (tier = 1; tier <= max_tier; ++tier) {
+            exr_simd_force(tier);
+            memcpy(got, seed, n);
+            exr_simd.predictor_decode(got, n);
+            if (memcmp(ref, got, n) != 0) pred_ok = 0;
+            memset(dgot, 0xAB, n);
+            exr_simd.interleave(seed, dgot, n);
+            if (memcmp(dref, dgot, n) != 0) intl_ok = 0;
+        }
+    }
+    exr_simd_force(max_tier);
+    CHECK(pred_ok, "SIMD ZIP predictor_decode matches scalar (all tiers/tails)");
+    CHECK(intl_ok, "SIMD ZIP interleave matches scalar (all tiers/tails)");
+    free(seed); free(ref); free(got); free(dref); free(dgot);
+}
+
 static void util_resize_tests(void) {
     const exr_allocator *a = NULL;
     int w = 8, h = 6, i;
@@ -3495,6 +3547,7 @@ static void util_tests(void) {
     util_convert_tests();
     printf("== util: SIMD parity ==\n");
     util_simd_parity_tests();
+    simd_zip_kernel_parity_tests();
     printf("== util: resize ==\n");
     util_resize_tests();
     printf("== util: tonemap ==\n");
