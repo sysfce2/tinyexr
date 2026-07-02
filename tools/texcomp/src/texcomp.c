@@ -4746,7 +4746,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     uint16_t selected_candidates[64];
     uint64_t selected_errors[64];
     uint32_t selected_count = 0;
-    uint32_t selected_limit = quality > 1 ? 48u : (quality > 0 ? 16u : 4u);
+    uint32_t selected_limit = quality > 1 ? 48u : (quality > 0 ? 16u : 2u);
     uint64_t best_err = UINT64_MAX;
 
     uint8_t path_out[16];
@@ -4812,7 +4812,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     candidate_count = tc_astc_get_candidates(ctx, candidate_endpoint_end_bit, &candidates);
     /* Reduced-effort levels only fit the top-ranked viable candidates
      * (candidates whose color budget cannot fit do not use up the cap). */
-    scan_cap = quality > 1 ? candidate_count : (quality > 0 ? 20u : 8u);
+    scan_cap = quality > 1 ? candidate_count : (quality > 0 ? 20u : 5u);
     if (selected_limit > candidate_count) selected_limit = candidate_count;
 
     if (axis_valid[4]) {
