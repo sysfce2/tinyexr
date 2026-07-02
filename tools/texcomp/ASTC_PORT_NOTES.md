@@ -94,3 +94,30 @@ exact scoring everywhere for quality. The remaining medium delta needs
 either the wholesale batched-pipeline rewrite (rejected above) or
 threading (deferred by project decision; multiplies both columns'
 relationship unchanged since astcenc scales the same way).
+
+## Tried and REJECTED: blue-contract endpoint trial (2026-07-03)
+
+Prototyped the astcenc-style blue-contract encoding trial for CEM 8/12 at
+quality 2 only: at emit, also encode the inverse-blue-contract preimages of
+the chosen endpoints (V1=invcontract(lo), V0=invcontract(hi), taking the
+decoder's swap path when stored sum(V0)>sum(V1)), score both direct and
+contract encodings against the block with the fixed winning weights via
+tc_astc_recon_sse, and keep the lower-SSE one. Correct and strictly
+non-regressing (picks better of two), but measured gain is below the 0.05 dB
+keep threshold on a real corpus:
+
+| image (q2)  | 4x4    | 6x6    | 8x8    |
+|-------------|--------|--------|--------|
+| StillLife   | +0.001 | +0.005 | +0.006 |
+| Desk        | +0.001 | +0.003 | +0.003 |
+| Carrots     | +0.009 | +0.032 | +0.036 |
+| MtTamWest   | +0.003 | +0.034 | +0.027 |
+| Tree        | +0.002 | +0.014 | +0.014 |
+| asakusa.png | +0.030 | +0.080 | +0.043 |
+
+Corpus average ~0.02 dB (best real EXR ~0.034 dB at 6x6); smooth synthetic
+gradients gain ~0.000. Not worth ~90 lines of subtle endpoint bit-packing
+plus a per-CEM8/12-block rescore in the emit path. Decoder already handles
+the swap+contract path correctly (aref_blue_contract), so this is purely an
+encoder-side quantization choice; revisit only if it can be folded into the
+per-candidate LSQ quantization for free rather than as a separate emit trial.
