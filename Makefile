@@ -586,6 +586,174 @@ wasm-tocio-demo: | build
 	  -o web/tocio/tocio_demo.mjs
 	@echo "built web/tocio/tocio_demo.mjs + .wasm"
 
+# ---- tools/resize (tir: standalone SIMD image resize library) --------------
+# Pure C11, no dependency on the v3 core; only the CLI/bench link
+# libtinyexr3.a (for EXR file I/O). See tools/resize/README.md.
+TIR_INC  = -Itools/resize/include -Itools/resize/src
+TIR_SRC  = $(wildcard tools/resize/src/*.c)
+TIR_OBJ  = $(patsubst tools/resize/src/%.c,build/tir-%.o,$(TIR_SRC))
+TIR_HDRS = tools/resize/include/tir.h tools/resize/src/tir_internal.h
+# Only tir_kernels_sve.c is built with +sve so the HWCAP runtime gate stays
+# sound (everything else remains baseline). Opt in with TIR_SVE=1 on aarch64.
+TIR_SVE_FLAGS =
+ifeq ($(TIR_SVE),1)
+TIR_SVE_FLAGS = -march=armv8-a+sve
+endif
+
+.PHONY: resize-lib resize-c11-gate resize-test resize-test-asan \
+        resize-test-threads resize-test-tsan resize-test-f16 resize-bench \
+        resize-cli resize-cli-asan resize-fuzz resize-fuzz-corpus \
+        resize-arm-test resize-sve-test
+
+build/tir-%.o: tools/resize/src/%.c $(TIR_HDRS) | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -O2 -g -c $< -o $@
+build/tir-tir_kernels_sve.o: tools/resize/src/tir_kernels_sve.c $(TIR_HDRS) | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) $(TIR_SVE_FLAGS) -O2 -g -c $< -o $@
+
+resize-lib: $(TIR_OBJ)
+	$(AR) rcs build/libtir.a $(TIR_OBJ)
+	@echo "built build/libtir.a"
+
+resize-c11-gate: | build
+	@for f in $(TIR_SRC); do \
+	  echo "  C11  $$f"; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	@echo "  scan: library sources must not include <stdio.h>"
+	@bad=`grep -rl '<stdio.h>' tools/resize/src/ || true`; \
+	  if [ -n "$$bad" ]; then echo "  FAIL: stdio leaked into: $$bad"; exit 1; fi
+	@echo "resize pure-C11 gate: OK"
+
+resize-test: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -O1 -g $(SAN) \
+	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test
+	ASAN_OPTIONS=detect_leaks=0 ./build/tir_test
+
+# Same unit tests, but with LeakSanitizer on (the library is single-alloc /
+# single-free, so the suite must be leak-clean) and threads enabled so the
+# banded whole-image paths run under ASan+UBSan+LSan too.
+resize-test-asan: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
+	  -O1 -g $(SAN) \
+	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_asan
+	ASAN_OPTIONS=detect_leaks=1 ./build/tir_test_asan
+
+resize-test-threads: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
+	  -O1 -g $(SAN) \
+	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_mt
+	ASAN_OPTIONS=detect_leaks=0 ./build/tir_test_mt
+
+# ThreadSanitizer build. Uses the pthread threading backend
+# (-DTIR_THREADS_PTHREAD): TSan does not intercept glibc's C11 thrd_create, so
+# a worker would SEGV in __tsan_func_entry before running. The band logic and
+# shared-data access pattern are backend-independent, so this validly checks
+# the threaded paths for data races.
+resize-test-tsan: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) \
+	  -DTIR_ENABLE_THREADS -DTIR_THREADS_PTHREAD -pthread \
+	  -O1 -g -fsanitize=thread \
+	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_tsan
+	./build/tir_test_tsan
+
+# Exhaustive f16<->f32 converter sweep (all 65536 half codes, every SIMD
+# level vs the scalar reference, both directions). Guards the SIMD sNaN
+# preservation, which the resize pipeline itself cannot exercise. Runs the
+# native levels, then the aarch64 NEON/SVE kernels under qemu when the cross
+# toolchain (ARM_CC, default gcc-13; pass ARM_CC=... for another) is present.
+resize-test-f16: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -O2 -g \
+	  tools/resize/tests/tir_f16_test.c $(TIR_SRC) -lm -o build/tir_f16_test
+	./build/tir_f16_test
+	@if command -v $(ARM_CC) >/dev/null 2>&1; then \
+	  echo "== NEON (qemu) =="; \
+	  $(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TIR_INC) \
+	    -O2 tools/resize/tests/tir_f16_test.c $(TIR_SRC) -lm \
+	    -o build/tir_f16_test_arm && $(ARM_QEMU) ./build/tir_f16_test_arm; \
+	  echo "== SVE (qemu) =="; \
+	  $(ARM_CC) -static -march=armv8-a+sve $(V3_CSTD) -Wall -Wextra \
+	    $(TIR_INC) -O2 -c tools/resize/src/tir_kernels_sve.c \
+	    -o build/tir-sve-kernels-f16.o && \
+	  $(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TIR_INC) \
+	    -O2 tools/resize/tests/tir_f16_test.c \
+	    $(filter-out tools/resize/src/tir_kernels_sve.c,$(TIR_SRC)) \
+	    build/tir-sve-kernels-f16.o -lm -o build/tir_f16_test_sve && \
+	  $(ARM_QEMU) -cpu max,sve=on,sve256=on ./build/tir_f16_test_sve; \
+	else echo "  ($(ARM_CC) not found; skipping NEON/SVE f16 sweep)"; fi
+
+# STB=1 adds a stb_image_resize2 comparison column; the header is NOT
+# vendored - drop stb_image_resize2.h into tools/resize/tests/ first.
+TIR_BENCH_DEFS =
+ifeq ($(STB),1)
+TIR_BENCH_DEFS = -DTIR_BENCH_STB
+endif
+
+resize-bench: lib | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) $(V3_INC) $(TIR_BENCH_DEFS) -O2 -g \
+	  tools/resize/tests/tir_bench.c $(TIR_SRC) build/libtinyexr3.a \
+	  -lm -o build/tir_bench
+	./build/tir_bench
+
+resize-cli: lib resize-lib | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -Iinclude -O2 \
+	  tools/resize/cli/tir_resize_main.c build/libtir.a build/libtinyexr3.a \
+	  -lm -o build/tir_resize
+	@echo "built build/tir_resize"
+
+# CLI under ASan+UBSan+LeakSanitizer: a real EXR round-trip plus an error
+# path, guarding the CLI's malloc checks and the single-cleanup free path.
+resize-cli-asan: lib | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -Iinclude -O1 -g $(SAN) \
+	  tools/resize/cli/tir_resize_main.c $(TIR_SRC) build/libtinyexr3.a \
+	  -lm -o build/tir_resize_asan
+	@echo "  round-trip under ASan+LSan (must be leak-clean)"
+	ASAN_OPTIONS=detect_leaks=1 ./build/tir_resize_asan asakusa.exr \
+	  -o build/tir_asan_out.exr --scale 0.5 --filter lanczos3 \
+	  --antiring 1 --clamp-min 0 --stats
+	@echo "  error path (save failure) must not leak"
+	@ASAN_OPTIONS=detect_leaks=1:exitcode=99 ./build/tir_resize_asan \
+	  asakusa.exr -o /nonexistent_dir_zzz/out.exr --scale 0.5; \
+	  rc=$$?; if [ $$rc = 99 ]; then echo "  FAIL: leak on error path"; \
+	  exit 1; fi; echo "  error path clean (exit $$rc)"
+	@echo "resize CLI ASan: OK"
+
+# Coverage-guided libFuzzer harness for the resize library (threads enabled so
+# the banded whole-image path is fuzzed too). Needs clang.
+resize-fuzz: tools/resize/tests/tir_fuzz.c | build
+	clang $(V3_CSTD) $(TIR_INC) -DTIR_ENABLE_THREADS -pthread -O1 -g -w \
+	  -fsanitize=fuzzer,address,undefined \
+	  tools/resize/tests/tir_fuzz.c $(TIR_SRC) -lm -o build/resize_fuzz
+	@echo "built build/resize_fuzz"
+	@echo "  run: mkdir -p build/corpus_resize && cp tools/resize/tests/corpus/* \\"
+	@echo "       build/corpus_resize/ && ./build/resize_fuzz -max_total_time=300 \\"
+	@echo "       build/corpus_resize tools/resize/tests/corpus"
+
+# Deterministic replay under ASan+UBSan (no libFuzzer; CI gate). First replays
+# the committed seed corpus, then runs 8000 generated pseudo-random inputs.
+resize-fuzz-corpus: tools/resize/tests/tir_fuzz.c | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
+	  -O1 -g $(SAN) -DTIR_FUZZ_STANDALONE \
+	  tools/resize/tests/tir_fuzz.c $(TIR_SRC) -lm -o build/resize_fuzz_replay
+	ASAN_OPTIONS=detect_leaks=0 ./build/resize_fuzz_replay \
+	  tools/resize/tests/corpus/*
+	ASAN_OPTIONS=detect_leaks=0 ./build/resize_fuzz_replay
+
+# Cross-build for AArch64 (NEON kernels) and run under qemu.
+resize-arm-test: | build
+	$(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TIR_INC) -O2 \
+	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_arm
+	$(ARM_QEMU) ./build/tir_test_arm
+
+# Same, with the SVE unit enabled and qemu exposing SVE (256-bit vectors).
+resize-sve-test: | build
+	$(ARM_CC) -static -march=armv8-a+sve $(V3_CSTD) -Wall -Wextra $(TIR_INC) -O2 \
+	  -c tools/resize/src/tir_kernels_sve.c -o build/tir-sve-kernels-arm.o
+	$(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TIR_INC) -O2 \
+	  tools/resize/tests/tir_test.c \
+	  $(filter-out tools/resize/src/tir_kernels_sve.c,$(TIR_SRC)) \
+	  build/tir-sve-kernels-arm.o -lm -o build/tir_test_sve
+	$(ARM_QEMU) -cpu max,sve=on,sve256=on ./build/tir_test_sve
+
 clean:
 	rm -rf $(TARGET) miniz.o build $(PARSE_HARNESS)
 
@@ -607,6 +775,9 @@ help:
 	@echo "make freestanding-gate - prove the core builds with no libc (stdint/stddef only)"
 	@echo "make arm-smoke - cross-build (aarch64) + run NEON SIMD smoke under qemu"
 	@echo "make host-smoke - build + run the SIMD smoke test natively"
+	@echo "make resize-test - tools/resize (tir) unit tests, ASan+UBSan"
+	@echo "make resize-bench - tir throughput vs exr_resize_float (STB=1 adds stb2)"
+	@echo "make resize-cli - build/tir_resize EXR resize tool (see tools/resize/README.md)"
 	@echo ""
 	@echo "DEFLATE=auto|libdeflate|intree selects the ZIP/ZIPS/PXR24 zlib backend"
 	@echo "  (default: auto = vendored libdeflate, faster on natural images; both"
