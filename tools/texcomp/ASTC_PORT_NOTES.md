@@ -73,3 +73,24 @@ Anomaly (unexplained, reverted): cutting medium trial counts
 fits should not cost time; investigate the interaction with the
 partition/dual dispatch before retrying medium cuts. Closing medium
 further likely needs astcenc's batched pipeline shape.
+
+## Port complete (2026-07-02, through eb09ab2)
+
+All four planned astcenc algorithm ports have landed: (1) block-mode
+percentile tables, (2) weight-space candidate scoring (per-texel form of
+compute_error_of_weight_set; grid-point-only scoring mis-ranks coarse
+grids on high-frequency content), (3) iterative endpoint/weight
+refinement, (4) trial-count presets. Final single-thread standings
+(1024x1024 photo, 6x6, pure coding, ISA-matched astcenc-sse2 -j 1):
+
+| tier   | ours              | astcenc-sse2             | gap  |
+|--------|-------------------|--------------------------|------|
+| fast   | 0.080 s, 47.14 dB | -fastest 0.057 s, 47.78  | 1.4x |
+| medium | 0.400 s, 48.17 dB | -medium  0.119 s, 48.63  | 3.4x |
+
+Notes: the dual-plane path keeps exact candidate fits (weight-space
+scores tie across direct grids and mis-pick); the normal tier keeps
+exact scoring everywhere for quality. The remaining medium delta needs
+either the wholesale batched-pipeline rewrite (rejected above) or
+threading (deferred by project decision; multiplies both columns'
+relationship unchanged since astcenc scales the same way).
