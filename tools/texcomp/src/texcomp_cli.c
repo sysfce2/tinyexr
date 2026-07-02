@@ -304,7 +304,7 @@ static tc_result write_file(const char *path, const void *data, size_t size) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr] "
+            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
             "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
             "[--quick on|off] [--mode-mask HEX] "
@@ -420,6 +420,14 @@ int main(int argc, char **argv) {
     if (strcmp(format, "dxt1") == 0) format = "bc1";
     if (strcmp(format, "dxt5") == 0) format = "bc3";
     if (strcmp(format, "uastc_hdr") == 0) format = "astc_hdr";
+    /* UASTC LDR is a subset of standard ASTC LDR 4x4; our ASTC encoder emits
+     * the (superset) standard format, decodable by any ASTC device. This is
+     * not the constrained 19-mode transcodable subset (see docs). */
+    if (strcmp(format, "uastc_ldr") == 0 || strcmp(format, "uastc") == 0) {
+        format = "astc";
+        astc_opt.block_x = 4;
+        astc_opt.block_y = 4;
+    }
     if (strcmp(format, "etc2") == 0 || strcmp(format, "etc2_rgba") == 0) {
         etc2_opt.alpha = 1;
         format = "etc2_rgba";
