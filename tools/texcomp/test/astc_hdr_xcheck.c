@@ -127,6 +127,34 @@ int main(void) {
         return 1;
     }
 
+    /* (c) anti-correlated gradient (R up, G down, B quadratic): a single
+     * weight line cannot fit this, so the dual-plane path must engage and
+     * clear a floor above the ~44 dB single-subset ceiling. */
+    for (y = 0; y < H; ++y) {
+        for (x = 0; x < W; ++x) {
+            float t = (float)(x + y) / (float)(2 * (W - 1));
+            float *px = src + ((size_t)y * W + x) * 3;
+            px[0] = 0.05f + t * 8.0f;
+            px[1] = 0.02f + (1.0f - t) * 4.0f;
+            px[2] = 0.10f + t * t * 16.0f;
+        }
+    }
+    if (tc_astc_hdr_compress_rgbf(src, W, H, (size_t)W * 3u * sizeof(float),
+                                  &opt, blocks, need) != TC_SUCCESS) {
+        fprintf(stderr, "FAIL: hdr encode (anti-correlated)\n");
+        return 1;
+    }
+    if (astc_hdr_decode(blocks, need, W, H, dec) != 0) {
+        fprintf(stderr, "FAIL: astcenc hdr decode (anti-correlated)\n");
+        return 1;
+    }
+    p = psnr_rgb(src, dec, (size_t)W * H, 24.0);
+    printf("astc-hdr anti-correlated 64x64: %.2f dB\n", p);
+    if (p < 46.0) {
+        fprintf(stderr, "FAIL: anti-correlated psnr %.2f dB below floor\n", p);
+        return 1;
+    }
+
     printf("astc hdr xcheck: OK\n");
     return 0;
 }

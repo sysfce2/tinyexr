@@ -3950,26 +3950,52 @@ static uint32_t tc_astc_hdr_find_block_mode_4x4(void) {
     return 0;
 }
 
+/* 4x4 dual-plane grid, weight range 3 (trit), single partition. */
+static uint32_t tc_astc_hdr_find_dual_block_mode(void) {
+    uint32_t bm;
+    for (bm = 0; bm < 2048u; ++bm) {
+        tc_astc_block_mode_info info;
+        if (tc_astc_decode_block_mode_2d(bm, &info) && info.weight_x == 4u &&
+            info.weight_y == 4u && info.dual_plane == 1u &&
+            info.quant_method == 1u)
+            return bm;
+    }
+    return 0;
+}
+
+/* Quantise an ideal [0,64] weight to the nearest symbol of a weight range. */
+static uint8_t tc_astc_hdr_quant_weight(int w64, uint32_t qm, uint32_t levels) {
+    uint32_t q, best = 0, bestd = 1u << 30;
+    for (q = 0; q < levels; ++q) {
+        int d = (int)tc_astc_weight_unquant(q, qm) - w64;
+        uint32_t ad = (uint32_t)(d < 0 ? -d : d);
+        if (ad < bestd) {
+            bestd = ad;
+            best = q;
+        }
+    }
+    return (uint8_t)best;
+}
+
 uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
-    static uint32_t block_mode_4x4 = 0xffffffffu;
+    static uint32_t bm_single = 0xffffffffu, bm_dual = 0xffffffffu;
     static tc_astc_encode_context hdr_ctx; /* only its colour quant LUT is used */
     static int hdr_ctx_ready = 0;
-    uint8_t weightbuf[16], weights[16];
-    uint8_t v[8], packed[8];
-    int e0[3], e1[3], qe0[3], qe1[3];
-    int i, c;
-    int64_t dir[3], dlen2 = 0;
-    uint64_t sse = 0;
+    uint8_t weightbuf[16], packed[8], sw[16];
+    uint8_t v[8];
+    int e0[3], e1[3], qe0[3], qe1[3], dir[3];
+    int i, c, ccs;
+    int64_t dlen2 = 0, sse_single = 0, best_dual_sse = -1;
+    int best_ccs = -1;
+    uint8_t dp1[16], dp2[16];
     uint32_t bitpos;
 
-    if (block_mode_4x4 == 0xffffffffu)
-        block_mode_4x4 = tc_astc_hdr_find_block_mode_4x4();
+    if (bm_single == 0xffffffffu) bm_single = tc_astc_hdr_find_block_mode_4x4();
+    if (bm_dual == 0xffffffffu) bm_dual = tc_astc_hdr_find_dual_block_mode();
     if (!hdr_ctx_ready) {
         tc_astc_encode_context_init(&hdr_ctx, 4u, 4u, 0);
         hdr_ctx_ready = 1;
     }
-    memset(out, 0, 16u);
-    memset(weightbuf, 0, sizeof(weightbuf));
 
     /* endpoints: per-channel LNS bounding box (min -> e0, max -> e1). */
     for (c = 0; c < 3; ++c) {
@@ -3984,13 +4010,13 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     tc_astc_cem11_pack(e0, e1, v);
     tc_astc_cem11_unpack(v, qe0, qe1);
     for (c = 0; c < 3; ++c) {
-        dir[c] = (int64_t)qe1[c] - qe0[c];
-        dlen2 += dir[c] * dir[c];
+        dir[c] = qe1[c] - qe0[c];
+        dlen2 += (int64_t)dir[c] * dir[c];
     }
 
-    /* per-texel weights: project onto [qe0,qe1], quantise to range 8. */
+    /* single plane: project all 3 channels, weights at range 8 (3-bit). */
     for (i = 0; i < 16; ++i) {
-        int w64 = 0, best = 0, bestd = 1 << 30, q;
+        int w64 = 0, uq;
         if (dlen2 > 0) {
             int64_t dot = 0;
             for (c = 0; c < 3; ++c)
@@ -3999,38 +4025,96 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
             if (dot > dlen2) dot = dlen2;
             w64 = (int)((dot * 64 + dlen2 / 2) / dlen2);
         }
-        for (q = 0; q < 8; ++q) {
-            int d = (int)tc_astc_weight_unquant((uint32_t)q, 5u) - w64;
-            if (d < 0) d = -d;
-            if (d < bestd) {
-                bestd = d;
-                best = q;
-            }
-        }
-        weights[i] = (uint8_t)best;
-        /* reconstruction SSE in the LNS domain (for mode selection). */
-        {
-            int uq = (int)tc_astc_weight_unquant((uint32_t)best, 5u);
-            for (c = 0; c < 3; ++c) {
-                int64_t recon = qe0[c] + ((int64_t)(qe1[c] - qe0[c]) * uq) / 64;
-                int64_t e = recon - lns[i][c];
-                sse += (uint64_t)(e * e);
-            }
+        sw[i] = tc_astc_hdr_quant_weight(w64, 5u, 8u);
+        uq = (int)tc_astc_weight_unquant(sw[i], 5u);
+        for (c = 0; c < 3; ++c) {
+            int64_t rec = qe0[c] + ((int64_t)dir[c] * uq) / 64;
+            int64_t e = rec - lns[i][c];
+            sse_single += e * e;
         }
     }
-    tc_astc_scramble_weights(weights, 16u, 5u);
-    (void)tc_astc_ise_encode_bits(5u, 16u, weights, weightbuf, sizeof(weightbuf),
-                                  0u);
-    for (i = 0; i < 16; ++i) out[i] = tc_bitrev8(weightbuf[15 - i]);
 
+    /* dual plane: one channel gets its own weight plane. Try each candidate
+     * separate channel; weights are coarser (range 3 / trit) because the two
+     * interleaved planes cost ~2x the weight bits, but decoupling a channel
+     * wins big on anti-correlated / single-channel-independent blocks. */
+    for (ccs = 0; ccs < 3; ++ccs) {
+        int64_t d1 = 0, d2 = (int64_t)dir[ccs] * dir[ccs], dsse = 0;
+        uint8_t t1[16], t2[16];
+        for (c = 0; c < 3; ++c)
+            if (c != ccs) d1 += (int64_t)dir[c] * dir[c];
+        for (i = 0; i < 16; ++i) {
+            int w1 = 0, w2 = 0, u1, u2;
+            if (d1 > 0) {
+                int64_t dot = 0;
+                for (c = 0; c < 3; ++c)
+                    if (c != ccs)
+                        dot += ((int64_t)lns[i][c] - qe0[c]) * dir[c];
+                if (dot < 0) dot = 0;
+                if (dot > d1) dot = d1;
+                w1 = (int)((dot * 64 + d1 / 2) / d1);
+            }
+            if (d2 > 0) {
+                int64_t dot = ((int64_t)lns[i][ccs] - qe0[ccs]) * dir[ccs];
+                if (dot < 0) dot = 0;
+                if (dot > d2) dot = d2;
+                w2 = (int)((dot * 64 + d2 / 2) / d2);
+            }
+            t1[i] = tc_astc_hdr_quant_weight(w1, 1u, 3u);
+            t2[i] = tc_astc_hdr_quant_weight(w2, 1u, 3u);
+            u1 = (int)tc_astc_weight_unquant(t1[i], 1u);
+            u2 = (int)tc_astc_weight_unquant(t2[i], 1u);
+            for (c = 0; c < 3; ++c) {
+                int uq = (c == ccs) ? u2 : u1;
+                int64_t rec = qe0[c] + ((int64_t)dir[c] * uq) / 64;
+                int64_t e = rec - lns[i][c];
+                dsse += e * e;
+            }
+        }
+        if (best_ccs < 0 || dsse < best_dual_sse) {
+            best_dual_sse = dsse;
+            best_ccs = ccs;
+            memcpy(dp1, t1, 16u);
+            memcpy(dp2, t2, 16u);
+        }
+    }
+
+    memset(out, 0, 16u);
+    memset(weightbuf, 0, sizeof(weightbuf));
+
+    if (best_ccs >= 0 && best_dual_sse < sse_single) {
+        uint8_t dualw[32];
+        uint32_t wbits = tc_astc_ise_sequence_bitcount(32u, 1u);
+        tc_astc_scramble_weights(dp1, 16u, 1u);
+        tc_astc_scramble_weights(dp2, 16u, 1u);
+        for (i = 0; i < 16; ++i) {
+            dualw[i * 2] = dp1[i];      /* plane 0 (shared) -> even */
+            dualw[i * 2 + 1] = dp2[i];  /* plane 1 (ccs)    -> odd  */
+        }
+        (void)tc_astc_ise_encode_bits(1u, 32u, dualw, weightbuf,
+                                      sizeof(weightbuf), 0u);
+        for (i = 0; i < 16; ++i) out[i] = tc_bitrev8(weightbuf[15 - i]);
+        bitpos = 0;
+        tc_set_bits(out, &bitpos, bm_dual, 11u);
+        tc_set_bits(out, &bitpos, 0u, 2u);
+        tc_set_bits(out, &bitpos, 11u, 4u);
+        bitpos = 128u - wbits - 2u; /* colour component selector below weights */
+        tc_set_bits(out, &bitpos, (uint32_t)best_ccs, 2u);
+        tc_astc_quantize_color_values(&hdr_ctx, 20u, 6u, v, packed);
+        (void)tc_astc_ise_encode_bits(20u, 6u, packed, out, 16u, 17u);
+        return (uint64_t)best_dual_sse;
+    }
+
+    tc_astc_scramble_weights(sw, 16u, 5u);
+    (void)tc_astc_ise_encode_bits(5u, 16u, sw, weightbuf, sizeof(weightbuf), 0u);
+    for (i = 0; i < 16; ++i) out[i] = tc_bitrev8(weightbuf[15 - i]);
     bitpos = 0;
-    tc_set_bits(out, &bitpos, block_mode_4x4, 11u);
-    tc_set_bits(out, &bitpos, 0u, 2u);  /* single partition */
-    tc_set_bits(out, &bitpos, 11u, 4u); /* CEM 11 (HDR RGB direct) */
-    /* Endpoints at colour quant 256 (level 20): map values -> ISE symbols. */
+    tc_set_bits(out, &bitpos, bm_single, 11u);
+    tc_set_bits(out, &bitpos, 0u, 2u);
+    tc_set_bits(out, &bitpos, 11u, 4u);
     tc_astc_quantize_color_values(&hdr_ctx, 20u, 6u, v, packed);
     (void)tc_astc_ise_encode_bits(20u, 6u, packed, out, 16u, 17u);
-    return sse;
+    return (uint64_t)sse_single;
 }
 
 #if defined(TC_X86)
