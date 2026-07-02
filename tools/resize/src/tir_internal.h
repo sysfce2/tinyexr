@@ -30,8 +30,10 @@
 #define TIR_MAX_DIMENSION (1 << 24)
 
 /* Weight rows are zero-padded to a multiple of TIR_PAD floats so the
- * horizontal kernels loop in whole blocks with no scalar tail. */
-#define TIR_PAD 8
+ * horizontal kernels loop in whole blocks with no scalar tail. 4 keeps the
+ * tables compact (better cache) for the common small-tap filters; every
+ * kernel reads the weight table in <=4-wide blocks or predicated (SVE). */
+#define TIR_PAD 4
 
 /* ===========================================================================
  * Overflow-checked size arithmetic (all hostile-input math goes through it)

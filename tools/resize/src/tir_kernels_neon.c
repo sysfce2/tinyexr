@@ -58,6 +58,7 @@ static void h_dot1_neon(float *dst, const float *src, const int32_t *start,
                         const int32_t *count, const float *w, int padded,
                         int x0, int x1) {
     int x = x0;
+    (void)count;
     for (; x + 4 <= x1; x += 4) {
         const float *w0 = w + (size_t)(x + 0) * (size_t)padded;
         const float *w1 = w + (size_t)(x + 1) * (size_t)padded;
@@ -67,15 +68,11 @@ static void h_dot1_neon(float *dst, const float *src, const int32_t *start,
         const float *s1 = src + (size_t)start[x + 1];
         const float *s2 = src + (size_t)start[x + 2];
         const float *s3 = src + (size_t)start[x + 3];
-        int c = count[x], nb, t;
         float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
         float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
         float32x4x2_t p01, p23;
-        if (count[x + 1] > c) c = count[x + 1];
-        if (count[x + 2] > c) c = count[x + 2];
-        if (count[x + 3] > c) c = count[x + 3];
-        nb = (c + 3) & ~3;
-        for (t = 0; t < nb; t += 4) {
+        int t;
+        for (t = 0; t < padded; t += 4) {
             a0 = vfmaq_f32(a0, vld1q_f32(w0 + t), vld1q_f32(s0 + t));
             a1 = vfmaq_f32(a1, vld1q_f32(w1 + t), vld1q_f32(s1 + t));
             a2 = vfmaq_f32(a2, vld1q_f32(w2 + t), vld1q_f32(s2 + t));
@@ -93,9 +90,9 @@ static void h_dot1_neon(float *dst, const float *src, const int32_t *start,
     for (; x < x1; ++x) {
         const float *wr = w + (size_t)x * (size_t)padded;
         const float *sp = src + (size_t)start[x];
-        int nblk = (count[x] + 3) & ~3, t;
         float32x4_t acc = vdupq_n_f32(0.0f);
-        for (t = 0; t < nblk; t += 4)
+        int t;
+        for (t = 0; t < padded; t += 4)
             acc = vfmaq_f32(acc, vld1q_f32(wr + t), vld1q_f32(sp + t));
         dst[x] = vaddvq_f32(acc);
     }
