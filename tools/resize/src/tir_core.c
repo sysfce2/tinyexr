@@ -172,6 +172,22 @@ static size_t arena_push(arena_builder *b, size_t count, size_t elem) {
     return off;
 }
 
+/* Push (a * c + add) elements of `elem` bytes, with every multiply/add
+ * overflow-checked. The plain arena_push only guards count*elem, but most
+ * callers pass a product as `count`; on an ILP32 build (32-bit size_t) that
+ * product can wrap to a small value and under-size the arena, so route the
+ * factors through here instead of multiplying them at the call site. */
+static size_t arena_pushm(arena_builder *b, size_t a, size_t c, size_t add,
+                          size_t elem) {
+    size_t count;
+    if (!b->ok) return 0;
+    if (!tir__mul_ok(a, c, &count) || !tir__add_ok(count, add, &count)) {
+        b->ok = 0;
+        return 0;
+    }
+    return arena_push(b, count, elem);
+}
+
 typedef struct axis_offs {
     size_t start, count, w, exc_idx, exc_w, ar_start, ar_count;
 } axis_offs;
@@ -180,11 +196,11 @@ static void axis_layout(arena_builder *b, int d, const tir__axis_dims *dm,
                         axis_offs *o) {
     o->start = arena_push(b, (size_t)d, sizeof(int32_t));
     o->count = arena_push(b, (size_t)d, sizeof(int32_t));
-    o->w = arena_push(b, (size_t)d * (size_t)dm->padded, sizeof(float));
-    o->exc_idx = arena_push(b, (size_t)dm->n_exc * (size_t)dm->taps,
-                            sizeof(int32_t));
-    o->exc_w =
-        arena_push(b, (size_t)dm->n_exc * (size_t)dm->taps, sizeof(float));
+    o->w = arena_pushm(b, (size_t)d, (size_t)dm->padded, 0, sizeof(float));
+    o->exc_idx = arena_pushm(b, (size_t)dm->n_exc, (size_t)dm->taps, 0,
+                             sizeof(int32_t));
+    o->exc_w = arena_pushm(b, (size_t)dm->n_exc, (size_t)dm->taps, 0,
+                           sizeof(float));
     o->ar_start = arena_push(b, (size_t)d, sizeof(int32_t));
     o->ar_count = arena_push(b, (size_t)d, sizeof(int32_t));
 }
@@ -311,53 +327,54 @@ tir_result tir_sampler_create(const tir_allocator *a, int src_w, int src_h,
         size_t off_ring, off_mn = 0, off_mx = 0, off_srcy, off_dec, off_stg;
         size_t off_smn = 0, off_smx = 0, off_rep = 0, off_scratch;
         size_t off_vstg = 0, off_vmn = 0, off_vmx = 0, off_stmp = 0;
-        size_t win_max, nrep;
+        size_t win_max, nrep, dec_w = 0;
         tir_sampler *s;
         char *base;
 
         b.total = sizeof(tir_sampler);
         b.ok = 1;
+        /* decode/vstaging width = src_w + horizontal padding slack (elems/ch) */
+        if (!tir__add_ok((size_t)src_w, (size_t)dx.padded, &dec_w)) b.ok = 0;
         axis_layout(&b, dst_w, &dx, &ox);
         axis_layout(&b, dst_h, &dy, &oy);
-        off_ring = arena_push(&b, (size_t)ring_cap * ring_stride,
-                              sizeof(float));
+        off_ring = arena_pushm(&b, (size_t)ring_cap, ring_stride, 0,
+                               sizeof(float));
         if (do_ar && !v_first) {
-            off_mn = arena_push(&b, (size_t)ring_cap * ring_stride,
-                                sizeof(float));
-            off_mx = arena_push(&b, (size_t)ring_cap * ring_stride,
-                                sizeof(float));
+            off_mn = arena_pushm(&b, (size_t)ring_cap, ring_stride, 0,
+                                 sizeof(float));
+            off_mx = arena_pushm(&b, (size_t)ring_cap, ring_stride, 0,
+                                 sizeof(float));
         }
         off_srcy = arena_push(&b, (size_t)ring_cap, sizeof(int32_t));
-        off_dec = arena_push(
-            &b, ((size_t)src_w + (size_t)dx.padded) * (size_t)wc,
-            sizeof(float));
-        off_stg =
-            arena_push(&b, (size_t)dst_w * (size_t)wc + 4, sizeof(float));
+        off_dec = arena_pushm(&b, dec_w, (size_t)wc, 0, sizeof(float));
+        off_stg = arena_pushm(&b, (size_t)dst_w, (size_t)wc, 4, sizeof(float));
         if (do_ar) {
             off_smn =
-                arena_push(&b, (size_t)dst_w * (size_t)wc + 4, sizeof(float));
+                arena_pushm(&b, (size_t)dst_w, (size_t)wc, 4, sizeof(float));
             off_smx =
-                arena_push(&b, (size_t)dst_w * (size_t)wc + 4, sizeof(float));
+                arena_pushm(&b, (size_t)dst_w, (size_t)wc, 4, sizeof(float));
         }
         if (v_first) {
-            off_vstg = arena_push(
-                &b, ((size_t)src_w + (size_t)dx.padded) * (size_t)wc,
-                sizeof(float));
+            off_vstg = arena_pushm(&b, dec_w, (size_t)wc, 0, sizeof(float));
             if (do_ar) {
-                off_vmn = arena_push(&b, (size_t)src_w * (size_t)wc,
-                                     sizeof(float));
-                off_vmx = arena_push(&b, (size_t)src_w * (size_t)wc,
-                                     sizeof(float));
-                off_stmp = arena_push(&b, (size_t)dst_w * (size_t)wc + 4,
+                off_vmn = arena_pushm(&b, (size_t)src_w, (size_t)wc, 0,
                                       sizeof(float));
+                off_vmx = arena_pushm(&b, (size_t)src_w, (size_t)wc, 0,
+                                      sizeof(float));
+                off_stmp = arena_pushm(&b, (size_t)dst_w, (size_t)wc, 4,
+                                       sizeof(float));
             }
         }
-        nrep = (o.nonfinite == TIR_NONFINITE_REPAIR)
-                   ? 3u * (size_t)src_w * (size_t)channels
-                   : 0u;
+        nrep = 0u;
+        if (o.nonfinite == TIR_NONFINITE_REPAIR) {
+            /* 3 source rows of src_w*channels for the NaN repair window */
+            if (!tir__mul_ok((size_t)src_w, (size_t)channels, &nrep) ||
+                !tir__mul_ok(nrep, 3u, &nrep))
+                b.ok = 0;
+        }
         if (nrep) off_rep = arena_push(&b, nrep, sizeof(float));
         win_max = (size_t)(dx.win_max > dy.win_max ? dx.win_max : dy.win_max);
-        off_scratch = arena_push(&b, 2u * win_max, sizeof(double));
+        off_scratch = arena_pushm(&b, 2u, win_max, 0, sizeof(double));
         if (!b.ok) return TIR_ERROR_TOO_LARGE;
 
         base = (char *)a->alloc(a->user, b.total);
