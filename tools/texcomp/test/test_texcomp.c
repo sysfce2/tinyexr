@@ -328,17 +328,17 @@ static int astc_ref_roundtrip_test(void) {
      * ~1 dB safety margin. Raise when the encoder improves. */
     static const double floors[4][4][3] = {
         /* gradient */
-        {{36.5, 37.0, 37.0}, {33.0, 33.0, 30.9}, {30.5, 31.0, 30.0},
-         {27.0, 26.5, 27.5}},
+        {{37.0, 37.5, 37.5}, {33.5, 33.7, 33.8}, {31.0, 31.4, 31.4},
+         {27.3, 27.6, 28.1}},
         /* clusters */
-        {{60.0, 60.0, 60.0}, {60.0, 60.0, 60.0}, {20.0, 50.0, 50.0},
-         {15.0, 18.5, 18.5}},
+        {{60.0, 60.0, 60.0}, {60.0, 60.0, 60.0}, {20.7, 53.0, 53.0},
+         {15.3, 20.5, 20.5}},
         /* alpha ramp */
-        {{34.5, 35.0, 34.4}, {31.0, 30.5, 28.5}, {28.5, 28.0, 25.3},
-         {25.0, 26.7, 26.0}},
+        {{34.8, 35.5, 35.5}, {31.2, 31.7, 31.9}, {28.7, 29.2, 29.2},
+         {25.0, 26.8, 26.1}},
         /* rgba noise */
-        {{10.5, 12.0, 12.0}, {9.8, 11.0, 11.0}, {9.6, 10.4, 10.4},
-         {9.5, 10.0, 10.0}}};
+        {{11.6, 12.6, 12.6}, {10.4, 11.4, 11.4}, {10.0, 10.6, 10.6},
+         {9.6, 10.0, 10.0}}};
     enum { W = 48, H = 48 };
     static uint8_t img[W * H * 4];
     static uint8_t dec[W * H * 4];
@@ -866,18 +866,19 @@ int main(void) {
     for (i = 0; i < 6u; ++i) {
         for (j = 0; j < 6u; ++j) {
             size_t p = (i * 12u + j) * 4u;
-            if (j < 3u) { /* solid red, luma between the pair below */
+            if (j < 3u) { /* solid red */
                 astc_rgba[p + 0u] = 240u;
                 astc_rgba[p + 1u] = 20u;
                 astc_rgba[p + 2u] = 30u;
-            } else if ((i + j) & 1u) { /* bright green (global max luma) */
+            } else if ((i + j) & 1u) { /* bright green-cyan */
                 astc_rgba[p + 0u] = 30u;
                 astc_rgba[p + 1u] = 230u;
-                astc_rgba[p + 2u] = 60u;
-            } else { /* dark blue-green (global min luma) */
+                astc_rgba[p + 2u] = 200u;
+            } else { /* dark green-cyan (channels co-vary with the bright
+                        one, so the pair lies on its partition's diagonal) */
                 astc_rgba[p + 0u] = 20u;
                 astc_rgba[p + 1u] = 90u;
-                astc_rgba[p + 2u] = 200u;
+                astc_rgba[p + 2u] = 60u;
             }
             astc_rgba[p + 3u] = 255u;
         }
@@ -970,14 +971,15 @@ int main(void) {
                 astc_rgba[p + 0u] = 240u;
                 astc_rgba[p + 1u] = 20u;
                 astc_rgba[p + 2u] = 30u;
-            } else if ((i + j) & 1u) { /* yellow (defeats the scale check) */
-                astc_rgba[p + 0u] = 240u;
-                astc_rgba[p + 1u] = 240u;
-                astc_rgba[p + 2u] = 60u;
-            } else { /* dark blue */
-                astc_rgba[p + 0u] = 20u;
-                astc_rgba[p + 1u] = 30u;
+            } else if ((i + j) & 1u) { /* co-varying pair that still fails
+                                          the scale check (hue drift) */
+                astc_rgba[p + 0u] = 60u;
+                astc_rgba[p + 1u] = 230u;
                 astc_rgba[p + 2u] = 200u;
+            } else {
+                astc_rgba[p + 0u] = 20u;
+                astc_rgba[p + 1u] = 120u;
+                astc_rgba[p + 2u] = 60u;
             }
             astc_rgba[p + 3u] = 255u;
         }

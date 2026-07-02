@@ -22,3 +22,16 @@ currently emits valid unsigned-float and signed-float BC6H using one-region mode
 11 with 4-bit selectors. It evaluates per-channel bounds and luma-axis endpoint
 candidates per block; full multi-mode BC6H rate-distortion search remains
 future work.
+
+The ASTC LDR encoder covers all fourteen 2D footprints with decimated weight
+grids, one to four partitions (per-partition weight fitting on a shared grid),
+dual-plane alpha, and CEM 0/4/6/8/10/12 including mixed per-partition formats.
+Endpoints are refined with an integer least-squares solve and all encoding
+paths compete on quantization-aware reconstruction error. Conformance is
+verified against a reference decoder in test/astc_ref_decode.h and against
+Arm's astcenc (`make texcomp-astc-arm-smoke`); quality is tracked by
+`make texcomp-astc-psnr`. The partition-pattern hash and the ISE/unquant data
+tables follow the Khronos ASTC specification (cross-checked against
+https://github.com/ARM-software/astc-encoder). SIMD kernels for the encoder
+search loops remain future optimization work; only constant-color blocks use
+SIMD today.

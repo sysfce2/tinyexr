@@ -2368,6 +2368,10 @@ typedef struct tc_astc_encode_context {
 } tc_astc_encode_context;
 
 static void tc_astc_build_color_pquant_lut(tc_astc_encode_context *ctx);
+static uint32_t tc_astc_color_symbol_uquant(uint32_t quant_method,
+                                            uint32_t sym);
+static uint32_t tc_astc_color_roundtrip(const tc_astc_encode_context *ctx,
+                                        uint32_t quant_method, uint32_t v);
 
 static int tc_astc_decode_block_mode_2d(uint32_t block_mode,
                                         tc_astc_block_mode_info *info) {
@@ -2845,6 +2849,181 @@ static void tc_astc_invert_weights(uint8_t *weights, uint32_t count,
     uint32_t i, maxq = tc_astc_quant_levels(quant_method) - 1u;
     for (i = 0; i < count; ++i)
         weights[i] = (uint8_t)(maxq - weights[i]);
+}
+
+/* Signed rounded division, den > 0. Avoids C's truncation-toward-zero
+ * asymmetry so the integer least-squares solve matches the real solution
+ * within one step. */
+static int64_t tc_div_round_s64(int64_t num, int64_t den) {
+    int64_t half = den / 2;
+    if (num >= 0) return (num + half) / den;
+    return -((-num + half) / den);
+}
+
+/* Expands the quantized decimated weight grid into per-texel interpolated
+ * weights [0,64]. */
+static void tc_astc_infill_weights(const uint8_t *weights,
+                                   const tc_astc_decim_cache_entry *decim,
+                                   uint32_t count, uint32_t quant_method,
+                                   uint8_t wt[144]) {
+    uint32_t i;
+    for (i = 0; i < count; ++i) {
+        wt[i] = (uint8_t)tc_astc_infilled_weight_table(
+            weights, decim->tw_idx[i], decim->tw_contrib[i], decim->tw_count[i],
+            quant_method);
+    }
+}
+
+/* Least-squares endpoint solve: given the per-texel interpolated weights,
+ * finds the endpoint pair minimizing the sum of squared errors of
+ * lerp(lo, hi, w/64) per channel (2x2 normal equations). Returns 0 when the
+ * system is degenerate (all weights equal). Magnitude bound: every term is
+ * at most 64 * (144*64*255) * (144*64^2) < 2^47, safely inside int64. */
+static int tc_astc_lsq_endpoints(const uint8_t block[144][4], uint32_t count,
+                                 const uint8_t wt[144], uint32_t lo[4],
+                                 uint32_t hi[4]) {
+    int64_t saa = 0, sab = 0, sbb = 0, det;
+    int64_t sap[4] = {0, 0, 0, 0}, sbp[4] = {0, 0, 0, 0};
+    uint32_t i, c;
+    for (i = 0; i < count; ++i) {
+        int64_t a = 64 - wt[i];
+        int64_t b = wt[i];
+        saa += a * a;
+        sab += a * b;
+        sbb += b * b;
+        for (c = 0; c < 4u; ++c) {
+            sap[c] += a * block[i][c];
+            sbp[c] += b * block[i][c];
+        }
+    }
+    det = saa * sbb - sab * sab;
+    if (det <= 0) return 0;
+    for (c = 0; c < 4u; ++c) {
+        int64_t l = tc_div_round_s64((sap[c] * sbb - sbp[c] * sab) * 64, det);
+        int64_t h = tc_div_round_s64((sbp[c] * saa - sap[c] * sab) * 64, det);
+        lo[c] = (uint32_t)tc_clamp_i32((int32_t)l, 0, 255);
+        hi[c] = (uint32_t)tc_clamp_i32((int32_t)h, 0, 255);
+    }
+    return 1;
+}
+
+/* Quantization-aware reconstruction error of a single-partition encoding:
+ * round-trips the endpoints through the color quantizer exactly as they
+ * will be emitted for this endpoint format, then evaluates the interpolated
+ * weights against the source texels. Matches the reference decoder model
+ * (CEM 8/12 endpoint swaps are error-neutral thanks to exact weight
+ * mirroring, so no swap handling is needed for scoring). */
+static uint64_t tc_astc_eval_single_sse(const tc_astc_encode_context *ctx,
+                                        const uint8_t block[144][4],
+                                        uint32_t count, const uint8_t wt[144],
+                                        uint32_t endpoint_format,
+                                        const uint32_t lo[4],
+                                        const uint32_t hi[4],
+                                        uint32_t color_quant_method) {
+    uint32_t e0[4], e1[4];
+    uint32_t i, c;
+    uint64_t err = 0;
+    switch (endpoint_format) {
+        case 0u:
+            e0[0] = e0[1] = e0[2] =
+                tc_astc_color_roundtrip(ctx, color_quant_method, lo[0]);
+            e1[0] = e1[1] = e1[2] =
+                tc_astc_color_roundtrip(ctx, color_quant_method, hi[0]);
+            e0[3] = e1[3] = 255u;
+            break;
+        case 4u:
+            e0[0] = e0[1] = e0[2] =
+                tc_astc_color_roundtrip(ctx, color_quant_method, lo[0]);
+            e1[0] = e1[1] = e1[2] =
+                tc_astc_color_roundtrip(ctx, color_quant_method, hi[0]);
+            e0[3] = tc_astc_color_roundtrip(ctx, color_quant_method, lo[3]);
+            e1[3] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[3]);
+            break;
+        case 6u:
+        case 10u: {
+            uint32_t sum_lo = lo[0] + lo[1] + lo[2];
+            uint32_t sum_hi = hi[0] + hi[1] + hi[2];
+            uint32_t scale =
+                sum_hi ? (sum_lo * 256u + sum_hi / 2u) / sum_hi : 0u;
+            if (scale > 255u) scale = 255u;
+            scale = tc_astc_color_roundtrip(ctx, color_quant_method, scale);
+            for (c = 0; c < 3u; ++c) {
+                e1[c] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[c]);
+                e0[c] = (e1[c] * scale) >> 8;
+            }
+            if (endpoint_format == 10u) {
+                e0[3] = tc_astc_color_roundtrip(ctx, color_quant_method, lo[3]);
+                e1[3] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[3]);
+            } else {
+                e0[3] = e1[3] = 255u;
+            }
+            break;
+        }
+        default: /* CEM 8 / 12: direct per-channel pairs. */
+            for (c = 0; c < 3u; ++c) {
+                e0[c] = tc_astc_color_roundtrip(ctx, color_quant_method, lo[c]);
+                e1[c] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[c]);
+            }
+            if (endpoint_format == 12u) {
+                e0[3] = tc_astc_color_roundtrip(ctx, color_quant_method, lo[3]);
+                e1[3] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[3]);
+            } else {
+                e0[3] = e1[3] = 255u;
+            }
+            break;
+    }
+    for (i = 0; i < count; ++i) {
+        uint32_t w = wt[i];
+        for (c = 0; c < 4u; ++c) {
+            uint32_t recon = (e0[c] * (64u - w) + e1[c] * w + 32u) >> 6;
+            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
+            err += (uint64_t)(d * d);
+        }
+    }
+    return err;
+}
+
+/* Dual-plane variant: RGB follows the color-plane weights, alpha the
+ * alpha-plane weights; endpoints round-trip through the color quantizer
+ * with CEM 10/12 semantics. */
+static uint64_t tc_astc_eval_dual_sse(const tc_astc_encode_context *ctx,
+                                      const uint8_t block[144][4],
+                                      uint32_t count, const uint8_t wtc[144],
+                                      const uint8_t wta[144],
+                                      uint32_t endpoint_format,
+                                      const uint32_t lo[4],
+                                      const uint32_t hi[4],
+                                      uint32_t color_quant_method) {
+    uint32_t e0[4], e1[4];
+    uint32_t i, c;
+    uint64_t err = 0;
+    if (endpoint_format == 10u) {
+        uint32_t sum_lo = lo[0] + lo[1] + lo[2];
+        uint32_t sum_hi = hi[0] + hi[1] + hi[2];
+        uint32_t scale = sum_hi ? (sum_lo * 256u + sum_hi / 2u) / sum_hi : 0u;
+        if (scale > 255u) scale = 255u;
+        scale = tc_astc_color_roundtrip(ctx, color_quant_method, scale);
+        for (c = 0; c < 3u; ++c) {
+            e1[c] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[c]);
+            e0[c] = (e1[c] * scale) >> 8;
+        }
+    } else {
+        for (c = 0; c < 3u; ++c) {
+            e0[c] = tc_astc_color_roundtrip(ctx, color_quant_method, lo[c]);
+            e1[c] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[c]);
+        }
+    }
+    e0[3] = tc_astc_color_roundtrip(ctx, color_quant_method, lo[3]);
+    e1[3] = tc_astc_color_roundtrip(ctx, color_quant_method, hi[3]);
+    for (i = 0; i < count; ++i) {
+        for (c = 0; c < 4u; ++c) {
+            uint32_t w = c == 3u ? wta[i] : wtc[i];
+            uint32_t recon = (e0[c] * (64u - w) + e1[c] * w + 32u) >> 6;
+            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
+            err += (uint64_t)(d * d);
+        }
+    }
+    return err;
 }
 
 static int tc_astc_color_quant_supported(uint32_t quant_method) {
@@ -3487,30 +3666,63 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
     }
     if (best == 0xffffffffu) return 0;
 
-    /* Model error of the emitted dual-plane block: RGB follows the color
-     * plane, alpha follows the alpha plane. */
+    /* Quantization-aware error of the emitted dual-plane block, with a
+     * least-squares refinement pass over both planes' endpoints. */
     {
         const tc_astc_decim_cache_entry *bd = tc_astc_get_decim_cache(
             ctx, candidates[best].weight_x, candidates[best].weight_y);
-        uint64_t err = 0;
+        uint8_t wtc[144], wta[144];
+        uint32_t cur[2][4], lsq_lo[4], lsq_hi[4];
+        uint64_t err;
         if (!bd) return 0;
-        for (i = 0; i < count; ++i) {
-            uint32_t wc = tc_astc_infilled_weight_table(
-                color_weights, bd->tw_idx[i], bd->tw_contrib[i],
-                bd->tw_count[i], candidates[best].quant_method);
-            uint32_t wa = tc_astc_infilled_weight_table(
-                alpha_weights, bd->tw_idx[i], bd->tw_contrib[i],
-                bd->tw_count[i], candidates[best].quant_method);
-            uint32_t recon;
-            int32_t d;
+        tc_astc_infill_weights(color_weights, bd, count,
+                               candidates[best].quant_method, wtc);
+        tc_astc_infill_weights(alpha_weights, bd, count,
+                               candidates[best].quant_method, wta);
+        for (c = 0; c < 4u; ++c) {
+            cur[0][c] = c == 3u ? alpha_lo[3] : color_lo[c];
+            cur[1][c] = c == 3u ? alpha_hi[3] : color_hi[c];
+        }
+        err = tc_astc_eval_dual_sse(ctx, block, count, wtc, wta,
+                                    endpoint_format, cur[0], cur[1],
+                                    color_quant_method);
+        if (tc_astc_lsq_endpoints(block, count, wtc, lsq_lo, lsq_hi)) {
+            uint32_t try_lo[4], try_hi[4];
+            uint64_t lsq_err;
+            memcpy(try_lo, cur[0], sizeof(try_lo));
+            memcpy(try_hi, cur[1], sizeof(try_hi));
             for (c = 0; c < 3u; ++c) {
-                recon = (color_lo[c] * (64u - wc) + color_hi[c] * wc + 32u) >> 6;
-                d = (int32_t)block[i][c] - (int32_t)recon;
-                err += (uint64_t)(d * d);
+                try_lo[c] = lsq_lo[c];
+                try_hi[c] = lsq_hi[c];
             }
-            recon = (alpha_lo[3] * (64u - wa) + alpha_hi[3] * wa + 32u) >> 6;
-            d = (int32_t)block[i][3] - (int32_t)recon;
-            err += (uint64_t)(d * d);
+            lsq_err = tc_astc_eval_dual_sse(ctx, block, count, wtc, wta,
+                                            endpoint_format, try_lo, try_hi,
+                                            color_quant_method);
+            if (lsq_err < err) {
+                err = lsq_err;
+                for (c = 0; c < 3u; ++c) {
+                    color_lo[c] = try_lo[c];
+                    color_hi[c] = try_hi[c];
+                }
+                memcpy(cur[0], try_lo, sizeof(try_lo));
+                memcpy(cur[1], try_hi, sizeof(try_hi));
+            }
+        }
+        if (tc_astc_lsq_endpoints(block, count, wta, lsq_lo, lsq_hi)) {
+            uint32_t try_lo[4], try_hi[4];
+            uint64_t lsq_err;
+            memcpy(try_lo, cur[0], sizeof(try_lo));
+            memcpy(try_hi, cur[1], sizeof(try_hi));
+            try_lo[3] = lsq_lo[3];
+            try_hi[3] = lsq_hi[3];
+            lsq_err = tc_astc_eval_dual_sse(ctx, block, count, wtc, wta,
+                                            endpoint_format, try_lo, try_hi,
+                                            color_quant_method);
+            if (lsq_err < err) {
+                err = lsq_err;
+                alpha_lo[3] = try_lo[3];
+                alpha_hi[3] = try_hi[3];
+            }
         }
         *out_err = err;
     }
@@ -3735,14 +3947,35 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
             cand_color_quant_method = 20u;
         }
         for (axis = quality > 0 ? 0u : 4u; axis < 5u; ++axis) {
-            uint32_t cand_lo[4], cand_hi[4];
+            uint32_t cand_lo[4], cand_hi[4], lsq_lo[4], lsq_hi[4];
             uint8_t cand_weights[64];
-            uint64_t err = tc_astc_try_endpoint_axis(
+            uint8_t wt[144];
+            uint64_t err;
+            (void)tc_astc_try_endpoint_axis(
                 block, count, axis, candidates[candidate_index].weight_x,
                 candidates[candidate_index].weight_y,
                 candidates[candidate_index].quant_method, decim->tw_idx, decim->tw_contrib,
                 decim->tw_count,
                 cand_lo, cand_hi, cand_weights);
+            /* Score with the endpoints as they will actually decode
+             * (quantized), and try replacing the axis-extreme endpoints
+             * with the least-squares solution for the fitted weights. */
+            tc_astc_infill_weights(cand_weights, decim, count,
+                                   candidates[candidate_index].quant_method,
+                                   wt);
+            err = tc_astc_eval_single_sse(ctx, block, count, wt,
+                                          endpoint_format, cand_lo, cand_hi,
+                                          cand_color_quant_method);
+            if (tc_astc_lsq_endpoints(block, count, wt, lsq_lo, lsq_hi)) {
+                uint64_t lsq_err = tc_astc_eval_single_sse(
+                    ctx, block, count, wt, endpoint_format, lsq_lo, lsq_hi,
+                    cand_color_quant_method);
+                if (lsq_err < err) {
+                    err = lsq_err;
+                    memcpy(cand_lo, lsq_lo, sizeof(cand_lo));
+                    memcpy(cand_hi, lsq_hi, sizeof(cand_hi));
+                }
+            }
             if (err < best_err) {
                 best_err = err;
                 best_block_mode = candidates[candidate_index].block_mode;
