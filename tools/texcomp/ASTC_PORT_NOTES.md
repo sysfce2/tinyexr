@@ -121,3 +121,47 @@ plus a per-CEM8/12-block rescore in the emit path. Decoder already handles
 the swap+contract path correctly (aref_blue_contract), so this is purely an
 encoder-side quantization choice; revisit only if it can be folded into the
 per-candidate LSQ quantization for free rather than as a separate emit trial.
+
+## Medium-tier gap: real-photo characterization (2026-07-03)
+
+The value-noise photo1k benchmark substantially OVERSTATED competitiveness.
+Re-measured on real photos (OpenEXR ScanLines, linear->sRGB tonemapped to
+8-bit, 6x6, single thread, pure coding, decoded with astcenc unorm8; our
+output verified to decode identically under astcenc fp16/unorm8 and the
+in-tree reference decoder, so the gap is real, not a decode-mode artifact):
+
+| photo     | ours q1 (medium) | ours q2 (normal) | astcenc -fast | astcenc -medium |
+|-----------|------------------|------------------|---------------|-----------------|
+| StillLife | 0.16 s / 40.82   | 3.37 s / 42.12   | 0.13 s / 42.83| 0.43 s / 43.53  |
+| Desk      | 0.08 s / 33.25   | 2.04 s / 35.35   | 0.27 s / 36.58| 0.62 s / 37.40  |
+| Carrots   | 0.04 s / 42.19   | 0.73 s / 42.95   | 0.03 s / 43.17| 0.12 s / 44.64  |
+
+On real content astcenc's -fast preset beats OUR -normal (e.g. Desk 36.58 vs
+35.35), and our medium trails astcenc-medium by 1.7-4.2 dB. Contrast the
+value-noise photo1k, where our normal is only -0.29 dB from astcenc-medium
+(44.48 vs 44.77) -- that number, and the memory's "-0.32 dB", reflect
+high-frequency noise where weight error dominates and endpoint/partition
+precision barely matters. It is not representative of photographic content.
+
+The medium quality KNOBS ARE SATURATED. Cranking every medium lever at once
+(opaque scan 24, selected 8, full-axis 4, partition scan 32, part2 shortlist
+48) moves StillLife medium only +0.10 dB (40.82 -> 40.92) for 2.2x the time.
+partition-scan and part2-shortlist knobs move it 0.000 dB. So there is no
+knob configuration that meaningfully closes the gap, and none was shipped.
+
+The scan-cap non-monotonicity (opaque scan 10 -> 16 gets WORSE, 16 -> 20
+recovers) is now understood: pass 1 proxy-scores `scan_cap` candidates with
+score_from_ideal and shortlists the top `selected_limit`; pass 2 exact-fits
+only the shortlist. The proxy is imperfectly correlated with the exact fit,
+so a larger scan pool can admit proxy-good/exact-bad candidates that evict
+proxy-mediocre/exact-good ones. It is a selection imperfection (~0.1 dB), not
+a correctness bug, and is dwarfed by the architectural gap.
+
+Conclusion: the real-photo medium (and normal) gap is a QUALITY-CEILING
+problem in the partition / dual-plane / endpoint search, not effort tuning.
+Closing it needs algorithmic work (astcenc's batched trial-partitioning +
+decimation pipeline), which remains the deliberately-deferred big rewrite.
+Knob tuning is exhausted; do not re-sweep it expecting real-content gains.
+Harness to reproduce lives in the session scratchpad: genphoto.c (photo1k),
+exr2png.c (tonemap), ourtime.c (our timer+PSNR), astctime.c (astcenc-sse2
+ref), sweepimg.sh (knob A/B).
