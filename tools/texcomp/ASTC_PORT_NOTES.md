@@ -47,3 +47,12 @@ Measured dead end (do not revisit): winner-only LSQ — 10-20% speed for
 Threading remains the biggest single lever (astcenc numbers above are
 already single-thread; ours parallelizes trivially per block row now
 that the encode context is heap-allocated).
+
+## Measured: AVX2 widening of the recon kernels does not pay (2026-07-02)
+
+8-texel AVX2 variants of the recon/recon_pt kernels were bit-exact but
+*slower* (fast 0.131 -> 0.170 s, medium 0.512 -> 0.751 s): at 6x6 the
+kernels see 36-texel calls, so the per-call ymm constant/shuffle-mask
+setup and the SSE tail dominate. AVX2 only makes sense with a batched
+pipeline (many blocks' texels processed per call, astcenc-style), not
+by widening the current per-candidate call shape. Reverted.
