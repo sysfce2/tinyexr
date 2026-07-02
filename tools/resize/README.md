@@ -51,18 +51,33 @@ tir_resize(NULL, &src, &dst, &o);
 Separable two-pass resampling over f32 with precomputed, edge-folded,
 zero-padded coefficient tables (branchless inner loops), a streaming ring
 buffer of `filter_taps` rows (O(support) memory, one arena allocation), FMA
-kernels with independent accumulator chains, and pass-order selection by a
-multiply-count cost model (vertical-first when the geometry favors it).
+kernels with independent accumulator chains (the 1-channel horizontal pass
+batches 4 outputs and reduces them with one 4×4 transpose instead of a
+per-output horizontal sum), and pass-order selection by a multiply-count
+cost model (vertical-first when the geometry favors it).
 
-`make resize-bench`, output MP/s, f32, AMD/Intel AVX2 vs the TinyEXR core
-resizer (`exr_resize_float`):
+`make resize-bench` (`STB=1` adds a stb_image_resize2 column with the
+matched filter), output MP/s of f32 pixels on one AVX2 core (Ryzen 9 3950X,
+Zen 2). tir vs the TinyEXR core resizer `exr_resize_float` and
+stb_image_resize2, Mitchell (4 taps, the fairest cross-library filter):
 
-| shape, filter | scalar | SSE2 | AVX2 | exr_v3 |
-|---|---|---|---|---|
-| 2× up, mitchell, 4ch | 137 | 241 | 285 | 122 |
-| 2× down, mitchell, 4ch | 38 | 55 | 67 | 22 |
-| 7.3× down, mitchell, 1ch | 11.1 | 24.2 | 26.8 | 7.2 |
-| 7.3× down, lanczos3, 1ch | 7.6 | 17.6 | 19.6 | — |
+| shape, 4-channel | tir AVX2 | exr_v3 | stb2 |
+|---|---|---|---|
+| 2× up | 286 | 123 | 269 |
+| 2× down | 73 | 20 | 71 |
+| 7.3× down | 7.9 | 1.6 | 6.1 |
+
+| shape, 1-channel | tir AVX2 | exr_v3 | stb2 |
+|---|---|---|---|
+| 2× up | 1080 | 424 | 1212 |
+| 2× down | 281 | 89 | 358 |
+| 7.3× down | 26.1 | 7.2 | 24.7 |
+
+tir beats `exr_resize_float` 2–5× everywhere. Against stb2 (with matched
+filters), tir wins on **every 4-channel case** — the primary HDR/RGBA path —
+and on extreme 1-channel downscale; stb2 is ~1.15–1.3× faster on 1-channel
+2× cubic upscale/downscale, where it keeps output pixels in SIMD lanes and
+avoids the per-output reduction the transpose kernel still pays.
 
 Pixel I/O types: `TIR_F32`, `TIR_F16` (IEEE half, F16C/NEON converters),
 `TIR_U8`/`TIR_U16` unorm. Filtering is always f32; SIMD kernels may

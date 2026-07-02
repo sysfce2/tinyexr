@@ -52,15 +52,48 @@ static void v_fma4_neon(float *dst, const float *const src[4], const float *w,
     }
 }
 
+/* 1-channel horizontal: batch 4 outputs, four independent FMA chains, one
+ * 4x4 transpose to reduce (instead of four vaddvq horizontal sums). */
 static void h_dot1_neon(float *dst, const float *src, const int32_t *start,
                         const int32_t *count, const float *w, int padded,
                         int x0, int x1) {
-    int x;
-    for (x = x0; x < x1; ++x) {
+    int x = x0;
+    for (; x + 4 <= x1; x += 4) {
+        const float *w0 = w + (size_t)(x + 0) * (size_t)padded;
+        const float *w1 = w + (size_t)(x + 1) * (size_t)padded;
+        const float *w2 = w + (size_t)(x + 2) * (size_t)padded;
+        const float *w3 = w + (size_t)(x + 3) * (size_t)padded;
+        const float *s0 = src + (size_t)start[x + 0];
+        const float *s1 = src + (size_t)start[x + 1];
+        const float *s2 = src + (size_t)start[x + 2];
+        const float *s3 = src + (size_t)start[x + 3];
+        int c = count[x], nb, t;
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+        float32x4x2_t p01, p23;
+        if (count[x + 1] > c) c = count[x + 1];
+        if (count[x + 2] > c) c = count[x + 2];
+        if (count[x + 3] > c) c = count[x + 3];
+        nb = (c + 3) & ~3;
+        for (t = 0; t < nb; t += 4) {
+            a0 = vfmaq_f32(a0, vld1q_f32(w0 + t), vld1q_f32(s0 + t));
+            a1 = vfmaq_f32(a1, vld1q_f32(w1 + t), vld1q_f32(s1 + t));
+            a2 = vfmaq_f32(a2, vld1q_f32(w2 + t), vld1q_f32(s2 + t));
+            a3 = vfmaq_f32(a3, vld1q_f32(w3 + t), vld1q_f32(s3 + t));
+        }
+        /* 4x4 transpose then column sum: lane i = sum of a_i's lanes */
+        p01 = vtrnq_f32(a0, a1);
+        p23 = vtrnq_f32(a2, a3);
+        a0 = vcombine_f32(vget_low_f32(p01.val[0]), vget_low_f32(p23.val[0]));
+        a1 = vcombine_f32(vget_low_f32(p01.val[1]), vget_low_f32(p23.val[1]));
+        a2 = vcombine_f32(vget_high_f32(p01.val[0]), vget_high_f32(p23.val[0]));
+        a3 = vcombine_f32(vget_high_f32(p01.val[1]), vget_high_f32(p23.val[1]));
+        vst1q_f32(dst + x, vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    }
+    for (; x < x1; ++x) {
         const float *wr = w + (size_t)x * (size_t)padded;
         const float *sp = src + (size_t)start[x];
-        int nblk = (count[x] + 3) & ~3;
-        int t;
+        int nblk = (count[x] + 3) & ~3, t;
         float32x4_t acc = vdupq_n_f32(0.0f);
         for (t = 0; t < nblk; t += 4)
             acc = vfmaq_f32(acc, vld1q_f32(wr + t), vld1q_f32(sp + t));

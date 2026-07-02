@@ -56,12 +56,17 @@ typedef struct fcase {
     tir_filter tf;
     exr_resize_filter ef;
     int have_exr;
+    int stb_filter; /* stbir_filter enum value; -1 = no stb equivalent */
+    int stb_wider;  /* 1 if tir's filter is wider than stb's (unfair to tir) */
 } fcase;
 
+/* stbir_filter: 1=BOX 2=TRIANGLE 3=CUBICBSPLINE 4=CATMULLROM 5=MITCHELL.
+ * stb has no Lanczos; the lanczos3 row runs a 4-tap Catmull-Rom on the stb
+ * side, so tir is doing 1.5x the taps there (flagged stb_wider). */
 static const fcase FILTERS[] = {
-    {"triangle", TIR_FILTER_TRIANGLE, EXR_RESIZE_TRIANGLE, 1},
-    {"mitchell", TIR_FILTER_MITCHELL, EXR_RESIZE_MITCHELL, 1},
-    {"lanczos3", TIR_FILTER_LANCZOS3, (exr_resize_filter)0, 0},
+    {"triangle", TIR_FILTER_TRIANGLE, EXR_RESIZE_TRIANGLE, 1, 2, 0},
+    {"mitchell", TIR_FILTER_MITCHELL, EXR_RESIZE_MITCHELL, 1, 5, 0},
+    {"lanczos3", TIR_FILTER_LANCZOS3, (exr_resize_filter)0, 0, 4, 1},
 };
 
 /* run fn repeatedly until ~0.3s elapsed, return output MP/s */
@@ -145,15 +150,15 @@ int main(void) {
                     printf(" %9s", "-");
                 }
 #if defined(TIR_BENCH_STB)
-                { /* stb2 with its default filter - a reference point, not a
-                   * per-filter comparison */
+                { /* matched filter (Catmull-Rom stands in for Lanczos3) */
                     stbir_pixel_layout pl =
                         ch == 1 ? STBIR_1CHANNEL : STBIR_4CHANNEL;
+                    stbir_filter sf = (stbir_filter)fc->stb_filter;
                     BENCH(mps, sp->dw, sp->dh,
-                          stbir_resize_float_linear(src, sp->sw, sp->sh, 0,
-                                                    dst, sp->dw, sp->dh, 0,
-                                                    pl));
-                    printf(" %9.1f", mps);
+                          stbir_resize(src, sp->sw, sp->sh, 0, dst, sp->dw,
+                                       sp->dh, 0, pl, STBIR_TYPE_FLOAT,
+                                       STBIR_EDGE_CLAMP, sf));
+                    printf(" %9.1f%s", mps, fc->stb_wider ? "*" : " ");
                 }
 #endif
                 printf("\n");

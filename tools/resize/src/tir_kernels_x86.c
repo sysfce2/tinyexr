@@ -77,16 +77,49 @@ static void v_fma4_sse2(float *dst, const float *const src[4], const float *w,
     }
 }
 
+/* 1-channel horizontal: batch 4 outputs with independent accumulators and
+ * reduce them with one 4x4 transpose instead of four per-output horizontal
+ * sums. The source row carries `padded` zeroed slack, so the shared inner
+ * loop can run to the batch's rounded max tap count. */
 TIR_TGT("sse2")
 static void h_dot1_sse2(float *dst, const float *src, const int32_t *start,
                         const int32_t *count, const float *w, int padded,
                         int x0, int x1) {
-    int x;
-    for (x = x0; x < x1; ++x) {
+    int x = x0;
+    for (; x + 4 <= x1; x += 4) {
+        const float *w0 = w + (size_t)(x + 0) * (size_t)padded;
+        const float *w1 = w + (size_t)(x + 1) * (size_t)padded;
+        const float *w2 = w + (size_t)(x + 2) * (size_t)padded;
+        const float *w3 = w + (size_t)(x + 3) * (size_t)padded;
+        const float *s0 = src + (size_t)start[x + 0];
+        const float *s1 = src + (size_t)start[x + 1];
+        const float *s2 = src + (size_t)start[x + 2];
+        const float *s3 = src + (size_t)start[x + 3];
+        int c = count[x], nb, t;
+        if (count[x + 1] > c) c = count[x + 1];
+        if (count[x + 2] > c) c = count[x + 2];
+        if (count[x + 3] > c) c = count[x + 3];
+        nb = (c + 3) & ~3;
+        __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
+        __m128 a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
+        for (t = 0; t < nb; t += 4) {
+            a0 = _mm_add_ps(a0,
+                            _mm_mul_ps(_mm_loadu_ps(w0 + t), _mm_loadu_ps(s0 + t)));
+            a1 = _mm_add_ps(a1,
+                            _mm_mul_ps(_mm_loadu_ps(w1 + t), _mm_loadu_ps(s1 + t)));
+            a2 = _mm_add_ps(a2,
+                            _mm_mul_ps(_mm_loadu_ps(w2 + t), _mm_loadu_ps(s2 + t)));
+            a3 = _mm_add_ps(a3,
+                            _mm_mul_ps(_mm_loadu_ps(w3 + t), _mm_loadu_ps(s3 + t)));
+        }
+        _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
+        _mm_storeu_ps(dst + x,
+                      _mm_add_ps(_mm_add_ps(a0, a1), _mm_add_ps(a2, a3)));
+    }
+    for (; x < x1; ++x) {
         const float *wr = w + (size_t)x * (size_t)padded;
         const float *sp = src + (size_t)start[x];
-        int nblk = (count[x] + 3) & ~3;
-        int t;
+        int nblk = (count[x] + 3) & ~3, t;
         __m128 acc = _mm_setzero_ps();
         for (t = 0; t < nblk; t += 4)
             acc = _mm_add_ps(
@@ -355,16 +388,46 @@ static void v_fma4_avx2(float *dst, const float *const src[4], const float *w,
     }
 }
 
+/* 1-channel horizontal: batch 4 outputs, four independent FMA chains, one
+ * 4x4 transpose to reduce (vs four per-output horizontal sums). The 4-wide
+ * inner loop wastes fewer lanes than an 8-wide single-output dot at the
+ * small tap counts typical of resampling; wider 8-output batches lose to the
+ * cross-lane transpose they need to reduce, so 4-wide is the sweet spot. */
 TIR_TGT(TIR_AVX2)
 static void h_dot1_avx2(float *dst, const float *src, const int32_t *start,
                         const int32_t *count, const float *w, int padded,
                         int x0, int x1) {
-    int x;
-    for (x = x0; x < x1; ++x) {
+    int x = x0;
+    for (; x + 4 <= x1; x += 4) {
+        const float *w0 = w + (size_t)(x + 0) * (size_t)padded;
+        const float *w1 = w + (size_t)(x + 1) * (size_t)padded;
+        const float *w2 = w + (size_t)(x + 2) * (size_t)padded;
+        const float *w3 = w + (size_t)(x + 3) * (size_t)padded;
+        const float *s0 = src + (size_t)start[x + 0];
+        const float *s1 = src + (size_t)start[x + 1];
+        const float *s2 = src + (size_t)start[x + 2];
+        const float *s3 = src + (size_t)start[x + 3];
+        int c = count[x], nb, t;
+        if (count[x + 1] > c) c = count[x + 1];
+        if (count[x + 2] > c) c = count[x + 2];
+        if (count[x + 3] > c) c = count[x + 3];
+        nb = (c + 3) & ~3;
+        __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
+        __m128 a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
+        for (t = 0; t < nb; t += 4) {
+            a0 = _mm_fmadd_ps(_mm_loadu_ps(w0 + t), _mm_loadu_ps(s0 + t), a0);
+            a1 = _mm_fmadd_ps(_mm_loadu_ps(w1 + t), _mm_loadu_ps(s1 + t), a1);
+            a2 = _mm_fmadd_ps(_mm_loadu_ps(w2 + t), _mm_loadu_ps(s2 + t), a2);
+            a3 = _mm_fmadd_ps(_mm_loadu_ps(w3 + t), _mm_loadu_ps(s3 + t), a3);
+        }
+        _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
+        _mm_storeu_ps(dst + x,
+                      _mm_add_ps(_mm_add_ps(a0, a1), _mm_add_ps(a2, a3)));
+    }
+    for (; x < x1; ++x) {
         const float *wr = w + (size_t)x * (size_t)padded;
         const float *sp = src + (size_t)start[x];
-        int nblk = (count[x] + 7) & ~7;
-        int t;
+        int nblk = (count[x] + 7) & ~7, t;
         __m256 acc = _mm256_setzero_ps();
         for (t = 0; t < nblk; t += 8)
             acc = _mm256_fmadd_ps(_mm256_loadu_ps(wr + t),
