@@ -226,8 +226,12 @@ static void unpremult4_sse2(float *rgba, size_t npix) {
         __m128 a = _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 3, 3, 3));
         __m128 nz = _mm_cmpneq_ps(a, _mm_setzero_ps());
         __m128 inv = _mm_and_ps(_mm_div_ps(one, a), nz);
-        __m128 m = _mm_mul_ps(p, inv);
-        m = _mm_or_ps(_mm_and_ps(m, rgbmask), _mm_andnot_ps(rgbmask, p));
+        __m128 scaled = _mm_mul_ps(p, inv);
+        /* a==0: keep filtered RGB (matches scalar/OIIO), don't zero it */
+        __m128 rgb = _mm_or_ps(_mm_and_ps(nz, scaled),
+                               _mm_andnot_ps(nz, p));
+        __m128 m = _mm_or_ps(_mm_and_ps(rgb, rgbmask),
+                             _mm_andnot_ps(rgbmask, p));
         _mm_storeu_ps(rgba + i * 4, m);
     }
 }

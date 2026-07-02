@@ -398,7 +398,11 @@ tir_result tir_sampler_create(const tir_allocator *a, int src_w, int src_h,
         s->already_premult = (o.alpha == TIR_ALPHA_PREMULTIPLIED);
         s->hicomp_ch = hicomp_ch;
         s->ar_strength = ar_strength;
-        s->clamp_lo = o.hicomp && o.clamp_min < 0.0f ? 0.0f : o.clamp_min;
+        /* highlight compression clamps negatives to 0 after expand -- but only
+     * when it is actually applied (hicomp_ch != 0). Guarding on hicomp_ch
+     * rather than the raw flag avoids clamping legitimately-signed data (e.g.
+     * normal-map X/Y components, where hicomp is disabled). */
+    s->clamp_lo = hicomp_ch && o.clamp_min < 0.0f ? 0.0f : o.clamp_min;
         s->clamp_hi = o.clamp_max;
         s->do_clamp = (s->clamp_lo > -INFINITY) || (s->clamp_hi < INFINITY);
         s->nlen_out = o.normal_length_out;
@@ -451,9 +455,14 @@ tir_result tir__run_range(tir_sampler *s, const void *src,
     tir__reset(s);
     s->cur_dst = y0;
     if (y0 > 0) {
-        int first = (y0 >= s->fy.fast_lo && y0 < s->fy.fast_hi)
-                        ? s->fy.start[y0]
-                        : 0; /* wrap-y band needs everything */
+        /* Fast-forward the push cursor only when the whole band lies inside the
+         * contiguous "fast" range. Any exception output in the band (a WRAP or
+         * REFLECT border) may reference an arbitrary source row -- e.g. a WRAP
+         * bottom output wraps back to row 0 -- so those rows must be pushed;
+         * start from row 0 in that case. (Bands with exceptions already buffer
+         * the whole image, since n_exc>0 forces ring_cap = src_h.) */
+        int band_fast = (y0 >= s->fy.fast_lo && y1 <= s->fy.fast_hi);
+        int first = band_fast ? s->fy.start[y0] : 0;
         if (s->opt.nonfinite == TIR_NONFINITE_REPAIR && first > 0)
             first--; /* one extra row so the repair window is complete */
         s->rows_pushed = first;
