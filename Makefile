@@ -223,11 +223,18 @@ test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/unit/test_e
 	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_v3
 	ASAN_OPTIONS=detect_leaks=0 ./build/test_exr_v3
 
-# ---- tools/texcomp: pure-C11 BC7 texture compression ----------------------
+# ---- tools/texcomp: pure-C11 BC/ETC/ASTC texture compression --------------
+# One translation unit per codec, plus texcomp.c for the shared core
+# (backend dispatch, options, sizes, DDS/KTX/ASTC containers).
 TEXCOMP_INC = -Itools/texcomp/include -Iinclude -Isrc -Iexamples/common
-TEXCOMP_SRC = tools/texcomp/src/texcomp.c
-TEXCOMP_OBJ = build/texcomp/texcomp.o
-TEXCOMP_TEST_OBJ = build/texcomp/test-texcomp.o
+TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
+  tools/texcomp/src/texcomp_bc1.c tools/texcomp/src/texcomp_bc3.c \
+  tools/texcomp/src/texcomp_bc5.c tools/texcomp/src/texcomp_bc6h.c \
+  tools/texcomp/src/texcomp_bc7.c tools/texcomp/src/texcomp_etc2.c \
+  tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c
+TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
+TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
+TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))
 TEXCOMP_OPT ?= -O3
 TEXCOMP_WASM_OPT ?= -O3
 TEXCOMP_WASM_CACHE ?= /tmp/tinyexr-emcc-cache
@@ -245,10 +252,10 @@ build/texcomp:
 build/texcomp/wasm build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE):
 	@mkdir -p $@
 
-build/texcomp/texcomp.o: tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h | build/texcomp
+build/texcomp/%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp
 	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) $(TEXCOMP_OPT) -g -c $< -o $@
 
-build/texcomp/test-texcomp.o: tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h | build/texcomp
+build/texcomp/test-%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) -c $< -o $@
 
 texcomp: lib $(TEXCOMP_OBJ) tools/texcomp/src/texcomp_cli.c | build/texcomp
@@ -257,44 +264,47 @@ texcomp: lib $(TEXCOMP_OBJ) tools/texcomp/src/texcomp_cli.c | build/texcomp
 	  tools/texcomp/src/texcomp_cli.c build/libtexcomp.a build/libtinyexr3.a \
 	  -pthread -lm -o build/texcomp/texcomp
 
-build/texcomp/wasm/texcomp.o: tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h | build/texcomp/wasm $(TEXCOMP_WASM_CACHE)
+TEXCOMP_WASM_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/wasm/%.o,$(TEXCOMP_SRC))
+TEXCOMP_WASM_SIMD_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/wasm-simd/%.o,$(TEXCOMP_SRC))
+
+build/texcomp/wasm/%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp/wasm $(TEXCOMP_WASM_CACHE)
 	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) -c $< -o $@
 
-build/texcomp/wasm-simd/texcomp.o: tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h | build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE)
+build/texcomp/wasm-simd/%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE)
 	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) $(TEXCOMP_WASM_SIMD) -c $< -o $@
 
-build/texcomp/wasm/libtexcomp.a: build/texcomp/wasm/texcomp.o
-	$(EMAR) rcs $@ $<
+build/texcomp/wasm/libtexcomp.a: $(TEXCOMP_WASM_OBJ)
+	$(EMAR) rcs $@ $^
 
-build/texcomp/wasm-simd/libtexcomp.a: build/texcomp/wasm-simd/texcomp.o
-	$(EMAR) rcs $@ $<
+build/texcomp/wasm-simd/libtexcomp.a: $(TEXCOMP_WASM_SIMD_OBJ)
+	$(EMAR) rcs $@ $^
 
-build/texcomp/wasm/texcomp.mjs: build/texcomp/wasm/texcomp.o | $(TEXCOMP_WASM_CACHE)
-	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_OPT) $< \
+build/texcomp/wasm/texcomp.mjs: $(TEXCOMP_WASM_OBJ) | $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_OPT) $(TEXCOMP_WASM_OBJ) \
 	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
 	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
 	  -s "EXPORTED_FUNCTIONS=$(TEXCOMP_WASM_EXPORTS)" \
 	  -s "EXPORTED_RUNTIME_METHODS=$(TEXCOMP_WASM_RUNTIME)" \
 	  -o $@
 
-build/texcomp/wasm-simd/texcomp.mjs: build/texcomp/wasm-simd/texcomp.o | $(TEXCOMP_WASM_CACHE)
-	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_OPT) $(TEXCOMP_WASM_SIMD) $< \
+build/texcomp/wasm-simd/texcomp.mjs: $(TEXCOMP_WASM_SIMD_OBJ) | $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_OPT) $(TEXCOMP_WASM_SIMD) $(TEXCOMP_WASM_SIMD_OBJ) \
 	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
 	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
 	  -s "EXPORTED_FUNCTIONS=$(TEXCOMP_WASM_EXPORTS)" \
 	  -s "EXPORTED_RUNTIME_METHODS=$(TEXCOMP_WASM_RUNTIME)" \
 	  -o $@
 
-build/texcomp/wasm/texcomp_cli.js: tools/texcomp/src/texcomp_cli.c tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h $(TEXCOMP_WASM_EXR_SRC) | build/texcomp/wasm $(TEXCOMP_WASM_CACHE)
+build/texcomp/wasm/texcomp_cli.js: tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_HDRS) $(TEXCOMP_WASM_EXR_SRC) | build/texcomp/wasm $(TEXCOMP_WASM_CACHE)
 	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) $(TEXCOMP_WASM_CLI_WARN) $(V3_INC) \
-	  tools/texcomp/src/texcomp_cli.c tools/texcomp/src/texcomp.c $(TEXCOMP_WASM_EXR_SRC) \
+	  tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_WASM_EXR_SRC) \
 	  -s FORCE_FILESYSTEM=1 -s NODERAWFS=1 -s ALLOW_MEMORY_GROWTH=1 \
 	  -s EXIT_RUNTIME=1 -s ENVIRONMENT=node \
 	  -o $@
 
-build/texcomp/wasm-simd/texcomp_cli.js: tools/texcomp/src/texcomp_cli.c tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h $(TEXCOMP_WASM_EXR_SRC) | build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE)
+build/texcomp/wasm-simd/texcomp_cli.js: tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_HDRS) $(TEXCOMP_WASM_EXR_SRC) | build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE)
 	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) $(TEXCOMP_WASM_CLI_WARN) $(TEXCOMP_WASM_SIMD) $(V3_INC) \
-	  tools/texcomp/src/texcomp_cli.c tools/texcomp/src/texcomp.c $(TEXCOMP_WASM_EXR_SRC) \
+	  tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_WASM_EXR_SRC) \
 	  -s FORCE_FILESYSTEM=1 -s NODERAWFS=1 -s ALLOW_MEMORY_GROWTH=1 \
 	  -s EXIT_RUNTIME=1 -s ENVIRONMENT=node \
 	  -o $@
@@ -310,7 +320,9 @@ wasm-texcomp: texcomp-wasm
 wasm-texcomp-simd: texcomp-wasm-simd
 
 texcomp-c11-gate: | build/texcomp
-	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) -O1 -fsyntax-only tools/texcomp/src/texcomp.c
+	for f in $(TEXCOMP_SRC); do \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
 	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) $(V3_INC) -O1 -fsyntax-only tools/texcomp/src/texcomp_cli.c
 	@echo "texcomp pure-C11 gate: OK"
 
@@ -350,7 +362,7 @@ texcomp-arm: lib $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/src/texcomp_cli
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
 	  -DTEXCOMP_HAVE_ASTCENC -Ideps/astcenc \
 	  -c tools/texcomp/src/texcomp_cli.c -o build/texcomp/texcomp_cli_arm.o
-	$(CXX) build/texcomp/texcomp_cli_arm.o build/texcomp/texcomp.o \
+	$(CXX) build/texcomp/texcomp_cli_arm.o $(TEXCOMP_OBJ) \
 	  build/libtexcomp_astcenc.a build/libtinyexr3.a \
 	  -pthread -lm -o build/texcomp/texcomp-arm
 
