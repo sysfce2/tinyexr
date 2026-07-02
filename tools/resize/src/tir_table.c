@@ -12,6 +12,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include <stdlib.h>
+
 #include "tir_internal.h"
 
 #define TIR_PI 3.14159265358979323846
@@ -260,31 +262,34 @@ tir_result tir__axis_measure(const tir__axis_params *p, tir__axis_dims *out) {
     axis_geom g;
     int i, taps = 1, ar_taps = 1;
     int fast_lo = 0, fast_hi = p->d, seen_fast = 0;
+    double *ws;
     axis_geom_init(p, &g);
     memset(out, 0, sizeof(*out));
     out->win_max = win_bound(&g, p);
     if (out->win_max < 0) return TIR_ERROR_TOO_LARGE;
 
+    /* Classify with the SAME trimmed window that fill will build. An untrimmed
+     * window can be a dense wrap run (fast) yet, once its ~0 end taps are
+     * trimmed, become a sparse period-straddling window (exception) -- and a
+     * measure/fill disagreement corrupts the arena (fill's fast branch would
+     * then run with an unset run_lo/run_hi). window_weights trims exactly as
+     * fill does; the temporary win_max buffer is no larger than the
+     * coefficient scratch tir_sampler_create allocates anyway. */
+    ws = (double *)malloc((size_t)out->win_max * sizeof(double));
+    if (!ws) return TIR_ERROR_OUT_OF_MEMORY;
+
     for (i = 0; i < p->d; ++i) {
-        double center = axis_center(&g, p, i);
-        int lo, hi, n, run_lo, run_hi, fast;
-        /* window extent without weights (measure must not allocate) */
-        if (p->filter == TIR_FILTER_BOX) {
-            lo = (int)ceil(center - g.box_sb - 0.5);
-            hi = (int)floor(center + g.box_sb + 0.5);
-        } else {
-            lo = (int)ceil(center - g.support);
-            hi = (int)floor(center + g.support);
-        }
-        if (hi < lo) hi = lo;
-        if (hi - lo + 1 > out->win_max) hi = lo + out->win_max - 1;
-        n = hi - lo + 1;
+        int lo, n, run_lo, run_hi, fast;
+        n = window_weights(p, &g, i, &lo, ws, out->win_max);
         fast = window_fold(p, lo, n, &run_lo, &run_hi);
         if (fast) {
             int cnt = run_hi - run_lo + 1;
             if (cnt > taps) taps = cnt;
             seen_fast = 1;
-            if (i >= fast_hi) return TIR_ERROR_INVALID_ARGUMENT; /* unreachable */
+            if (i >= fast_hi) { /* fast after a suffix exception: unsupported */
+                free(ws);
+                return TIR_ERROR_INVALID_ARGUMENT;
+            }
         } else {
             if (n > taps) taps = n; /* exceptions share the taps bound */
             if (!seen_fast)
@@ -299,6 +304,7 @@ tir_result tir__axis_measure(const tir__axis_params *p, tir__axis_dims *out) {
             if (acnt > ar_taps) ar_taps = acnt;
         }
     }
+    free(ws);
     if (!seen_fast) fast_hi = fast_lo; /* everything exceptional (tiny wrap) */
     out->taps = taps;
     out->padded = (int)tir__align_up((size_t)taps, TIR_PAD);
