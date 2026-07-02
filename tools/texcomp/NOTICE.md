@@ -1,0 +1,24 @@
+# TinyEXR Texcomp Notices
+
+This directory contains TinyEXR BSD-3-Clause code plus CLI-only use of
+`examples/common/stb_image.h` for PNG loading.
+
+The BC7 API and QuickBC7 option names are designed for a pure-C11 port of the
+QuickBC7-enabled etcpak fork:
+
+- Paper: QuickBC7: Fast BC7 Texture Compression Heuristics, Hyeon-ki Lee and
+  Jae-Ho Nah, Computer & Graphics 2026.
+- Reference source: https://github.com/gusrlLee/etcpak, inspected at commit
+  `b88c8f4`.
+
+The current C11 encoder emits valid BC7 modes 0 through 7 and selects the
+lowest reconstructed-error candidate per block using a scalar endpoint search.
+Quick mode ports the QuickBC7 luma/alpha mode predecision and LUT partition
+prediction for two-subset modes 1 and 7. The upstream least-squares endpoint
+optimizer and SIMD kernels remain future optimization work.
+
+BC5 support is a scalar BC4-pair encoder for unsigned RG data. BC6H support
+currently emits valid unsigned-float and signed-float BC6H using one-region mode
+11 with 4-bit selectors. It evaluates per-channel bounds and luma-axis endpoint
+candidates per block; full multi-mode BC6H rate-distortion search remains
+future work.

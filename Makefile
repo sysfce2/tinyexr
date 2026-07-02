@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke
 
 all: $(TARGET)
 
@@ -221,6 +221,55 @@ test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/unit/test_e
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) \
 	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_v3
 	ASAN_OPTIONS=detect_leaks=0 ./build/test_exr_v3
+
+# ---- tools/texcomp: pure-C11 BC7 texture compression ----------------------
+TEXCOMP_INC = -Itools/texcomp/include -Iinclude -Isrc -Iexamples/common
+TEXCOMP_SRC = tools/texcomp/src/texcomp.c
+TEXCOMP_OBJ = build/texcomp/texcomp.o
+TEXCOMP_TEST_OBJ = build/texcomp/test-texcomp.o
+TEXCOMP_OPT ?= -O3
+
+build/texcomp:
+	@mkdir -p build/texcomp
+
+build/texcomp/texcomp.o: tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h | build/texcomp
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) $(TEXCOMP_OPT) -g -c $< -o $@
+
+build/texcomp/test-texcomp.o: tools/texcomp/src/texcomp.c tools/texcomp/include/texcomp.h | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) -c $< -o $@
+
+texcomp: lib $(TEXCOMP_OBJ) tools/texcomp/src/texcomp_cli.c | build/texcomp
+	$(AR) rcs build/libtexcomp.a $(TEXCOMP_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  tools/texcomp/src/texcomp_cli.c build/libtexcomp.a build/libtinyexr3.a \
+	  $(THREAD_LIBS) -lm -o build/texcomp/texcomp
+
+texcomp-c11-gate: | build/texcomp
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) -O1 -fsyntax-only tools/texcomp/src/texcomp.c
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) $(V3_INC) -O1 -fsyntax-only tools/texcomp/src/texcomp_cli.c
+	@echo "texcomp pure-C11 gate: OK"
+
+texcomp-test: $(TEXCOMP_TEST_OBJ) tools/texcomp/test/test_texcomp.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) \
+	  tools/texcomp/test/test_texcomp.c $(TEXCOMP_TEST_OBJ) -lm -o build/test_texcomp
+	ASAN_OPTIONS=detect_leaks=0 ./build/test_texcomp
+
+texcomp-bench: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_bench.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O3 \
+	  tools/texcomp/bench/texcomp_bench.c $(TEXCOMP_OBJ) -lm -o build/texcomp_bench
+	./build/texcomp_bench
+
+texcomp-astc-psnr: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_psnr.c tools/texcomp/test/astc_ref_decode.h | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -O2 \
+	  tools/texcomp/bench/texcomp_psnr.c $(TEXCOMP_OBJ) -lm -o build/texcomp_psnr
+	./build/texcomp_psnr
+
+ASTCENC ?= /tmp/astc-encoder/build/Source/astcenc-native
+
+texcomp-astc-arm-smoke: texcomp
+	@test -x "$(ASTCENC)" || { echo "set ASTCENC=/path/to/astcenc-native"; exit 77; }
+	./build/texcomp/texcomp -i issue40.exr -o build/texcomp/arm_smoke_6x6.astc --format astc --astc-block 6x6 --quality normal
+	"$(ASTCENC)" -dl build/texcomp/arm_smoke_6x6.astc build/texcomp/arm_smoke_6x6.png -silent
 
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:
@@ -597,6 +646,12 @@ help:
 	@echo "make test-c-tsan - threaded unit tests under ThreadSanitizer"
 	@echo "make c11-gate - strict C11 -Werror compile of all src/*.c"
 	@echo "make bench  - codec/SIMD throughput benchmark (incl. HTJ2K SIMD tiers)"
+	@echo "make texcomp - build tools/texcomp BC7 CLI (build/texcomp/texcomp)"
+	@echo "make texcomp-c11-gate - strict C11 -Werror compile of texcomp"
+	@echo "make texcomp-test - run texcomp unit tests (ASan+UBSan)"
+	@echo "make texcomp-bench - run texcomp BC7 throughput benchmark"
+	@echo "make texcomp-astc-psnr - ASTC encode/reference-decode PSNR table"
+	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
 	@echo "make fuzz   - build libFuzzer target (build/fuzz_v3)"
 	@echo "make fuzz-corpus - replay regression corpus under ASan+UBSan+LSan"
