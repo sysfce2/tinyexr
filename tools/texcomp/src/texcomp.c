@@ -2331,6 +2331,7 @@ typedef struct tc_astc_decim_cache_entry {
     uint8_t block_y;
     uint8_t weight_x;
     uint8_t weight_y;
+    uint8_t direct; /* weight grid == block footprint: one weight per texel */
     uint8_t tw_idx[144][4];
     uint8_t tw_contrib[144][4];
     uint8_t tw_count[144];
@@ -2356,10 +2357,14 @@ typedef struct tc_astc_encode_context {
     int quality;
     tc_astc_candidate_cache_entry candidate_cache[4];
     tc_astc_decim_cache_entry decim_cache[169];
+    /* (weight_y-2)*11 + (weight_x-2) -> decim_cache slot + 1, 0 = unbuilt. */
+    uint8_t decim_index[121];
     tc_astc_partition_info part2_cache[1024];
     tc_astc_partition_info part3_cache[1024];
     tc_astc_partition_info part4_cache[1024];
     uint8_t color_pquant_lut[21][256];
+    /* [value_count][bit_budget] -> color quant method, 0xff = none fits. */
+    uint8_t color_quant_lut[19][112];
     uint32_t decim_cache_count;
     uint32_t part2_count;
     uint32_t part3_count;
@@ -2367,6 +2372,9 @@ typedef struct tc_astc_encode_context {
 } tc_astc_encode_context;
 
 static void tc_astc_build_color_pquant_lut(tc_astc_encode_context *ctx);
+static int tc_astc_choose_color_quant(uint32_t value_count,
+                                      uint32_t bit_budget,
+                                      uint32_t *quant_method);
 static uint32_t tc_astc_color_symbol_uquant(uint32_t quant_method,
                                             uint32_t sym);
 static uint32_t tc_astc_color_roundtrip(const tc_astc_encode_context *ctx,
@@ -2662,6 +2670,16 @@ static void tc_astc_encode_context_init(tc_astc_encode_context *ctx,
     ctx->texel_count = block_x * block_y;
     ctx->quality = quality;
     tc_astc_build_color_pquant_lut(ctx);
+    {
+        uint32_t vc, bits;
+        for (vc = 1; vc < 19u; ++vc) {
+            for (bits = 0; bits < 112u; ++bits) {
+                uint32_t m;
+                if (!tc_astc_choose_color_quant(vc, bits, &m)) m = 0xffu;
+                ctx->color_quant_lut[vc][bits] = (uint8_t)m;
+            }
+        }
+    }
     tc_astc_build_partition_cache(ctx, 2u, ctx->part2_cache, &ctx->part2_count);
     if (quality > 1)
         tc_astc_build_partition_cache(ctx, 3u, ctx->part3_cache, &ctx->part3_count);
@@ -2733,18 +2751,21 @@ static uint32_t tc_astc_texel_weights_2d(uint32_t block_x, uint32_t block_y,
 static const tc_astc_decim_cache_entry *tc_astc_get_decim_cache(
     tc_astc_encode_context *ctx, uint32_t weight_x, uint32_t weight_y) {
     uint32_t i;
-    for (i = 0; i < ctx->decim_cache_count; ++i) {
-        if (ctx->decim_cache[i].weight_x == weight_x &&
-            ctx->decim_cache[i].weight_y == weight_y)
-            return ctx->decim_cache + i;
-    }
+    uint32_t slot = (weight_y - 2u) * 11u + (weight_x - 2u);
+    if (weight_x < 2u || weight_x > 12u || weight_y < 2u || weight_y > 12u)
+        return NULL;
+    if (ctx->decim_index[slot])
+        return ctx->decim_cache + (ctx->decim_index[slot] - 1u);
     if (ctx->decim_cache_count >= 169u) return NULL;
+    ctx->decim_index[slot] = (uint8_t)(ctx->decim_cache_count + 1u);
     {
         tc_astc_decim_cache_entry *entry = ctx->decim_cache + ctx->decim_cache_count;
         entry->block_x = (uint8_t)ctx->block_x;
         entry->block_y = (uint8_t)ctx->block_y;
         entry->weight_x = (uint8_t)weight_x;
         entry->weight_y = (uint8_t)weight_y;
+        entry->direct =
+            (uint8_t)(weight_x == ctx->block_x && weight_y == ctx->block_y);
         for (i = 0; i < ctx->texel_count; ++i) {
             uint32_t x = i % ctx->block_x;
             uint32_t y = i / ctx->block_x;
@@ -2768,26 +2789,12 @@ static uint32_t tc_astc_infilled_weight_table(const uint8_t weights[64],
     return sum >> 4;
 }
 
-static uint64_t tc_astc_try_endpoint_axis(const uint8_t block[144][4],
-                                          uint32_t count, uint32_t axis,
-                                          uint32_t weight_x, uint32_t weight_y,
-                                          uint32_t quant_method,
-                                          const uint8_t tw_idx[144][4],
-                                          const uint8_t tw_contrib[144][4],
-                                          const uint8_t tw_count[144],
-                                          uint32_t best_lo[4],
-                                          uint32_t best_hi[4],
-                                          uint8_t best_weights[64]) {
-    uint8_t weights[64];
-    uint32_t weight_count = weight_x * weight_y;
-    uint32_t lo[4], hi[4];
-    uint32_t i, c, lo_i = 0, hi_i = 0;
+/* Texel indices of the extreme values along an axis (0-3: channel, 4: luma). */
+static void tc_astc_axis_extremes(const uint8_t block[144][4], uint32_t count,
+                                  uint32_t axis, uint32_t *out_lo_i,
+                                  uint32_t *out_hi_i) {
+    uint32_t i, lo_i = 0, hi_i = 0;
     uint32_t lo_key = 0xffffffffu, hi_key = 0u;
-    uint32_t dr, dg, db, da, denom;
-    uint32_t weight_accum[64];
-    uint32_t weight_contrib[64];
-    uint64_t err = 0;
-
     for (i = 0; i < count; ++i) {
         uint32_t key = tc_astc_axis_value(block[i], axis);
         if (key < lo_key) {
@@ -2799,6 +2806,35 @@ static uint64_t tc_astc_try_endpoint_axis(const uint8_t block[144][4],
             hi_i = i;
         }
     }
+    *out_lo_i = lo_i;
+    *out_hi_i = hi_i;
+}
+
+/* Fixed-point reciprocal projection: matches (dot*64 + denom/2) / denom
+ * within one step and has a division-free per-texel form that the SIMD
+ * kernels reproduce bit-exactly. */
+#define TC_ASTC_PROJ_RECIP(denom) \
+    ((uint32_t)(((1ull << 31) + (denom) / 2u) / (denom)))
+
+static uint32_t tc_astc_project_weight(uint32_t dot64, uint32_t recip) {
+    uint32_t w = (uint32_t)(((uint64_t)dot64 * recip + (1u << 30)) >> 31);
+    return w > 64u ? 64u : w;
+}
+
+static uint64_t tc_astc_try_endpoint_axis(const uint8_t block[144][4],
+                                          uint32_t count, uint32_t lo_i,
+                                          uint32_t hi_i, uint32_t quant_method,
+                                          const tc_astc_decim_cache_entry *decim,
+                                          uint32_t weight_count,
+                                          uint32_t best_lo[4],
+                                          uint32_t best_hi[4],
+                                          uint8_t best_weights[64]) {
+    uint8_t weights[64];
+    uint32_t lo[4], hi[4];
+    uint32_t i, c;
+    uint32_t dr, dg, db, da, denom, recip;
+    uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
+    uint64_t err = 0;
 
     for (c = 0; c < 4u; ++c) {
         lo[c] = block[lo_i][c];
@@ -2811,51 +2847,74 @@ static uint64_t tc_astc_try_endpoint_axis(const uint8_t block[144][4],
     da = hi[3] > lo[3] ? hi[3] - lo[3] : lo[3] - hi[3];
     denom = dr * dr + dg * dg + db * db + da * da;
     if (!denom) return UINT64_MAX;
+    recip = TC_ASTC_PROJ_RECIP(denom);
 
-    for (i = 0; i < weight_count; ++i) {
-        weight_accum[i] = 0;
-        weight_contrib[i] = 0;
-    }
-
-    for (i = 0; i < count; ++i) {
-        uint32_t n, j;
-        const uint8_t *p = block[i];
-        int32_t dot = 0;
-        uint32_t ideal;
-        for (c = 0; c < 4u; ++c) {
-            dot += (int32_t)((int32_t)p[c] - (int32_t)lo[c]) *
-                   (int32_t)((int32_t)hi[c] - (int32_t)lo[c]);
+    if (decim->direct) {
+        /* One weight per texel: project, quantize and reconstruct in a
+         * single fused pass with no scatter/normalize step. */
+        for (i = 0; i < count; ++i) {
+            const uint8_t *p = block[i];
+            int32_t dot = 0;
+            uint32_t ideal, q, w;
+            for (c = 0; c < 4u; ++c) {
+                dot += (int32_t)((int32_t)p[c] - (int32_t)lo[c]) *
+                       (int32_t)((int32_t)hi[c] - (int32_t)lo[c]);
+            }
+            ideal = dot <= 0 ? 0u
+                             : tc_astc_project_weight((uint32_t)dot * 64u,
+                                                      recip);
+            q = (ideal * maxq + 32u) / 64u;
+            if (q > maxq) q = maxq;
+            weights[i] = (uint8_t)q;
+            w = tc_astc_weight_unquant(q, quant_method);
+            for (c = 0; c < 4u; ++c) {
+                uint32_t recon = (lo[c] * (64u - w) + hi[c] * w + 32u) >> 6;
+                int32_t d = (int32_t)p[c] - (int32_t)recon;
+                err += (uint64_t)(d * d);
+            }
         }
-        if (dot <= 0) {
-            ideal = 0;
-        } else {
-            uint32_t w = ((uint32_t)dot * 64u + denom / 2u) / denom;
-            ideal = w > 64u ? 64u : w;
+    } else {
+        uint32_t weight_accum[64];
+        uint32_t weight_contrib[64];
+        for (i = 0; i < weight_count; ++i) {
+            weight_accum[i] = 0;
+            weight_contrib[i] = 0;
         }
-        n = tw_count[i];
-        for (j = 0; j < n; ++j) {
-            weight_accum[tw_idx[i][j]] += ideal * tw_contrib[i][j];
-            weight_contrib[tw_idx[i][j]] += tw_contrib[i][j];
+        for (i = 0; i < count; ++i) {
+            uint32_t n, j;
+            const uint8_t *p = block[i];
+            int32_t dot = 0;
+            uint32_t ideal;
+            for (c = 0; c < 4u; ++c) {
+                dot += (int32_t)((int32_t)p[c] - (int32_t)lo[c]) *
+                       (int32_t)((int32_t)hi[c] - (int32_t)lo[c]);
+            }
+            ideal = dot <= 0 ? 0u
+                             : tc_astc_project_weight((uint32_t)dot * 64u,
+                                                      recip);
+            n = decim->tw_count[i];
+            for (j = 0; j < n; ++j) {
+                weight_accum[decim->tw_idx[i][j]] += ideal * decim->tw_contrib[i][j];
+                weight_contrib[decim->tw_idx[i][j]] += decim->tw_contrib[i][j];
+            }
         }
-    }
-
-    for (i = 0; i < weight_count; ++i) {
-        uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
-        uint32_t ideal = weight_contrib[i]
-                             ? (weight_accum[i] + weight_contrib[i] / 2u) /
-                                   weight_contrib[i]
-                             : 0u;
-        uint32_t q = (ideal * maxq + 32u) / 64u;
-        weights[i] = (uint8_t)(q > maxq ? maxq : q);
-    }
-
-    for (i = 0; i < count; ++i) {
-        uint32_t w = tc_astc_infilled_weight_table(weights, tw_idx[i], tw_contrib[i],
-                                                   tw_count[i], quant_method);
-        for (c = 0; c < 4u; ++c) {
-            uint32_t recon = (lo[c] * (64u - w) + hi[c] * w + 32u) >> 6;
-            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
-            err += (uint64_t)(d * d);
+        for (i = 0; i < weight_count; ++i) {
+            uint32_t ideal = weight_contrib[i]
+                                 ? (weight_accum[i] + weight_contrib[i] / 2u) /
+                                       weight_contrib[i]
+                                 : 0u;
+            uint32_t q = (ideal * maxq + 32u) / 64u;
+            weights[i] = (uint8_t)(q > maxq ? maxq : q);
+        }
+        for (i = 0; i < count; ++i) {
+            uint32_t w = tc_astc_infilled_weight_table(
+                weights, decim->tw_idx[i], decim->tw_contrib[i],
+                decim->tw_count[i], quant_method);
+            for (c = 0; c < 4u; ++c) {
+                uint32_t recon = (lo[c] * (64u - w) + hi[c] * w + 32u) >> 6;
+                int32_t d = (int32_t)block[i][c] - (int32_t)recon;
+                err += (uint64_t)(d * d);
+            }
         }
     }
 
@@ -2902,6 +2961,11 @@ static void tc_astc_infill_weights(const uint8_t *weights,
                                    uint32_t count, uint32_t quant_method,
                                    uint8_t wt[144]) {
     uint32_t i;
+    if (decim->direct) {
+        for (i = 0; i < count; ++i)
+            wt[i] = (uint8_t)tc_astc_weight_unquant(weights[i], quant_method);
+        return;
+    }
     for (i = 0; i < count; ++i) {
         wt[i] = (uint8_t)tc_astc_infilled_weight_table(
             weights, decim->tw_idx[i], decim->tw_contrib[i], decim->tw_count[i],
@@ -3213,6 +3277,18 @@ static int tc_astc_choose_color_quant(uint32_t value_count, uint32_t bit_budget,
     return 0;
 }
 
+/* Table-backed variant of tc_astc_choose_color_quant for the hot loops. */
+static int tc_astc_lut_color_quant(const tc_astc_encode_context *ctx,
+                                   uint32_t value_count, uint32_t bit_budget,
+                                   uint32_t *quant_method) {
+    uint8_t m;
+    if (bit_budget > 111u) bit_budget = 111u;
+    m = ctx->color_quant_lut[value_count][bit_budget];
+    if (m == 0xffu) return 0;
+    *quant_method = m;
+    return 1;
+}
+
 static void tc_astc_quantize_color_values(const tc_astc_encode_context *ctx,
                                           uint32_t quant_method,
                                           uint32_t value_count,
@@ -3422,12 +3498,10 @@ static uint64_t tc_astc_try_partition_fit(
     const uint8_t block[144][4], uint32_t count,
     const tc_astc_partition_info *pi, uint32_t partition_count,
     const uint32_t part_lo[4][4], const uint32_t part_hi[4][4],
-    uint32_t quant_method, const uint8_t tw_idx[144][4],
-    const uint8_t tw_contrib[144][4], const uint8_t tw_count[144],
+    uint32_t quant_method, const tc_astc_decim_cache_entry *decim,
     uint32_t weight_count, uint8_t out_weights[64]) {
-    uint32_t denom[4];
-    uint32_t weight_accum[64];
-    uint32_t weight_contrib[64];
+    uint32_t denom[4], recip[4];
+    uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
     uint32_t i, c, p;
     uint64_t err = 0;
 
@@ -3438,48 +3512,76 @@ static uint64_t tc_astc_try_partition_fit(
             d += range * range;
         }
         denom[p] = d;
+        recip[p] = d ? TC_ASTC_PROJ_RECIP(d) : 0u;
     }
-    for (i = 0; i < weight_count; ++i) {
-        weight_accum[i] = 0;
-        weight_contrib[i] = 0;
+    if (decim->direct) {
+        for (i = 0; i < count; ++i) {
+            uint32_t part = pi->partition_of_texel[i];
+            const uint8_t *px = block[i];
+            int32_t dot = 0;
+            uint32_t ideal, q;
+            if (!denom[part]) {
+                out_weights[i] = 0;
+                continue; /* solid partition: reconstruction ignores w */
+            }
+            for (c = 0; c < 4u; ++c) {
+                dot += (int32_t)((int32_t)px[c] - (int32_t)part_lo[part][c]) *
+                       (int32_t)((int32_t)part_hi[part][c] -
+                                 (int32_t)part_lo[part][c]);
+            }
+            ideal = dot <= 0 ? 0u
+                             : tc_astc_project_weight((uint32_t)dot * 64u,
+                                                      recip[part]);
+            q = (ideal * maxq + 32u) / 64u;
+            if (q > maxq) q = maxq;
+            out_weights[i] = (uint8_t)q;
+        }
+    } else {
+        uint32_t weight_accum[64];
+        uint32_t weight_contrib[64];
+        for (i = 0; i < weight_count; ++i) {
+            weight_accum[i] = 0;
+            weight_contrib[i] = 0;
+        }
+        for (i = 0; i < count; ++i) {
+            uint32_t part = pi->partition_of_texel[i];
+            const uint8_t *px = block[i];
+            int32_t dot = 0;
+            uint32_t ideal, n, j;
+            if (!denom[part]) continue; /* solid partition: no constraint */
+            for (c = 0; c < 4u; ++c) {
+                dot += (int32_t)((int32_t)px[c] - (int32_t)part_lo[part][c]) *
+                       (int32_t)((int32_t)part_hi[part][c] -
+                                 (int32_t)part_lo[part][c]);
+            }
+            ideal = dot <= 0 ? 0u
+                             : tc_astc_project_weight((uint32_t)dot * 64u,
+                                                      recip[part]);
+            n = decim->tw_count[i];
+            for (j = 0; j < n; ++j) {
+                weight_accum[decim->tw_idx[i][j]] += ideal * decim->tw_contrib[i][j];
+                weight_contrib[decim->tw_idx[i][j]] += decim->tw_contrib[i][j];
+            }
+        }
+        for (i = 0; i < weight_count; ++i) {
+            uint32_t ideal = weight_contrib[i]
+                                 ? (weight_accum[i] + weight_contrib[i] / 2u) /
+                                       weight_contrib[i]
+                                 : 0u;
+            uint32_t q = (ideal * maxq + 32u) / 64u;
+            out_weights[i] = (uint8_t)(q > maxq ? maxq : q);
+        }
     }
     for (i = 0; i < count; ++i) {
         uint32_t part = pi->partition_of_texel[i];
-        const uint8_t *px = block[i];
-        int32_t dot = 0;
-        uint32_t ideal, n, j;
-        if (!denom[part]) continue; /* solid partition: no constraint */
-        for (c = 0; c < 4u; ++c) {
-            dot += (int32_t)((int32_t)px[c] - (int32_t)part_lo[part][c]) *
-                   (int32_t)((int32_t)part_hi[part][c] -
-                             (int32_t)part_lo[part][c]);
-        }
-        if (dot <= 0) {
-            ideal = 0;
+        uint32_t w;
+        if (decim->direct) {
+            w = tc_astc_weight_unquant(out_weights[i], quant_method);
         } else {
-            uint32_t w = ((uint32_t)dot * 64u + denom[part] / 2u) / denom[part];
-            ideal = w > 64u ? 64u : w;
+            w = tc_astc_infilled_weight_table(out_weights, decim->tw_idx[i],
+                                              decim->tw_contrib[i],
+                                              decim->tw_count[i], quant_method);
         }
-        n = tw_count[i];
-        for (j = 0; j < n; ++j) {
-            weight_accum[tw_idx[i][j]] += ideal * tw_contrib[i][j];
-            weight_contrib[tw_idx[i][j]] += tw_contrib[i][j];
-        }
-    }
-    for (i = 0; i < weight_count; ++i) {
-        uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
-        uint32_t ideal = weight_contrib[i]
-                             ? (weight_accum[i] + weight_contrib[i] / 2u) /
-                                   weight_contrib[i]
-                             : 0u;
-        uint32_t q = (ideal * maxq + 32u) / 64u;
-        out_weights[i] = (uint8_t)(q > maxq ? maxq : q);
-    }
-    for (i = 0; i < count; ++i) {
-        uint32_t part = pi->partition_of_texel[i];
-        uint32_t w = tc_astc_infilled_weight_table(out_weights, tw_idx[i],
-                                                   tw_contrib[i], tw_count[i],
-                                                   quant_method);
         for (c = 0; c < 4u; ++c) {
             uint32_t recon =
                 (part_lo[part][c] * (64u - w) + part_hi[part][c] * w + 32u) >>
@@ -3555,8 +3657,8 @@ static int tc_encode_astc_partition_rgb_block(const uint8_t block[144][4],
         uint32_t color_bits_available = 99u - candidates[ci].weight_bits;
         uint64_t err;
         if (candidates[ci].weight_bits >= 99u ||
-            !tc_astc_choose_color_quant(endpoint_value_count, color_bits_available,
-                                        &cand_color_quant))
+            !tc_astc_lut_color_quant(ctx, endpoint_value_count,
+                                     color_bits_available, &cand_color_quant))
             continue;
         decim = tc_astc_get_decim_cache(ctx, candidates[ci].weight_x,
                                         candidates[ci].weight_y);
@@ -3564,8 +3666,7 @@ static int tc_encode_astc_partition_rgb_block(const uint8_t block[144][4],
         err = tc_astc_try_partition_fit(
             block, count, pi, partition_count,
             (const uint32_t(*)[4])part_lo, (const uint32_t(*)[4])part_hi,
-            candidates[ci].quant_method, decim->tw_idx, decim->tw_contrib,
-            decim->tw_count,
+            candidates[ci].quant_method, decim,
             (uint32_t)candidates[ci].weight_x * candidates[ci].weight_y,
             cand_weights);
         if (err < best_err) {
@@ -3717,6 +3818,7 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
     uint8_t values[8];
     uint32_t cand_count, ci, c, i, bitpos, best = 0xffffffffu;
     uint32_t color_lo[4], color_hi[4], alpha_lo[4], alpha_hi[4];
+    uint32_t luma_lo_i, luma_hi_i, alpha_lo_i, alpha_hi_i;
     uint32_t alpha_min = 255u, alpha_max = 0u;
     int is_rgb_scale = tc_astc_block_is_rgb_scale(block, count);
     uint32_t endpoint_format = is_rgb_scale ? 10u : 12u;
@@ -3733,6 +3835,8 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
     }
     if (alpha_max - alpha_min < 48u) return 0;
 
+    tc_astc_axis_extremes(block, count, 4u, &luma_lo_i, &luma_hi_i);
+    tc_astc_axis_extremes(block, count, 3u, &alpha_lo_i, &alpha_hi_i);
     cand_count = tc_astc_build_dual_block_mode_candidates(
         ctx->block_x, ctx->block_y, 17u, quality, candidates);
     for (ci = 0; ci < cand_count; ++ci) {
@@ -3746,21 +3850,21 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
             (uint32_t)candidates[ci].weight_x * candidates[ci].weight_y;
         if (candidates[ci].weight_bits >= 109u) continue;
         color_bits_available = 109u - candidates[ci].weight_bits;
-        if (!tc_astc_choose_color_quant(endpoint_value_count,
-                                        color_bits_available,
-                                        &cand_color_quant_method))
+        if (!tc_astc_lut_color_quant(ctx, endpoint_value_count,
+                                     color_bits_available,
+                                     &cand_color_quant_method))
             continue;
         decim = tc_astc_get_decim_cache(ctx, candidates[ci].weight_x,
                                         candidates[ci].weight_y);
         if (!decim) continue;
         color_err = tc_astc_try_endpoint_axis(
-            block, count, 4u, candidates[ci].weight_x, candidates[ci].weight_y,
-            candidates[ci].quant_method, decim->tw_idx, decim->tw_contrib,
-            decim->tw_count, cand_color_lo, cand_color_hi, cand_color_weights);
+            block, count, luma_lo_i, luma_hi_i, candidates[ci].quant_method,
+            decim, weight_count, cand_color_lo, cand_color_hi,
+            cand_color_weights);
         alpha_err = tc_astc_try_endpoint_axis(
-            block, count, 3u, candidates[ci].weight_x, candidates[ci].weight_y,
-            candidates[ci].quant_method, decim->tw_idx, decim->tw_contrib,
-            decim->tw_count, cand_alpha_lo, cand_alpha_hi, cand_alpha_weights);
+            block, count, alpha_lo_i, alpha_hi_i, candidates[ci].quant_method,
+            decim, weight_count, cand_alpha_lo, cand_alpha_hi,
+            cand_alpha_weights);
         err = color_err + alpha_err;
         if (err < best_err) {
             best_err = err;
@@ -3958,6 +4062,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
 
     uint8_t path_out[16];
     uint8_t cand_out[16];
+    uint32_t axis_lo_i[5], axis_hi_i[5];
     uint64_t path_err = UINT64_MAX, cand_err;
     int have_path = 0;
 
@@ -3999,6 +4104,9 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
         memcpy(path_out, cand_out, 16u);
         have_path = 1;
     }
+    for (axis = 0; axis < 5u; ++axis)
+        tc_astc_axis_extremes(block, count, axis, &axis_lo_i[axis],
+                              &axis_hi_i[axis]);
     candidate_count = tc_astc_get_candidates(ctx, candidate_endpoint_end_bit, &candidates);
     if (selected_limit > candidate_count) selected_limit = candidate_count;
 
@@ -4012,16 +4120,17 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
         if (quality > 0) {
             uint32_t color_bits_available = 111u - candidates[ci].weight_bits;
             if (candidates[ci].weight_bits >= 111u ||
-                !tc_astc_choose_color_quant(endpoint_value_count,
-                                            color_bits_available,
-                                            &cand_color_quant))
+                !tc_astc_lut_color_quant(ctx, endpoint_value_count,
+                                         color_bits_available,
+                                         &cand_color_quant))
                 continue;
         }
         if (!decim) continue;
         err = tc_astc_try_endpoint_axis(
-            block, count, 4u, candidates[ci].weight_x, candidates[ci].weight_y,
-            candidates[ci].quant_method, decim->tw_idx, decim->tw_contrib,
-            decim->tw_count, cand_lo, cand_hi, cand_weights);
+            block, count, axis_lo_i[4], axis_hi_i[4],
+            candidates[ci].quant_method, decim,
+            (uint32_t)candidates[ci].weight_x * candidates[ci].weight_y,
+            cand_lo, cand_hi, cand_weights);
         if (selected_count < selected_limit) {
             pos = selected_count++;
         } else if (selected_count && err < selected_errors[selected_count - 1u]) {
@@ -4049,9 +4158,9 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
             uint32_t color_bits_available =
                 111u - candidates[candidate_index].weight_bits;
             if (candidates[candidate_index].weight_bits >= 111u ||
-                !tc_astc_choose_color_quant(endpoint_value_count,
-                                            color_bits_available,
-                                            &cand_color_quant_method))
+                !tc_astc_lut_color_quant(ctx, endpoint_value_count,
+                                         color_bits_available,
+                                         &cand_color_quant_method))
                 continue;
         } else {
             cand_color_quant_method = 20u;
@@ -4061,11 +4170,14 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
             uint8_t cand_weights[64];
             uint8_t wt[144];
             uint64_t err;
+            if (axis_lo_i[axis] == axis_lo_i[4] &&
+                axis_hi_i[axis] == axis_hi_i[4] && axis != 4u)
+                continue; /* same endpoint pair as the luma axis */
             (void)tc_astc_try_endpoint_axis(
-                block, count, axis, candidates[candidate_index].weight_x,
-                candidates[candidate_index].weight_y,
-                candidates[candidate_index].quant_method, decim->tw_idx, decim->tw_contrib,
-                decim->tw_count,
+                block, count, axis_lo_i[axis], axis_hi_i[axis],
+                candidates[candidate_index].quant_method, decim,
+                (uint32_t)candidates[candidate_index].weight_x *
+                    candidates[candidate_index].weight_y,
                 cand_lo, cand_hi, cand_weights);
             /* Score with the endpoints as they will actually decode
              * (quantized), and try replacing the axis-extreme endpoints
