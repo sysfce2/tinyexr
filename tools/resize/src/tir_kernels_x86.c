@@ -482,30 +482,59 @@ static void h_dot3_avx2(float *dst, const float *src, const int32_t *start,
     }
 }
 
+/* 4-channel horizontal: one RGBA pixel is a 128-bit vector, so pack two
+ * output pixels into a __m256 (low/high halves) and drive both with 256-bit
+ * FMA. Each tap broadcasts its two coefficients into the matching halves;
+ * the source is a loadu2 of the two pixels' windows. Two accumulators over
+ * tap pairs hide FMA latency. The per-tap coefficient insertf128 only pays
+ * off for narrow windows (up/mild-down); wide downscale windows keep the
+ * single-pixel kernel whose coefficient broadcast is a plain set1. */
 TIR_TGT(TIR_AVX2)
 static void h_dot4_avx2(float *dst, const float *src, const int32_t *start,
                         const int32_t *count, const float *w, int padded,
                         int x0, int x1) {
-    int x;
-    for (x = x0; x < x1; ++x) {
+    int x = x0;
+    (void)count;
+    if (padded <= 8)
+    for (; x + 2 <= x1; x += 2) {
+        const float *w0 = w + (size_t)(x + 0) * (size_t)padded;
+        const float *w1 = w + (size_t)(x + 1) * (size_t)padded;
+        const float *s0 = src + (size_t)start[x + 0] * 4;
+        const float *s1 = src + (size_t)start[x + 1] * 4;
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        int t;
+        for (t = 0; t < padded; t += 2) {
+            __m256 c0 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_set1_ps(w0[t])),
+                _mm_set1_ps(w1[t]), 1);
+            __m256 c1 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_set1_ps(w0[t + 1])),
+                _mm_set1_ps(w1[t + 1]), 1);
+            __m256 v0 = _mm256_loadu2_m128(s1 + (size_t)t * 4,
+                                           s0 + (size_t)t * 4);
+            __m256 v1 = _mm256_loadu2_m128(s1 + (size_t)(t + 1) * 4,
+                                           s0 + (size_t)(t + 1) * 4);
+            acc0 = _mm256_fmadd_ps(c0, v0, acc0);
+            acc1 = _mm256_fmadd_ps(c1, v1, acc1);
+        }
+        acc0 = _mm256_add_ps(acc0, acc1);
+        _mm_storeu_ps(dst + (size_t)(x + 0) * 4,
+                      _mm256_castps256_ps128(acc0));
+        _mm_storeu_ps(dst + (size_t)(x + 1) * 4,
+                      _mm256_extractf128_ps(acc0, 1));
+    }
+    for (; x < x1; ++x) {
         const float *wr = w + (size_t)x * (size_t)padded;
         const float *sp = src + (size_t)start[x] * 4;
-        int nblk = (count[x] + 3) & ~3;
-        int t;
         __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
-        __m128 a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
-        for (t = 0; t < nblk; t += 4) {
+        int t;
+        for (t = 0; t < padded; t += 2) {
             a0 = _mm_fmadd_ps(_mm_loadu_ps(sp + (size_t)t * 4),
                               _mm_set1_ps(wr[t]), a0);
             a1 = _mm_fmadd_ps(_mm_loadu_ps(sp + (size_t)(t + 1) * 4),
                               _mm_set1_ps(wr[t + 1]), a1);
-            a2 = _mm_fmadd_ps(_mm_loadu_ps(sp + (size_t)(t + 2) * 4),
-                              _mm_set1_ps(wr[t + 2]), a2);
-            a3 = _mm_fmadd_ps(_mm_loadu_ps(sp + (size_t)(t + 3) * 4),
-                              _mm_set1_ps(wr[t + 3]), a3);
         }
-        _mm_storeu_ps(dst + (size_t)x * 4,
-                      _mm_add_ps(_mm_add_ps(a0, a1), _mm_add_ps(a2, a3)));
+        _mm_storeu_ps(dst + (size_t)x * 4, _mm_add_ps(a0, a1));
     }
 }
 

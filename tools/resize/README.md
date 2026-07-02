@@ -53,7 +53,8 @@ zero-padded coefficient tables (branchless inner loops), a streaming ring
 buffer of `filter_taps` rows (O(support) memory, one arena allocation), FMA
 kernels with independent accumulator chains (the 1-channel horizontal pass
 batches 4 outputs and reduces them with one 4×4 transpose instead of a
-per-output horizontal sum; weight rows are padded to 4 floats to keep the
+per-output horizontal sum; the 4-channel pass packs two RGBA output pixels
+into a 256-bit register; weight rows are padded to 4 floats to keep the
 coefficient tables cache-compact), and pass-order selection by a
 multiply-count cost model (vertical-first when the geometry favors it).
 
@@ -64,9 +65,9 @@ stb_image_resize2, Mitchell (4 taps, the fairest cross-library filter):
 
 | shape, 4-channel | tir AVX2 | exr_v3 | stb2 |
 |---|---|---|---|
-| 2× up | 275 | 121 | 266 |
-| 2× down | 77 | 30 | 73 |
-| 7.3× down | 7.5 | 2.3 | 6.1 |
+| 2× up | 295 | 135 | 266 |
+| 2× down | 78 | 30 | 73 |
+| 7.3× down | 7.6 | 2.2 | 6.4 |
 
 | shape, 1-channel | tir AVX2 | exr_v3 | stb2 |
 |---|---|---|---|
