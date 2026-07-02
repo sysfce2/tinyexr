@@ -2983,6 +2983,109 @@ static uint64_t tc_astc_eval_single_sse(const tc_astc_encode_context *ctx,
     return err;
 }
 
+/* Multi-partition variant: every texel interpolates its own partition's
+ * endpoint pair with the shared per-texel weights. Endpoints round-trip
+ * through the color quantizer with each partition's CEM semantics.
+ * Returns UINT64_MAX when a CEM 8/12 pair would decode swapped
+ * (blue-contracted), which shared weights cannot compensate. */
+static uint64_t tc_astc_eval_partition_sse(
+    const tc_astc_encode_context *ctx, const uint8_t block[144][4],
+    uint32_t count, const tc_astc_partition_info *pi, uint32_t partition_count,
+    const uint8_t formats[4], const uint32_t part_lo[4][4],
+    const uint32_t part_hi[4][4], uint32_t color_quant_method,
+    const uint8_t wt[144]) {
+    uint32_t e0[4][4], e1[4][4];
+    uint32_t i, c, p;
+    uint64_t err = 0;
+    for (p = 0; p < partition_count; ++p) {
+        if (formats[p] == 6u || formats[p] == 10u) {
+            uint32_t sum_lo = part_lo[p][0] + part_lo[p][1] + part_lo[p][2];
+            uint32_t sum_hi = part_hi[p][0] + part_hi[p][1] + part_hi[p][2];
+            uint32_t scale =
+                sum_hi ? (sum_lo * 256u + sum_hi / 2u) / sum_hi : 0u;
+            if (scale > 255u) scale = 255u;
+            scale = tc_astc_color_roundtrip(ctx, color_quant_method, scale);
+            for (c = 0; c < 3u; ++c) {
+                e1[p][c] = tc_astc_color_roundtrip(ctx, color_quant_method,
+                                                   part_hi[p][c]);
+                e0[p][c] = (e1[p][c] * scale) >> 8;
+            }
+            if (formats[p] == 10u) {
+                e0[p][3] = tc_astc_color_roundtrip(ctx, color_quant_method,
+                                                   part_lo[p][3]);
+                e1[p][3] = tc_astc_color_roundtrip(ctx, color_quant_method,
+                                                   part_hi[p][3]);
+            } else {
+                e0[p][3] = e1[p][3] = 255u;
+            }
+        } else { /* CEM 8 / 12 */
+            uint32_t s0 = 0, s1 = 0;
+            for (c = 0; c < 3u; ++c) {
+                e0[p][c] = tc_astc_color_roundtrip(ctx, color_quant_method,
+                                                   part_lo[p][c]);
+                e1[p][c] = tc_astc_color_roundtrip(ctx, color_quant_method,
+                                                   part_hi[p][c]);
+                s0 += e0[p][c];
+                s1 += e1[p][c];
+            }
+            if (s0 > s1) return UINT64_MAX;
+            if (formats[p] == 12u) {
+                e0[p][3] = tc_astc_color_roundtrip(ctx, color_quant_method,
+                                                   part_lo[p][3]);
+                e1[p][3] = tc_astc_color_roundtrip(ctx, color_quant_method,
+                                                   part_hi[p][3]);
+            } else {
+                e0[p][3] = e1[p][3] = 255u;
+            }
+        }
+    }
+    for (i = 0; i < count; ++i) {
+        uint32_t part = pi->partition_of_texel[i];
+        uint32_t w = wt[i];
+        for (c = 0; c < 4u; ++c) {
+            uint32_t recon =
+                (e0[part][c] * (64u - w) + e1[part][c] * w + 32u) >> 6;
+            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
+            err += (uint64_t)(d * d);
+        }
+    }
+    return err;
+}
+
+/* Per-partition least-squares endpoint solve restricted to one partition's
+ * texels. Returns 0 when degenerate. */
+static int tc_astc_lsq_endpoints_partition(const uint8_t block[144][4],
+                                           uint32_t count,
+                                           const tc_astc_partition_info *pi,
+                                           uint32_t part, const uint8_t wt[144],
+                                           uint32_t lo[4], uint32_t hi[4]) {
+    int64_t saa = 0, sab = 0, sbb = 0, det;
+    int64_t sap[4] = {0, 0, 0, 0}, sbp[4] = {0, 0, 0, 0};
+    uint32_t i, c;
+    for (i = 0; i < count; ++i) {
+        int64_t a, b;
+        if (pi->partition_of_texel[i] != part) continue;
+        a = 64 - wt[i];
+        b = wt[i];
+        saa += a * a;
+        sab += a * b;
+        sbb += b * b;
+        for (c = 0; c < 4u; ++c) {
+            sap[c] += a * block[i][c];
+            sbp[c] += b * block[i][c];
+        }
+    }
+    det = saa * sbb - sab * sab;
+    if (det <= 0) return 0;
+    for (c = 0; c < 4u; ++c) {
+        int64_t l = tc_div_round_s64((sap[c] * sbb - sbp[c] * sab) * 64, det);
+        int64_t h = tc_div_round_s64((sbp[c] * saa - sap[c] * sab) * 64, det);
+        lo[c] = (uint32_t)tc_clamp_i32((int32_t)l, 0, 255);
+        hi[c] = (uint32_t)tc_clamp_i32((int32_t)h, 0, 255);
+    }
+    return 1;
+}
+
 /* Dual-plane variant: RGB follows the color-plane weights, alpha the
  * alpha-plane weights; endpoints round-trip through the color quantizer
  * with CEM 10/12 semantics. */
@@ -3485,82 +3588,50 @@ static int tc_encode_astc_partition_rgb_block(const uint8_t block[144][4],
         }
     }
 
-    endpoint_value_count = tc_astc_emit_partition_endpoint_values(
-        ctx, color_quant_method, partition_count, endpoint_formats, part_lo, part_hi,
-        color_values);
-
-    /* Reconstruction error of the emitted representation: decode the
-     * quantized endpoint symbols the way a conformant decoder does and
-     * evaluate the infilled weights against the source texels. The caller
-     * compares this against the other encoding paths. */
+    /* Refine each partition's endpoints with a least-squares solve against
+     * the shared fitted weights, accepting per partition only when the
+     * quantization-aware reconstruction error improves (formats stay as
+     * classified from the componentwise bounds). */
     {
-        uint32_t uq_e0[4][4], uq_e1[4][4], vi = 0;
-        uint64_t err = 0;
+        uint8_t wt[144];
+        uint64_t err;
         decim = tc_astc_get_decim_cache(ctx, candidates[best].weight_x,
                                         candidates[best].weight_y);
         if (!decim) return 0;
+        tc_astc_infill_weights(weights, decim, count,
+                               candidates[best].quant_method, wt);
+        err = tc_astc_eval_partition_sse(
+            ctx, block, count, pi, partition_count, endpoint_formats,
+            (const uint32_t(*)[4])part_lo, (const uint32_t(*)[4])part_hi,
+            color_quant_method, wt);
         for (i = 0; i < partition_count; ++i) {
-            if (endpoint_formats[i] == 6u || endpoint_formats[i] == 10u) {
-                uint32_t scale;
-                for (c = 0; c < 3u; ++c) {
-                    uq_e1[i][c] = tc_astc_color_symbol_uquant(
-                        color_quant_method, color_values[vi + c]);
-                }
-                scale = tc_astc_color_symbol_uquant(color_quant_method,
-                                                    color_values[vi + 3u]);
-                for (c = 0; c < 3u; ++c)
-                    uq_e0[i][c] = (uq_e1[i][c] * scale) >> 8;
-                if (endpoint_formats[i] == 10u) {
-                    uq_e0[i][3] = tc_astc_color_symbol_uquant(
-                        color_quant_method, color_values[vi + 4u]);
-                    uq_e1[i][3] = tc_astc_color_symbol_uquant(
-                        color_quant_method, color_values[vi + 5u]);
-                    vi += 6u;
-                } else {
-                    uq_e0[i][3] = uq_e1[i][3] = 255u;
-                    vi += 4u;
-                }
-            } else { /* CEM 8 or 12: per-channel (lo,hi) pairs. */
-                uint32_t s0 = 0, s1 = 0;
-                for (c = 0; c < 3u; ++c) {
-                    uq_e0[i][c] = tc_astc_color_symbol_uquant(
-                        color_quant_method, color_values[vi + c * 2u]);
-                    uq_e1[i][c] = tc_astc_color_symbol_uquant(
-                        color_quant_method, color_values[vi + c * 2u + 1u]);
-                    s0 += uq_e0[i][c];
-                    s1 += uq_e1[i][c];
-                }
-                if (endpoint_formats[i] == 12u) {
-                    uq_e0[i][3] = tc_astc_color_symbol_uquant(
-                        color_quant_method, color_values[vi + 6u]);
-                    uq_e1[i][3] = tc_astc_color_symbol_uquant(
-                        color_quant_method, color_values[vi + 7u]);
-                    vi += 8u;
-                } else {
-                    uq_e0[i][3] = uq_e1[i][3] = 255u;
-                    vi += 6u;
-                }
-                /* Componentwise bounds keep the pair sum-ordered; a swapped
-                 * pair would decode blue-contracted, which this path cannot
-                 * compensate with shared weights, so refuse the encoding. */
-                if (s0 > s1) return 0;
+            uint32_t lsq_lo[4], lsq_hi[4], keep_lo[4], keep_hi[4];
+            uint64_t lsq_err;
+            if (!tc_astc_lsq_endpoints_partition(block, count, pi, i, wt,
+                                                 lsq_lo, lsq_hi))
+                continue;
+            memcpy(keep_lo, part_lo[i], sizeof(keep_lo));
+            memcpy(keep_hi, part_hi[i], sizeof(keep_hi));
+            memcpy(part_lo[i], lsq_lo, sizeof(lsq_lo));
+            memcpy(part_hi[i], lsq_hi, sizeof(lsq_hi));
+            lsq_err = tc_astc_eval_partition_sse(
+                ctx, block, count, pi, partition_count, endpoint_formats,
+                (const uint32_t(*)[4])part_lo, (const uint32_t(*)[4])part_hi,
+                color_quant_method, wt);
+            if (lsq_err < err) {
+                err = lsq_err;
+            } else {
+                memcpy(part_lo[i], keep_lo, sizeof(keep_lo));
+                memcpy(part_hi[i], keep_hi, sizeof(keep_hi));
             }
         }
-        for (i = 0; i < count; ++i) {
-            uint32_t part = pi->partition_of_texel[i];
-            uint32_t w = tc_astc_infilled_weight_table(
-                weights, decim->tw_idx[i], decim->tw_contrib[i],
-                decim->tw_count[i], candidates[best].quant_method);
-            for (c = 0; c < 4u; ++c) {
-                uint32_t recon =
-                    (uq_e0[part][c] * (64u - w) + uq_e1[part][c] * w + 32u) >>
-                    6;
-                int32_t d = (int32_t)block[i][c] - (int32_t)recon;
-                err += (uint64_t)(d * d);
-            }
-        }
+        if (err == UINT64_MAX) return 0;
         *out_err = err;
     }
+
+    endpoint_value_count = tc_astc_emit_partition_endpoint_values(
+        ctx, color_quant_method, partition_count, endpoint_formats, part_lo, part_hi,
+        color_values);
 
     memset(out, 0, 16u);
     memset(weightbuf, 0, sizeof(weightbuf));
