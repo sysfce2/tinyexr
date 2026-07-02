@@ -2897,24 +2897,19 @@ static const tc_astc_decim_cache_entry *tc_astc_get_decim_cache(
         for (i = 0; i < ctx->texel_count; ++i) {
             uint32_t x = i % ctx->block_x;
             uint32_t y = i / ctx->block_x;
-            entry->tw_count[i] = (uint8_t)tc_astc_texel_weights_2d(
+            uint32_t n = tc_astc_texel_weights_2d(
                 ctx->block_x, ctx->block_y, weight_x, weight_y, x, y,
                 entry->tw_idx[i], entry->tw_contrib[i]);
+            entry->tw_count[i] = (uint8_t)n;
+            /* Pad to four taps so the infill loop is branch-free. */
+            for (; n < 4u; ++n) {
+                entry->tw_idx[i][n] = entry->tw_idx[i][0];
+                entry->tw_contrib[i][n] = 0;
+            }
         }
         ++ctx->decim_cache_count;
         return entry;
     }
-}
-
-static uint32_t tc_astc_infilled_weight_table(const uint8_t weights[64],
-                                              const uint8_t idx[4],
-                                              const uint8_t contrib[4],
-                                              uint32_t n,
-                                              uint32_t quant_method) {
-    uint32_t i, sum = 8u;
-    for (i = 0; i < n; ++i)
-        sum += tc_astc_weight_unquant(weights[idx[i]], quant_method) * contrib[i];
-    return sum >> 4;
 }
 
 /* Texel indices of the extreme values along an axis (0-3: channel, 4: luma). */
@@ -3450,16 +3445,24 @@ static void tc_astc_infill_weights(const uint8_t *weights,
                                    const tc_astc_decim_cache_entry *decim,
                                    uint32_t count, uint32_t quant_method,
                                    uint8_t wt[144]) {
-    uint32_t i;
+    uint8_t grid[64];
+    uint32_t i, n;
     if (decim->direct) {
         for (i = 0; i < count; ++i)
             wt[i] = (uint8_t)tc_astc_weight_unquant(weights[i], quant_method);
         return;
     }
+    /* Unquantize the (small) weight grid once, then the per-texel infill
+     * is four unconditional multiply-adds over bytes. */
+    n = (uint32_t)decim->weight_x * decim->weight_y;
+    for (i = 0; i < n; ++i)
+        grid[i] = (uint8_t)tc_astc_weight_unquant(weights[i], quant_method);
     for (i = 0; i < count; ++i) {
-        wt[i] = (uint8_t)tc_astc_infilled_weight_table(
-            weights, decim->tw_idx[i], decim->tw_contrib[i], decim->tw_count[i],
-            quant_method);
+        const uint8_t *idx = decim->tw_idx[i];
+        const uint8_t *cb = decim->tw_contrib[i];
+        uint32_t sum = 8u + grid[idx[0]] * cb[0] + grid[idx[1]] * cb[1] +
+                       grid[idx[2]] * cb[2] + grid[idx[3]] * cb[3];
+        wt[i] = (uint8_t)(sum >> 4);
     }
 }
 
