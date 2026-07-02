@@ -2479,24 +2479,51 @@ static int tc_astc_decode_block_mode_2d(uint32_t block_mode,
     return 1;
 }
 
-/* Ranks candidates so the ones that use the weight bit budget best come
- * first. The score mixes budget utilization (weight_bits) with grid
- * resolution (weight_count), since fine 1-bit grids and coarse high-quant
- * grids serve different content. The reduced-effort quality levels only
- * scan a prefix of this ordering. */
-static uint32_t tc_astc_candidate_rank(const tc_astc_block_mode_info *info) {
-    return (uint32_t)info->weight_bits +
-           (uint32_t)info->weight_x * info->weight_y;
+#include "texcomp_astc_percentiles.inc"
+
+static int tc_astc_footprint_index(uint32_t block_x, uint32_t block_y) {
+    static const uint8_t dims[14][2] = {{4, 4},  {5, 4},  {5, 5},  {6, 5},
+                                        {6, 6},  {8, 5},  {8, 6},  {8, 8},
+                                        {10, 5}, {10, 6}, {10, 8}, {10, 10},
+                                        {12, 10}, {12, 12}};
+    int i;
+    for (i = 0; i < 14; ++i) {
+        if (dims[i][0] == block_x && dims[i][1] == block_y) return i;
+    }
+    return -1;
+}
+
+/* Ranks candidates by real-world usage: primary key is the astcenc
+ * block-mode usage percentile for this footprint (lower = used more by
+ * actual best encodings), tie-broken by budget utilization x grid
+ * resolution. The reduced-effort quality levels only scan a prefix of
+ * this ordering. */
+static uint64_t tc_astc_candidate_rank(const tc_astc_block_mode_info *info,
+                                       int fp, uint32_t dual) {
+    uint32_t perc = 65535u;
+    uint32_t merit = (uint32_t)info->weight_bits +
+                     (uint32_t)info->weight_x * info->weight_y;
+    if (fp >= 0) {
+        perc = tc_astc_mode_percentile[fp][dual][info->weight_y - 2u]
+                                      [info->weight_x - 2u][info->quant_method];
+    }
+    /* Lower percentile first; higher merit first within a tie. */
+    return ((uint64_t)perc << 16) | (0xffffu - merit);
 }
 
 static void tc_astc_rank_block_mode_candidates(tc_astc_block_mode_info *out,
-                                               uint32_t count) {
+                                               uint32_t count,
+                                               uint32_t block_x,
+                                               uint32_t block_y,
+                                               uint32_t dual) {
+    int fp = tc_astc_footprint_index(block_x, block_y);
     uint32_t i, j;
     for (i = 1; i < count; ++i) {
         tc_astc_block_mode_info key = out[i];
-        uint32_t key_rank = tc_astc_candidate_rank(&key);
+        uint64_t key_rank = tc_astc_candidate_rank(&key, fp, dual);
         j = i;
-        while (j > 0u && tc_astc_candidate_rank(&out[j - 1u]) < key_rank) {
+        while (j > 0u &&
+               tc_astc_candidate_rank(&out[j - 1u], fp, dual) > key_rank) {
             out[j] = out[j - 1u];
             --j;
         }
@@ -2524,7 +2551,7 @@ static uint32_t tc_astc_build_block_mode_candidates(uint32_t block_x,
         seen[info.weight_y][info.weight_x][info.quant_method] = 1u;
         out[count++] = info;
     }
-    tc_astc_rank_block_mode_candidates(out, count);
+    tc_astc_rank_block_mode_candidates(out, count, block_x, block_y, 0u);
     return count;
 }
 
@@ -2546,7 +2573,7 @@ static uint32_t tc_astc_build_dual_block_mode_candidates(
         seen[info.weight_y][info.weight_x][info.quant_method] = 1u;
         out[count++] = info;
     }
-    tc_astc_rank_block_mode_candidates(out, count);
+    tc_astc_rank_block_mode_candidates(out, count, block_x, block_y, 1u);
     return count;
 }
 
@@ -4698,7 +4725,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     candidate_count = tc_astc_get_candidates(ctx, candidate_endpoint_end_bit, &candidates);
     /* Reduced-effort levels only fit the top-ranked viable candidates
      * (candidates whose color budget cannot fit do not use up the cap). */
-    scan_cap = quality > 1 ? candidate_count : (quality > 0 ? 32u : 12u);
+    scan_cap = quality > 1 ? candidate_count : (quality > 0 ? 20u : 8u);
     if (selected_limit > candidate_count) selected_limit = candidate_count;
 
     if (axis_valid[4]) {
