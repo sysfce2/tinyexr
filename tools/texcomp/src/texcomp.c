@@ -2373,6 +2373,8 @@ typedef struct tc_astc_encode_context {
      * quant method. Collapses the quantize+unquant chain in the fit loops. */
     uint8_t wq_q[12][65];
     uint8_t wq_wt[12][65];
+    tc_astc_block_mode_info dual_candidates[2048];
+    uint32_t dual_count;
     uint32_t decim_cache_count;
     uint32_t part2_count;
     uint32_t part3_count;
@@ -2380,6 +2382,14 @@ typedef struct tc_astc_encode_context {
 } tc_astc_encode_context;
 
 static void tc_astc_build_color_pquant_lut(tc_astc_encode_context *ctx);
+static uint32_t tc_astc_get_candidates(
+    tc_astc_encode_context *ctx, uint32_t endpoint_end_bit,
+    const tc_astc_block_mode_info **out_candidates);
+static const tc_astc_decim_cache_entry *tc_astc_get_decim_cache(
+    tc_astc_encode_context *ctx, uint32_t weight_x, uint32_t weight_y);
+static uint32_t tc_astc_build_dual_block_mode_candidates(
+    uint32_t block_x, uint32_t block_y, uint32_t endpoint_end_bit, int quality,
+    tc_astc_block_mode_info out[2048]);
 static int tc_astc_choose_color_quant(uint32_t value_count,
                                       uint32_t bit_budget,
                                       uint32_t *quant_method);
@@ -2816,6 +2826,31 @@ static void tc_astc_encode_context_init(tc_astc_encode_context *ctx,
         tc_astc_build_partition_cache(ctx, 3u, ctx->part3_cache, &ctx->part3_count);
     if (quality > 1)
         tc_astc_build_partition_cache(ctx, 4u, ctx->part4_cache, &ctx->part4_count);
+    /* Build every lazily-fillable cache eagerly so the context is strictly
+     * read-only during encoding and can be shared across encode threads:
+     * all decimation grids this footprint can use, the single-plane
+     * candidate lists for every endpoint-end-bit key the quality level
+     * requests, and the dual-plane candidate list. */
+    {
+        uint32_t wx, wy;
+        const tc_astc_block_mode_info *cl;
+        for (wy = 2; wy <= block_y && wy <= 12u; ++wy) {
+            for (wx = 2; wx <= block_x && wx <= 12u; ++wx) {
+                if (wx * wy > 64u) continue;
+                (void)tc_astc_get_decim_cache(ctx, wx, wy);
+            }
+        }
+        if (quality > 0) {
+            (void)tc_astc_get_candidates(ctx, 17u, &cl);
+        } else {
+            (void)tc_astc_get_candidates(ctx, 33u, &cl); /* luminance */
+            (void)tc_astc_get_candidates(ctx, 49u, &cl); /* lum+a / scale */
+            (void)tc_astc_get_candidates(ctx, 65u, &cl); /* rgb / scale+a */
+            (void)tc_astc_get_candidates(ctx, 81u, &cl); /* rgba */
+        }
+        ctx->dual_count = tc_astc_build_dual_block_mode_candidates(
+            block_x, block_y, 17u, quality, ctx->dual_candidates);
+    }
 }
 
 static uint32_t tc_astc_get_candidates(
@@ -4590,7 +4625,7 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
                                           tc_astc_encode_context *ctx,
                                           uint8_t out[16],
                                           uint64_t *out_err) {
-    tc_astc_block_mode_info candidates[2048];
+    const tc_astc_block_mode_info *candidates;
     const tc_astc_decim_cache_entry *decim;
     uint8_t weightbuf[16], weights[128], color_weights[64], alpha_weights[64];
     uint8_t values[8];
@@ -4629,8 +4664,8 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
                           color_recip, color_ideal);
     tc_astc_project_ideal(block, count, line_alpha_lo, line_alpha_hi,
                           alpha_recip, alpha_ideal);
-    cand_count = tc_astc_build_dual_block_mode_candidates(
-        ctx->block_x, ctx->block_y, 17u, quality, candidates);
+    candidates = ctx->dual_candidates;
+    cand_count = ctx->dual_count;
     scan_cap = cand_count; /* dual candidates are few; no cap needed */
     for (ci = 0; ci < cand_count && scanned < scan_cap; ++ci) {
         uint64_t color_err, alpha_err, err;
@@ -5289,21 +5324,17 @@ static void tc_encode_astc_const_block(const uint8_t block[144][4],
 /* Encodes block rows [brow_begin, brow_end) with a private context; output
  * ranges of distinct bands are disjoint, so bands run in parallel without
  * synchronization and produce output byte-identical to the serial order. */
-static tc_result tc_astc_compress_band(const uint8_t *rgba, uint32_t width,
+static tc_result tc_astc_compress_band(tc_astc_encode_context *astc_ctx,
+                                       const uint8_t *rgba, uint32_t width,
                                        uint32_t height, size_t stride,
                                        const tc_astc_options *opt,
                                        uint8_t *out_astc, uint32_t brow_begin,
                                        uint32_t brow_end) {
-    tc_astc_encode_context *astc_ctx;
     uint8_t block[144][4];
     uint32_t bx, by, xx, yy, x, y, brow;
     uint32_t blocks_x = (width + opt->block_x - 1u) / opt->block_x;
     size_t off = (size_t)brow_begin * blocks_x * 16u;
 
-    astc_ctx = (tc_astc_encode_context *)malloc(sizeof(*astc_ctx));
-    if (!astc_ctx) return TC_ERROR_OUT_OF_MEMORY;
-    tc_astc_encode_context_init(astc_ctx, opt->block_x, opt->block_y,
-                                opt->quality);
     for (brow = brow_begin; brow < brow_end; ++brow) {
         by = brow * opt->block_y;
         for (bx = 0; bx < width; bx += opt->block_x) {
@@ -5329,7 +5360,6 @@ static tc_result tc_astc_compress_band(const uint8_t *rgba, uint32_t width,
             off += 16u;
         }
     }
-    free(astc_ctx);
     return TC_SUCCESS;
 }
 
@@ -5338,6 +5368,7 @@ static tc_result tc_astc_compress_band(const uint8_t *rgba, uint32_t width,
 #define TC_ASTC_HAVE_THREADS 1
 
 typedef struct tc_astc_thread_job {
+    tc_astc_encode_context *ctx; /* shared; strictly read-only here */
     const uint8_t *rgba;
     uint32_t width, height;
     size_t stride;
@@ -5349,9 +5380,10 @@ typedef struct tc_astc_thread_job {
 
 static int tc_astc_thread_worker(void *arg) {
     tc_astc_thread_job *job = (tc_astc_thread_job *)arg;
-    job->result = tc_astc_compress_band(job->rgba, job->width, job->height,
-                                        job->stride, job->opt, job->out_astc,
-                                        job->brow_begin, job->brow_end);
+    job->result = tc_astc_compress_band(job->ctx, job->rgba, job->width,
+                                        job->height, job->stride, job->opt,
+                                        job->out_astc, job->brow_begin,
+                                        job->brow_end);
     return 0;
 }
 #endif
@@ -5380,6 +5412,16 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
     if (nthreads > blocks_y) nthreads = blocks_y;
     if (nthreads > 64u) nthreads = 64u;
 
+    /* One context, built once; encoding only reads it, so every band
+     * shares it (all lazy caches are filled eagerly at init). */
+    {
+        tc_astc_encode_context *astc_ctx =
+            (tc_astc_encode_context *)malloc(sizeof(*astc_ctx));
+        tc_result tr_all;
+        if (!astc_ctx) return TC_ERROR_OUT_OF_MEMORY;
+        tc_astc_encode_context_init(astc_ctx, opt->block_x, opt->block_y,
+                                    opt->quality);
+
 #if defined(TC_ASTC_HAVE_THREADS)
     if (nthreads > 1u) {
         tc_astc_thread_job jobs[64];
@@ -5390,6 +5432,7 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
         tc_result tr = TC_SUCCESS;
         for (t = 0; t < nthreads; ++t) {
             uint32_t rows = base + (t < rem ? 1u : 0u);
+            jobs[t].ctx = astc_ctx;
             jobs[t].rgba = rgba;
             jobs[t].width = width;
             jobs[t].height = height;
@@ -5418,11 +5461,15 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
         for (t = 0; t < nthreads; ++t) {
             if (jobs[t].result != TC_SUCCESS) tr = jobs[t].result;
         }
+        free(astc_ctx);
         return tr;
     }
 #endif
-    return tc_astc_compress_band(rgba, width, height, stride, opt, out_astc,
-                                 0u, blocks_y);
+        tr_all = tc_astc_compress_band(astc_ctx, rgba, width, height, stride,
+                                       opt, out_astc, 0u, blocks_y);
+        free(astc_ctx);
+        return tr_all;
+    }
 }
 
 size_t tc_dds_bc7_size(uint32_t width, uint32_t height) {
