@@ -38,6 +38,14 @@ typedef struct tc_bc7_options {
     uint32_t mode_mask; /* bit N enables BC7 mode N; 0 means all modes */
 } tc_bc7_options;
 
+typedef struct tc_bc1_options {
+    int srgb; /* mark the DDS container as sRGB (BC1_UNORM_SRGB) */
+} tc_bc1_options;
+
+typedef struct tc_bc3_options {
+    int srgb; /* mark the DDS container as sRGB (BC3_UNORM_SRGB) */
+} tc_bc3_options;
+
 typedef struct tc_bc5_options {
     int snorm;
 } tc_bc5_options;
@@ -79,12 +87,16 @@ const char *tc_backend_name(void);
 uint32_t tc_backend_available_mask(void);
 void tc_backend_force_mask(uint32_t mask);
 void tc_bc7_options_init(tc_bc7_options *opt);
+void tc_bc1_options_init(tc_bc1_options *opt);
+void tc_bc3_options_init(tc_bc3_options *opt);
 void tc_bc5_options_init(tc_bc5_options *opt);
 void tc_bc6h_options_init(tc_bc6h_options *opt);
 void tc_etc2_options_init(tc_etc2_options *opt);
 void tc_astc_options_init(tc_astc_options *opt);
 
 size_t tc_bc7_compressed_size(uint32_t width, uint32_t height);
+size_t tc_bc1_compressed_size(uint32_t width, uint32_t height);
+size_t tc_bc3_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc5_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc6h_compressed_size(uint32_t width, uint32_t height);
 size_t tc_etc2_rgb_compressed_size(uint32_t width, uint32_t height);
@@ -102,6 +114,14 @@ tc_result tc_astc_ise_encode_bits(unsigned int quant_level, unsigned int value_c
 tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride,
                                 const tc_bc7_options *opt, uint8_t *out_bc7,
+                                size_t out_size);
+tc_result tc_bc1_compress_rgba8(const uint8_t *rgba, uint32_t width,
+                                uint32_t height, size_t stride,
+                                const tc_bc1_options *opt, uint8_t *out_bc1,
+                                size_t out_size);
+tc_result tc_bc3_compress_rgba8(const uint8_t *rgba, uint32_t width,
+                                uint32_t height, size_t stride,
+                                const tc_bc3_options *opt, uint8_t *out_bc3,
                                 size_t out_size);
 tc_result tc_bc5_compress_rg8(const uint8_t *rg, uint32_t width,
                               uint32_t height, size_t stride,
@@ -128,6 +148,8 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                  uint8_t *out_astc, size_t out_size);
 
 size_t tc_dds_bc7_size(uint32_t width, uint32_t height);
+size_t tc_dds_bc1_size(uint32_t width, uint32_t height);
+size_t tc_dds_bc3_size(uint32_t width, uint32_t height);
 size_t tc_dds_bc5_size(uint32_t width, uint32_t height);
 size_t tc_dds_bc6h_size(uint32_t width, uint32_t height);
 size_t tc_ktx_etc2_size(uint32_t width, uint32_t height,
@@ -136,6 +158,12 @@ size_t tc_astc_file_size(uint32_t width, uint32_t height,
                          const tc_astc_options *opt);
 tc_result tc_dds_write_bc7_memory(const uint8_t *bc7, uint32_t width,
                                   uint32_t height, const tc_bc7_options *opt,
+                                  uint8_t *out_dds, size_t out_size);
+tc_result tc_dds_write_bc1_memory(const uint8_t *bc1, uint32_t width,
+                                  uint32_t height, const tc_bc1_options *opt,
+                                  uint8_t *out_dds, size_t out_size);
+tc_result tc_dds_write_bc3_memory(const uint8_t *bc3, uint32_t width,
+                                  uint32_t height, const tc_bc3_options *opt,
                                   uint8_t *out_dds, size_t out_size);
 tc_result tc_dds_write_bc5_memory(const uint8_t *bc5, uint32_t width,
                                   uint32_t height, const tc_bc5_options *opt,

@@ -304,7 +304,7 @@ static tc_result write_file(const char *path, const void *data, size_t size) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: texcomp -i in.{png,exr} -o out [--format bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc] "
+            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
             "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
             "[--quick on|off] [--mode-mask HEX] "
@@ -332,6 +332,8 @@ int main(int argc, char **argv) {
     uint32_t w = 0, h = 0;
     size_t compressed_size, container_size;
     tc_bc7_options bc7_opt;
+    tc_bc1_options bc1_opt;
+    tc_bc3_options bc3_opt;
     tc_bc5_options bc5_opt;
     tc_bc6h_options bc6h_opt;
     tc_etc2_options etc2_opt;
@@ -341,6 +343,8 @@ int main(int argc, char **argv) {
     int i;
 
     tc_bc7_options_init(&bc7_opt);
+    tc_bc1_options_init(&bc1_opt);
+    tc_bc3_options_init(&bc3_opt);
     tc_bc5_options_init(&bc5_opt);
     tc_bc6h_options_init(&bc6h_opt);
     tc_etc2_options_init(&etc2_opt);
@@ -355,6 +359,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--part") == 0 && i + 1 < argc) part = atoi(argv[++i]);
         else if (strcmp(argv[i], "--srgb") == 0) {
             bc7_opt.srgb = 1;
+            bc1_opt.srgb = 1;
+            bc3_opt.srgb = 1;
             etc2_opt.srgb = 1;
             astc_opt.srgb = 1;
         }
@@ -411,6 +417,8 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(format, "bc6") == 0) format = "bc6h";
+    if (strcmp(format, "dxt1") == 0) format = "bc1";
+    if (strcmp(format, "dxt5") == 0) format = "bc3";
     if (strcmp(format, "etc2") == 0 || strcmp(format, "etc2_rgba") == 0) {
         etc2_opt.alpha = 1;
         format = "etc2_rgba";
@@ -436,6 +444,12 @@ int main(int argc, char **argv) {
     if (strcmp(format, "bc7") == 0) {
         compressed_size = tc_bc7_compressed_size(w, h);
         container_size = tc_dds_bc7_size(w, h);
+    } else if (strcmp(format, "bc1") == 0) {
+        compressed_size = tc_bc1_compressed_size(w, h);
+        container_size = tc_dds_bc1_size(w, h);
+    } else if (strcmp(format, "bc3") == 0) {
+        compressed_size = tc_bc3_compressed_size(w, h);
+        container_size = tc_dds_bc3_size(w, h);
     } else if (strcmp(format, "bc5") == 0) {
         compressed_size = tc_bc5_compressed_size(w, h);
         container_size = tc_dds_bc5_size(w, h);
@@ -483,6 +497,18 @@ int main(int argc, char **argv) {
                                    compressed, compressed_size);
         if (tr == TC_SUCCESS)
             tr = tc_dds_write_bc7_memory(compressed, w, h, &bc7_opt, container,
+                                         container_size);
+    } else if (strcmp(format, "bc1") == 0) {
+        tr = tc_bc1_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc1_opt,
+                                   compressed, compressed_size);
+        if (tr == TC_SUCCESS)
+            tr = tc_dds_write_bc1_memory(compressed, w, h, &bc1_opt, container,
+                                         container_size);
+    } else if (strcmp(format, "bc3") == 0) {
+        tr = tc_bc3_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc3_opt,
+                                   compressed, compressed_size);
+        if (tr == TC_SUCCESS)
+            tr = tc_dds_write_bc3_memory(compressed, w, h, &bc3_opt, container,
                                          container_size);
     } else if (strcmp(format, "bc5") == 0) {
         tr = tc_bc5_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc5_opt,

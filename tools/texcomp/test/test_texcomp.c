@@ -39,6 +39,54 @@ static uint32_t rd_bits(const uint8_t *p, uint32_t bitpos, uint32_t nbits) {
     return v;
 }
 
+/* Reference decode of a DXT1/BC1 colour block into 16 RGB triples. Handles
+ * both the 4-colour (c0 > c1) and 3-colour (c0 <= c1) modes. */
+static void bc1_decode(const uint8_t in[8], uint8_t out[16][3]) {
+    uint32_t c0 = (uint32_t)in[0] | ((uint32_t)in[1] << 8);
+    uint32_t c1 = (uint32_t)in[2] | ((uint32_t)in[3] << 8);
+    int p[4][3], i, k;
+    int r0 = (int)((c0 >> 11) & 0x1f), g0 = (int)((c0 >> 5) & 0x3f),
+        b0 = (int)(c0 & 0x1f);
+    int r1 = (int)((c1 >> 11) & 0x1f), g1 = (int)((c1 >> 5) & 0x3f),
+        b1 = (int)(c1 & 0x1f);
+    p[0][0] = (r0 << 3) | (r0 >> 2);
+    p[0][1] = (g0 << 2) | (g0 >> 4);
+    p[0][2] = (b0 << 3) | (b0 >> 2);
+    p[1][0] = (r1 << 3) | (r1 >> 2);
+    p[1][1] = (g1 << 2) | (g1 >> 4);
+    p[1][2] = (b1 << 3) | (b1 >> 2);
+    for (k = 0; k < 3; ++k) {
+        if (c0 > c1) {
+            p[2][k] = (2 * p[0][k] + p[1][k] + 1) / 3;
+            p[3][k] = (p[0][k] + 2 * p[1][k] + 1) / 3;
+        } else {
+            p[2][k] = (p[0][k] + p[1][k]) / 2;
+            p[3][k] = 0; /* punch-through */
+        }
+    }
+    for (i = 0; i < 16; ++i) {
+        int idx = (in[4 + (i >> 2)] >> ((i & 3) * 2)) & 3;
+        for (k = 0; k < 3; ++k) out[i][k] = (uint8_t)p[idx][k];
+    }
+}
+
+/* Reference decode of a BC4/DXT5 alpha block into 16 alpha samples. */
+static void bc4_decode(const uint8_t in[8], uint8_t out[16]) {
+    int a0 = in[0], a1 = in[1], pal[8], i;
+    uint64_t bits = 0;
+    pal[0] = a0;
+    pal[1] = a1;
+    if (a0 > a1) {
+        for (i = 1; i <= 6; ++i) pal[i + 1] = ((7 - i) * a0 + i * a1 + 3) / 7;
+    } else {
+        for (i = 1; i <= 4; ++i) pal[i + 1] = ((5 - i) * a0 + i * a1 + 2) / 5;
+        pal[6] = 0;
+        pal[7] = 255;
+    }
+    for (i = 0; i < 6; ++i) bits |= (uint64_t)in[2 + i] << (8 * i);
+    for (i = 0; i < 16; ++i) out[i] = (uint8_t)pal[(bits >> (3 * i)) & 7u];
+}
+
 static int astc_test_decode_mode_2d(uint32_t mode, uint32_t *wx, uint32_t *wy,
                                     uint32_t *quant, uint32_t *dual) {
     uint32_t base_quant = (mode >> 4) & 1u;
@@ -488,12 +536,15 @@ int main(void) {
     uint8_t part_rgba[4 * 4 * 4];
     uint8_t astc_rgba[12 * 12 * 4];
     uint8_t bc7[64], bc5[64], bc6h[64];
+    uint8_t bc1[64], bc3[64];
     uint8_t etc2[64], eac[64], astc[64];
     uint8_t dds[148 + 64];
     uint8_t ktx[68 + 64], astc_file[16 + 64];
     float rgbf[7 * 5 * 3];
     float rgbf_block[16 * 3];
     tc_bc7_options opt;
+    tc_bc1_options bc1_opt;
+    tc_bc3_options bc3_opt;
     tc_bc5_options bc5_opt;
     tc_bc6h_options bc6h_opt;
     tc_etc2_options etc2_opt;
@@ -505,6 +556,8 @@ int main(void) {
     size_t i, j;
 
     tc_bc7_options_init(&opt);
+    tc_bc1_options_init(&bc1_opt);
+    tc_bc3_options_init(&bc3_opt);
     tc_bc5_options_init(&bc5_opt);
     tc_bc6h_options_init(&bc6h_opt);
     tc_etc2_options_init(&etc2_opt);
@@ -514,6 +567,8 @@ int main(void) {
     astc4_opt.block_y = 4;
     CHECK(tc_bc7_compressed_size(4, 4) == 16, "4x4 size");
     CHECK(tc_bc7_compressed_size(7, 5) == 64, "padded size");
+    CHECK(tc_bc1_compressed_size(7, 5) == 32, "bc1 padded size");
+    CHECK(tc_bc3_compressed_size(7, 5) == 64, "bc3 padded size");
     CHECK(tc_bc5_compressed_size(7, 5) == 64, "bc5 padded size");
     CHECK(tc_bc6h_compressed_size(7, 5) == 64, "bc6h padded size");
     CHECK(tc_etc2_rgb_compressed_size(7, 5) == 32, "etc2 rgb padded size");
@@ -541,6 +596,8 @@ int main(void) {
           "astc ise trit encode");
     CHECK(ise_bits[0] == 233u, "astc ise trit payload");
     CHECK(tc_dds_bc7_size(7, 5) == 148 + 64, "dds size");
+    CHECK(tc_dds_bc1_size(7, 5) == 148 + 32, "bc1 dds size");
+    CHECK(tc_dds_bc3_size(7, 5) == 148 + 64, "bc3 dds size");
     CHECK(tc_dds_bc5_size(7, 5) == 148 + 64, "bc5 dds size");
     CHECK(tc_dds_bc6h_size(7, 5) == 148 + 64, "bc6h dds size");
     CHECK(tc_ktx_etc2_size(7, 5, &etc2_opt) == 68 + 64, "etc2 ktx size");
@@ -599,6 +656,107 @@ int main(void) {
               TC_SUCCESS,
           "bc5 dds write");
     CHECK(rd_u32(dds + 112) == 83, "bc5 dxgi format");
+
+    /* BC1 / BC3: encode 4x4 RGBA blocks, reference-decode, check quality.
+     * A two-cluster block fits BC1's endpoints almost exactly (strict floor);
+     * a full-range gradient exercises the interpolated indices (2 and 3) and
+     * is bounded only loosely, since BC1's 4 colours per block inherently
+     * quantise a 16-step ramp to ~24 dB. */
+    {
+        uint8_t clus[4 * 4 * 4], grad[4 * 4 * 4];
+        uint8_t dec[16][3], deca[16];
+        uint64_t sse_rgb, sse_a;
+        double psnr_rgb, psnr_a;
+        int saw_interp = 0;
+        size_t n;
+        for (n = 0; n < 16u; ++n) {
+            int hi = n >= 8u;
+            clus[n * 4u + 0u] = hi ? 200u : 50u;
+            clus[n * 4u + 1u] = hi ? 160u : 80u;
+            clus[n * 4u + 2u] = hi ? 90u : 120u;
+            clus[n * 4u + 3u] = hi ? 240u : 40u;
+            grad[n * 4u + 0u] = (uint8_t)(20u + n * 13u);
+            grad[n * 4u + 1u] = (uint8_t)(30u + n * 12u);
+            grad[n * 4u + 2u] = (uint8_t)(40u + n * 11u);
+            grad[n * 4u + 3u] = (uint8_t)(n * 17u);
+        }
+
+        /* Two-cluster block: near-exact, strict floors. */
+        CHECK(tc_bc1_compress_rgba8(clus, 4, 4, 4 * 4, &bc1_opt, bc1,
+                                    sizeof(bc1)) == TC_SUCCESS,
+              "bc1 compress");
+        CHECK(((uint32_t)bc1[0] | ((uint32_t)bc1[1] << 8)) >=
+                  ((uint32_t)bc1[2] | ((uint32_t)bc1[3] << 8)),
+              "bc1 4-colour endpoint order");
+        bc1_decode(bc1, dec);
+        sse_rgb = 0;
+        for (n = 0; n < 16u; ++n) {
+            int c;
+            for (c = 0; c < 3; ++c) {
+                int d = (int)clus[n * 4u + (size_t)c] - (int)dec[n][c];
+                sse_rgb += (uint64_t)(d * d);
+            }
+        }
+        psnr_rgb =
+            sse_rgb ? 10.0 * log10(255.0 * 255.0 / ((double)sse_rgb / 48.0))
+                    : 99.0;
+        CHECK(psnr_rgb >= 38.0, "bc1 cluster rgb psnr floor");
+        CHECK(tc_dds_write_bc1_memory(bc1, 4, 4, &bc1_opt, dds, sizeof(dds)) ==
+                  TC_SUCCESS,
+              "bc1 dds write");
+        CHECK(rd_u32(dds + 112) == 71, "bc1 dxgi format");
+
+        /* Gradient block: loose floor + must use interpolated indices. */
+        CHECK(tc_bc1_compress_rgba8(grad, 4, 4, 4 * 4, &bc1_opt, bc1,
+                                    sizeof(bc1)) == TC_SUCCESS,
+              "bc1 gradient compress");
+        for (n = 0; n < 16u; ++n) {
+            int idx = (bc1[4 + (n >> 2)] >> ((n & 3u) * 2u)) & 3;
+            if (idx >= 2) saw_interp = 1;
+        }
+        CHECK(saw_interp, "bc1 uses interpolated indices");
+        bc1_decode(bc1, dec);
+        sse_rgb = 0;
+        for (n = 0; n < 16u; ++n) {
+            int c;
+            for (c = 0; c < 3; ++c) {
+                int d = (int)grad[n * 4u + (size_t)c] - (int)dec[n][c];
+                sse_rgb += (uint64_t)(d * d);
+            }
+        }
+        psnr_rgb =
+            sse_rgb ? 10.0 * log10(255.0 * 255.0 / ((double)sse_rgb / 48.0))
+                    : 99.0;
+        CHECK(psnr_rgb >= 24.0, "bc1 gradient rgb psnr floor");
+
+        /* BC3: cluster colours + per-pixel alpha (BC4 alpha is near-exact). */
+        CHECK(tc_bc3_compress_rgba8(clus, 4, 4, 4 * 4, &bc3_opt, bc3,
+                                    sizeof(bc3)) == TC_SUCCESS,
+              "bc3 compress");
+        bc4_decode(bc3, deca);    /* alpha half */
+        bc1_decode(bc3 + 8, dec); /* colour half */
+        sse_rgb = 0;
+        sse_a = 0;
+        for (n = 0; n < 16u; ++n) {
+            int c, da = (int)clus[n * 4u + 3u] - (int)deca[n];
+            sse_a += (uint64_t)(da * da);
+            for (c = 0; c < 3; ++c) {
+                int d = (int)clus[n * 4u + (size_t)c] - (int)dec[n][c];
+                sse_rgb += (uint64_t)(d * d);
+            }
+        }
+        psnr_rgb =
+            sse_rgb ? 10.0 * log10(255.0 * 255.0 / ((double)sse_rgb / 48.0))
+                    : 99.0;
+        psnr_a = sse_a ? 10.0 * log10(255.0 * 255.0 / ((double)sse_a / 16.0))
+                       : 99.0;
+        CHECK(psnr_rgb >= 38.0, "bc3 rgb psnr floor");
+        CHECK(psnr_a >= 45.0, "bc3 alpha psnr floor");
+        CHECK(tc_dds_write_bc3_memory(bc3, 4, 4, &bc3_opt, dds, sizeof(dds)) ==
+                  TC_SUCCESS,
+              "bc3 dds write");
+        CHECK(rd_u32(dds + 112) == 77, "bc3 dxgi format");
+    }
 
     CHECK(tc_etc2_compress_rgba8(rgba, 7, 5, 7 * 4, &etc2_opt, etc2,
                                  sizeof(etc2)) == TC_SUCCESS,
