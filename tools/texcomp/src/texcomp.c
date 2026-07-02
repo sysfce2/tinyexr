@@ -2753,9 +2753,10 @@ static uint32_t tc_popcount64(uint64_t v) {
 TC_TARGET("popcnt")
 static uint32_t tc_astc_bitmap_mismatch_popcnt(const uint64_t bbits[3],
                                                const uint64_t seed_bits[3],
-                                               const uint64_t mask[3]) {
+                                               const uint64_t mask[3],
+                                               uint32_t words) {
     uint32_t direct = 0, inverse = 0, w;
-    for (w = 0; w < 3u; ++w) {
+    for (w = 0; w < words; ++w) {
         direct += (uint32_t)__builtin_popcountll((bbits[w] ^ seed_bits[w]) &
                                                  mask[w]);
         inverse += (uint32_t)__builtin_popcountll((bbits[w] ^ ~seed_bits[w]) &
@@ -2767,13 +2768,14 @@ static uint32_t tc_astc_bitmap_mismatch_popcnt(const uint64_t bbits[3],
 
 static uint32_t tc_astc_bitmap_mismatch(const uint64_t bbits[3],
                                         const uint64_t seed_bits[3],
-                                        const uint64_t mask[3]) {
+                                        const uint64_t mask[3],
+                                        uint32_t words) {
     uint32_t direct = 0, inverse = 0, w;
 #if defined(TC_X86)
     if (tc_cpu_caps() & (TC_CPU_SSE41 | TC_CPU_AVX2))
-        return tc_astc_bitmap_mismatch_popcnt(bbits, seed_bits, mask);
+        return tc_astc_bitmap_mismatch_popcnt(bbits, seed_bits, mask, words);
 #endif
-    for (w = 0; w < 3u; ++w) {
+    for (w = 0; w < words; ++w) {
         direct += tc_popcount64((bbits[w] ^ seed_bits[w]) & mask[w]);
         inverse += tc_popcount64((bbits[w] ^ ~seed_bits[w]) & mask[w]);
     }
@@ -4028,6 +4030,7 @@ static int tc_astc_find_best_partition(const uint8_t block[144][4],
     if (partition_count == 2u && cache_count > shortlist_limit) {
         uint64_t bbits[3] = {0, 0, 0};
         uint64_t mask[3] = {0, 0, 0};
+        uint32_t bitmap_words = (ctx->texel_count + 63u) / 64u;
         uint32_t t, it, n1 = 0;
         uint16_t worst_of_best = 0xffffu;
         int32_t mean0[4], mean1[4];
@@ -4088,7 +4091,9 @@ static int tc_astc_find_best_partition(const uint8_t block[144][4],
         if (n1 == 0u || n1 == ctx->texel_count) goto full_scan;
         for (i = 0; i < cache_count; ++i) {
             const tc_astc_partition_info *pi = cache + i;
-            uint32_t mm = tc_astc_bitmap_mismatch(bbits, pi->bits, mask), pos;
+            uint32_t mm = tc_astc_bitmap_mismatch(bbits, pi->bits, mask,
+                                                  bitmap_words),
+                     pos;
             if (shortlist_count == shortlist_limit && mm >= worst_of_best)
                 continue;
             pos = shortlist_count < shortlist_limit ? shortlist_count++
@@ -4845,7 +4850,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     uint16_t selected_candidates[64];
     uint64_t selected_errors[64];
     uint32_t selected_count = 0;
-    uint32_t selected_limit = quality > 1 ? 48u : (quality > 0 ? 16u : 2u);
+    uint32_t selected_limit = quality > 1 ? 48u : (quality > 0 ? 12u : 2u);
     uint64_t best_err = UINT64_MAX;
 
     uint8_t path_out[16];
