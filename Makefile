@@ -602,7 +602,8 @@ endif
 
 .PHONY: resize-lib resize-c11-gate resize-test resize-test-asan \
         resize-test-threads resize-test-tsan resize-test-f16 resize-bench \
-        resize-cli resize-cli-asan resize-arm-test resize-sve-test
+        resize-cli resize-cli-asan resize-fuzz resize-fuzz-corpus \
+        resize-arm-test resize-sve-test
 
 build/tir-%.o: tools/resize/src/%.c $(TIR_HDRS) | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -O2 -g -c $< -o $@
@@ -709,6 +710,23 @@ resize-cli-asan: lib | build
 	  rc=$$?; if [ $$rc = 99 ]; then echo "  FAIL: leak on error path"; \
 	  exit 1; fi; echo "  error path clean (exit $$rc)"
 	@echo "resize CLI ASan: OK"
+
+# Coverage-guided libFuzzer harness for the resize library (threads enabled so
+# the banded whole-image path is fuzzed too). Needs clang.
+resize-fuzz: tools/resize/tests/tir_fuzz.c | build
+	clang $(V3_CSTD) $(TIR_INC) -DTIR_ENABLE_THREADS -pthread -O1 -g -w \
+	  -fsanitize=fuzzer,address,undefined \
+	  tools/resize/tests/tir_fuzz.c $(TIR_SRC) -lm -o build/resize_fuzz
+	@echo "built build/resize_fuzz"
+	@echo "  run: ./build/resize_fuzz -max_total_time=300 [corpus_dir]"
+
+# Deterministic replay under ASan+UBSan (no libFuzzer; CI gate). With no file
+# args it runs 8000 generated pseudo-random inputs; with args it replays them.
+resize-fuzz-corpus: tools/resize/tests/tir_fuzz.c | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
+	  -O1 -g $(SAN) -DTIR_FUZZ_STANDALONE \
+	  tools/resize/tests/tir_fuzz.c $(TIR_SRC) -lm -o build/resize_fuzz_replay
+	ASAN_OPTIONS=detect_leaks=0 ./build/resize_fuzz_replay
 
 # Cross-build for AArch64 (NEON kernels) and run under qemu.
 resize-arm-test: | build
