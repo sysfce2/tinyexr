@@ -479,7 +479,20 @@ tir_result tir__run_range(tir_sampler *s, const void *src,
          * start from row 0 in that case. (Bands with exceptions already buffer
          * the whole image, since n_exc>0 forces ring_cap = src_h.) */
         int band_fast = (y0 >= s->fy.fast_lo && y1 <= s->fy.fast_hi);
-        int first = band_fast ? s->fy.start[y0] : 0;
+        int first = 0;
+        if (band_fast) {
+            /* start[] is NOT monotonic: an output whose center lands exactly
+             * on an integer source row collapses to a single-tap window (the
+             * off-integer taps of a windowed-sinc are exactly zero), spiking
+             * its start above its neighbours'. Fast-forward to the minimum
+             * start over the whole band so no row a later output needs is
+             * skipped -- otherwise the band deadlocks (pull waits on a row the
+             * push cursor stepped past). */
+            int q;
+            first = s->fy.start[y0];
+            for (q = y0 + 1; q < y1; ++q)
+                if (s->fy.start[q] < first) first = s->fy.start[q];
+        }
         if (s->opt.nonfinite == TIR_NONFINITE_REPAIR && first > 0)
             first--; /* one extra row so the repair window is complete */
         s->rows_pushed = first;
