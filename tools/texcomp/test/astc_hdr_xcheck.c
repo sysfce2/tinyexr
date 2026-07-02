@@ -155,6 +155,39 @@ int main(void) {
         return 1;
     }
 
+    /* (d) two differently-oriented gradients per block (left cols vary R,
+     * right cols vary G): a single endpoint line cannot fit both, so the
+     * 2-subset partition path must engage to clear the floor. */
+    for (y = 0; y < H; ++y) {
+        for (x = 0; x < W; ++x) {
+            float t = (float)(y & 3) / 3.0f;
+            float *px = src + ((size_t)y * W + x) * 3;
+            if ((x & 3) < 2) {
+                px[0] = 5.0f + t * 20.0f;
+                px[1] = 2.0f;
+            } else {
+                px[0] = 2.0f;
+                px[1] = 5.0f + t * 20.0f;
+            }
+            px[2] = 2.0f;
+        }
+    }
+    if (tc_astc_hdr_compress_rgbf(src, W, H, (size_t)W * 3u * sizeof(float),
+                                  &opt, blocks, need) != TC_SUCCESS) {
+        fprintf(stderr, "FAIL: hdr encode (two-gradient)\n");
+        return 1;
+    }
+    if (astc_hdr_decode(blocks, need, W, H, dec) != 0) {
+        fprintf(stderr, "FAIL: astcenc hdr decode (two-gradient)\n");
+        return 1;
+    }
+    p = psnr_rgb(src, dec, (size_t)W * H, 24.0);
+    printf("astc-hdr two-gradient 64x64: %.2f dB\n", p);
+    if (p < 20.0) {
+        fprintf(stderr, "FAIL: two-gradient psnr %.2f dB below floor\n", p);
+        return 1;
+    }
+
     printf("astc hdr xcheck: OK\n");
     return 0;
 }

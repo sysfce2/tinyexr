@@ -483,15 +483,23 @@ tc_result tc_astc_hdr_compress_rgbf(const float *rgb, uint32_t width,
                                               tc_float_to_half_bits(src0[2]),
                                               0x3C00u, out_astc + off);
             } else {
-                /* Encode CEM 11 and a constant (block-mean void-extent); keep
-                 * whichever reconstructs the block with less LNS-domain error,
-                 * so the per-texel path never loses to the constant one. */
-                uint8_t cem[16];
-                uint64_t cem_sse, ve_sse = 0;
+                /* Try CEM 11 (single/dual plane), 2-subset partitions, and a
+                 * constant (block-mean void-extent); keep whichever
+                 * reconstructs the block with the least LNS-domain error. */
+                uint8_t cem[16], sub[16];
+                uint64_t cem_sse, sub_sse, ve_sse = 0, best_sse;
+                const uint8_t *best_buf;
                 int mean[3];
                 int64_t sum[3] = {0, 0, 0};
                 int i, cc;
                 cem_sse = tc_encode_astc_hdr_cem11_block(lns, cem);
+                sub_sse = tc_encode_astc_hdr_cem11_2subset_block(lns, sub);
+                best_buf = cem;
+                best_sse = cem_sse;
+                if (sub_sse < best_sse) {
+                    best_sse = sub_sse;
+                    best_buf = sub;
+                }
                 for (i = 0; i < 16; ++i)
                     for (cc = 0; cc < 3; ++cc) sum[cc] += lns[i][cc];
                 for (cc = 0; cc < 3; ++cc) mean[cc] = (int)(sum[cc] / 16);
@@ -500,13 +508,13 @@ tc_result tc_astc_hdr_compress_rgbf(const float *rgb, uint32_t width,
                         int64_t e = (int64_t)lns[i][cc] - mean[cc];
                         ve_sse += (uint64_t)(e * e);
                     }
-                if (ve_sse <= cem_sse) {
+                if (ve_sse <= best_sse) {
                     tc_astc_hdr_write_void_extent(
                         tc_astc_lns16_to_sf16(mean[0]),
                         tc_astc_lns16_to_sf16(mean[1]),
                         tc_astc_lns16_to_sf16(mean[2]), 0x3C00u, out_astc + off);
                 } else {
-                    memcpy(out_astc + off, cem, 16u);
+                    memcpy(out_astc + off, best_buf, 16u);
                 }
             }
             off += 16u;

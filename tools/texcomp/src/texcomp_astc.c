@@ -3971,6 +3971,19 @@ int tc_astc_hdr_color_roundtrip(uint32_t level, int value) {
     return (int)tc_astc_color_roundtrip(&tc_hdr_ctx, level, (uint32_t)value);
 }
 
+/* 4x4 single-plane grid at a given weight quant_method. */
+static uint32_t tc_astc_hdr_find_grid_mode(uint32_t qm) {
+    uint32_t bm;
+    for (bm = 0; bm < 2048u; ++bm) {
+        tc_astc_block_mode_info info;
+        if (tc_astc_decode_block_mode_2d(bm, &info) && info.weight_x == 4u &&
+            info.weight_y == 4u && info.dual_plane == 0u &&
+            info.quant_method == qm)
+            return bm;
+    }
+    return 0;
+}
+
 /* 4x4 dual-plane grid, weight range 3 (trit), single partition. */
 static uint32_t tc_astc_hdr_find_dual_block_mode(void) {
     uint32_t bm;
@@ -4131,6 +4144,106 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 6u, v, packed);
     (void)tc_astc_ise_encode_bits(20u, 6u, packed, out, 16u, 17u);
     return (uint64_t)sse_single;
+}
+
+/* Two-subset CEM 11 block. Each subset gets its own HDR endpoint pair (12
+ * values total), stored at a lower colour quant (to fit the 4x4 budget) via
+ * the quant-aware packer; a 10-bit partition index selects the region split.
+ * Returns the reconstruction SSE, or UINT64_MAX if no usable partition/quant.
+ * Layout: [11 mode][2 part-count][10 partition idx][6 multi-CEM][12-value
+ * endpoint ISE @bit29][per-texel weights reversed from top]. */
+uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
+                                                uint8_t out[16]) {
+    static uint32_t bm = 0xffffffffu;
+    uint8_t proxy[144][4];
+    const tc_astc_partition_info *pi = NULL;
+    uint8_t weightbuf[16], weights[16], ev[16], packed[16];
+    int qe0[2][3], qe1[2][3];
+    int i, c, s, cnt[2];
+    uint32_t clevel, bitpos;
+    uint64_t sse = 0;
+
+    /* Weight range 4 (2-bit): each region is fairly uniform, so coarse weights
+     * are cheap and the freed bits buy higher-precision endpoints (12 values
+     * fit at a better colour quant). */
+    if (bm == 0xffffffffu) bm = tc_astc_hdr_find_grid_mode(2u);
+    tc_hdr_ctx_ensure();
+
+    memset(proxy, 0, sizeof(proxy));
+    for (i = 0; i < 16; ++i) {
+        for (c = 0; c < 3; ++c) {
+            int p = lns[i][c] >> 8;
+            proxy[i][c] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+        }
+        proxy[i][3] = 255u;
+    }
+    if (!tc_astc_find_best_partition((const uint8_t(*)[4])proxy,
+                                     tc_hdr_ctx.part2_cache,
+                                     tc_hdr_ctx.part2_count, 2u, &tc_hdr_ctx,
+                                     &pi))
+        return (uint64_t)-1;
+    /* colour quant for 12 endpoint values; weight_bits = 48 (4x4 range 8). */
+    if (!tc_astc_lut_color_quant(&tc_hdr_ctx, 12u, 99u - 32u, &clevel))
+        return (uint64_t)-1;
+
+    cnt[0] = cnt[1] = 0;
+    for (s = 0; s < 2; ++s) {
+        int e0[3] = {0, 0, 0}, e1[3] = {0, 0, 0}, have = 0;
+        uint8_t vv[6];
+        for (i = 0; i < 16; ++i) {
+            if (pi->partition_of_texel[i] != s) continue;
+            for (c = 0; c < 3; ++c) {
+                if (!have || lns[i][c] < e0[c]) e0[c] = lns[i][c];
+                if (!have || lns[i][c] > e1[c]) e1[c] = lns[i][c];
+            }
+            have = 1;
+            cnt[s]++;
+        }
+        tc_astc_cem11_pack(e0, e1, (int)clevel, vv);
+        tc_astc_cem11_unpack(vv, qe0[s], qe1[s]);
+        for (c = 0; c < 6; ++c) ev[s * 6 + c] = vv[c];
+    }
+    if (cnt[0] == 0 || cnt[1] == 0) return (uint64_t)-1;
+
+    for (i = 0; i < 16; ++i) {
+        int s2 = pi->partition_of_texel[i], w64 = 0, uq, d[3];
+        int64_t dl = 0, dot = 0;
+        for (c = 0; c < 3; ++c) {
+            d[c] = qe1[s2][c] - qe0[s2][c];
+            dl += (int64_t)d[c] * d[c];
+        }
+        if (dl > 0) {
+            for (c = 0; c < 3; ++c)
+                dot += ((int64_t)lns[i][c] - qe0[s2][c]) * d[c];
+            if (dot < 0) dot = 0;
+            if (dot > dl) dot = dl;
+            w64 = (int)((dot * 64 + dl / 2) / dl);
+        }
+        weights[i] = tc_astc_hdr_quant_weight(w64, 2u, 4u);
+        uq = (int)tc_astc_weight_unquant(weights[i], 2u);
+        for (c = 0; c < 3; ++c) {
+            int64_t rec = qe0[s2][c] + ((int64_t)d[c] * uq) / 64;
+            int64_t e = rec - lns[i][c];
+            sse += (uint64_t)(e * e);
+        }
+    }
+
+    memset(out, 0, 16u);
+    memset(weightbuf, 0, sizeof(weightbuf));
+    tc_astc_scramble_weights(weights, 16u, 2u);
+    (void)tc_astc_ise_encode_bits(2u, 16u, weights, weightbuf, sizeof(weightbuf),
+                                  0u);
+    for (i = 0; i < 16; ++i) out[i] = tc_bitrev8(weightbuf[15 - i]);
+    bitpos = 0;
+    tc_set_bits(out, &bitpos, bm, 11u);
+    tc_set_bits(out, &bitpos, 1u, 2u); /* partition count - 1 */
+    tc_set_bits(out, &bitpos, (uint32_t)(pi->partition_index & 63u), 6u);
+    tc_set_bits(out, &bitpos, (uint32_t)(pi->partition_index >> 6), 4u);
+    bitpos = 23u;
+    tc_set_bits(out, &bitpos, 11u << 2, 6u); /* multi-CEM: all-same, CEM 11 */
+    tc_astc_quantize_color_values(&tc_hdr_ctx, clevel, 12u, ev, packed);
+    (void)tc_astc_ise_encode_bits(clevel, 12u, packed, out, 16u, 29u);
+    return sse;
 }
 
 #if defined(TC_X86)
