@@ -644,8 +644,14 @@ resize-test-threads: | build
 	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_mt
 	ASAN_OPTIONS=detect_leaks=0 ./build/tir_test_mt
 
+# ThreadSanitizer build. Uses the pthread threading backend
+# (-DTIR_THREADS_PTHREAD): TSan does not intercept glibc's C11 thrd_create, so
+# a worker would SEGV in __tsan_func_entry before running. The band logic and
+# shared-data access pattern are backend-independent, so this validly checks
+# the threaded paths for data races.
 resize-test-tsan: | build
-	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) \
+	  -DTIR_ENABLE_THREADS -DTIR_THREADS_PTHREAD -pthread \
 	  -O1 -g -fsanitize=thread \
 	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_tsan
 	./build/tir_test_tsan
