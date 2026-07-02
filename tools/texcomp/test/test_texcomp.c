@@ -318,6 +318,56 @@ static double astc_psnr(const uint8_t *a, const uint8_t *b, size_t n) {
     return 10.0 * log10(65025.0 / mse);
 }
 
+/* The ASTC search kernels must be bit-exact across SIMD backends: full
+ * compressed images are compared byte-for-byte against the scalar backend. */
+static int astc_backend_parity_test(void) {
+    enum { W = 48, H = 48 };
+    static uint8_t img[W * H * 4];
+    static uint8_t ref[(W / 4) * (H / 4) * 16];
+    static uint8_t alt[(W / 4) * (H / 4) * 16];
+    static const uint32_t masks[4] = {TC_BACKEND_SSE2, TC_BACKEND_SSE41,
+                                      TC_BACKEND_AVX2, TC_BACKEND_NEON};
+    uint32_t avail = tc_backend_available_mask();
+    int kind, q;
+    uint32_t bi, mi;
+    static const uint32_t bs[2][2] = {{4, 4}, {6, 6}};
+    for (kind = 0; kind < 4; ++kind) {
+        astc_fill_test_image(img, W, H, kind);
+        for (bi = 0; bi < 2u; ++bi) {
+            for (q = 0; q <= 2; ++q) {
+                tc_astc_options opt;
+                size_t need;
+                tc_astc_options_init(&opt);
+                opt.block_x = bs[bi][0];
+                opt.block_y = bs[bi][1];
+                opt.quality = q;
+                need = tc_astc_compressed_size(W, H, &opt);
+                tc_backend_force_mask(TC_BACKEND_SCALAR);
+                CHECK(tc_astc_compress_rgba8(img, W, H, W * 4u, &opt, ref,
+                                             need) == TC_SUCCESS,
+                      "astc parity scalar encode");
+                for (mi = 0; mi < 4u; ++mi) {
+                    if (!(avail & masks[mi])) continue;
+                    tc_backend_force_mask(masks[mi]);
+                    CHECK(tc_astc_compress_rgba8(img, W, H, W * 4u, &opt, alt,
+                                                 need) == TC_SUCCESS,
+                          "astc parity simd encode");
+                    if (memcmp(ref, alt, need) != 0) {
+                        tc_backend_force_mask(TC_BACKEND_ALL);
+                        fprintf(stderr,
+                                "FAIL: astc backend parity kind=%d block=%ux%u "
+                                "q=%d mask=%u\n",
+                                kind, bs[bi][0], bs[bi][1], q, masks[mi]);
+                        return 1;
+                    }
+                }
+                tc_backend_force_mask(TC_BACKEND_ALL);
+            }
+        }
+    }
+    return 0;
+}
+
 /* Encode -> reference-decode round trip: every emitted block must decode,
  * and quality must stay above per-configuration floors. Floors are set from
  * bench/texcomp_psnr.c measurements minus a safety margin; raise them when
@@ -1134,6 +1184,7 @@ int main(void) {
     if (astc_ise_roundtrip_test()) return 1;
     if (astc_weight_symmetry_test()) return 1;
     if (astc_ref_roundtrip_test()) return 1;
+    if (astc_backend_parity_test()) return 1;
 
     printf("texcomp tests: OK\n");
     return 0;

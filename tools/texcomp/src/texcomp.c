@@ -2379,6 +2379,10 @@ static uint32_t tc_astc_color_symbol_uquant(uint32_t quant_method,
                                             uint32_t sym);
 static uint32_t tc_astc_color_roundtrip(const tc_astc_encode_context *ctx,
                                         uint32_t quant_method, uint32_t v);
+static void tc_astc_infill_weights(const uint8_t *weights,
+                                   const tc_astc_decim_cache_entry *decim,
+                                   uint32_t count, uint32_t quant_method,
+                                   uint8_t wt[144]);
 
 static int tc_astc_decode_block_mode_2d(uint32_t block_mode,
                                         tc_astc_block_mode_info *info) {
@@ -2821,57 +2825,446 @@ static uint32_t tc_astc_project_weight(uint32_t dot64, uint32_t recip) {
     return w > 64u ? 64u : w;
 }
 
-static uint64_t tc_astc_try_endpoint_axis(const uint8_t block[144][4],
-                                          uint32_t count, uint32_t lo_i,
-                                          uint32_t hi_i, uint32_t quant_method,
-                                          const tc_astc_decim_cache_entry *decim,
-                                          uint32_t weight_count,
-                                          uint32_t best_lo[4],
-                                          uint32_t best_hi[4],
-                                          uint8_t best_weights[64]) {
-    uint8_t weights[64];
-    uint32_t lo[4], hi[4];
-    uint32_t i, c;
-    uint32_t dr, dg, db, da, denom, recip;
-    uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
-    uint64_t err = 0;
+/* ---- ASTC search kernels (scalar reference + SIMD, bit-exact) ------------
+ * Two vertical loop shapes dominate the encoder search:
+ *   project: ideal weight of each texel on a lo->hi endpoint line
+ *   recon:   squared error of interpolating endpoints with given weights
+ * The SIMD variants must match the scalar forms exactly; the parity tests
+ * compare whole compressed images across backends. */
 
+static void tc_astc_project_ideal_scalar(const uint8_t block[144][4],
+                                         uint32_t count, const uint32_t lo[4],
+                                         const uint32_t hi[4], uint32_t recip,
+                                         uint8_t ideal[144]) {
+    uint32_t i, c;
+    for (i = 0; i < count; ++i) {
+        const uint8_t *p = block[i];
+        int32_t dot = 0;
+        for (c = 0; c < 4u; ++c) {
+            dot += (int32_t)((int32_t)p[c] - (int32_t)lo[c]) *
+                   (int32_t)((int32_t)hi[c] - (int32_t)lo[c]);
+        }
+        ideal[i] = (uint8_t)(dot <= 0 ? 0u
+                                      : tc_astc_project_weight(
+                                            (uint32_t)dot * 64u, recip));
+    }
+}
+
+static uint64_t tc_astc_recon_sse_scalar(const uint8_t block[144][4],
+                                         uint32_t count, const uint32_t e0[4],
+                                         const uint32_t e1[4],
+                                         const uint8_t wt[144]) {
+    uint32_t i, c;
+    uint64_t err = 0;
+    for (i = 0; i < count; ++i) {
+        uint32_t w = wt[i];
+        for (c = 0; c < 4u; ++c) {
+            uint32_t recon = (e0[c] * (64u - w) + e1[c] * w + 32u) >> 6;
+            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
+            err += (uint64_t)(d * d);
+        }
+    }
+    return err;
+}
+
+static uint64_t tc_astc_recon_sse_pt_scalar(const uint8_t block[144][4],
+                                            uint32_t count,
+                                            const uint8_t e0t[144][4],
+                                            const uint8_t e1t[144][4],
+                                            const uint8_t wt[144]) {
+    uint32_t i, c;
+    uint64_t err = 0;
+    for (i = 0; i < count; ++i) {
+        uint32_t w = wt[i];
+        for (c = 0; c < 4u; ++c) {
+            uint32_t recon =
+                ((uint32_t)e0t[i][c] * (64u - w) + (uint32_t)e1t[i][c] * w +
+                 32u) >>
+                6;
+            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
+            err += (uint64_t)(d * d);
+        }
+    }
+    return err;
+}
+
+#if defined(TC_X86)
+TC_TARGET("sse2")
+static void tc_astc_project_ideal_sse2(const uint8_t block[144][4],
+                                       uint32_t count, const uint32_t lo[4],
+                                       const uint32_t hi[4], uint32_t recip,
+                                       uint8_t ideal[144]) {
+    uint32_t packed_lo = lo[0] | (lo[1] << 8) | (lo[2] << 16) | (lo[3] << 24);
+    uint32_t packed_hi = hi[0] | (hi[1] << 8) | (hi[2] << 16) | (hi[3] << 24);
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i lo16 =
+        _mm_unpacklo_epi8(_mm_set1_epi32((int32_t)packed_lo), zero);
+    const __m128i hi16 =
+        _mm_unpacklo_epi8(_mm_set1_epi32((int32_t)packed_hi), zero);
+    const __m128i dir16 = _mm_sub_epi16(hi16, lo16);
+    const __m128i vrecip = _mm_set1_epi32((int32_t)recip);
+    const __m128i round = _mm_set1_epi64x(1ll << 30);
+    const __m128i v64 = _mm_set1_epi32(64);
+    uint32_t i = 0;
+    for (; i + 4u <= count; i += 4u) {
+        __m128i px = _mm_loadu_si128((const __m128i *)block[i]);
+        __m128i pa = _mm_unpacklo_epi8(px, zero);
+        __m128i pb = _mm_unpackhi_epi8(px, zero);
+        __m128i da = _mm_madd_epi16(_mm_sub_epi16(pa, lo16), dir16);
+        __m128i db = _mm_madd_epi16(_mm_sub_epi16(pb, lo16), dir16);
+        /* fold channel pairs: [t.rg, t.ba] -> per-texel dot */
+        __m128i sa = _mm_add_epi32(
+            da, _mm_shuffle_epi32(da, _MM_SHUFFLE(2, 3, 0, 1)));
+        __m128i sb = _mm_add_epi32(
+            db, _mm_shuffle_epi32(db, _MM_SHUFFLE(2, 3, 0, 1)));
+        __m128i dots = _mm_castps_si128(
+            _mm_shuffle_ps(_mm_castsi128_ps(sa), _mm_castsi128_ps(sb),
+                           _MM_SHUFFLE(2, 0, 2, 0)));
+        __m128i pos = _mm_cmpgt_epi32(dots, zero);
+        __m128i dot64 = _mm_slli_epi32(_mm_and_si128(dots, pos), 6);
+        __m128i even = _mm_srli_epi64(
+            _mm_add_epi64(_mm_mul_epu32(dot64, vrecip), round), 31);
+        __m128i odd = _mm_srli_epi64(
+            _mm_add_epi64(_mm_mul_epu32(_mm_srli_si128(dot64, 4), vrecip),
+                          round),
+            31);
+        __m128i w = _mm_castps_si128(
+            _mm_shuffle_ps(_mm_castsi128_ps(_mm_unpacklo_epi32(even, odd)),
+                           _mm_castsi128_ps(_mm_unpackhi_epi32(even, odd)),
+                           _MM_SHUFFLE(1, 0, 1, 0)));
+        __m128i over = _mm_cmpgt_epi32(w, v64);
+        uint32_t tmp[4];
+        w = _mm_or_si128(_mm_and_si128(over, v64), _mm_andnot_si128(over, w));
+        _mm_storeu_si128((__m128i *)tmp, w);
+        ideal[i + 0u] = (uint8_t)tmp[0];
+        ideal[i + 1u] = (uint8_t)tmp[1];
+        ideal[i + 2u] = (uint8_t)tmp[2];
+        ideal[i + 3u] = (uint8_t)tmp[3];
+    }
+    if (i < count)
+        tc_astc_project_ideal_scalar(block + i, count - i, lo, hi, recip,
+                                     ideal + i);
+}
+
+TC_TARGET("sse2")
+static __m128i tc_astc_sse2_wpair(__m128i w4, int which) {
+    /* w4 = [w0 w1 w2 w3 x x x x] (u16); replicate a texel pair across
+     * channel lanes: [wA wA wA wA wB wB wB wB]. */
+    __m128i s = which
+                    ? _mm_shufflelo_epi16(w4, _MM_SHUFFLE(3, 3, 2, 2))
+                    : _mm_shufflelo_epi16(w4, _MM_SHUFFLE(1, 1, 0, 0));
+    return _mm_unpacklo_epi16(s, s);
+}
+
+TC_TARGET("sse2")
+static uint64_t tc_astc_recon_sse_sse2(const uint8_t block[144][4],
+                                       uint32_t count, const uint32_t e0[4],
+                                       const uint32_t e1[4],
+                                       const uint8_t wt[144]) {
+    uint32_t packed_e0 = e0[0] | (e0[1] << 8) | (e0[2] << 16) | (e0[3] << 24);
+    uint32_t packed_e1 = e1[0] | (e1[1] << 8) | (e1[2] << 16) | (e1[3] << 24);
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i e0_16 =
+        _mm_unpacklo_epi8(_mm_set1_epi32((int32_t)packed_e0), zero);
+    const __m128i e1_16 =
+        _mm_unpacklo_epi8(_mm_set1_epi32((int32_t)packed_e1), zero);
+    const __m128i v64 = _mm_set1_epi16(64);
+    const __m128i v32 = _mm_set1_epi16(32);
+    __m128i acc = _mm_setzero_si128();
+    uint32_t i = 0;
+    uint64_t err;
+    for (; i + 4u <= count; i += 4u) {
+        __m128i w4 = _mm_unpacklo_epi8(
+            _mm_cvtsi32_si128((int32_t)(wt[i] | (wt[i + 1u] << 8) |
+                                        ((uint32_t)wt[i + 2u] << 16) |
+                                        ((uint32_t)wt[i + 3u] << 24))),
+            zero);
+        __m128i px = _mm_loadu_si128((const __m128i *)block[i]);
+        __m128i pa = _mm_unpacklo_epi8(px, zero);
+        __m128i pb = _mm_unpackhi_epi8(px, zero);
+        __m128i wa = tc_astc_sse2_wpair(w4, 0);
+        __m128i wb = tc_astc_sse2_wpair(w4, 1);
+        __m128i ra = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_add_epi16(_mm_mullo_epi16(e0_16, _mm_sub_epi16(v64, wa)),
+                              _mm_mullo_epi16(e1_16, wa)),
+                v32),
+            6);
+        __m128i rb = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_add_epi16(_mm_mullo_epi16(e0_16, _mm_sub_epi16(v64, wb)),
+                              _mm_mullo_epi16(e1_16, wb)),
+                v32),
+            6);
+        __m128i da = _mm_sub_epi16(pa, ra);
+        __m128i db = _mm_sub_epi16(pb, rb);
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(da, da));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(db, db));
+    }
+    {
+        uint32_t lanes[4];
+        _mm_storeu_si128((__m128i *)lanes, acc);
+        err = (uint64_t)lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    }
+    if (i < count)
+        err += tc_astc_recon_sse_scalar(block + i, count - i, e0, e1, wt + i);
+    return err;
+}
+
+TC_TARGET("sse2")
+static uint64_t tc_astc_recon_sse_pt_sse2(const uint8_t block[144][4],
+                                          uint32_t count,
+                                          const uint8_t e0t[144][4],
+                                          const uint8_t e1t[144][4],
+                                          const uint8_t wt[144]) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i v64 = _mm_set1_epi16(64);
+    const __m128i v32 = _mm_set1_epi16(32);
+    __m128i acc = _mm_setzero_si128();
+    uint32_t i = 0;
+    uint64_t err;
+    for (; i + 4u <= count; i += 4u) {
+        __m128i w4 = _mm_unpacklo_epi8(
+            _mm_cvtsi32_si128((int32_t)(wt[i] | (wt[i + 1u] << 8) |
+                                        ((uint32_t)wt[i + 2u] << 16) |
+                                        ((uint32_t)wt[i + 3u] << 24))),
+            zero);
+        __m128i px = _mm_loadu_si128((const __m128i *)block[i]);
+        __m128i q0 = _mm_loadu_si128((const __m128i *)e0t[i]);
+        __m128i q1 = _mm_loadu_si128((const __m128i *)e1t[i]);
+        __m128i wa = tc_astc_sse2_wpair(w4, 0);
+        __m128i wb = tc_astc_sse2_wpair(w4, 1);
+        __m128i e0a = _mm_unpacklo_epi8(q0, zero);
+        __m128i e0b = _mm_unpackhi_epi8(q0, zero);
+        __m128i e1a = _mm_unpacklo_epi8(q1, zero);
+        __m128i e1b = _mm_unpackhi_epi8(q1, zero);
+        __m128i pa = _mm_unpacklo_epi8(px, zero);
+        __m128i pb = _mm_unpackhi_epi8(px, zero);
+        __m128i ra = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_add_epi16(_mm_mullo_epi16(e0a, _mm_sub_epi16(v64, wa)),
+                              _mm_mullo_epi16(e1a, wa)),
+                v32),
+            6);
+        __m128i rb = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_add_epi16(_mm_mullo_epi16(e0b, _mm_sub_epi16(v64, wb)),
+                              _mm_mullo_epi16(e1b, wb)),
+                v32),
+            6);
+        __m128i da = _mm_sub_epi16(pa, ra);
+        __m128i db = _mm_sub_epi16(pb, rb);
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(da, da));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(db, db));
+    }
+    {
+        uint32_t lanes[4];
+        _mm_storeu_si128((__m128i *)lanes, acc);
+        err = (uint64_t)lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    }
+    if (i < count)
+        err += tc_astc_recon_sse_pt_scalar(block + i, count - i, e0t + i,
+                                           e1t + i, wt + i);
+    return err;
+}
+#endif /* TC_X86 */
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+static void tc_astc_project_ideal_neon(const uint8_t block[144][4],
+                                       uint32_t count, const uint32_t lo[4],
+                                       const uint32_t hi[4], uint32_t recip,
+                                       uint8_t ideal[144]) {
+    uint8_t lob[8], hib[8];
+    uint32_t i = 0, c;
+    int16x8_t lo16, dir16;
     for (c = 0; c < 4u; ++c) {
+        lob[c] = lob[c + 4u] = (uint8_t)lo[c];
+        hib[c] = hib[c + 4u] = (uint8_t)hi[c];
+    }
+    lo16 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(lob)));
+    dir16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(hib))), lo16);
+    for (; i + 2u <= count; i += 2u) {
+        int16x8_t p16 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(block[i])));
+        int16x8_t d = vsubq_s16(p16, lo16);
+        int32x4_t m = vmull_s16(vget_low_s16(d), vget_low_s16(dir16));
+        int32x4_t n = vmull_s16(vget_high_s16(d), vget_high_s16(dir16));
+        int32_t d0 = vaddvq_s32(m);
+        int32_t d1 = vaddvq_s32(n);
+        ideal[i] = (uint8_t)(d0 <= 0 ? 0u
+                                     : tc_astc_project_weight(
+                                           (uint32_t)d0 * 64u, recip));
+        ideal[i + 1u] =
+            (uint8_t)(d1 <= 0 ? 0u
+                              : tc_astc_project_weight((uint32_t)d1 * 64u,
+                                                       recip));
+    }
+    if (i < count)
+        tc_astc_project_ideal_scalar(block + i, count - i, lo, hi, recip,
+                                     ideal + i);
+}
+
+static uint64_t tc_astc_recon_sse_neon(const uint8_t block[144][4],
+                                       uint32_t count, const uint32_t e0[4],
+                                       const uint32_t e1[4],
+                                       const uint8_t wt[144]) {
+    uint8_t e0b[8], e1b[8];
+    uint32_t i = 0, c;
+    uint16x8_t e0_16, e1_16;
+    uint32x4_t acc = vdupq_n_u32(0);
+    uint64_t err;
+    for (c = 0; c < 4u; ++c) {
+        e0b[c] = e0b[c + 4u] = (uint8_t)e0[c];
+        e1b[c] = e1b[c + 4u] = (uint8_t)e1[c];
+    }
+    e0_16 = vmovl_u8(vld1_u8(e0b));
+    e1_16 = vmovl_u8(vld1_u8(e1b));
+    for (; i + 2u <= count; i += 2u) {
+        uint16x8_t p16 = vmovl_u8(vld1_u8(block[i]));
+        uint16x8_t w = vcombine_u16(vdup_n_u16(wt[i]), vdup_n_u16(wt[i + 1u]));
+        uint16x8_t r = vshrq_n_u16(
+            vaddq_u16(vaddq_u16(vmulq_u16(e0_16,
+                                          vsubq_u16(vdupq_n_u16(64), w)),
+                                vmulq_u16(e1_16, w)),
+                      vdupq_n_u16(32)),
+            6);
+        int16x8_t d = vsubq_s16(vreinterpretq_s16_u16(p16),
+                                vreinterpretq_s16_u16(r));
+        acc = vaddq_u32(
+            acc, vreinterpretq_u32_s32(vmull_s16(vget_low_s16(d),
+                                                 vget_low_s16(d))));
+        acc = vaddq_u32(
+            acc, vreinterpretq_u32_s32(vmull_s16(vget_high_s16(d),
+                                                 vget_high_s16(d))));
+    }
+    err = (uint64_t)vaddvq_u32(acc);
+    if (i < count)
+        err += tc_astc_recon_sse_scalar(block + i, count - i, e0, e1, wt + i);
+    return err;
+}
+
+static uint64_t tc_astc_recon_sse_pt_neon(const uint8_t block[144][4],
+                                          uint32_t count,
+                                          const uint8_t e0t[144][4],
+                                          const uint8_t e1t[144][4],
+                                          const uint8_t wt[144]) {
+    uint32x4_t acc = vdupq_n_u32(0);
+    uint32_t i = 0;
+    uint64_t err;
+    for (; i + 2u <= count; i += 2u) {
+        uint16x8_t p16 = vmovl_u8(vld1_u8(block[i]));
+        uint16x8_t q0 = vmovl_u8(vld1_u8(e0t[i]));
+        uint16x8_t q1 = vmovl_u8(vld1_u8(e1t[i]));
+        uint16x8_t w = vcombine_u16(vdup_n_u16(wt[i]), vdup_n_u16(wt[i + 1u]));
+        uint16x8_t r = vshrq_n_u16(
+            vaddq_u16(vaddq_u16(vmulq_u16(q0, vsubq_u16(vdupq_n_u16(64), w)),
+                                vmulq_u16(q1, w)),
+                      vdupq_n_u16(32)),
+            6);
+        int16x8_t d = vsubq_s16(vreinterpretq_s16_u16(p16),
+                                vreinterpretq_s16_u16(r));
+        acc = vaddq_u32(
+            acc, vreinterpretq_u32_s32(vmull_s16(vget_low_s16(d),
+                                                 vget_low_s16(d))));
+        acc = vaddq_u32(
+            acc, vreinterpretq_u32_s32(vmull_s16(vget_high_s16(d),
+                                                 vget_high_s16(d))));
+    }
+    err = (uint64_t)vaddvq_u32(acc);
+    if (i < count)
+        err += tc_astc_recon_sse_pt_scalar(block + i, count - i, e0t + i,
+                                           e1t + i, wt + i);
+    return err;
+}
+#endif /* NEON */
+
+static void tc_astc_project_ideal(const uint8_t block[144][4], uint32_t count,
+                                  const uint32_t lo[4], const uint32_t hi[4],
+                                  uint32_t recip, uint8_t ideal[144]) {
+#if defined(TC_X86)
+    if (tc_cpu_caps() & (TC_CPU_SSE2 | TC_CPU_SSE41 | TC_CPU_AVX2)) {
+        tc_astc_project_ideal_sse2(block, count, lo, hi, recip, ideal);
+        return;
+    }
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (tc_cpu_caps() & TC_CPU_NEON) {
+        tc_astc_project_ideal_neon(block, count, lo, hi, recip, ideal);
+        return;
+    }
+#endif
+    tc_astc_project_ideal_scalar(block, count, lo, hi, recip, ideal);
+}
+
+static uint64_t tc_astc_recon_sse(const uint8_t block[144][4], uint32_t count,
+                                  const uint32_t e0[4], const uint32_t e1[4],
+                                  const uint8_t wt[144]) {
+#if defined(TC_X86)
+    if (tc_cpu_caps() & (TC_CPU_SSE2 | TC_CPU_SSE41 | TC_CPU_AVX2))
+        return tc_astc_recon_sse_sse2(block, count, e0, e1, wt);
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (tc_cpu_caps() & TC_CPU_NEON)
+        return tc_astc_recon_sse_neon(block, count, e0, e1, wt);
+#endif
+    return tc_astc_recon_sse_scalar(block, count, e0, e1, wt);
+}
+
+static uint64_t tc_astc_recon_sse_pt(const uint8_t block[144][4],
+                                     uint32_t count, const uint8_t e0t[144][4],
+                                     const uint8_t e1t[144][4],
+                                     const uint8_t wt[144]) {
+#if defined(TC_X86)
+    if (tc_cpu_caps() & (TC_CPU_SSE2 | TC_CPU_SSE41 | TC_CPU_AVX2))
+        return tc_astc_recon_sse_pt_sse2(block, count, e0t, e1t, wt);
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (tc_cpu_caps() & TC_CPU_NEON)
+        return tc_astc_recon_sse_pt_neon(block, count, e0t, e1t, wt);
+#endif
+    return tc_astc_recon_sse_pt_scalar(block, count, e0t, e1t, wt);
+}
+
+/* Endpoint line for an axis: the extreme texels' colors plus the projection
+ * reciprocal. Returns 0 when the line is degenerate. */
+static int tc_astc_axis_line(const uint8_t block[144][4], uint32_t lo_i,
+                             uint32_t hi_i, uint32_t lo[4], uint32_t hi[4],
+                             uint32_t *recip) {
+    uint32_t c, denom = 0;
+    for (c = 0; c < 4u; ++c) {
+        uint32_t d;
         lo[c] = block[lo_i][c];
         hi[c] = block[hi_i][c];
+        d = hi[c] > lo[c] ? hi[c] - lo[c] : lo[c] - hi[c];
+        denom += d * d;
     }
+    if (!denom) return 0;
+    *recip = TC_ASTC_PROJ_RECIP(denom);
+    return 1;
+}
 
-    dr = hi[0] > lo[0] ? hi[0] - lo[0] : lo[0] - hi[0];
-    dg = hi[1] > lo[1] ? hi[1] - lo[1] : lo[1] - hi[1];
-    db = hi[2] > lo[2] ? hi[2] - lo[2] : lo[2] - hi[2];
-    da = hi[3] > lo[3] ? hi[3] - lo[3] : lo[3] - hi[3];
-    denom = dr * dr + dg * dg + db * db + da * da;
-    if (!denom) return UINT64_MAX;
-    recip = TC_ASTC_PROJ_RECIP(denom);
+/* Quantizes precomputed per-texel ideal weights onto a candidate's weight
+ * grid and returns the reconstruction SSE against lo/hi. The projection is
+ * hoisted out because the ideal weights depend only on the endpoint line,
+ * not on the candidate's grid or quantization. */
+static uint64_t tc_astc_fit_from_ideal(const uint8_t block[144][4],
+                                       uint32_t count,
+                                       const uint8_t ideal[144],
+                                       const uint32_t lo[4],
+                                       const uint32_t hi[4],
+                                       uint32_t quant_method,
+                                       const tc_astc_decim_cache_entry *decim,
+                                       uint32_t weight_count,
+                                       uint8_t out_weights[64]) {
+    uint8_t wt[144];
+    uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
+    uint32_t i;
 
     if (decim->direct) {
-        /* One weight per texel: project, quantize and reconstruct in a
-         * single fused pass with no scatter/normalize step. */
         for (i = 0; i < count; ++i) {
-            const uint8_t *p = block[i];
-            int32_t dot = 0;
-            uint32_t ideal, q, w;
-            for (c = 0; c < 4u; ++c) {
-                dot += (int32_t)((int32_t)p[c] - (int32_t)lo[c]) *
-                       (int32_t)((int32_t)hi[c] - (int32_t)lo[c]);
-            }
-            ideal = dot <= 0 ? 0u
-                             : tc_astc_project_weight((uint32_t)dot * 64u,
-                                                      recip);
-            q = (ideal * maxq + 32u) / 64u;
+            uint32_t q = ((uint32_t)ideal[i] * maxq + 32u) / 64u;
             if (q > maxq) q = maxq;
-            weights[i] = (uint8_t)q;
-            w = tc_astc_weight_unquant(q, quant_method);
-            for (c = 0; c < 4u; ++c) {
-                uint32_t recon = (lo[c] * (64u - w) + hi[c] * w + 32u) >> 6;
-                int32_t d = (int32_t)p[c] - (int32_t)recon;
-                err += (uint64_t)(d * d);
-            }
+            out_weights[i] = (uint8_t)q;
+            wt[i] = (uint8_t)tc_astc_weight_unquant(q, quant_method);
         }
     } else {
         uint32_t weight_accum[64];
@@ -2881,52 +3274,26 @@ static uint64_t tc_astc_try_endpoint_axis(const uint8_t block[144][4],
             weight_contrib[i] = 0;
         }
         for (i = 0; i < count; ++i) {
-            uint32_t n, j;
-            const uint8_t *p = block[i];
-            int32_t dot = 0;
-            uint32_t ideal;
-            for (c = 0; c < 4u; ++c) {
-                dot += (int32_t)((int32_t)p[c] - (int32_t)lo[c]) *
-                       (int32_t)((int32_t)hi[c] - (int32_t)lo[c]);
-            }
-            ideal = dot <= 0 ? 0u
-                             : tc_astc_project_weight((uint32_t)dot * 64u,
-                                                      recip);
-            n = decim->tw_count[i];
+            uint32_t n = decim->tw_count[i], j;
             for (j = 0; j < n; ++j) {
-                weight_accum[decim->tw_idx[i][j]] += ideal * decim->tw_contrib[i][j];
+                weight_accum[decim->tw_idx[i][j]] +=
+                    (uint32_t)ideal[i] * decim->tw_contrib[i][j];
                 weight_contrib[decim->tw_idx[i][j]] += decim->tw_contrib[i][j];
             }
         }
         for (i = 0; i < weight_count; ++i) {
-            uint32_t ideal = weight_contrib[i]
-                                 ? (weight_accum[i] + weight_contrib[i] / 2u) /
-                                       weight_contrib[i]
-                                 : 0u;
-            uint32_t q = (ideal * maxq + 32u) / 64u;
-            weights[i] = (uint8_t)(q > maxq ? maxq : q);
+            uint32_t v = weight_contrib[i]
+                             ? (weight_accum[i] + weight_contrib[i] / 2u) /
+                                   weight_contrib[i]
+                             : 0u;
+            uint32_t q = (v * maxq + 32u) / 64u;
+            out_weights[i] = (uint8_t)(q > maxq ? maxq : q);
         }
-        for (i = 0; i < count; ++i) {
-            uint32_t w = tc_astc_infilled_weight_table(
-                weights, decim->tw_idx[i], decim->tw_contrib[i],
-                decim->tw_count[i], quant_method);
-            for (c = 0; c < 4u; ++c) {
-                uint32_t recon = (lo[c] * (64u - w) + hi[c] * w + 32u) >> 6;
-                int32_t d = (int32_t)block[i][c] - (int32_t)recon;
-                err += (uint64_t)(d * d);
-            }
-        }
+        tc_astc_infill_weights(out_weights, decim, count, quant_method, wt);
     }
-
-    for (c = 0; c < 4u; ++c) {
-        best_lo[c] = lo[c];
-        best_hi[c] = hi[c];
-    }
-    /* Weights are returned as unscrambled quantized indices; callers must
-     * scramble with tc_astc_scramble_weights() before ISE-encoding them. */
-    memcpy(best_weights, weights, weight_count);
-    return err;
+    return tc_astc_recon_sse(block, count, lo, hi, wt);
 }
+
 
 static void tc_astc_scramble_weights(uint8_t *weights, uint32_t count,
                                      uint32_t quant_method) {
@@ -3020,8 +3387,7 @@ static uint64_t tc_astc_eval_single_sse(const tc_astc_encode_context *ctx,
                                         const uint32_t hi[4],
                                         uint32_t color_quant_method) {
     uint32_t e0[4], e1[4];
-    uint32_t i, c;
-    uint64_t err = 0;
+    uint32_t c;
     switch (endpoint_format) {
         case 0u:
             e0[0] = e0[1] = e0[2] =
@@ -3071,15 +3437,7 @@ static uint64_t tc_astc_eval_single_sse(const tc_astc_encode_context *ctx,
             }
             break;
     }
-    for (i = 0; i < count; ++i) {
-        uint32_t w = wt[i];
-        for (c = 0; c < 4u; ++c) {
-            uint32_t recon = (e0[c] * (64u - w) + e1[c] * w + 32u) >> 6;
-            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
-            err += (uint64_t)(d * d);
-        }
-    }
-    return err;
+    return tc_astc_recon_sse(block, count, e0, e1, wt);
 }
 
 /* Multi-partition variant: every texel interpolates its own partition's
@@ -3095,7 +3453,6 @@ static uint64_t tc_astc_eval_partition_sse(
     const uint8_t wt[144]) {
     uint32_t e0[4][4], e1[4][4];
     uint32_t i, c, p;
-    uint64_t err = 0;
     for (p = 0; p < partition_count; ++p) {
         if (formats[p] == 6u || formats[p] == 10u) {
             uint32_t sum_lo = part_lo[p][0] + part_lo[p][1] + part_lo[p][2];
@@ -3138,17 +3495,19 @@ static uint64_t tc_astc_eval_partition_sse(
             }
         }
     }
-    for (i = 0; i < count; ++i) {
-        uint32_t part = pi->partition_of_texel[i];
-        uint32_t w = wt[i];
-        for (c = 0; c < 4u; ++c) {
-            uint32_t recon =
-                (e0[part][c] * (64u - w) + e1[part][c] * w + 32u) >> 6;
-            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
-            err += (uint64_t)(d * d);
+    {
+        uint8_t e0t[144][4], e1t[144][4];
+        for (i = 0; i < count; ++i) {
+            uint32_t part = pi->partition_of_texel[i];
+            for (c = 0; c < 4u; ++c) {
+                e0t[i][c] = (uint8_t)e0[part][c];
+                e1t[i][c] = (uint8_t)e1[part][c];
+            }
         }
+        return tc_astc_recon_sse_pt(block, count,
+                                    (const uint8_t(*)[4])e0t,
+                                    (const uint8_t(*)[4])e1t, wt);
     }
-    return err;
 }
 
 /* Per-partition least-squares endpoint solve restricted to one partition's
@@ -3494,17 +3853,20 @@ static uint32_t tc_astc_emit_partition_endpoint_values(
  * lines: each texel's ideal weight comes from projecting onto its own
  * partition's lo->hi diagonal. Returns the reconstruction SSE with the
  * (unquantized) per-partition endpoints. */
-static uint64_t tc_astc_try_partition_fit(
-    const uint8_t block[144][4], uint32_t count,
-    const tc_astc_partition_info *pi, uint32_t partition_count,
-    const uint32_t part_lo[4][4], const uint32_t part_hi[4][4],
-    uint32_t quant_method, const tc_astc_decim_cache_entry *decim,
-    uint32_t weight_count, uint8_t out_weights[64]) {
+/* Per-texel projection onto each texel's own partition line, plus the
+ * per-texel (unquantized) endpoint arrays used for fit-time reconstruction.
+ * Candidate-independent, so it runs once per partitioned block. */
+static void tc_astc_partition_project(const uint8_t block[144][4],
+                                      uint32_t count,
+                                      const tc_astc_partition_info *pi,
+                                      uint32_t partition_count,
+                                      const uint32_t part_lo[4][4],
+                                      const uint32_t part_hi[4][4],
+                                      uint8_t ideal[144], uint8_t active[144],
+                                      uint8_t e0t[144][4],
+                                      uint8_t e1t[144][4]) {
     uint32_t denom[4], recip[4];
-    uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
     uint32_t i, c, p;
-    uint64_t err = 0;
-
     for (p = 0; p < partition_count; ++p) {
         uint32_t d = 0;
         for (c = 0; c < 4u; ++c) {
@@ -3514,27 +3876,55 @@ static uint64_t tc_astc_try_partition_fit(
         denom[p] = d;
         recip[p] = d ? TC_ASTC_PROJ_RECIP(d) : 0u;
     }
+    for (i = 0; i < count; ++i) {
+        uint32_t part = pi->partition_of_texel[i];
+        const uint8_t *px = block[i];
+        int32_t dot = 0;
+        for (c = 0; c < 4u; ++c) {
+            e0t[i][c] = (uint8_t)part_lo[part][c];
+            e1t[i][c] = (uint8_t)part_hi[part][c];
+        }
+        if (!denom[part]) {
+            /* Solid partition: reconstruction ignores the weight, so the
+             * texel must not constrain the shared grid either. */
+            ideal[i] = 0;
+            active[i] = 0;
+            continue;
+        }
+        active[i] = 1;
+        for (c = 0; c < 4u; ++c) {
+            dot += (int32_t)((int32_t)px[c] - (int32_t)part_lo[part][c]) *
+                   (int32_t)((int32_t)part_hi[part][c] -
+                             (int32_t)part_lo[part][c]);
+        }
+        ideal[i] = (uint8_t)(dot <= 0 ? 0u
+                                      : tc_astc_project_weight(
+                                            (uint32_t)dot * 64u, recip[part]));
+    }
+}
+
+/* Partition-path counterpart of tc_astc_fit_from_ideal: quantize the
+ * hoisted ideal weights onto a candidate grid and reconstruct against the
+ * per-texel endpoint arrays. */
+static uint64_t tc_astc_fit_from_ideal_pt(const uint8_t block[144][4],
+                                          uint32_t count,
+                                          const uint8_t ideal[144],
+                                          const uint8_t active[144],
+                                          const uint8_t e0t[144][4],
+                                          const uint8_t e1t[144][4],
+                                          uint32_t quant_method,
+                                          const tc_astc_decim_cache_entry *decim,
+                                          uint32_t weight_count,
+                                          uint8_t out_weights[64]) {
+    uint8_t wt[144];
+    uint32_t maxq = tc_astc_quant_levels(quant_method) - 1u;
+    uint32_t i;
     if (decim->direct) {
         for (i = 0; i < count; ++i) {
-            uint32_t part = pi->partition_of_texel[i];
-            const uint8_t *px = block[i];
-            int32_t dot = 0;
-            uint32_t ideal, q;
-            if (!denom[part]) {
-                out_weights[i] = 0;
-                continue; /* solid partition: reconstruction ignores w */
-            }
-            for (c = 0; c < 4u; ++c) {
-                dot += (int32_t)((int32_t)px[c] - (int32_t)part_lo[part][c]) *
-                       (int32_t)((int32_t)part_hi[part][c] -
-                                 (int32_t)part_lo[part][c]);
-            }
-            ideal = dot <= 0 ? 0u
-                             : tc_astc_project_weight((uint32_t)dot * 64u,
-                                                      recip[part]);
-            q = (ideal * maxq + 32u) / 64u;
+            uint32_t q = ((uint32_t)ideal[i] * maxq + 32u) / 64u;
             if (q > maxq) q = maxq;
             out_weights[i] = (uint8_t)q;
+            wt[i] = (uint8_t)tc_astc_weight_unquant(q, quant_method);
         }
     } else {
         uint32_t weight_accum[64];
@@ -3544,53 +3934,25 @@ static uint64_t tc_astc_try_partition_fit(
             weight_contrib[i] = 0;
         }
         for (i = 0; i < count; ++i) {
-            uint32_t part = pi->partition_of_texel[i];
-            const uint8_t *px = block[i];
-            int32_t dot = 0;
-            uint32_t ideal, n, j;
-            if (!denom[part]) continue; /* solid partition: no constraint */
-            for (c = 0; c < 4u; ++c) {
-                dot += (int32_t)((int32_t)px[c] - (int32_t)part_lo[part][c]) *
-                       (int32_t)((int32_t)part_hi[part][c] -
-                                 (int32_t)part_lo[part][c]);
-            }
-            ideal = dot <= 0 ? 0u
-                             : tc_astc_project_weight((uint32_t)dot * 64u,
-                                                      recip[part]);
-            n = decim->tw_count[i];
+            uint32_t n = decim->tw_count[i], j;
+            if (!active[i]) continue;
             for (j = 0; j < n; ++j) {
-                weight_accum[decim->tw_idx[i][j]] += ideal * decim->tw_contrib[i][j];
+                weight_accum[decim->tw_idx[i][j]] +=
+                    (uint32_t)ideal[i] * decim->tw_contrib[i][j];
                 weight_contrib[decim->tw_idx[i][j]] += decim->tw_contrib[i][j];
             }
         }
         for (i = 0; i < weight_count; ++i) {
-            uint32_t ideal = weight_contrib[i]
-                                 ? (weight_accum[i] + weight_contrib[i] / 2u) /
-                                       weight_contrib[i]
-                                 : 0u;
-            uint32_t q = (ideal * maxq + 32u) / 64u;
+            uint32_t v = weight_contrib[i]
+                             ? (weight_accum[i] + weight_contrib[i] / 2u) /
+                                   weight_contrib[i]
+                             : 0u;
+            uint32_t q = (v * maxq + 32u) / 64u;
             out_weights[i] = (uint8_t)(q > maxq ? maxq : q);
         }
+        tc_astc_infill_weights(out_weights, decim, count, quant_method, wt);
     }
-    for (i = 0; i < count; ++i) {
-        uint32_t part = pi->partition_of_texel[i];
-        uint32_t w;
-        if (decim->direct) {
-            w = tc_astc_weight_unquant(out_weights[i], quant_method);
-        } else {
-            w = tc_astc_infilled_weight_table(out_weights, decim->tw_idx[i],
-                                              decim->tw_contrib[i],
-                                              decim->tw_count[i], quant_method);
-        }
-        for (c = 0; c < 4u; ++c) {
-            uint32_t recon =
-                (part_lo[part][c] * (64u - w) + part_hi[part][c] * w + 32u) >>
-                6;
-            int32_t d = (int32_t)block[i][c] - (int32_t)recon;
-            err += (uint64_t)(d * d);
-        }
-    }
-    return err;
+    return tc_astc_recon_sse_pt(block, count, e0t, e1t, wt);
 }
 
 static int tc_encode_astc_partition_rgb_block(const uint8_t block[144][4],
@@ -3603,6 +3965,8 @@ static int tc_encode_astc_partition_rgb_block(const uint8_t block[144][4],
     const tc_astc_decim_cache_entry *decim;
     uint8_t weightbuf[16], weights[64], color_values[18];
     uint8_t endpoint_formats[4];
+    uint8_t fit_ideal[144], fit_active[144];
+    uint8_t fit_e0t[144][4], fit_e1t[144][4];
     uint32_t cand_count, ci, c, i, bitpos, best = 0xffffffffu;
     uint32_t part_lo[4][4], part_hi[4][4];
     const tc_astc_partition_info *pi = NULL;
@@ -3650,6 +4014,10 @@ static int tc_encode_astc_partition_rgb_block(const uint8_t block[144][4],
         }
     }
 
+    tc_astc_partition_project(block, count, pi, partition_count,
+                              (const uint32_t(*)[4])part_lo,
+                              (const uint32_t(*)[4])part_hi, fit_ideal,
+                              fit_active, fit_e0t, fit_e1t);
     cand_count = tc_astc_get_candidates(ctx, 29u, &candidates);
     for (ci = 0; ci < cand_count; ++ci) {
         uint8_t cand_weights[64];
@@ -3663,9 +4031,9 @@ static int tc_encode_astc_partition_rgb_block(const uint8_t block[144][4],
         decim = tc_astc_get_decim_cache(ctx, candidates[ci].weight_x,
                                         candidates[ci].weight_y);
         if (!decim) continue;
-        err = tc_astc_try_partition_fit(
-            block, count, pi, partition_count,
-            (const uint32_t(*)[4])part_lo, (const uint32_t(*)[4])part_hi,
+        err = tc_astc_fit_from_ideal_pt(
+            block, count, fit_ideal, fit_active,
+            (const uint8_t(*)[4])fit_e0t, (const uint8_t(*)[4])fit_e1t,
             candidates[ci].quant_method, decim,
             (uint32_t)candidates[ci].weight_x * candidates[ci].weight_y,
             cand_weights);
@@ -3818,7 +4186,11 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
     uint8_t values[8];
     uint32_t cand_count, ci, c, i, bitpos, best = 0xffffffffu;
     uint32_t color_lo[4], color_hi[4], alpha_lo[4], alpha_hi[4];
+    uint32_t line_color_lo[4], line_color_hi[4], line_alpha_lo[4],
+        line_alpha_hi[4];
     uint32_t luma_lo_i, luma_hi_i, alpha_lo_i, alpha_hi_i;
+    uint32_t color_recip, alpha_recip;
+    uint8_t color_ideal[144], alpha_ideal[144];
     uint32_t alpha_min = 255u, alpha_max = 0u;
     int is_rgb_scale = tc_astc_block_is_rgb_scale(block, count);
     uint32_t endpoint_format = is_rgb_scale ? 10u : 12u;
@@ -3837,11 +4209,18 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
 
     tc_astc_axis_extremes(block, count, 4u, &luma_lo_i, &luma_hi_i);
     tc_astc_axis_extremes(block, count, 3u, &alpha_lo_i, &alpha_hi_i);
+    if (!tc_astc_axis_line(block, luma_lo_i, luma_hi_i, line_color_lo,
+                           line_color_hi, &color_recip) ||
+        !tc_astc_axis_line(block, alpha_lo_i, alpha_hi_i, line_alpha_lo,
+                           line_alpha_hi, &alpha_recip))
+        return 0;
+    tc_astc_project_ideal(block, count, line_color_lo, line_color_hi,
+                          color_recip, color_ideal);
+    tc_astc_project_ideal(block, count, line_alpha_lo, line_alpha_hi,
+                          alpha_recip, alpha_ideal);
     cand_count = tc_astc_build_dual_block_mode_candidates(
         ctx->block_x, ctx->block_y, 17u, quality, candidates);
     for (ci = 0; ci < cand_count; ++ci) {
-        uint32_t cand_color_lo[4], cand_color_hi[4];
-        uint32_t cand_alpha_lo[4], cand_alpha_hi[4];
         uint8_t cand_color_weights[64], cand_alpha_weights[64];
         uint64_t color_err, alpha_err, err;
         uint32_t cand_color_quant_method;
@@ -3857,28 +4236,28 @@ static int tc_encode_astc_dual_rgba_block(const uint8_t block[144][4],
         decim = tc_astc_get_decim_cache(ctx, candidates[ci].weight_x,
                                         candidates[ci].weight_y);
         if (!decim) continue;
-        color_err = tc_astc_try_endpoint_axis(
-            block, count, luma_lo_i, luma_hi_i, candidates[ci].quant_method,
-            decim, weight_count, cand_color_lo, cand_color_hi,
-            cand_color_weights);
-        alpha_err = tc_astc_try_endpoint_axis(
-            block, count, alpha_lo_i, alpha_hi_i, candidates[ci].quant_method,
-            decim, weight_count, cand_alpha_lo, cand_alpha_hi,
-            cand_alpha_weights);
+        color_err = tc_astc_fit_from_ideal(block, count, color_ideal,
+                                           line_color_lo, line_color_hi,
+                                           candidates[ci].quant_method, decim,
+                                           weight_count, cand_color_weights);
+        alpha_err = tc_astc_fit_from_ideal(block, count, alpha_ideal,
+                                           line_alpha_lo, line_alpha_hi,
+                                           candidates[ci].quant_method, decim,
+                                           weight_count, cand_alpha_weights);
         err = color_err + alpha_err;
         if (err < best_err) {
             best_err = err;
             best = ci;
-            memcpy(color_lo, cand_color_lo, sizeof(color_lo));
-            memcpy(color_hi, cand_color_hi, sizeof(color_hi));
-            memcpy(alpha_lo, cand_alpha_lo, sizeof(alpha_lo));
-            memcpy(alpha_hi, cand_alpha_hi, sizeof(alpha_hi));
             memcpy(color_weights, cand_color_weights, weight_count);
             memcpy(alpha_weights, cand_alpha_weights, weight_count);
             color_quant_method = cand_color_quant_method;
         }
     }
     if (best == 0xffffffffu) return 0;
+    memcpy(color_lo, line_color_lo, sizeof(color_lo));
+    memcpy(color_hi, line_color_hi, sizeof(color_hi));
+    memcpy(alpha_lo, line_alpha_lo, sizeof(alpha_lo));
+    memcpy(alpha_hi, line_alpha_hi, sizeof(alpha_hi));
 
     /* Quantization-aware error of the emitted dual-plane block, with a
      * least-squares refinement pass over both planes' endpoints. */
@@ -4063,6 +4442,9 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     uint8_t path_out[16];
     uint8_t cand_out[16];
     uint32_t axis_lo_i[5], axis_hi_i[5];
+    uint32_t axis_lo[5][4], axis_hi[5][4], axis_recip[5];
+    uint8_t axis_ideal[5][144];
+    int axis_valid[5];
     uint64_t path_err = UINT64_MAX, cand_err;
     int have_path = 0;
 
@@ -4104,47 +4486,59 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
         memcpy(path_out, cand_out, 16u);
         have_path = 1;
     }
-    for (axis = 0; axis < 5u; ++axis)
+    /* Endpoint lines and projected ideal weights depend only on the axis,
+     * not on the candidate's weight grid, so compute them once per block. */
+    for (axis = 0; axis < 5u; ++axis) {
         tc_astc_axis_extremes(block, count, axis, &axis_lo_i[axis],
                               &axis_hi_i[axis]);
+        axis_valid[axis] = tc_astc_axis_line(block, axis_lo_i[axis],
+                                             axis_hi_i[axis], axis_lo[axis],
+                                             axis_hi[axis], &axis_recip[axis]);
+        if (axis_valid[axis])
+            tc_astc_project_ideal(block, count, axis_lo[axis], axis_hi[axis],
+                                  axis_recip[axis], axis_ideal[axis]);
+    }
     candidate_count = tc_astc_get_candidates(ctx, candidate_endpoint_end_bit, &candidates);
     if (selected_limit > candidate_count) selected_limit = candidate_count;
 
-    for (ci = 0; ci < candidate_count; ++ci) {
-        const tc_astc_decim_cache_entry *decim = tc_astc_get_decim_cache(
-            ctx, candidates[ci].weight_x, candidates[ci].weight_y);
-        uint32_t cand_lo[4], cand_hi[4], pos;
-        uint8_t cand_weights[64];
-        uint32_t cand_color_quant;
-        uint64_t err;
-        if (quality > 0) {
-            uint32_t color_bits_available = 111u - candidates[ci].weight_bits;
-            if (candidates[ci].weight_bits >= 111u ||
-                !tc_astc_lut_color_quant(ctx, endpoint_value_count,
-                                         color_bits_available,
-                                         &cand_color_quant))
+    if (axis_valid[4]) {
+        for (ci = 0; ci < candidate_count; ++ci) {
+            const tc_astc_decim_cache_entry *decim = tc_astc_get_decim_cache(
+                ctx, candidates[ci].weight_x, candidates[ci].weight_y);
+            uint32_t pos;
+            uint8_t cand_weights[64];
+            uint32_t cand_color_quant;
+            uint64_t err;
+            if (quality > 0) {
+                uint32_t color_bits_available = 111u - candidates[ci].weight_bits;
+                if (candidates[ci].weight_bits >= 111u ||
+                    !tc_astc_lut_color_quant(ctx, endpoint_value_count,
+                                             color_bits_available,
+                                             &cand_color_quant))
+                    continue;
+            }
+            if (!decim) continue;
+            err = tc_astc_fit_from_ideal(
+                block, count, axis_ideal[4], axis_lo[4], axis_hi[4],
+                candidates[ci].quant_method, decim,
+                (uint32_t)candidates[ci].weight_x * candidates[ci].weight_y,
+                cand_weights);
+            if (selected_count < selected_limit) {
+                pos = selected_count++;
+            } else if (selected_count &&
+                       err < selected_errors[selected_count - 1u]) {
+                pos = selected_count - 1u;
+            } else {
                 continue;
+            }
+            while (pos > 0u && err < selected_errors[pos - 1u]) {
+                selected_errors[pos] = selected_errors[pos - 1u];
+                selected_candidates[pos] = selected_candidates[pos - 1u];
+                --pos;
+            }
+            selected_errors[pos] = err;
+            selected_candidates[pos] = (uint16_t)ci;
         }
-        if (!decim) continue;
-        err = tc_astc_try_endpoint_axis(
-            block, count, axis_lo_i[4], axis_hi_i[4],
-            candidates[ci].quant_method, decim,
-            (uint32_t)candidates[ci].weight_x * candidates[ci].weight_y,
-            cand_lo, cand_hi, cand_weights);
-        if (selected_count < selected_limit) {
-            pos = selected_count++;
-        } else if (selected_count && err < selected_errors[selected_count - 1u]) {
-            pos = selected_count - 1u;
-        } else {
-            continue;
-        }
-        while (pos > 0u && err < selected_errors[pos - 1u]) {
-            selected_errors[pos] = selected_errors[pos - 1u];
-            selected_candidates[pos] = selected_candidates[pos - 1u];
-            --pos;
-        }
-        selected_errors[pos] = err;
-        selected_candidates[pos] = (uint16_t)ci;
     }
 
     for (ci = 0; ci < selected_count; ++ci) {
@@ -4170,15 +4564,18 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
             uint8_t cand_weights[64];
             uint8_t wt[144];
             uint64_t err;
+            if (!axis_valid[axis]) continue;
             if (axis_lo_i[axis] == axis_lo_i[4] &&
                 axis_hi_i[axis] == axis_hi_i[4] && axis != 4u)
                 continue; /* same endpoint pair as the luma axis */
-            (void)tc_astc_try_endpoint_axis(
-                block, count, axis_lo_i[axis], axis_hi_i[axis],
+            memcpy(cand_lo, axis_lo[axis], sizeof(cand_lo));
+            memcpy(cand_hi, axis_hi[axis], sizeof(cand_hi));
+            (void)tc_astc_fit_from_ideal(
+                block, count, axis_ideal[axis], cand_lo, cand_hi,
                 candidates[candidate_index].quant_method, decim,
                 (uint32_t)candidates[candidate_index].weight_x *
                     candidates[candidate_index].weight_y,
-                cand_lo, cand_hi, cand_weights);
+                cand_weights);
             /* Score with the endpoints as they will actually decode
              * (quantized), and try replacing the axis-extreme endpoints
              * with the least-squares solution for the fitted weights. */

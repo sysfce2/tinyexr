@@ -32,6 +32,7 @@ verified against a reference decoder in test/astc_ref_decode.h and against
 Arm's astcenc (`make texcomp-astc-arm-smoke`); quality is tracked by
 `make texcomp-astc-psnr`. The partition-pattern hash and the ISE/unquant data
 tables follow the Khronos ASTC specification (cross-checked against
-https://github.com/ARM-software/astc-encoder). SIMD kernels for the encoder
-search loops remain future optimization work; only constant-color blocks use
-SIMD today.
+https://github.com/ARM-software/astc-encoder). The projection and
+reconstruction kernels of the encoder search have SSE2 and NEON variants
+that are bit-exact with the scalar forms (enforced by cross-backend parity
+tests); AVX2-widened kernels remain future optimization work.
