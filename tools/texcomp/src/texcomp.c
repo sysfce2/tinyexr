@@ -8,6 +8,7 @@
 #include "texcomp.h"
 
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
@@ -4000,7 +4001,7 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
     tc_astc_options defopt;
     uint32_t bx, by, xx, yy, x, y;
     uint8_t block[144][4];
-    tc_astc_encode_context astc_ctx;
+    tc_astc_encode_context *astc_ctx;
     size_t need, off = 0;
 
     if (!opt) {
@@ -4013,7 +4014,11 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
     if (stride < (size_t)width * 4u) return TC_ERROR_INVALID_ARGUMENT;
     need = tc_astc_compressed_size(width, height, opt);
     if (!need || out_size < need) return TC_ERROR_INVALID_ARGUMENT;
-    tc_astc_encode_context_init(&astc_ctx, opt->block_x, opt->block_y,
+    /* The context holds several MB of partition/decimation caches; keep it
+     * off the stack (one allocation per image, not per block). */
+    astc_ctx = (tc_astc_encode_context *)malloc(sizeof(*astc_ctx));
+    if (!astc_ctx) return TC_ERROR_OUT_OF_MEMORY;
+    tc_astc_encode_context_init(astc_ctx, opt->block_x, opt->block_y,
                                 opt->quality);
 
     for (by = 0; by < height; by += opt->block_y) {
@@ -4032,7 +4037,7 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
                 }
             }
             if (!tc_astc_block_is_solid(block, count)) {
-                tc_encode_astc_ldr_block(block, count, opt->quality, &astc_ctx,
+                tc_encode_astc_ldr_block(block, count, opt->quality, astc_ctx,
                                          out_astc + off);
             } else {
                 tc_encode_astc_const_block(block, count, out_astc + off);
@@ -4041,6 +4046,7 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
         }
     }
 
+    free(astc_ctx);
     return TC_SUCCESS;
 }
 
