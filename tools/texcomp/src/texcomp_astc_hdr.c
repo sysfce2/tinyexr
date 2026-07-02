@@ -104,7 +104,20 @@ static float tc_fclamp(float x, float lo, float hi) {
 }
 static float tc_fabs(float x) { return x < 0.0f ? -x : x; }
 
-void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]) {
+/* quant_color / retain-top-bits at colour quant `level` (identity at 256). */
+static int tc_cem11_qc(int level, int value) {
+    return tc_astc_hdr_color_roundtrip((uint32_t)level, value);
+}
+static int tc_cem11_retain(int level, int value, int topmask) {
+    for (;;) {
+        int q = tc_cem11_qc(level, value);
+        if ((value & topmask) == (q & topmask) || value <= 0) return q;
+        value--;
+    }
+}
+
+void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], int level,
+                        uint8_t v[6]) {
     static const int mode_bits[8][4] = {{9, 7, 6, 7},  {9, 8, 6, 6},
                                         {10, 6, 7, 7}, {10, 7, 7, 6},
                                         {11, 8, 6, 5}, {11, 6, 8, 6},
@@ -165,31 +178,22 @@ void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]) {
             continue;
 
         a_iv = tc_rtn(a_base * ms);
+        a_iv = (a_iv & ~0xFF) | tc_cem11_qc(level, a_iv & 0xFF);
         a_f = (float)a_iv * mr;
+
         c_f = tc_fclamp(a_f - c0[0], 0.0f, 65535.0f);
         c_iv = tc_rtn(c_f * ms);
         if (c_iv >= c_ic) continue;
+        c_lo = (c_iv & 0x3f) | ((mode & 1) << 7) | ((a_iv & 0x100) >> 2);
+        c_lo = tc_cem11_retain(level, c_lo, 0xC0);
+        c_iv = (c_iv & ~0x3F) | (c_lo & 0x3F);
+        c_f = (float)c_iv * mr;
+
         b0_f = tc_fclamp(a_f - c1[1], 0.0f, 65535.0f);
         b1_f = tc_fclamp(a_f - c1[2], 0.0f, 65535.0f);
         b0_iv = tc_rtn(b0_f * ms);
         b1_iv = tc_rtn(b1_f * ms);
         if (b0_iv >= b_ic || b1_iv >= b_ic) continue;
-        /* recompute d from the (identity-)quantised a/b/c */
-        {
-            float d0_f = tc_fclamp(a_f - (float)b0_iv * mr - (float)c_iv * mr -
-                                       c0[1],
-                                   -65535.0f, 65535.0f);
-            float d1_f = tc_fclamp(a_f - (float)b1_iv * mr - (float)c_iv * mr -
-                                       c0[2],
-                                   -65535.0f, 65535.0f);
-            d0_iv = tc_rtn(d0_f * ms);
-            d1_iv = tc_rtn(d1_f * ms);
-        }
-        if ((d0_iv < 0 ? -d0_iv : d0_iv) >= d_ic ||
-            (d1_iv < 0 ? -d1_iv : d1_iv) >= d_ic)
-            continue;
-
-        c_lo = (c_iv & 0x3f) | ((mode & 1) << 7) | ((a_iv & 0x100) >> 2);
         b0_lo = b0_iv & 0x3f;
         b1_lo = b1_iv & 0x3f;
         bit0 = (mode == 2 || mode == 5 || mode == 7) ? ((a_iv >> 9) & 1)
@@ -202,6 +206,24 @@ void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]) {
             bit1 = (b1_iv >> 6) & 1;
         b0_lo |= (bit0 << 6) | (((mode >> 1) & 1) << 7);
         b1_lo |= (bit1 << 6) | (((mode >> 2) & 1) << 7);
+        b0_lo = tc_cem11_retain(level, b0_lo, 0xC0);
+        b1_lo = tc_cem11_retain(level, b1_lo, 0xC0);
+        b0_iv = (b0_iv & ~0x3f) | (b0_lo & 0x3f);
+        b1_iv = (b1_iv & ~0x3f) | (b1_lo & 0x3f);
+        b0_f = (float)b0_iv * mr;
+        b1_f = (float)b1_iv * mr;
+
+        {
+            float d0_f =
+                tc_fclamp(a_f - b0_f - c_f - c0[1], -65535.0f, 65535.0f);
+            float d1_f =
+                tc_fclamp(a_f - b1_f - c_f - c0[2], -65535.0f, 65535.0f);
+            d0_iv = tc_rtn(d0_f * ms);
+            d1_iv = tc_rtn(d1_f * ms);
+        }
+        if ((d0_iv < 0 ? -d0_iv : d0_iv) >= d_ic ||
+            (d1_iv < 0 ? -d1_iv : d1_iv) >= d_ic)
+            continue;
 
         d0_lo = d0_iv & 0x1f;
         d1_lo = d1_iv & 0x1f;
@@ -230,6 +252,8 @@ void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]) {
         }
         d0_lo |= (bit2 << 6) | (bit4 << 5) | ((majcomp & 1) << 7);
         d1_lo |= (bit3 << 6) | (bit5 << 5) | (((majcomp >> 1) & 1) << 7);
+        d0_lo = tc_cem11_retain(level, d0_lo, 0xF0);
+        d1_lo = tc_cem11_retain(level, d1_lo, 0xF0);
 
         v[0] = (uint8_t)(a_iv & 0xFF);
         v[1] = (uint8_t)c_lo;
@@ -242,18 +266,12 @@ void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]) {
 
     /* Flat fallback == majcomp==3 direct (R/G 8-bit, B 7-bit qlog). */
     {
-        int r0 = tc_rtn(tc_fclamp((float)lns0[0], 0, 65020) / 256.0f);
-        int r1 = tc_rtn(tc_fclamp((float)lns1[0], 0, 65020) / 256.0f);
-        int g0 = tc_rtn(tc_fclamp((float)lns0[1], 0, 65020) / 256.0f);
-        int g1 = tc_rtn(tc_fclamp((float)lns1[1], 0, 65020) / 256.0f);
-        int b0 = tc_rtn(tc_fclamp((float)lns0[2], 0, 65020) / 512.0f) + 128;
-        int b1 = tc_rtn(tc_fclamp((float)lns1[2], 0, 65020) / 512.0f) + 128;
-        if (r0 > 255) r0 = 255;
-        if (r1 > 255) r1 = 255;
-        if (g0 > 255) g0 = 255;
-        if (g1 > 255) g1 = 255;
-        if (b0 > 255) b0 = 255;
-        if (b1 > 255) b1 = 255;
+        int r0 = tc_cem11_qc(level, tc_rtn(tc_fclamp((float)lns0[0], 0, 65020) / 256.0f));
+        int r1 = tc_cem11_qc(level, tc_rtn(tc_fclamp((float)lns1[0], 0, 65020) / 256.0f));
+        int g0 = tc_cem11_qc(level, tc_rtn(tc_fclamp((float)lns0[1], 0, 65020) / 256.0f));
+        int g1 = tc_cem11_qc(level, tc_rtn(tc_fclamp((float)lns1[1], 0, 65020) / 256.0f));
+        int b0 = tc_cem11_retain(level, tc_rtn(tc_fclamp((float)lns0[2], 0, 65020) / 512.0f) + 128, 0xC0);
+        int b1 = tc_cem11_retain(level, tc_rtn(tc_fclamp((float)lns1[2], 0, 65020) / 512.0f) + 128, 0xC0);
         v[0] = (uint8_t)r0;
         v[1] = (uint8_t)r1;
         v[2] = (uint8_t)g0;

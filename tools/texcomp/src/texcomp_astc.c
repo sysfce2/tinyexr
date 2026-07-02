@@ -3950,6 +3950,27 @@ static uint32_t tc_astc_hdr_find_block_mode_4x4(void) {
     return 0;
 }
 
+/* Shared read-only encode context for the HDR path (colour quant LUTs). */
+static tc_astc_encode_context tc_hdr_ctx;
+static int tc_hdr_ctx_ready = 0;
+static void tc_hdr_ctx_ensure(void) {
+    if (!tc_hdr_ctx_ready) {
+        tc_astc_encode_context_init(&tc_hdr_ctx, 4u, 4u, 0);
+        tc_hdr_ctx_ready = 1;
+    }
+}
+
+/* quant_color equivalent: value as the decoder reconstructs it at a colour
+ * quant level. Exposed so the CEM 11 endpoint packer (texcomp_astc_hdr.c) can
+ * quantise endpoints to sub-256 levels (needed for 2-subset budgets). */
+int tc_astc_hdr_color_roundtrip(uint32_t level, int value) {
+    if (value < 0) value = 0;
+    if (value > 255) value = 255;
+    if (level >= 20u) return value; /* 256 levels == identity */
+    tc_hdr_ctx_ensure();
+    return (int)tc_astc_color_roundtrip(&tc_hdr_ctx, level, (uint32_t)value);
+}
+
 /* 4x4 dual-plane grid, weight range 3 (trit), single partition. */
 static uint32_t tc_astc_hdr_find_dual_block_mode(void) {
     uint32_t bm;
@@ -3979,8 +4000,6 @@ static uint8_t tc_astc_hdr_quant_weight(int w64, uint32_t qm, uint32_t levels) {
 
 uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     static uint32_t bm_single = 0xffffffffu, bm_dual = 0xffffffffu;
-    static tc_astc_encode_context hdr_ctx; /* only its colour quant LUT is used */
-    static int hdr_ctx_ready = 0;
     uint8_t weightbuf[16], packed[8], sw[16];
     uint8_t v[8];
     int e0[3], e1[3], qe0[3], qe1[3], dir[3];
@@ -3992,10 +4011,7 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
 
     if (bm_single == 0xffffffffu) bm_single = tc_astc_hdr_find_block_mode_4x4();
     if (bm_dual == 0xffffffffu) bm_dual = tc_astc_hdr_find_dual_block_mode();
-    if (!hdr_ctx_ready) {
-        tc_astc_encode_context_init(&hdr_ctx, 4u, 4u, 0);
-        hdr_ctx_ready = 1;
-    }
+    tc_hdr_ctx_ensure();
 
     /* endpoints: per-channel LNS bounding box (min -> e0, max -> e1). */
     for (c = 0; c < 3; ++c) {
@@ -4007,7 +4023,7 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
             if (lns[i][c] < e0[c]) e0[c] = lns[i][c];
             if (lns[i][c] > e1[c]) e1[c] = lns[i][c];
         }
-    tc_astc_cem11_pack(e0, e1, v);
+    tc_astc_cem11_pack(e0, e1, 20, v);
     tc_astc_cem11_unpack(v, qe0, qe1);
     for (c = 0; c < 3; ++c) {
         dir[c] = qe1[c] - qe0[c];
@@ -4100,7 +4116,7 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
         tc_set_bits(out, &bitpos, 11u, 4u);
         bitpos = 128u - wbits - 2u; /* colour component selector below weights */
         tc_set_bits(out, &bitpos, (uint32_t)best_ccs, 2u);
-        tc_astc_quantize_color_values(&hdr_ctx, 20u, 6u, v, packed);
+        tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 6u, v, packed);
         (void)tc_astc_ise_encode_bits(20u, 6u, packed, out, 16u, 17u);
         return (uint64_t)best_dual_sse;
     }
@@ -4112,7 +4128,7 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     tc_set_bits(out, &bitpos, bm_single, 11u);
     tc_set_bits(out, &bitpos, 0u, 2u);
     tc_set_bits(out, &bitpos, 11u, 4u);
-    tc_astc_quantize_color_values(&hdr_ctx, 20u, 6u, v, packed);
+    tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 6u, v, packed);
     (void)tc_astc_ise_encode_bits(20u, 6u, packed, out, 16u, 17u);
     return (uint64_t)sse_single;
 }

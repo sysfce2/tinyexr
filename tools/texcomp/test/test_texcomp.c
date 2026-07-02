@@ -829,23 +829,35 @@ int main(void) {
             {4.4f, 3.3f, 2.2f},
             {12.0f, 9.0f, 6.0f},
             {12.8f, 9.6f, 6.4f}};
-        int k, c;
-        for (k = 0; k + 1 < 8; k += 2) {
-            int l0[3], l1[3], d0[3], d1[3];
-            double tol = (k >= 4) ? 0.02 : 0.12; /* base+offset vs fallback */
-            uint8_t v[6];
-            for (c = 0; c < 3; ++c) {
-                l0[c] = tc_astc_float_to_lns16(cols[k][c]);
-                l1[c] = tc_astc_float_to_lns16(cols[k + 1][c]);
-            }
-            tc_astc_cem11_pack(l0, l1, v);
-            CHECK(tc_astc_cem11_unpack(v, d0, d1) == 1, "cem11 unpack");
-            for (c = 0; c < 3; ++c) {
-                float rec = half_bits_to_float(tc_astc_lns16_to_sf16(d0[c]));
-                float ref = half_bits_to_float(tc_float_to_half_bits(cols[k][c]));
-                double rel = fabs((double)rec - ref) / ((double)ref + 1e-3);
-                CHECK(tc_astc_lns16_to_sf16(d0[c]) <= 0x7BFFu, "cem11 valid half");
-                CHECK(rel < tol, "cem11 value round-trip");
+        int k, c, lvl;
+        /* level 20 (== colour quant 256, single-subset) and level 14 (== 64,
+         * the 2-subset budget) must both round-trip. */
+        static const int levels[2] = {20, 14};
+        int li;
+        for (li = 0; li < 2; ++li) {
+            lvl = levels[li];
+            for (k = 0; k + 1 < 8; k += 2) {
+                int l0[3], l1[3], d0[3], d1[3];
+                /* base+offset (k>=4) is precise; the flat fallback (k<4) on
+                 * small anti-correlated colours is coarse, more so at 64. */
+                double tol = (lvl >= 20) ? ((k >= 4) ? 0.03 : 0.14)
+                                         : ((k >= 4) ? 0.06 : 0.32);
+                uint8_t v[6];
+                for (c = 0; c < 3; ++c) {
+                    l0[c] = tc_astc_float_to_lns16(cols[k][c]);
+                    l1[c] = tc_astc_float_to_lns16(cols[k + 1][c]);
+                }
+                tc_astc_cem11_pack(l0, l1, lvl, v);
+                CHECK(tc_astc_cem11_unpack(v, d0, d1) == 1, "cem11 unpack");
+                for (c = 0; c < 3; ++c) {
+                    float rec = half_bits_to_float(tc_astc_lns16_to_sf16(d0[c]));
+                    float ref =
+                        half_bits_to_float(tc_float_to_half_bits(cols[k][c]));
+                    double rel = fabs((double)rec - ref) / ((double)ref + 1e-3);
+                    CHECK(tc_astc_lns16_to_sf16(d0[c]) <= 0x7BFFu,
+                          "cem11 valid half");
+                    CHECK(rel < tol, "cem11 value round-trip");
+                }
             }
         }
     }

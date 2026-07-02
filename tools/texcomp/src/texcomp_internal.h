@@ -71,7 +71,12 @@ uint16_t tc_float_to_half_bits(float fv);
  * logarithmic domain ASTC HDR interpolates endpoints in. */
 int tc_astc_float_to_lns16(float a);
 uint16_t tc_astc_lns16_to_sf16(int p);
-void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]);
+/* quant_color equivalent (defined in texcomp_astc.c): value as reconstructed
+ * at a colour quant level; identity at level 20 (256). */
+int tc_astc_hdr_color_roundtrip(uint32_t level, int value);
+/* CEM 11 endpoint pack at colour quant `level` (20 == 256). */
+void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], int level,
+                        uint8_t v[6]);
 int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]);
 /* Per-texel CEM 11 4x4 block encoder (defined in texcomp_astc.c, which owns
  * the ASTC block/ISE machinery). `lns` is 16 texels of 16-bit LNS RGB; returns
