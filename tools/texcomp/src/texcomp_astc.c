@@ -4168,27 +4168,30 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
     if (nthreads > blocks_y) nthreads = blocks_y;
     if (nthreads > 64u) nthreads = 64u;
 
-    /* One context, built once; encoding only reads it, so every band
-     * shares it (all lazy caches are filled eagerly at init). */
-    {
-        tc_astc_encode_context *astc_ctx =
-            (tc_astc_encode_context *)malloc(sizeof(*astc_ctx));
-        tc_result tr_all;
-        if (!astc_ctx) return TC_ERROR_OUT_OF_MEMORY;
-        tc_astc_encode_context_init(astc_ctx, opt->block_x, opt->block_y,
-                                    opt->quality);
-
+    /* The encode context memoizes decimation tables lazily during encoding
+     * (tc_astc_get_decim_cache), so it is NOT safe to share across threads --
+     * concurrent cache fills race. Give every worker its own context. The
+     * caches are pure memoization, so per-thread contexts produce output
+     * byte-identical to the single-threaded path. */
 #if defined(TC_ASTC_HAVE_THREADS)
     if (nthreads > 1u) {
         tc_astc_thread_job jobs[64];
         thrd_t tids[64];
-        uint32_t t, spawned = 0;
+        tc_astc_encode_context *ctxs[64];
+        uint32_t t, k, spawned = 0;
         uint32_t base = blocks_y / nthreads, rem = blocks_y % nthreads;
         uint32_t row = 0;
         tc_result tr = TC_SUCCESS;
         for (t = 0; t < nthreads; ++t) {
             uint32_t rows = base + (t < rem ? 1u : 0u);
-            jobs[t].ctx = astc_ctx;
+            ctxs[t] = (tc_astc_encode_context *)malloc(sizeof(*ctxs[t]));
+            if (!ctxs[t]) {
+                for (k = 0; k < t; ++k) free(ctxs[k]);
+                return TC_ERROR_OUT_OF_MEMORY;
+            }
+            tc_astc_encode_context_init(ctxs[t], opt->block_x, opt->block_y,
+                                        opt->quality);
+            jobs[t].ctx = ctxs[t];
             jobs[t].rgba = rgba;
             jobs[t].width = width;
             jobs[t].height = height;
@@ -4216,11 +4219,18 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
         }
         for (t = 0; t < nthreads; ++t) {
             if (jobs[t].result != TC_SUCCESS) tr = jobs[t].result;
+            free(ctxs[t]);
         }
-        free(astc_ctx);
         return tr;
     }
 #endif
+    {
+        tc_astc_encode_context *astc_ctx =
+            (tc_astc_encode_context *)malloc(sizeof(*astc_ctx));
+        tc_result tr_all;
+        if (!astc_ctx) return TC_ERROR_OUT_OF_MEMORY;
+        tc_astc_encode_context_init(astc_ctx, opt->block_x, opt->block_y,
+                                    opt->quality);
         tr_all = tc_astc_compress_band(astc_ctx, rgba, width, height, stride,
                                        opt, out_astc, 0u, blocks_y);
         free(astc_ctx);
