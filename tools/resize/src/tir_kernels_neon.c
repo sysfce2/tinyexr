@@ -268,9 +268,25 @@ static void f32_to_u16_neon(uint16_t *dst, const float *src, size_t n) {
 #if defined(__ARM_FP16_FORMAT_IEEE)
 static void f16_to_f32_neon(float *dst, const uint16_t *src, size_t n) {
     size_t i = 0;
-    for (; i + 4 <= n; i += 4)
+    for (; i + 4 <= n; i += 4) {
+        uint16x4_t h16 = vld1_u16(src + i);
+        float32x4_t f = vcvt_f32_f16(vreinterpret_f16_u16(h16));
+        /* FCVT force-quiets signaling NaNs (sets the top mantissa bit); the
+         * scalar path preserves the mantissa (sign | 0x7F800000 | man<<13), so
+         * recompute the NaN lanes and blend them in to stay bit-identical.
+         * inf/subnormal/finite lanes are already exact -- only NaN differs. */
+        uint32x4_t h = vmovl_u16(h16);
+        uint32x4_t man = vandq_u32(h, vdupq_n_u32(0x03FF));
+        uint32x4_t is_exp31 = vceqq_u32(
+            vandq_u32(h, vdupq_n_u32(0x7C00)), vdupq_n_u32(0x7C00));
+        uint32x4_t is_nan = vandq_u32(is_exp31, vtstq_u32(man, man));
+        uint32x4_t sign = vshlq_n_u32(vandq_u32(h, vdupq_n_u32(0x8000)), 16);
+        uint32x4_t nan_bits = vorrq_u32(
+            vorrq_u32(sign, vdupq_n_u32(0x7F800000)), vshlq_n_u32(man, 13));
         vst1q_f32(dst + i,
-                  vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(src + i))));
+                  vreinterpretq_f32_u32(vbslq_u32(
+                      is_nan, nan_bits, vreinterpretq_u32_f32(f))));
+    }
     if (i < n) tir__f16_to_f32_sc(dst + i, src + i, n - i);
 }
 

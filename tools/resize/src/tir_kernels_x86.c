@@ -596,10 +596,29 @@ static void clamp_range_avx2(float *dst, float lo, float hi, size_t n) {
 TIR_TGT(TIR_AVX2)
 static void f16_to_f32_f16c(float *dst, const uint16_t *src, size_t n) {
     size_t i = 0;
-    for (; i + 8 <= n; i += 8)
+    for (; i + 8 <= n; i += 8) {
+        __m128i h16 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m256 f = _mm256_cvtph_ps(h16);
+        /* vcvtph2ps force-quiets signaling NaNs (sets the top mantissa bit);
+         * the scalar path preserves the mantissa (sign | 0x7F800000 | man<<13),
+         * so recompute the NaN lanes and blend them in to stay bit-identical.
+         * inf/subnormal/finite lanes are already exact -- only NaN differs. */
+        __m256i h = _mm256_cvtepu16_epi32(h16);
+        __m256i man = _mm256_and_si256(h, _mm256_set1_epi32(0x03FF));
+        __m256i is_exp31 = _mm256_cmpeq_epi32(
+            _mm256_and_si256(h, _mm256_set1_epi32(0x7C00)),
+            _mm256_set1_epi32(0x7C00));
+        __m256i man_zero = _mm256_cmpeq_epi32(man, _mm256_setzero_si256());
+        __m256i is_nan = _mm256_andnot_si256(man_zero, is_exp31);
+        __m256i sign = _mm256_slli_epi32(
+            _mm256_and_si256(h, _mm256_set1_epi32(0x8000)), 16);
+        __m256i nan_bits = _mm256_or_si256(
+            _mm256_or_si256(sign, _mm256_set1_epi32(0x7F800000)),
+            _mm256_slli_epi32(man, 13));
         _mm256_storeu_ps(
-            dst + i,
-            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i))));
+            dst + i, _mm256_blendv_ps(f, _mm256_castsi256_ps(nan_bits),
+                                      _mm256_castsi256_ps(is_nan)));
+    }
     if (i < n) tir__f16_to_f32_sc(dst + i, src + i, n - i);
 }
 
