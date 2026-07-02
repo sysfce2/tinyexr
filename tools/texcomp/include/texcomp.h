@@ -72,6 +72,15 @@ typedef struct tc_astc_options {
     int threads;
 } tc_astc_options;
 
+/* ASTC HDR (UASTC HDR 4x4). Float RGB(A) input, standard ASTC HDR 4x4 output.
+ * quality: 0..4 (higher = better/slower). NOTE: the current encoder emits
+ * constant-colour (void-extent) HDR blocks only; per-texel CEM 7/11 modes are
+ * being added incrementally. */
+typedef struct tc_astc_hdr_options {
+    int quality;
+    int reserved;
+} tc_astc_hdr_options;
+
 typedef enum tc_backend_mask {
     TC_BACKEND_SCALAR = 0u,
     TC_BACKEND_SSE2 = 1u << 0,
@@ -93,6 +102,7 @@ void tc_bc5_options_init(tc_bc5_options *opt);
 void tc_bc6h_options_init(tc_bc6h_options *opt);
 void tc_etc2_options_init(tc_etc2_options *opt);
 void tc_astc_options_init(tc_astc_options *opt);
+void tc_astc_hdr_options_init(tc_astc_hdr_options *opt);
 
 size_t tc_bc7_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc1_compressed_size(uint32_t width, uint32_t height);
@@ -105,6 +115,7 @@ size_t tc_eac_r11_compressed_size(uint32_t width, uint32_t height);
 size_t tc_eac_rg11_compressed_size(uint32_t width, uint32_t height);
 size_t tc_astc_compressed_size(uint32_t width, uint32_t height,
                                const tc_astc_options *opt);
+size_t tc_astc_hdr_compressed_size(uint32_t width, uint32_t height);
 unsigned int tc_astc_ise_sequence_bitcount(unsigned int value_count,
                                            unsigned int quant_level);
 tc_result tc_astc_ise_encode_bits(unsigned int quant_level, unsigned int value_count,
@@ -146,6 +157,11 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                  uint32_t height, size_t stride,
                                  const tc_astc_options *opt,
                                  uint8_t *out_astc, size_t out_size);
+/* Encode float RGB (stride_bytes between rows) to ASTC HDR 4x4 blocks. */
+tc_result tc_astc_hdr_compress_rgbf(const float *rgb, uint32_t width,
+                                    uint32_t height, size_t stride_bytes,
+                                    const tc_astc_hdr_options *opt,
+                                    uint8_t *out_astc, size_t out_size);
 
 size_t tc_dds_bc7_size(uint32_t width, uint32_t height);
 size_t tc_dds_bc1_size(uint32_t width, uint32_t height);

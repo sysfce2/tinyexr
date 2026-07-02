@@ -63,4 +63,8 @@ void tc_encode_bc1_color_block(const uint8_t px[16][4], int dxt1, uint8_t out[8]
 /* EAC alpha block (defined in texcomp_eac.c), reused by texcomp_etc2.c. */
 uint64_t tc_encode_eac_alpha(const uint8_t alpha[16]);
 
+/* IEEE float -> binary16 bits (defined in texcomp_bc6h.c), reused by the
+ * ASTC HDR encoder for FP16 constant-colour (void-extent) blocks. */
+uint16_t tc_float_to_half_bits(float fv);
+
 #endif /* TINYEXR_TEXCOMP_INTERNAL_H_ */

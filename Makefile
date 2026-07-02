@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -231,7 +231,8 @@ TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
   tools/texcomp/src/texcomp_bc1.c tools/texcomp/src/texcomp_bc3.c \
   tools/texcomp/src/texcomp_bc5.c tools/texcomp/src/texcomp_bc6h.c \
   tools/texcomp/src/texcomp_bc7.c tools/texcomp/src/texcomp_etc2.c \
-  tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c
+  tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c \
+  tools/texcomp/src/texcomp_astc_hdr.c
 TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
 TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
 TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))
@@ -243,7 +244,7 @@ TEXCOMP_WASM_COMMON = $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(TEXCOMP_WASM_OPT
 TEXCOMP_WASM_CLI_WARN = -Wno-unused-function -Wno-macro-redefined
 TEXCOMP_WASM_SIMD = -msimd128
 TEXCOMP_WASM_EXR_SRC = $(V3_CORE_SRC) src/exr_stdio.c $(ZSTD_SRC)
-TEXCOMP_WASM_EXPORTS = ['_tc_result_string','_tc_backend_name','_tc_backend_available_mask','_tc_backend_force_mask','_tc_bc7_options_init','_tc_bc1_options_init','_tc_bc3_options_init','_tc_bc5_options_init','_tc_bc6h_options_init','_tc_etc2_options_init','_tc_astc_options_init','_tc_bc7_compressed_size','_tc_bc1_compressed_size','_tc_bc3_compressed_size','_tc_bc5_compressed_size','_tc_bc6h_compressed_size','_tc_etc2_rgb_compressed_size','_tc_etc2_rgba_compressed_size','_tc_eac_r11_compressed_size','_tc_eac_rg11_compressed_size','_tc_astc_compressed_size','_tc_astc_ise_sequence_bitcount','_tc_astc_ise_encode_bits','_tc_bc7_compress_rgba8','_tc_bc1_compress_rgba8','_tc_bc3_compress_rgba8','_tc_bc5_compress_rg8','_tc_bc5_compress_rgba8','_tc_bc6h_compress_rgb32f','_tc_etc2_compress_rgba8','_tc_eac_compress_rgba8','_tc_astc_compress_rgba8','_tc_dds_bc7_size','_tc_dds_bc1_size','_tc_dds_bc3_size','_tc_dds_bc5_size','_tc_dds_bc6h_size','_tc_ktx_etc2_size','_tc_astc_file_size','_tc_dds_write_bc7_memory','_tc_dds_write_bc1_memory','_tc_dds_write_bc3_memory','_tc_dds_write_bc5_memory','_tc_dds_write_bc6h_memory','_tc_ktx_write_etc2_memory','_tc_ktx_write_eac_memory','_tc_astc_write_file_memory','_malloc','_free']
+TEXCOMP_WASM_EXPORTS = ['_tc_result_string','_tc_backend_name','_tc_backend_available_mask','_tc_backend_force_mask','_tc_bc7_options_init','_tc_bc1_options_init','_tc_bc3_options_init','_tc_bc5_options_init','_tc_bc6h_options_init','_tc_etc2_options_init','_tc_astc_options_init','_tc_astc_hdr_options_init','_tc_bc7_compressed_size','_tc_bc1_compressed_size','_tc_bc3_compressed_size','_tc_bc5_compressed_size','_tc_bc6h_compressed_size','_tc_etc2_rgb_compressed_size','_tc_etc2_rgba_compressed_size','_tc_eac_r11_compressed_size','_tc_eac_rg11_compressed_size','_tc_astc_compressed_size','_tc_astc_hdr_compressed_size','_tc_astc_ise_sequence_bitcount','_tc_astc_ise_encode_bits','_tc_bc7_compress_rgba8','_tc_bc1_compress_rgba8','_tc_bc3_compress_rgba8','_tc_bc5_compress_rg8','_tc_bc5_compress_rgba8','_tc_bc6h_compress_rgb32f','_tc_etc2_compress_rgba8','_tc_eac_compress_rgba8','_tc_astc_compress_rgba8','_tc_astc_hdr_compress_rgbf','_tc_dds_bc7_size','_tc_dds_bc1_size','_tc_dds_bc3_size','_tc_dds_bc5_size','_tc_dds_bc6h_size','_tc_ktx_etc2_size','_tc_astc_file_size','_tc_dds_write_bc7_memory','_tc_dds_write_bc1_memory','_tc_dds_write_bc3_memory','_tc_dds_write_bc5_memory','_tc_dds_write_bc6h_memory','_tc_ktx_write_etc2_memory','_tc_ktx_write_eac_memory','_tc_astc_write_file_memory','_malloc','_free']
 TEXCOMP_WASM_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','HEAPU32','UTF8ToString','stringToUTF8','lengthBytesUTF8','ccall','cwrap']
 
 build/texcomp:
@@ -385,6 +386,18 @@ texcomp-astc-arm-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc
 	$(CXX) build/texcomp/astc_arm_xcheck.o $(TEXCOMP_OBJ) \
 	  build/libtexcomp_astcenc.a -lm -o build/texcomp/astc_arm_xcheck
 	./build/texcomp/astc_arm_xcheck
+
+# Self-contained CI gate for the ASTC HDR encoder: encodes deterministic HDR
+# images with the pure-C tc encoder and verifies them with astcenc's conformant
+# HDR decoder (const-colour round-trip + gradient PSNR floor).
+texcomp-astc-hdr-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc_hdr_xcheck.c | build/texcomp
+	$(AR) rcs build/libtexcomp_astcenc.a $(ASTCENC_LIB_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test \
+	  -DTEXCOMP_HAVE_ASTCENC -Ideps/astcenc -O2 -g -c \
+	  tools/texcomp/test/astc_hdr_xcheck.c -o build/texcomp/astc_hdr_xcheck.o
+	$(CXX) build/texcomp/astc_hdr_xcheck.o $(TEXCOMP_OBJ) \
+	  build/libtexcomp_astcenc.a -lm -o build/texcomp/astc_hdr_xcheck
+	./build/texcomp/astc_hdr_xcheck
 
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:

@@ -576,6 +576,7 @@ int main(void) {
     CHECK(tc_eac_r11_compressed_size(7, 5) == 32, "eac r11 padded size");
     CHECK(tc_eac_rg11_compressed_size(7, 5) == 64, "eac rg11 padded size");
     CHECK(tc_astc_compressed_size(7, 5, &astc_opt) == 32, "astc padded size");
+    CHECK(tc_astc_hdr_compressed_size(7, 5) == 64, "astc hdr padded size");
     CHECK(tc_astc_ise_sequence_bitcount(1, 0) == 1, "astc ise quant2 bits");
     CHECK(tc_astc_ise_sequence_bitcount(5, 1) == 8, "astc ise quant3 bits");
     CHECK(tc_astc_ise_sequence_bitcount(3, 3) == 7, "astc ise quant5 bits");
@@ -756,6 +757,27 @@ int main(void) {
                   TC_SUCCESS,
               "bc3 dds write");
         CHECK(rd_u32(dds + 112) == 77, "bc3 dxgi format");
+    }
+
+    /* ASTC HDR: constant-colour block must be a valid FP16 void-extent. */
+    {
+        float hdr[4 * 4 * 3];
+        uint8_t hblk[16];
+        tc_astc_hdr_options hopt;
+        size_t n;
+        tc_astc_hdr_options_init(&hopt);
+        for (n = 0; n < 16u; ++n) {
+            hdr[n * 3 + 0] = 3.5f;
+            hdr[n * 3 + 1] = 0.5f;
+            hdr[n * 3 + 2] = 40.0f;
+        }
+        CHECK(tc_astc_hdr_compress_rgbf(hdr, 4, 4, 4u * 3u * sizeof(float),
+                                        &hopt, hblk, sizeof(hblk)) == TC_SUCCESS,
+              "astc hdr encode");
+        /* FP16 void-extent marker (byte1 = FF; an LDR one would be FD). */
+        CHECK(hblk[0] == 0xFCu && hblk[1] == 0xFFu, "astc hdr void-extent marker");
+        CHECK((hblk[14] | (hblk[15] << 8)) == 0x3C00u, "astc hdr alpha = 1.0");
+        CHECK((hblk[8] | (hblk[9] << 8)) != 0u, "astc hdr red nonzero");
     }
 
     CHECK(tc_etc2_compress_rgba8(rgba, 7, 5, 7 * 4, &etc2_opt, etc2,

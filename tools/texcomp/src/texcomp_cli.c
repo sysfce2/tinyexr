@@ -304,7 +304,7 @@ static tc_result write_file(const char *path, const void *data, size_t size) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc] "
+            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
             "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
             "[--quick on|off] [--mode-mask HEX] "
@@ -419,6 +419,7 @@ int main(int argc, char **argv) {
     if (strcmp(format, "bc6") == 0) format = "bc6h";
     if (strcmp(format, "dxt1") == 0) format = "bc1";
     if (strcmp(format, "dxt5") == 0) format = "bc3";
+    if (strcmp(format, "uastc_hdr") == 0) format = "astc_hdr";
     if (strcmp(format, "etc2") == 0 || strcmp(format, "etc2_rgba") == 0) {
         etc2_opt.alpha = 1;
         format = "etc2_rgba";
@@ -429,7 +430,8 @@ int main(int argc, char **argv) {
     } else if (strcmp(format, "etc2_rg11") == 0) {
         format = "eac_rg11";
     }
-    if (strcmp(format, "bc6h") == 0 && ends_with(in, ".exr")) {
+    if ((strcmp(format, "bc6h") == 0 || strcmp(format, "astc_hdr") == 0) &&
+        ends_with(in, ".exr")) {
         tr = load_exr_rgbf(in, part, &rgbf, &w, &h);
     } else {
         if (ends_with(in, ".png")) tr = load_png_rgba(in, &rgba, &w, &h);
@@ -456,6 +458,13 @@ int main(int argc, char **argv) {
     } else if (strcmp(format, "bc6h") == 0) {
         compressed_size = tc_bc6h_compressed_size(w, h);
         container_size = tc_dds_bc6h_size(w, h);
+    } else if (strcmp(format, "astc_hdr") == 0) {
+        tc_astc_options hdr4;
+        tc_astc_options_init(&hdr4);
+        hdr4.block_x = 4;
+        hdr4.block_y = 4;
+        compressed_size = tc_astc_hdr_compressed_size(w, h);
+        container_size = tc_astc_file_size(w, h, &hdr4);
     } else if (strcmp(format, "etc2_rgba") == 0 || strcmp(format, "etc2_rgb") == 0) {
         compressed_size = etc2_opt.alpha ? tc_etc2_rgba_compressed_size(w, h)
                                          : tc_etc2_rgb_compressed_size(w, h);
@@ -524,6 +533,21 @@ int main(int argc, char **argv) {
         if (tr == TC_SUCCESS)
             tr = tc_dds_write_bc6h_memory(compressed, w, h, &bc6h_opt, container,
                                           container_size);
+    } else if (strcmp(format, "astc_hdr") == 0) {
+        tc_astc_options hdr4;
+        tc_astc_hdr_options hdr_opt;
+        tc_astc_hdr_options_init(&hdr_opt);
+        tc_astc_options_init(&hdr4);
+        hdr4.block_x = 4;
+        hdr4.block_y = 4;
+        if (!rgbf) tr = rgba_to_rgbf(rgba, w, h, &rgbf);
+        if (tr == TC_SUCCESS)
+            tr = tc_astc_hdr_compress_rgbf(rgbf, w, h,
+                                           (size_t)w * 3u * sizeof(float),
+                                           &hdr_opt, compressed, compressed_size);
+        if (tr == TC_SUCCESS)
+            tr = tc_astc_write_file_memory(compressed, w, h, &hdr4, container,
+                                           container_size);
     } else if (strcmp(format, "etc2_rgba") == 0 || strcmp(format, "etc2_rgb") == 0) {
         tr = tc_etc2_compress_rgba8(rgba, w, h, (size_t)w * 4u, &etc2_opt,
                                     compressed, compressed_size);

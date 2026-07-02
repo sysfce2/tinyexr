@@ -21,7 +21,7 @@ size_t tc_bc6h_compressed_size(uint32_t width, uint32_t height) {
     return tc_bc7_compressed_size(width, height);
 }
 
-static uint16_t tc_float_to_half_bits(float fv) {
+uint16_t tc_float_to_half_bits(float fv) {
     union {
         float f;
         uint32_t u;
