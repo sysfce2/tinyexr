@@ -718,14 +718,18 @@ resize-fuzz: tools/resize/tests/tir_fuzz.c | build
 	  -fsanitize=fuzzer,address,undefined \
 	  tools/resize/tests/tir_fuzz.c $(TIR_SRC) -lm -o build/resize_fuzz
 	@echo "built build/resize_fuzz"
-	@echo "  run: ./build/resize_fuzz -max_total_time=300 [corpus_dir]"
+	@echo "  run: mkdir -p build/corpus_resize && cp tools/resize/tests/corpus/* \\"
+	@echo "       build/corpus_resize/ && ./build/resize_fuzz -max_total_time=300 \\"
+	@echo "       build/corpus_resize tools/resize/tests/corpus"
 
-# Deterministic replay under ASan+UBSan (no libFuzzer; CI gate). With no file
-# args it runs 8000 generated pseudo-random inputs; with args it replays them.
+# Deterministic replay under ASan+UBSan (no libFuzzer; CI gate). First replays
+# the committed seed corpus, then runs 8000 generated pseudo-random inputs.
 resize-fuzz-corpus: tools/resize/tests/tir_fuzz.c | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
 	  -O1 -g $(SAN) -DTIR_FUZZ_STANDALONE \
 	  tools/resize/tests/tir_fuzz.c $(TIR_SRC) -lm -o build/resize_fuzz_replay
+	ASAN_OPTIONS=detect_leaks=0 ./build/resize_fuzz_replay \
+	  tools/resize/tests/corpus/*
 	ASAN_OPTIONS=detect_leaks=0 ./build/resize_fuzz_replay
 
 # Cross-build for AArch64 (NEON kernels) and run under qemu.
