@@ -56,3 +56,20 @@ kernels see 36-texel calls, so the per-call ymm constant/shuffle-mask
 setup and the SSE tail dominate. AVX2 only makes sense with a batched
 pipeline (many blocks' texels processed per call, astcenc-style), not
 by widening the current per-candidate call shape. Reverted.
+
+## Status after trial-count tuning (2026-07-02, ISA-matched comparison)
+
+astcenc built with -DASTCENC_ISA_SSE2 (same 128-bit width as our
+kernels; also representative of the NEON-vs-NEON situation on Arm):
+
+| tier   | ours              | astcenc-sse2 (-j 1)      | gap  |
+|--------|-------------------|--------------------------|------|
+| fast   | 0.085 s, 47.16 dB | -fastest 0.057 s, 47.78  | 1.5x |
+| medium | 0.538 s, 48.39 dB | -medium  0.119 s, 48.63  | 4.5x |
+
+Anomaly (unexplained, reverted): cutting medium trial counts
+(pass1 20->12, shortlist 16->8, partition candidates 24->12) made q1
+*slower* (0.54 -> 0.69 s) as well as worse (48.39 -> 47.95) - fewer
+fits should not cost time; investigate the interaction with the
+partition/dual dispatch before retrying medium cuts. Closing medium
+further likely needs astcenc's batched pipeline shape.
