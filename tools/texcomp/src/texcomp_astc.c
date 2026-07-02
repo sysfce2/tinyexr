@@ -3929,6 +3929,110 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     }
 }
 
+/* --- ASTC HDR CEM 11 single-subset block encoder (UASTC HDR 4x4) ---------
+ * Reuses the LDR block machinery (block-mode tables, weight quant/scramble,
+ * ISE codec, bit layout). Fixed config: 4x4 weight grid, weight range 8
+ * (3-bit), single partition, CEM 11 (HDR RGB direct) endpoints stored at
+ * colour quant 256 (so the 8-bit majcomp==3 endpoint bytes survive exactly:
+ * colour bits available = 111 - 48 weight bits = 63 >= 48, and 256 is the max
+ * colour quant). Endpoints come from the LNS-domain bounding box; each texel's
+ * weight is its projection onto the endpoint line. Input `lns` is per-texel
+ * 16-bit LNS RGB (see tc_astc_float_to_lns16). */
+static uint32_t tc_astc_hdr_find_block_mode_4x4(void) {
+    uint32_t bm;
+    for (bm = 0; bm < 2048u; ++bm) {
+        tc_astc_block_mode_info info;
+        if (tc_astc_decode_block_mode_2d(bm, &info) && info.weight_x == 4u &&
+            info.weight_y == 4u && info.dual_plane == 0u &&
+            info.quant_method == 5u)
+            return bm;
+    }
+    return 0;
+}
+
+uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
+    static uint32_t block_mode_4x4 = 0xffffffffu;
+    static tc_astc_encode_context hdr_ctx; /* only its colour quant LUT is used */
+    static int hdr_ctx_ready = 0;
+    uint8_t weightbuf[16], weights[16];
+    uint8_t v[8], packed[8];
+    int e0[3], e1[3], qe0[3], qe1[3];
+    int i, c;
+    int64_t dir[3], dlen2 = 0;
+    uint64_t sse = 0;
+    uint32_t bitpos;
+
+    if (block_mode_4x4 == 0xffffffffu)
+        block_mode_4x4 = tc_astc_hdr_find_block_mode_4x4();
+    if (!hdr_ctx_ready) {
+        tc_astc_encode_context_init(&hdr_ctx, 4u, 4u, 0);
+        hdr_ctx_ready = 1;
+    }
+    memset(out, 0, 16u);
+    memset(weightbuf, 0, sizeof(weightbuf));
+
+    /* endpoints: per-channel LNS bounding box (min -> e0, max -> e1). */
+    for (c = 0; c < 3; ++c) {
+        e0[c] = lns[0][c];
+        e1[c] = lns[0][c];
+    }
+    for (i = 1; i < 16; ++i)
+        for (c = 0; c < 3; ++c) {
+            if (lns[i][c] < e0[c]) e0[c] = lns[i][c];
+            if (lns[i][c] > e1[c]) e1[c] = lns[i][c];
+        }
+    tc_astc_cem11_pack(e0, e1, v);
+    tc_astc_cem11_unpack(v, qe0, qe1);
+    for (c = 0; c < 3; ++c) {
+        dir[c] = (int64_t)qe1[c] - qe0[c];
+        dlen2 += dir[c] * dir[c];
+    }
+
+    /* per-texel weights: project onto [qe0,qe1], quantise to range 8. */
+    for (i = 0; i < 16; ++i) {
+        int w64 = 0, best = 0, bestd = 1 << 30, q;
+        if (dlen2 > 0) {
+            int64_t dot = 0;
+            for (c = 0; c < 3; ++c)
+                dot += ((int64_t)lns[i][c] - qe0[c]) * dir[c];
+            if (dot < 0) dot = 0;
+            if (dot > dlen2) dot = dlen2;
+            w64 = (int)((dot * 64 + dlen2 / 2) / dlen2);
+        }
+        for (q = 0; q < 8; ++q) {
+            int d = (int)tc_astc_weight_unquant((uint32_t)q, 5u) - w64;
+            if (d < 0) d = -d;
+            if (d < bestd) {
+                bestd = d;
+                best = q;
+            }
+        }
+        weights[i] = (uint8_t)best;
+        /* reconstruction SSE in the LNS domain (for mode selection). */
+        {
+            int uq = (int)tc_astc_weight_unquant((uint32_t)best, 5u);
+            for (c = 0; c < 3; ++c) {
+                int64_t recon = qe0[c] + ((int64_t)(qe1[c] - qe0[c]) * uq) / 64;
+                int64_t e = recon - lns[i][c];
+                sse += (uint64_t)(e * e);
+            }
+        }
+    }
+    tc_astc_scramble_weights(weights, 16u, 5u);
+    (void)tc_astc_ise_encode_bits(5u, 16u, weights, weightbuf, sizeof(weightbuf),
+                                  0u);
+    for (i = 0; i < 16; ++i) out[i] = tc_bitrev8(weightbuf[15 - i]);
+
+    bitpos = 0;
+    tc_set_bits(out, &bitpos, block_mode_4x4, 11u);
+    tc_set_bits(out, &bitpos, 0u, 2u);  /* single partition */
+    tc_set_bits(out, &bitpos, 11u, 4u); /* CEM 11 (HDR RGB direct) */
+    /* Endpoints at colour quant 256 (level 20): map values -> ISE symbols. */
+    tc_astc_quantize_color_values(&hdr_ctx, 20u, 6u, v, packed);
+    (void)tc_astc_ise_encode_bits(20u, 6u, packed, out, 16u, 17u);
+    return sse;
+}
+
 #if defined(TC_X86)
 TC_TARGET("sse2")
 static void tc_encode_astc_const_block_sse2(const uint8_t block[16][4],

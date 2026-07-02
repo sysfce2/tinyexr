@@ -187,28 +187,67 @@ tc_result tc_astc_hdr_compress_rgbf(const float *rgb, uint32_t width,
 
     for (by = 0; by < height; by += 4) {
         for (bx = 0; bx < width; bx += 4) {
-            double sr = 0.0, sg = 0.0, sb = 0.0;
-            uint16_t hr, hg, hb;
+            int lns[16][3];
+            float src0[3] = {0.0f, 0.0f, 0.0f};
+            int allsame = 1;
             for (yy = 0; yy < 4; ++yy) {
                 y = by + yy;
                 if (y >= height) y = height - 1u;
                 for (xx = 0; xx < 4; ++xx) {
                     const float *src;
+                    int idx = (int)(yy * 4u + xx);
                     x = bx + xx;
                     if (x >= width) x = width - 1u;
                     src = (const float *)((const uint8_t *)rgb +
                                           (size_t)y * stride_bytes +
                                           (size_t)x * 3u * sizeof(float));
-                    sr += src[0];
-                    sg += src[1];
-                    sb += src[2];
+                    lns[idx][0] = tc_astc_float_to_lns16(src[0]);
+                    lns[idx][1] = tc_astc_float_to_lns16(src[1]);
+                    lns[idx][2] = tc_astc_float_to_lns16(src[2]);
+                    if (idx == 0) {
+                        src0[0] = src[0];
+                        src0[1] = src[1];
+                        src0[2] = src[2];
+                    } else if (lns[idx][0] != lns[0][0] ||
+                               lns[idx][1] != lns[0][1] ||
+                               lns[idx][2] != lns[0][2]) {
+                        allsame = 0;
+                    }
                 }
             }
-            hr = tc_float_to_half_bits((float)(sr / 16.0));
-            hg = tc_float_to_half_bits((float)(sg / 16.0));
-            hb = tc_float_to_half_bits((float)(sb / 16.0));
-            tc_astc_hdr_write_void_extent(hr, hg, hb, 0x3C00u /* 1.0 */,
-                                          out_astc + off);
+            if (allsame) {
+                /* Constant block: an FP16 void-extent is exact and cheaper. */
+                tc_astc_hdr_write_void_extent(tc_float_to_half_bits(src0[0]),
+                                              tc_float_to_half_bits(src0[1]),
+                                              tc_float_to_half_bits(src0[2]),
+                                              0x3C00u, out_astc + off);
+            } else {
+                /* Encode CEM 11 and a constant (block-mean void-extent); keep
+                 * whichever reconstructs the block with less LNS-domain error,
+                 * so the per-texel path never loses to the constant one. */
+                uint8_t cem[16];
+                uint64_t cem_sse, ve_sse = 0;
+                int mean[3];
+                int64_t sum[3] = {0, 0, 0};
+                int i, cc;
+                cem_sse = tc_encode_astc_hdr_cem11_block(lns, cem);
+                for (i = 0; i < 16; ++i)
+                    for (cc = 0; cc < 3; ++cc) sum[cc] += lns[i][cc];
+                for (cc = 0; cc < 3; ++cc) mean[cc] = (int)(sum[cc] / 16);
+                for (i = 0; i < 16; ++i)
+                    for (cc = 0; cc < 3; ++cc) {
+                        int64_t e = (int64_t)lns[i][cc] - mean[cc];
+                        ve_sse += (uint64_t)(e * e);
+                    }
+                if (ve_sse <= cem_sse) {
+                    tc_astc_hdr_write_void_extent(
+                        tc_astc_lns16_to_sf16(mean[0]),
+                        tc_astc_lns16_to_sf16(mean[1]),
+                        tc_astc_lns16_to_sf16(mean[2]), 0x3C00u, out_astc + off);
+                } else {
+                    memcpy(out_astc + off, cem, 16u);
+                }
+            }
             off += 16u;
         }
     }

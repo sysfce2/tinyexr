@@ -73,5 +73,9 @@ int tc_astc_float_to_lns16(float a);
 uint16_t tc_astc_lns16_to_sf16(int p);
 void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]);
 int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]);
+/* Per-texel CEM 11 4x4 block encoder (defined in texcomp_astc.c, which owns
+ * the ASTC block/ISE machinery). `lns` is 16 texels of 16-bit LNS RGB; returns
+ * the reconstruction SSE in the LNS domain (for mode selection). */
+uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]);
 
 #endif /* TINYEXR_TEXCOMP_INTERNAL_H_ */
