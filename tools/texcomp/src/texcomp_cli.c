@@ -6,6 +6,44 @@
  */
 
 #include "texcomp.h"
+
+#ifdef TEXCOMP_HAVE_ASTCENC
+/* Vendored Arm astcenc backend (deps/astcenc, Apache-2.0); its public API
+ * has C linkage, so the pure-C CLI can drive it directly. */
+#include "astcenc.h"
+
+static tc_result tc_cli_astcenc_compress(const uint8_t *rgba, uint32_t w,
+                                         uint32_t h,
+                                         const tc_astc_options *opt,
+                                         uint8_t *out, size_t out_size) {
+    static const float presets[3] = {ASTCENC_PRE_FASTEST, ASTCENC_PRE_MEDIUM,
+                                     ASTCENC_PRE_THOROUGH};
+    struct astcenc_config cfg;
+    struct astcenc_context *ctx = NULL;
+    struct astcenc_image img;
+    const struct astcenc_swizzle swz = {ASTCENC_SWZ_R, ASTCENC_SWZ_G,
+                                        ASTCENC_SWZ_B, ASTCENC_SWZ_A};
+    void *slice = (void *)rgba;
+    int q = opt->quality < 0 ? 0 : (opt->quality > 2 ? 2 : opt->quality);
+    tc_result tr = TC_SUCCESS;
+    if (astcenc_config_init(opt->srgb ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR,
+                            opt->block_x, opt->block_y, 1u, presets[q], 0,
+                            &cfg) != ASTCENC_SUCCESS)
+        return TC_ERROR_UNSUPPORTED;
+    if (astcenc_context_alloc(&cfg, 1u, &ctx, NULL) != ASTCENC_SUCCESS)
+        return TC_ERROR_OUT_OF_MEMORY;
+    img.dim_x = w;
+    img.dim_y = h;
+    img.dim_z = 1u;
+    img.data_type = ASTCENC_TYPE_U8;
+    img.data = &slice;
+    if (astcenc_compress_image(ctx, &img, &swz, out, out_size, 0u) !=
+        ASTCENC_SUCCESS)
+        tr = TC_ERROR_UNSUPPORTED;
+    astcenc_context_free(ctx);
+    return tr;
+}
+#endif
 #include "exr.h"
 
 #include <stdio.h>
@@ -197,7 +235,7 @@ static void usage(void) {
     fprintf(stderr,
             "usage: texcomp -i in.{png,exr} -o out [--format bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
-            "[--signed] [--astc-block WxH] [--quality fast|medium|normal] "
+            "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] "
             "[--quick on|off] [--mode-mask HEX] "
             "[--linear|--perceptual]\n");
 }
@@ -227,6 +265,7 @@ int main(int argc, char **argv) {
     tc_bc6h_options bc6h_opt;
     tc_etc2_options etc2_opt;
     tc_astc_options astc_opt;
+    int use_arm_encoder = 0;
     tc_result tr;
     int i;
 
@@ -235,6 +274,7 @@ int main(int argc, char **argv) {
     tc_bc6h_options_init(&bc6h_opt);
     tc_etc2_options_init(&etc2_opt);
     tc_astc_options_init(&astc_opt);
+    (void)use_arm_encoder;
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) in = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out = argv[++i];
@@ -248,6 +288,22 @@ int main(int argc, char **argv) {
             astc_opt.srgb = 1;
         }
         else if (strcmp(argv[i], "--signed") == 0) bc6h_opt.signed_float = 1;
+        else if (strcmp(argv[i], "--encoder") == 0 && i + 1 < argc) {
+            const char *e = argv[++i];
+            if (strcmp(e, "arm") == 0) {
+#ifdef TEXCOMP_HAVE_ASTCENC
+                use_arm_encoder = 1;
+#else
+                fprintf(stderr,
+                        "texcomp: built without the Arm astcenc backend "
+                        "(use `make texcomp-arm`)\n");
+                return 1;
+#endif
+            } else if (strcmp(e, "tc") != 0) {
+                fprintf(stderr, "texcomp: unknown encoder '%s'\n", e);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--astc-block") == 0 && i + 1 < argc) {
             if (!parse_astc_block(argv[++i], &astc_opt.block_x, &astc_opt.block_y)) {
                 usage();
@@ -381,6 +437,12 @@ int main(int argc, char **argv) {
             tr = tc_ktx_write_eac_memory(compressed, w, h, rg11, container,
                                          container_size);
     } else {
+#ifdef TEXCOMP_HAVE_ASTCENC
+        if (use_arm_encoder)
+            tr = tc_cli_astcenc_compress(rgba, w, h, &astc_opt, compressed,
+                                         compressed_size);
+        else
+#endif
         tr = tc_astc_compress_rgba8(rgba, w, h, (size_t)w * 4u, &astc_opt,
                                     compressed, compressed_size);
         if (tr == TC_SUCCESS)

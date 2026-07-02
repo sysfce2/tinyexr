@@ -3,6 +3,12 @@
 This directory contains TinyEXR BSD-3-Clause code plus CLI-only use of
 `examples/common/stb_image.h` for PNG loading.
 
+The upstream Arm astcenc encoder is ported wholesale into the tree at
+`deps/astcenc` (Copyright 2011-2024 Arm Limited, Apache-2.0; license text
+in `deps/astcenc/LICENSE.txt`). `make texcomp-arm` builds it as a backend
+for the texcomp CLI, selectable with `--encoder arm`; the default
+`make texcomp` build remains pure C11 with no C++ components.
+
 The BC7 API and QuickBC7 option names are designed for a pure-C11 port of the
 QuickBC7-enabled etcpak fork:
 

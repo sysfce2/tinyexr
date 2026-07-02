@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke
 
 all: $(TARGET)
 
@@ -263,6 +263,31 @@ texcomp-astc-psnr: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_psnr.c tools/texco
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -O2 \
 	  tools/texcomp/bench/texcomp_psnr.c $(TEXCOMP_OBJ) -lm -o build/texcomp_psnr
 	./build/texcomp_psnr
+
+# ---- vendored Arm astcenc backend (deps/astcenc, Apache-2.0) ---------------
+# Full port of the upstream Arm encoder, selectable at runtime with
+# `texcomp-arm --encoder arm`. Portable SSE2 baseline on x86, NEON on
+# aarch64; the default `make texcomp` stays pure C11 with no C++ parts.
+ASTCENC_LIB_SRC = $(wildcard deps/astcenc/*.cpp)
+ASTCENC_LIB_OBJ = $(patsubst deps/astcenc/%.cpp,build/astcenc/%.o,$(ASTCENC_LIB_SRC))
+ifeq ($(shell uname -m),aarch64)
+  ASTCENC_DEFS = -DASTCENC_SSE=0 -DASTCENC_AVX=0 -DASTCENC_NEON=1 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
+else
+  ASTCENC_DEFS = -DASTCENC_SSE=20 -DASTCENC_AVX=0 -DASTCENC_NEON=0 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
+endif
+
+build/astcenc/%.o: deps/astcenc/%.cpp
+	@mkdir -p build/astcenc
+	$(CXX) -std=c++14 -O3 -g -w $(ASTCENC_DEFS) -Ideps/astcenc -c $< -o $@
+
+texcomp-arm: lib $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/src/texcomp_cli.c | build/texcomp
+	$(AR) rcs build/libtexcomp_astcenc.a $(ASTCENC_LIB_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  -DTEXCOMP_HAVE_ASTCENC -Ideps/astcenc \
+	  -c tools/texcomp/src/texcomp_cli.c -o build/texcomp/texcomp_cli_arm.o
+	$(CXX) build/texcomp/texcomp_cli_arm.o build/texcomp/texcomp.o \
+	  build/libtexcomp_astcenc.a build/libtinyexr3.a \
+	  $(THREAD_LIBS) -lm -o build/texcomp/texcomp-arm
 
 ASTCENC ?= /tmp/astc-encoder/build/Source/astcenc-native
 
@@ -651,6 +676,7 @@ help:
 	@echo "make texcomp-test - run texcomp unit tests (ASan+UBSan)"
 	@echo "make texcomp-bench - run texcomp BC7 throughput benchmark"
 	@echo "make texcomp-astc-psnr - ASTC encode/reference-decode PSNR table"
+	@echo "make texcomp-arm - texcomp CLI with the vendored Arm astcenc backend (--encoder arm)"
 	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
 	@echo "make fuzz   - build libFuzzer target (build/fuzz_v3)"
