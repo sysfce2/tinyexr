@@ -242,7 +242,7 @@ texcomp: lib $(TEXCOMP_OBJ) tools/texcomp/src/texcomp_cli.c | build/texcomp
 	$(AR) rcs build/libtexcomp.a $(TEXCOMP_OBJ)
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
 	  tools/texcomp/src/texcomp_cli.c build/libtexcomp.a build/libtinyexr3.a \
-	  $(THREAD_LIBS) -lm -o build/texcomp/texcomp
+	  -pthread -lm -o build/texcomp/texcomp
 
 texcomp-c11-gate: | build/texcomp
 	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) -O1 -fsyntax-only tools/texcomp/src/texcomp.c
@@ -250,7 +250,7 @@ texcomp-c11-gate: | build/texcomp
 	@echo "texcomp pure-C11 gate: OK"
 
 texcomp-test: $(TEXCOMP_TEST_OBJ) tools/texcomp/test/test_texcomp.c | build/texcomp
-	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) \
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) -pthread \
 	  tools/texcomp/test/test_texcomp.c $(TEXCOMP_TEST_OBJ) -lm -o build/test_texcomp
 	./build/test_texcomp
 
@@ -287,7 +287,7 @@ texcomp-arm: lib $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/src/texcomp_cli
 	  -c tools/texcomp/src/texcomp_cli.c -o build/texcomp/texcomp_cli_arm.o
 	$(CXX) build/texcomp/texcomp_cli_arm.o build/texcomp/texcomp.o \
 	  build/libtexcomp_astcenc.a build/libtinyexr3.a \
-	  $(THREAD_LIBS) -lm -o build/texcomp/texcomp-arm
+	  -pthread -lm -o build/texcomp/texcomp-arm
 
 ASTCENC ?= /tmp/astc-encoder/build/Source/astcenc-native
 

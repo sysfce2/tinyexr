@@ -368,6 +368,36 @@ static int astc_backend_parity_test(void) {
     return 0;
 }
 
+/* Threaded encodes must be byte-identical to serial for any thread count
+ * (bands are independent and write disjoint output ranges). */
+static int astc_thread_parity_test(void) {
+    enum { W = 48, H = 48 };
+    static uint8_t img[W * H * 4];
+    static uint8_t ref[(W / 4) * (H / 4) * 16];
+    static uint8_t alt[(W / 4) * (H / 4) * 16];
+    int kind, q;
+    for (kind = 0; kind < 4; ++kind) {
+        astc_fill_test_image(img, W, H, kind);
+        for (q = 0; q <= 2; ++q) {
+            tc_astc_options opt;
+            size_t need;
+            tc_astc_options_init(&opt);
+            opt.quality = q;
+            need = tc_astc_compressed_size(W, H, &opt);
+            opt.threads = 1;
+            CHECK(tc_astc_compress_rgba8(img, W, H, W * 4u, &opt, ref, need) ==
+                      TC_SUCCESS,
+                  "astc thread parity serial encode");
+            opt.threads = 4;
+            CHECK(tc_astc_compress_rgba8(img, W, H, W * 4u, &opt, alt, need) ==
+                      TC_SUCCESS,
+                  "astc thread parity threaded encode");
+            CHECK(memcmp(ref, alt, need) == 0, "astc thread parity output");
+        }
+    }
+    return 0;
+}
+
 /* Encode -> reference-decode round trip: every emitted block must decode,
  * and quality must stay above per-configuration floors. Floors are set from
  * bench/texcomp_psnr.c measurements minus a safety margin; raise them when
@@ -1185,6 +1215,7 @@ int main(void) {
     if (astc_weight_symmetry_test()) return 1;
     if (astc_ref_roundtrip_test()) return 1;
     if (astc_backend_parity_test()) return 1;
+    if (astc_thread_parity_test()) return 1;
 
     printf("texcomp tests: OK\n");
     return 0;

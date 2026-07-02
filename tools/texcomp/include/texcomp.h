@@ -57,6 +57,11 @@ typedef struct tc_astc_options {
     uint32_t block_y;
     int srgb;
     int quality;
+    /* Worker threads for tc_astc_compress_rgba8 (<=1 = serial). Uses C11
+     * <threads.h>; builds where the implementation defines
+     * __STDC_NO_THREADS__ always encode serially. Output is byte-identical
+     * for any thread count. */
+    int threads;
 } tc_astc_options;
 
 typedef enum tc_backend_mask {

@@ -12,6 +12,36 @@
  * has C linkage, so the pure-C CLI can drive it directly. */
 #include "astcenc.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
+#if !defined(__STDC_NO_THREADS__)
+#include <threads.h>
+#define TC_CLI_HAVE_THREADS 1
+#endif
+
+#ifdef TC_CLI_HAVE_THREADS
+struct tc_cli_astcenc_job {
+    struct astcenc_context *ctx;
+    const struct astcenc_image *img;
+    const struct astcenc_swizzle *swz;
+    uint8_t *out;
+    size_t out_size;
+    unsigned int index;
+    int status;
+};
+
+static int tc_cli_astcenc_worker(void *arg) {
+    struct tc_cli_astcenc_job *job = (struct tc_cli_astcenc_job *)arg;
+    job->status = astcenc_compress_image(job->ctx, (struct astcenc_image *)job->img,
+                                         job->swz, job->out, job->out_size,
+                                         job->index) == ASTCENC_SUCCESS
+                      ? 0
+                      : 1;
+    return 0;
+}
+#endif
+
 static tc_result tc_cli_astcenc_compress(const uint8_t *rgba, uint32_t w,
                                          uint32_t h,
                                          const tc_astc_options *opt,
@@ -30,18 +60,59 @@ static tc_result tc_cli_astcenc_compress(const uint8_t *rgba, uint32_t w,
                             opt->block_x, opt->block_y, 1u, presets[q], 0,
                             &cfg) != ASTCENC_SUCCESS)
         return TC_ERROR_UNSUPPORTED;
-    if (astcenc_context_alloc(&cfg, 1u, &ctx, NULL) != ASTCENC_SUCCESS)
-        return TC_ERROR_OUT_OF_MEMORY;
-    img.dim_x = w;
-    img.dim_y = h;
-    img.dim_z = 1u;
-    img.data_type = ASTCENC_TYPE_U8;
-    img.data = &slice;
-    if (astcenc_compress_image(ctx, &img, &swz, out, out_size, 0u) !=
-        ASTCENC_SUCCESS)
-        tr = TC_ERROR_UNSUPPORTED;
-    astcenc_context_free(ctx);
-    return tr;
+    {
+        unsigned int nthreads = opt->threads > 0 ? (unsigned int)opt->threads : 1u;
+#ifndef TC_CLI_HAVE_THREADS
+        nthreads = 1u;
+#endif
+        if (nthreads > 64u) nthreads = 64u;
+        if (astcenc_context_alloc(&cfg, nthreads, &ctx, NULL) !=
+            ASTCENC_SUCCESS)
+            return TC_ERROR_OUT_OF_MEMORY;
+        img.dim_x = w;
+        img.dim_y = h;
+        img.dim_z = 1u;
+        img.data_type = ASTCENC_TYPE_U8;
+        img.data = &slice;
+#ifdef TC_CLI_HAVE_THREADS
+        if (nthreads > 1u) {
+            struct tc_cli_astcenc_job jobs[64];
+            thrd_t tids[64];
+            unsigned int t, spawned = 0;
+            for (t = 0; t < nthreads; ++t) {
+                jobs[t].ctx = ctx;
+                jobs[t].img = &img;
+                jobs[t].swz = &swz;
+                jobs[t].out = out;
+                jobs[t].out_size = out_size;
+                jobs[t].index = t;
+                jobs[t].status = 0;
+            }
+            for (t = 1; t < nthreads; ++t) {
+                if (thrd_create(&tids[t], tc_cli_astcenc_worker, &jobs[t]) !=
+                    thrd_success) {
+                    /* astcenc requires all workers; fail hard rather than
+                     * deadlock its internal barrier. */
+                    fprintf(stderr, "texcomp: thread spawn failed\n");
+                    exit(1);
+                }
+                ++spawned;
+            }
+            tc_cli_astcenc_worker(&jobs[0]);
+            for (t = 1; t <= spawned; ++t) {
+                int rr;
+                thrd_join(tids[t], &rr);
+            }
+            for (t = 0; t < nthreads; ++t)
+                if (jobs[t].status) tr = TC_ERROR_UNSUPPORTED;
+        } else
+#endif
+        if (astcenc_compress_image(ctx, &img, &swz, out, out_size, 0u) !=
+            ASTCENC_SUCCESS)
+            tr = TC_ERROR_UNSUPPORTED;
+        astcenc_context_free(ctx);
+        return tr;
+    }
 }
 #endif
 #include "exr.h"
@@ -235,7 +306,7 @@ static void usage(void) {
     fprintf(stderr,
             "usage: texcomp -i in.{png,exr} -o out [--format bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
-            "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] "
+            "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
             "[--quick on|off] [--mode-mask HEX] "
             "[--linear|--perceptual]\n");
 }
@@ -303,6 +374,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "texcomp: unknown encoder '%s'\n", e);
                 return 1;
             }
+        }
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            astc_opt.threads = atoi(argv[++i]);
+            if (astc_opt.threads < 1) astc_opt.threads = 1;
         }
         else if (strcmp(argv[i], "--astc-block") == 0 && i + 1 < argc) {
             if (!parse_astc_block(argv[++i], &astc_opt.block_x, &astc_opt.block_y)) {

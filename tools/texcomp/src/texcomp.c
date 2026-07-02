@@ -267,6 +267,7 @@ void tc_astc_options_init(tc_astc_options *opt) {
     opt->block_x = 6;
     opt->block_y = 6;
     opt->quality = 2;
+    opt->threads = 1;
 }
 
 static int tc_mul_ovf_size(size_t a, size_t b, size_t *out) {
@@ -5285,34 +5286,26 @@ static void tc_encode_astc_const_block(const uint8_t block[144][4],
     tc_astc_write_const_from_sum(sum, count, out);
 }
 
-tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
-                                 uint32_t height, size_t stride,
-                                 const tc_astc_options *opt,
-                                 uint8_t *out_astc, size_t out_size) {
-    tc_astc_options defopt;
-    uint32_t bx, by, xx, yy, x, y;
-    uint8_t block[144][4];
+/* Encodes block rows [brow_begin, brow_end) with a private context; output
+ * ranges of distinct bands are disjoint, so bands run in parallel without
+ * synchronization and produce output byte-identical to the serial order. */
+static tc_result tc_astc_compress_band(const uint8_t *rgba, uint32_t width,
+                                       uint32_t height, size_t stride,
+                                       const tc_astc_options *opt,
+                                       uint8_t *out_astc, uint32_t brow_begin,
+                                       uint32_t brow_end) {
     tc_astc_encode_context *astc_ctx;
-    size_t need, off = 0;
+    uint8_t block[144][4];
+    uint32_t bx, by, xx, yy, x, y, brow;
+    uint32_t blocks_x = (width + opt->block_x - 1u) / opt->block_x;
+    size_t off = (size_t)brow_begin * blocks_x * 16u;
 
-    if (!opt) {
-        tc_astc_options_init(&defopt);
-        opt = &defopt;
-    }
-    if (!rgba || !out_astc || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
-    if (!tc_astc_valid_block(opt->block_x, opt->block_y))
-        return TC_ERROR_INVALID_ARGUMENT;
-    if (stride < (size_t)width * 4u) return TC_ERROR_INVALID_ARGUMENT;
-    need = tc_astc_compressed_size(width, height, opt);
-    if (!need || out_size < need) return TC_ERROR_INVALID_ARGUMENT;
-    /* The context holds several MB of partition/decimation caches; keep it
-     * off the stack (one allocation per image, not per block). */
     astc_ctx = (tc_astc_encode_context *)malloc(sizeof(*astc_ctx));
     if (!astc_ctx) return TC_ERROR_OUT_OF_MEMORY;
     tc_astc_encode_context_init(astc_ctx, opt->block_x, opt->block_y,
                                 opt->quality);
-
-    for (by = 0; by < height; by += opt->block_y) {
+    for (brow = brow_begin; brow < brow_end; ++brow) {
+        by = brow * opt->block_y;
         for (bx = 0; bx < width; bx += opt->block_x) {
             uint32_t count = 0;
             for (yy = 0; yy < opt->block_y; ++yy) {
@@ -5336,9 +5329,100 @@ tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
             off += 16u;
         }
     }
-
     free(astc_ctx);
     return TC_SUCCESS;
+}
+
+#if !defined(__STDC_NO_THREADS__)
+#include <threads.h>
+#define TC_ASTC_HAVE_THREADS 1
+
+typedef struct tc_astc_thread_job {
+    const uint8_t *rgba;
+    uint32_t width, height;
+    size_t stride;
+    const tc_astc_options *opt;
+    uint8_t *out_astc;
+    uint32_t brow_begin, brow_end;
+    tc_result result;
+} tc_astc_thread_job;
+
+static int tc_astc_thread_worker(void *arg) {
+    tc_astc_thread_job *job = (tc_astc_thread_job *)arg;
+    job->result = tc_astc_compress_band(job->rgba, job->width, job->height,
+                                        job->stride, job->opt, job->out_astc,
+                                        job->brow_begin, job->brow_end);
+    return 0;
+}
+#endif
+
+tc_result tc_astc_compress_rgba8(const uint8_t *rgba, uint32_t width,
+                                 uint32_t height, size_t stride,
+                                 const tc_astc_options *opt,
+                                 uint8_t *out_astc, size_t out_size) {
+    tc_astc_options defopt;
+    uint32_t blocks_y, nthreads;
+    size_t need;
+
+    if (!opt) {
+        tc_astc_options_init(&defopt);
+        opt = &defopt;
+    }
+    if (!rgba || !out_astc || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    if (!tc_astc_valid_block(opt->block_x, opt->block_y))
+        return TC_ERROR_INVALID_ARGUMENT;
+    if (stride < (size_t)width * 4u) return TC_ERROR_INVALID_ARGUMENT;
+    need = tc_astc_compressed_size(width, height, opt);
+    if (!need || out_size < need) return TC_ERROR_INVALID_ARGUMENT;
+
+    blocks_y = (height + opt->block_y - 1u) / opt->block_y;
+    nthreads = opt->threads > 0 ? (uint32_t)opt->threads : 1u;
+    if (nthreads > blocks_y) nthreads = blocks_y;
+    if (nthreads > 64u) nthreads = 64u;
+
+#if defined(TC_ASTC_HAVE_THREADS)
+    if (nthreads > 1u) {
+        tc_astc_thread_job jobs[64];
+        thrd_t tids[64];
+        uint32_t t, spawned = 0;
+        uint32_t base = blocks_y / nthreads, rem = blocks_y % nthreads;
+        uint32_t row = 0;
+        tc_result tr = TC_SUCCESS;
+        for (t = 0; t < nthreads; ++t) {
+            uint32_t rows = base + (t < rem ? 1u : 0u);
+            jobs[t].rgba = rgba;
+            jobs[t].width = width;
+            jobs[t].height = height;
+            jobs[t].stride = stride;
+            jobs[t].opt = opt;
+            jobs[t].out_astc = out_astc;
+            jobs[t].brow_begin = row;
+            jobs[t].brow_end = row + rows;
+            jobs[t].result = TC_SUCCESS;
+            row += rows;
+        }
+        for (t = 1; t < nthreads; ++t) {
+            if (thrd_create(&tids[t], tc_astc_thread_worker, &jobs[t]) !=
+                thrd_success)
+                break;
+            ++spawned;
+        }
+        tc_astc_thread_worker(&jobs[0]);
+        /* Bands whose thread never launched run serially on this thread. */
+        for (t = spawned + 1u; t < nthreads; ++t)
+            tc_astc_thread_worker(&jobs[t]);
+        for (t = 1; t <= spawned; ++t) {
+            int rr;
+            thrd_join(tids[t], &rr);
+        }
+        for (t = 0; t < nthreads; ++t) {
+            if (jobs[t].result != TC_SUCCESS) tr = jobs[t].result;
+        }
+        return tr;
+    }
+#endif
+    return tc_astc_compress_band(rgba, width, height, stride, opt, out_astc,
+                                 0u, blocks_y);
 }
 
 size_t tc_dds_bc7_size(uint32_t width, uint32_t height) {
