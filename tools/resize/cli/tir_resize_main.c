@@ -236,9 +236,9 @@ int main(int argc, char **argv) {
         exr_image img;
         exr_part *part;
         exr_result erc;
-        int nch, ch_idx[4], sw, sh, dw, dh, c;
-        float *src_i, *dst_i;
-        void **out_planes;
+        int nch, ch_idx[4], sw, sh, dw, dh, c, status = 0;
+        float *src_i = NULL, *dst_i = NULL;
+        void **out_planes = NULL;
         exr_image out_img;
         exr_part out_part;
 
@@ -254,8 +254,8 @@ int main(int argc, char **argv) {
                     img.num_parts);
         if (part->is_deep || !part->images) {
             fprintf(stderr, "deep parts are not supported\n");
-            exr_image_free(&img);
-            return 1;
+            status = 1;
+            goto cleanup;
         }
         sw = part->width;
         sh = part->height;
@@ -288,8 +288,8 @@ int main(int argc, char **argv) {
             if (t != EXR_PIXEL_HALF && t != EXR_PIXEL_FLOAT) {
                 fprintf(stderr, "channel %s: only HALF/FLOAT supported\n",
                         part->header.channels[ch_idx[c]].name);
-                exr_image_free(&img);
-                return 1;
+                status = 1;
+                goto cleanup;
             }
         }
 
@@ -299,7 +299,8 @@ int main(int argc, char **argv) {
                                      sizeof(void *));
         if (!src_i || !dst_i || !out_planes) {
             fprintf(stderr, "out of memory\n");
-            return 1;
+            status = 1;
+            goto cleanup;
         }
         /* gather planar -> interleaved f32 */
         for (c = 0; c < nch; ++c) {
@@ -320,8 +321,8 @@ int main(int argc, char **argv) {
             tir_result trc = tir_resize(NULL, &sv, &dv, &opt);
             if (trc != TIR_SUCCESS) {
                 fprintf(stderr, "resize: %s\n", tir_result_string(trc));
-                exr_image_free(&img);
-                return 1;
+                status = 1;
+                goto cleanup;
             }
         }
 
@@ -349,10 +350,20 @@ int main(int argc, char **argv) {
             size_t n = (size_t)dw * dh, p;
             if (t == EXR_PIXEL_FLOAT) {
                 float *pl = (float *)malloc(n * sizeof(float));
+                if (!pl) {
+                    fprintf(stderr, "out of memory\n");
+                    status = 1;
+                    goto cleanup;
+                }
                 for (p = 0; p < n; ++p) pl[p] = dst_i[p * nch + c];
                 out_planes[ch_idx[c]] = pl;
             } else {
                 uint16_t *pl = (uint16_t *)malloc(n * 2);
+                if (!pl) {
+                    fprintf(stderr, "out of memory\n");
+                    status = 1;
+                    goto cleanup;
+                }
                 for (p = 0; p < n; ++p)
                     pl[p] = f32_to_half(dst_i[p * nch + c]);
                 out_planes[ch_idx[c]] = pl;
@@ -389,16 +400,21 @@ int main(int argc, char **argv) {
         }
         if (!EXR_OK(erc)) {
             fprintf(stderr, "save %s: %s\n", out_path, exr_result_string(erc));
-            return 1;
+            status = 1;
+            goto cleanup;
         }
         printf("%s (%dx%d) -> %s (%dx%d), %d ch, %s kernels\n", in_path, sw,
                sh, out_path, dw, dh, nch, tir_simd_info());
 
-        for (c = 0; c < part->header.num_channels; ++c) free(out_planes[c]);
-        free(out_planes);
+    cleanup:
+        if (out_planes) {
+            for (c = 0; c < part->header.num_channels; ++c)
+                free(out_planes[c]);
+            free(out_planes);
+        }
         free(src_i);
         free(dst_i);
         exr_image_free(&img);
+        return status;
     }
-    return 0;
 }
