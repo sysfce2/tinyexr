@@ -15,7 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if !defined(__STDC_NO_THREADS__)
+#if !defined(__STDC_NO_THREADS__) && !defined(TC_NO_THREADS)
 #include <threads.h>
 #define TC_CLI_HAVE_THREADS 1
 #endif
