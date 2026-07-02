@@ -67,4 +67,11 @@ uint64_t tc_encode_eac_alpha(const uint8_t alpha[16]);
  * ASTC HDR encoder for FP16 constant-colour (void-extent) blocks. */
 uint16_t tc_float_to_half_bits(float fv);
 
+/* ASTC HDR endpoint codec (defined in texcomp_astc_hdr.c). LNS = the 16-bit
+ * logarithmic domain ASTC HDR interpolates endpoints in. */
+int tc_astc_float_to_lns16(float a);
+uint16_t tc_astc_lns16_to_sf16(int p);
+void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]);
+int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]);
+
 #endif /* TINYEXR_TEXCOMP_INTERNAL_H_ */

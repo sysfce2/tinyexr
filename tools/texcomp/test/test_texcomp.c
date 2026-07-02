@@ -6,12 +6,43 @@
  */
 
 #include "texcomp.h"
+/* Internal helpers under test (ASTC HDR endpoint codec, etc.). */
+#include "../src/texcomp_internal.h"
 
 #include "astc_ref_decode.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+/* Decode FP16 bits to float (for HDR round-trip checks). */
+static float half_bits_to_float(uint16_t h) {
+    uint32_t s = (uint32_t)(h >> 15) & 1u, e = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t m = (uint32_t)h & 0x3FFu, f;
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    if (e == 0u) {
+        if (m == 0u) {
+            f = s << 31;
+        } else {
+            int ee = 127 - 15 + 1;
+            while (!(m & 0x400u)) {
+                m <<= 1;
+                ee--;
+            }
+            m &= 0x3FFu;
+            f = (s << 31) | ((uint32_t)ee << 23) | (m << 13);
+        }
+    } else if (e == 0x1Fu) {
+        f = (s << 31) | (0xFFu << 23) | (m << 13);
+    } else {
+        f = (s << 31) | ((e - 15u + 127u) << 23) | (m << 13);
+    }
+    v.u = f;
+    return v.f;
+}
 
 #define CHECK(x, msg)                                                           \
     do {                                                                        \
@@ -778,6 +809,43 @@ int main(void) {
         CHECK(hblk[0] == 0xFCu && hblk[1] == 0xFFu, "astc hdr void-extent marker");
         CHECK((hblk[14] | (hblk[15] << 8)) == 0x3C00u, "astc hdr alpha = 1.0");
         CHECK((hblk[8] | (hblk[9] << 8)) != 0u, "astc hdr red nonzero");
+    }
+
+    /* ASTC HDR CEM 11 (HDR RGB direct) endpoint codec round-trip: encode two
+     * HDR colours into the majcomp==3 direct sub-mode, decode, and verify both
+     * the LNS-domain quantisation bound and the reconstructed value error
+     * (R/G are 8-bit qlog, B is 7-bit qlog). */
+    {
+        static const float cols[6][3] = {
+            {2.5f, 0.1f, 30.0f},  {0.3f, 8.0f, 1.0f},
+            {0.02f, 0.05f, 0.5f}, {100.0f, 50.0f, 2000.0f},
+            {1.0f, 1.0f, 1.0f},   {0.5f, 3.0f, 12.0f}};
+        int k, c;
+        for (k = 0; k + 1 < 6; k += 2) {
+            int l0[3], l1[3], d0[3], d1[3];
+            uint8_t v[6];
+            for (c = 0; c < 3; ++c) {
+                l0[c] = tc_astc_float_to_lns16(cols[k][c]);
+                l1[c] = tc_astc_float_to_lns16(cols[k + 1][c]);
+            }
+            tc_astc_cem11_pack(l0, l1, v);
+            CHECK((v[4] & 0x80) && (v[5] & 0x80), "cem11 majcomp3 marker");
+            CHECK(tc_astc_cem11_unpack(v, d0, d1) == 1, "cem11 unpack");
+            for (c = 0; c < 3; ++c) {
+                int bound = (c == 2) ? 512 : 256; /* B 7-bit, R/G 8-bit qlog */
+                int e0 = d0[c] - l0[c], e1 = d1[c] - l1[c];
+                double rel, tol = (c == 2) ? 0.11 : 0.07;
+                float rec, ref;
+                if (e0 < 0) e0 = -e0;
+                if (e1 < 0) e1 = -e1;
+                CHECK(e0 <= bound && e1 <= bound, "cem11 lns quant bound");
+                CHECK(tc_astc_lns16_to_sf16(d0[c]) <= 0x7BFFu, "cem11 valid half");
+                rec = half_bits_to_float(tc_astc_lns16_to_sf16(d0[c]));
+                ref = half_bits_to_float(tc_float_to_half_bits(cols[k][c]));
+                rel = fabs((double)rec - ref) / ((double)ref + 1e-3);
+                CHECK(rel < tol, "cem11 value round-trip");
+            }
+        }
     }
 
     CHECK(tc_etc2_compress_rgba8(rgba, 7, 5, 7 * 4, &etc2_opt, etc2,

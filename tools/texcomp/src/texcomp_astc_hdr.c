@@ -16,6 +16,120 @@
 
 #include <string.h>
 
+/* ---- LNS (logarithmic) HDR value domain ---------------------------------
+ * ASTC HDR interpolates endpoints in a 16-bit "LNS" (log) domain and converts
+ * the interpolated value to FP16 with lns_to_sf16. These are scalar ports of
+ * astcenc's float_to_lns / lns_to_sf16 (astcenc_vecmathlib.h), the reference
+ * decoder we validate against. */
+static uint32_t tc_f2u(float f) {
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    v.f = f;
+    return v.u;
+}
+
+static float tc_u2f(uint32_t u) {
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    v.u = u;
+    return v.f;
+}
+
+/* astcenc-compatible frexp: mantissa in [0.5,1), exponent via the raw bits. */
+static float tc_astc_frexp(float a, int *expo) {
+    uint32_t ai = tc_f2u(a);
+    *expo = (int)((ai >> 23) & 0xFFu) - 126;
+    return tc_u2f((ai & 0x807FFFFFu) | 0x3F000000u);
+}
+
+/* float -> 16-bit LNS value (rounded, clamped to [0, 65535]). */
+int tc_astc_float_to_lns16(float a) {
+    int expo, ri, expv;
+    float mant, av, a2, r;
+    int underflow = !(a > (1.0f / 67108864.0f)); /* a <= 2^-26 (incl. neg/NaN) */
+    int infinity = a >= 65536.0f;
+    mant = tc_astc_frexp(a, &expo);
+    if (expo < -13) {
+        av = a * 33554432.0f; /* 2^25 */
+        expv = 0;
+    } else {
+        av = (mant - 0.5f) * 4096.0f;
+        expv = expo + 14;
+    }
+    if (av < 384.0f)
+        a2 = av * (4.0f / 3.0f);
+    else if (av <= 1408.0f)
+        a2 = av + 128.0f;
+    else
+        a2 = (av + 512.0f) * (4.0f / 5.0f);
+    r = a2 + (float)expv * 2048.0f + 1.0f;
+    if (infinity) r = 65535.0f;
+    if (underflow) r = 0.0f;
+    ri = (int)(r + 0.5f);
+    if (ri < 0) ri = 0;
+    if (ri > 65535) ri = 65535;
+    return ri;
+}
+
+/* 16-bit LNS value -> FP16 bits. */
+uint16_t tc_astc_lns16_to_sf16(int p) {
+    int mc = p & 0x7FF;
+    int ec = (int)((unsigned)p >> 11);
+    int mt, res;
+    if (mc < 512)
+        mt = mc * 3;
+    else if (mc < 1536)
+        mt = mc * 4 - 512;
+    else
+        mt = mc * 5 - 2048;
+    res = (ec << 10) | (mt >> 3);
+    if (res > 0x7BFF) res = 0x7BFF;
+    return (uint16_t)res;
+}
+
+/* ---- CEM 11 (HDR RGB direct) endpoint codec -----------------------------
+ * Endpoints are 16-bit LNS values per channel. pack uses the majcomp==3
+ * "direct" sub-mode (R/G at 8-bit, B at 7-bit qlog precision); unpack
+ * implements the ASTC hdr_rgb decode for that sub-mode. The full 8-mode /
+ * base+offset packing (astcenc quantize_hdr_rgb) is a later refinement. */
+void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]) {
+    int r0 = (lns0[0] + 128) >> 8, r1 = (lns1[0] + 128) >> 8;
+    int g0 = (lns0[1] + 128) >> 8, g1 = (lns1[1] + 128) >> 8;
+    int b0 = (lns0[2] + 256) >> 9, b1 = (lns1[2] + 256) >> 9;
+    if (r0 > 255) r0 = 255;
+    if (r1 > 255) r1 = 255;
+    if (g0 > 255) g0 = 255;
+    if (g1 > 255) g1 = 255;
+    if (b0 > 127) b0 = 127;
+    if (b1 > 127) b1 = 127;
+    v[0] = (uint8_t)r0;
+    v[1] = (uint8_t)r1;
+    v[2] = (uint8_t)g0;
+    v[3] = (uint8_t)g1;
+    v[4] = (uint8_t)(b0 | 0x80); /* bit7 = majcomp low  */
+    v[5] = (uint8_t)(b1 | 0x80); /* bit7 = majcomp high -> majcomp==3 */
+}
+
+/* Decode CEM 11 endpoints to 16-bit LNS per channel. Currently the majcomp==3
+ * direct sub-mode (what pack emits); returns 0 for other sub-modes (TODO). */
+int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]) {
+    int majcomp = ((v[4] & 0x80) >> 7) | (((v[5] & 0x80) >> 7) << 1);
+    if (majcomp == 3) {
+        out0[0] = v[0] << 8;
+        out0[1] = v[2] << 8;
+        out0[2] = (v[4] & 0x7F) << 9;
+        out1[0] = v[1] << 8;
+        out1[1] = v[3] << 8;
+        out1[2] = (v[5] & 0x7F) << 9;
+        return 1;
+    }
+    return 0;
+}
+
 void tc_astc_hdr_options_init(tc_astc_hdr_options *opt) {
     if (!opt) return;
     memset(opt, 0, sizeof(*opt));
