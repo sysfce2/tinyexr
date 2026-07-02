@@ -4850,7 +4850,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     uint16_t selected_candidates[64];
     uint64_t selected_errors[64];
     uint32_t selected_count = 0;
-    uint32_t selected_limit = quality > 1 ? 48u : (quality > 0 ? 12u : 2u);
+    uint32_t selected_limit = quality > 1 ? 48u : (quality > 0 ? 8u : 2u);
     uint64_t best_err = UINT64_MAX;
 
     uint8_t path_out[16];
