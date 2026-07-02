@@ -405,20 +405,23 @@ static int astc_thread_parity_test(void) {
 static int astc_ref_roundtrip_test(void) {
     static const uint32_t bs[4][2] = {{4, 4}, {6, 6}, {8, 8}, {12, 12}};
     /* floors[kind][block][quality], dB; measured on 48x48 images minus a
-     * ~1 dB safety margin. Raise when the encoder improves. */
+     * safety margin. Margin is ~0.3 dB for medium/normal (q1/q2), which must
+     * not regress, and ~0.6 dB for fast (q0) synthetic corners, which may
+     * trade up to ~1 dB in future effort-level tuning. Raise when the encoder
+     * improves; never lower silently. */
     static const double floors[4][4][3] = {
         /* gradient */
-        {{37.5, 38.1, 38.1}, {34.0, 34.4, 34.6}, {31.5, 31.6, 33.4},
-         {27.0, 27.6, 29.2}},
+        {{37.5, 38.1, 38.2}, {34.0, 34.4, 34.7}, {31.5, 31.7, 33.5},
+         {27.0, 28.0, 29.3}},
         /* clusters */
-        {{60.0, 60.0, 60.0}, {60.0, 60.0, 60.0}, {20.3, 53.0, 53.0},
-         {15.0, 21.0, 21.0}},
+        {{60.0, 60.0, 60.0}, {60.0, 60.0, 60.0}, {20.3, 53.8, 53.8},
+         {15.0, 21.2, 21.2}},
         /* alpha ramp */
-        {{35.4, 36.1, 36.1}, {31.4, 32.2, 32.3}, {28.7, 29.1, 29.8},
-         {25.1, 26.3, 27.3}},
+        {{35.4, 36.2, 36.2}, {31.4, 32.2, 32.4}, {28.7, 29.3, 29.9},
+         {25.1, 26.6, 27.4}},
         /* rgba noise */
-        {{12.2, 13.2, 13.2}, {11.0, 12.0, 12.0}, {10.9, 11.2, 11.2},
-         {10.6, 10.6, 10.6}}};
+        {{12.2, 13.3, 13.4}, {11.0, 12.2, 12.2}, {10.9, 11.3, 11.3},
+         {10.6, 10.7, 10.7}}};
     enum { W = 48, H = 48 };
     static uint8_t img[W * H * 4];
     static uint8_t dec[W * H * 4];
