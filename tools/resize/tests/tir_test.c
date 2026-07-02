@@ -1001,28 +1001,156 @@ static void test_vfirst(void) {
  * is unchanged); serial fallback without TIR_ENABLE_THREADS also passes
  * ========================================================================= */
 static void test_threads(void) {
-    int sw = 127, sh = 97, dw = 73, dh = 141, ch = 4;
+    static const tir_edge_mode edges[3] = {TIR_EDGE_CLAMP, TIR_EDGE_REFLECT,
+                                           TIR_EDGE_WRAP};
+    static const char *ename[3] = {"clamp", "reflect", "wrap"};
+    static const int nthreads[3] = {2, 3, 5};
+    int sw = 127, sh = 97, dw = 73, dh = 141, ch = 4, e, t;
     float *src = make_image(sw, sh, ch, 20.0f);
     float *d1 = (float *)malloc((size_t)dw * dh * ch * sizeof(float));
     float *d2 = (float *)malloc((size_t)dw * dh * ch * sizeof(float));
     tir_image_view sv = viewf(src, sw, sh, ch);
     tir_image_view dv1 = viewf(d1, dw, dh, ch);
     tir_image_view dv2 = viewf(d2, dw, dh, ch);
-    tir_options o;
     src[(size_t)(11 * sw + 17) * ch + 2] = NAN; /* exercise REPAIR banding */
-    tir_options_init(&o);
-    o.filter_x = o.filter_y = TIR_FILTER_LANCZOS3;
-    o.antiring = 0.9f;
-    o.nonfinite = TIR_NONFINITE_REPAIR;
-    o.num_threads = 0;
-    CHECK(tir_resize(NULL, &sv, &dv1, &o) == TIR_SUCCESS, "serial rc");
-    o.num_threads = 5;
-    CHECK(tir_resize(NULL, &sv, &dv2, &o) == TIR_SUCCESS, "threads rc");
-    CHECK(memcmp(d1, d2, (size_t)dw * dh * ch * sizeof(float)) == 0,
-          "threads == serial byte-identical");
+    /* Every edge mode x thread count must be byte-identical to serial. The
+     * wrap-y rows are the regression guard: a band that starts in the fast
+     * range but reaches the bottom wrap-exception rows (which wrap back to
+     * row 0) must still push those rows instead of fast-forwarding past them. */
+    for (e = 0; e < 3; ++e) {
+        tir_options o;
+        tir_options_init(&o);
+        o.filter_x = o.filter_y = TIR_FILTER_LANCZOS3;
+        o.edge_x = o.edge_y = edges[e];
+        o.antiring = 0.9f;
+        o.nonfinite = TIR_NONFINITE_REPAIR;
+        o.num_threads = 0;
+        CHECK(tir_resize(NULL, &sv, &dv1, &o) == TIR_SUCCESS, "serial rc");
+        for (t = 0; t < 3; ++t) {
+            char msg[64];
+            o.num_threads = nthreads[t];
+            CHECK(tir_resize(NULL, &sv, &dv2, &o) == TIR_SUCCESS, "threads rc");
+            snprintf(msg, sizeof(msg), "threads==serial edge=%s nt=%d",
+                     ename[e], nthreads[t]);
+            CHECK(memcmp(d1, d2, (size_t)dw * dh * ch * sizeof(float)) == 0,
+                  msg);
+        }
+    }
     free(src);
     free(d1);
     free(d2);
+}
+
+/* ===========================================================================
+ * regression guards for the three audit bugs (2026-07-02)
+ * ========================================================================= */
+
+/* Bug: unpremult4_sse2 zeroed RGB where alpha==0 instead of preserving the
+ * filtered RGB. Two RGBA texels whose alphas cancel to 0 under a box filter;
+ * the premultiplied RGB must survive, and every SIMD level must equal scalar. */
+static void test_unpremult_alpha0(void) {
+    float src[8] = {1, 2, 3, 0.5f, 4, 5, 6, -0.5f};
+    tir_image_view sv = {src, 2, 1, 4, TIR_F32, 0};
+    float ref[4];
+    uint32_t avail = tir_simd_available();
+    int l;
+    tir_options o;
+    tir_options_init(&o);
+    o.filter_x = o.filter_y = TIR_FILTER_BOX;
+    o.alpha = TIR_ALPHA_PREMULTIPLY;
+    tir_simd_force(TIR_SIMD_SCALAR);
+    {
+        tir_image_view dv = {ref, 1, 1, 4, TIR_F32, 0};
+        CHECK(tir_resize(NULL, &sv, &dv, &o) == TIR_SUCCESS, "unpremult ref");
+    }
+    CHECK(ref[3] == 0.0f, "alpha cancels to 0");
+    CHECK(ref[0] != 0.0f, "scalar keeps RGB where alpha==0");
+    for (l = 1; l <= TIR_SIMD_SVE; ++l) {
+        float out[4];
+        tir_image_view dv = {out, 1, 1, 4, TIR_F32, 0};
+        char msg[64];
+        if (!(avail & (1u << l))) continue;
+        tir_simd_force((tir_simd_level)l);
+        CHECK(tir_resize(NULL, &sv, &dv, &o) == TIR_SUCCESS, "unpremult lvl");
+        snprintf(msg, sizeof(msg), "unpremult alpha==0 level %d == scalar", l);
+        CHECK(memcmp(out, ref, sizeof(ref)) == 0, msg);
+    }
+    for (l = TIR_SIMD_SVE; l >= 0; --l)
+        if (avail & (1u << l)) { tir_simd_force((tir_simd_level)l); break; }
+}
+
+/* Bug: hicomp forced clamp_lo=0 mode-independently, but hicomp is disabled in
+ * normal-map mode -> --mode normal --hicomp clamped signed X/Y to 0. */
+static void test_normal_hicomp(void) {
+    float src[6] = {-0.6f, 0.3f, 0.74f, -0.5f, 0.2f, 0.84f};
+    float out[3];
+    tir_image_view sv = {src, 2, 1, 3, TIR_F32, 0};
+    tir_image_view dv = {out, 1, 1, 3, TIR_F32, 0};
+    tir_options o;
+    double len;
+    tir_options_init(&o);
+    o.mode = TIR_MODE_NORMAL_MAP;
+    o.normal_encoding = TIR_NORMAL_SNORM;
+    o.hicomp = 1;
+    o.filter_x = o.filter_y = TIR_FILTER_BOX;
+    CHECK(tir_resize(NULL, &sv, &dv, &o) == TIR_SUCCESS, "nm hicomp rc");
+    CHECK(out[0] < 0.0f, "normal+hicomp keeps signed X (not clamped to 0)");
+    len = sqrt((double)out[0] * out[0] + (double)out[1] * out[1] +
+               (double)out[2] * out[2]);
+    CHECK(fabs(len - 1.0) < 1e-5, "normal+hicomp output stays unit length");
+}
+
+/* Broad SIMD-vs-scalar parity: channels 1..4 x up/down/same geometries with
+ * the premult/antiring paths live. A single fixed geometry (test_simd_levels)
+ * missed the channel-specific unpremult bug; this sweeps the channel kernels. */
+static void test_simd_sweep(void) {
+    static const int geo[3][4] = {
+        {61, 47, 130, 99}, {130, 99, 41, 33}, {96, 64, 96, 64}};
+    uint32_t avail = tir_simd_available();
+    int ci, gi, l;
+    for (ci = 1; ci <= 4; ++ci)
+        for (gi = 0; gi < 3; ++gi) {
+            int sw = geo[gi][0], sh = geo[gi][1], dw = geo[gi][2],
+                dh = geo[gi][3];
+            size_t n = (size_t)dw * dh * ci;
+            float *src, *ref = (float *)malloc(n * sizeof(float));
+            float *cur = (float *)malloc(n * sizeof(float));
+            tir_image_view sv, dv;
+            tir_options o;
+            g_rng = 0x5A5A0000u + (uint32_t)(ci * 16 + gi);
+            src = make_image(sw, sh, ci, 8.0f);
+            sv = viewf(src, sw, sh, ci);
+            tir_options_init(&o);
+            o.filter_x = TIR_FILTER_LANCZOS3;
+            o.filter_y = TIR_FILTER_CATMULL_ROM;
+            o.antiring = 0.5f;
+            /* Straight alpha: exercise the 4-channel filtering kernels without
+             * the unpremult division amplifying reassociation noise (the
+             * unpremult path is covered exactly by test_unpremult_alpha0). */
+            o.alpha = TIR_ALPHA_STRAIGHT;
+            tir_simd_force(TIR_SIMD_SCALAR);
+            dv = viewf(ref, dw, dh, ci);
+            CHECK(tir_resize(NULL, &sv, &dv, &o) == TIR_SUCCESS, "sweep ref");
+            for (l = 1; l <= TIR_SIMD_SVE; ++l) {
+                char msg[80];
+                double err;
+                if (!(avail & (1u << l))) continue;
+                tir_simd_force((tir_simd_level)l);
+                dv = viewf(cur, dw, dh, ci);
+                CHECK(tir_resize(NULL, &sv, &dv, &o) == TIR_SUCCESS,
+                      "sweep lvl");
+                err = max_rel_err(cur, ref, n);
+                snprintf(msg, sizeof(msg),
+                         "simd sweep ch=%d geo=%d lvl=%d err=%g", ci, gi, l,
+                         err);
+                CHECK(err < 2e-5, msg);
+            }
+            free(src);
+            free(ref);
+            free(cur);
+        }
+    for (l = TIR_SIMD_SVE; l >= 0; --l)
+        if (avail & (1u << l)) { tir_simd_force((tir_simd_level)l); break; }
 }
 
 int main(void) {
@@ -1036,9 +1164,12 @@ int main(void) {
     fprintf(stderr, "[t] nonfinite\n"); test_nonfinite();
     fprintf(stderr, "[t] types\n"); test_types();
     fprintf(stderr, "[t] simd\n"); test_simd_levels();
+    fprintf(stderr, "[t] simd_sweep\n"); test_simd_sweep();
     fprintf(stderr, "[t] streaming\n"); test_streaming();
     fprintf(stderr, "[t] hostile\n"); test_hostile();
     fprintf(stderr, "[t] hicomp\n"); test_hicomp();
+    fprintf(stderr, "[t] unpremult_alpha0\n"); test_unpremult_alpha0();
+    fprintf(stderr, "[t] normal_hicomp\n"); test_normal_hicomp();
     fprintf(stderr, "[t] vfirst\n"); test_vfirst();
     fprintf(stderr, "[t] threads\n"); test_threads();
     printf("tir tests: %d passed, %d failed (simd: %s)\n", g_pass, g_fail,

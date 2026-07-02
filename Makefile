@@ -600,9 +600,9 @@ ifeq ($(TIR_SVE),1)
 TIR_SVE_FLAGS = -march=armv8-a+sve
 endif
 
-.PHONY: resize-lib resize-c11-gate resize-test resize-test-threads \
-        resize-test-tsan resize-bench resize-cli resize-arm-test \
-        resize-sve-test
+.PHONY: resize-lib resize-c11-gate resize-test resize-test-asan \
+        resize-test-threads resize-test-tsan resize-bench resize-cli \
+        resize-cli-asan resize-arm-test resize-sve-test
 
 build/tir-%.o: tools/resize/src/%.c $(TIR_HDRS) | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -O2 -g -c $< -o $@
@@ -627,6 +627,15 @@ resize-test: | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -O1 -g $(SAN) \
 	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test
 	ASAN_OPTIONS=detect_leaks=0 ./build/tir_test
+
+# Same unit tests, but with LeakSanitizer on (the library is single-alloc /
+# single-free, so the suite must be leak-clean) and threads enabled so the
+# banded whole-image paths run under ASan+UBSan+LSan too.
+resize-test-asan: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
+	  -O1 -g $(SAN) \
+	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_asan
+	ASAN_OPTIONS=detect_leaks=1 ./build/tir_test_asan
 
 resize-test-threads: | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -DTIR_ENABLE_THREADS -pthread \
@@ -658,6 +667,23 @@ resize-cli: lib resize-lib | build
 	  tools/resize/cli/tir_resize_main.c build/libtir.a build/libtinyexr3.a \
 	  -lm -o build/tir_resize
 	@echo "built build/tir_resize"
+
+# CLI under ASan+UBSan+LeakSanitizer: a real EXR round-trip plus an error
+# path, guarding the CLI's malloc checks and the single-cleanup free path.
+resize-cli-asan: lib | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -Iinclude -O1 -g $(SAN) \
+	  tools/resize/cli/tir_resize_main.c $(TIR_SRC) build/libtinyexr3.a \
+	  -lm -o build/tir_resize_asan
+	@echo "  round-trip under ASan+LSan (must be leak-clean)"
+	ASAN_OPTIONS=detect_leaks=1 ./build/tir_resize_asan asakusa.exr \
+	  -o build/tir_asan_out.exr --scale 0.5 --filter lanczos3 \
+	  --antiring 1 --clamp-min 0 --stats
+	@echo "  error path (save failure) must not leak"
+	@ASAN_OPTIONS=detect_leaks=1:exitcode=99 ./build/tir_resize_asan \
+	  asakusa.exr -o /nonexistent_dir_zzz/out.exr --scale 0.5; \
+	  rc=$$?; if [ $$rc = 99 ]; then echo "  FAIL: leak on error path"; \
+	  exit 1; fi; echo "  error path clean (exit $$rc)"
+	@echo "resize CLI ASan: OK"
 
 # Cross-build for AArch64 (NEON kernels) and run under qemu.
 resize-arm-test: | build
