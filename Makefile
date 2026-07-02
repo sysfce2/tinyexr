@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -360,6 +360,19 @@ texcomp-astc-arm-smoke: texcomp
 	@test -x "$(ASTCENC)" || { echo "set ASTCENC=/path/to/astcenc-native"; exit 77; }
 	./build/texcomp/texcomp -i issue40.exr -o build/texcomp/arm_smoke_6x6.astc --format astc --astc-block 6x6 --quality normal
 	"$(ASTCENC)" -dl build/texcomp/arm_smoke_6x6.astc build/texcomp/arm_smoke_6x6.png -silent
+
+# Self-contained CI gate for the vendored astcenc backend: builds the C++
+# encoder, encodes one image with both the pure-C `tc` path and astcenc, and
+# cross-checks their PSNR using astcenc's own decoder. No external binaries or
+# image assets, so it runs anywhere the backend compiles.
+texcomp-astc-arm-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc_arm_xcheck.c | build/texcomp
+	$(AR) rcs build/libtexcomp_astcenc.a $(ASTCENC_LIB_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test \
+	  -DTEXCOMP_HAVE_ASTCENC -Ideps/astcenc -O2 -g -c \
+	  tools/texcomp/test/astc_arm_xcheck.c -o build/texcomp/astc_arm_xcheck.o
+	$(CXX) build/texcomp/astc_arm_xcheck.o $(TEXCOMP_OBJ) \
+	  build/libtexcomp_astcenc.a -lm -o build/texcomp/astc_arm_xcheck
+	./build/texcomp/astc_arm_xcheck
 
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:
@@ -743,6 +756,7 @@ help:
 	@echo "make texcomp-astc-psnr - ASTC encode/reference-decode PSNR table"
 	@echo "make texcomp-arm - texcomp CLI with the vendored Arm astcenc backend (--encoder arm)"
 	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
+	@echo "make texcomp-astc-arm-gate - self-contained astcenc build + PSNR cross-check (CI gate)"
 	@echo "make texcomp-wasm - Emscripten texcomp C API + Node CLI (scalar wasm)"
 	@echo "make texcomp-wasm-simd - Emscripten texcomp C API + Node CLI (-msimd128)"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
