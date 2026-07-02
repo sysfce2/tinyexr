@@ -601,8 +601,8 @@ TIR_SVE_FLAGS = -march=armv8-a+sve
 endif
 
 .PHONY: resize-lib resize-c11-gate resize-test resize-test-asan \
-        resize-test-threads resize-test-tsan resize-bench resize-cli \
-        resize-cli-asan resize-arm-test resize-sve-test
+        resize-test-threads resize-test-tsan resize-test-f16 resize-bench \
+        resize-cli resize-cli-asan resize-arm-test resize-sve-test
 
 build/tir-%.o: tools/resize/src/%.c $(TIR_HDRS) | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(TIR_INC) -O2 -g -c $< -o $@
@@ -648,6 +648,31 @@ resize-test-tsan: | build
 	  -O1 -g -fsanitize=thread \
 	  tools/resize/tests/tir_test.c $(TIR_SRC) -lm -o build/tir_test_tsan
 	./build/tir_test_tsan
+
+# Exhaustive f16<->f32 converter sweep (all 65536 half codes, every SIMD
+# level vs the scalar reference, both directions). Guards the SIMD sNaN
+# preservation, which the resize pipeline itself cannot exercise. Runs the
+# native levels, then the aarch64 NEON/SVE kernels under qemu when the cross
+# toolchain (ARM_CC, default gcc-13; pass ARM_CC=... for another) is present.
+resize-test-f16: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TIR_INC) -O2 -g \
+	  tools/resize/tests/tir_f16_test.c $(TIR_SRC) -lm -o build/tir_f16_test
+	./build/tir_f16_test
+	@if command -v $(ARM_CC) >/dev/null 2>&1; then \
+	  echo "== NEON (qemu) =="; \
+	  $(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TIR_INC) \
+	    -O2 tools/resize/tests/tir_f16_test.c $(TIR_SRC) -lm \
+	    -o build/tir_f16_test_arm && $(ARM_QEMU) ./build/tir_f16_test_arm; \
+	  echo "== SVE (qemu) =="; \
+	  $(ARM_CC) -static -march=armv8-a+sve $(V3_CSTD) -Wall -Wextra \
+	    $(TIR_INC) -O2 -c tools/resize/src/tir_kernels_sve.c \
+	    -o build/tir-sve-kernels-f16.o && \
+	  $(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TIR_INC) \
+	    -O2 tools/resize/tests/tir_f16_test.c \
+	    $(filter-out tools/resize/src/tir_kernels_sve.c,$(TIR_SRC)) \
+	    build/tir-sve-kernels-f16.o -lm -o build/tir_f16_test_sve && \
+	  $(ARM_QEMU) -cpu max,sve=on,sve256=on ./build/tir_f16_test_sve; \
+	else echo "  ($(ARM_CC) not found; skipping NEON/SVE f16 sweep)"; fi
 
 # STB=1 adds a stb_image_resize2 comparison column; the header is NOT
 # vendored - drop stb_image_resize2.h into tools/resize/tests/ first.
