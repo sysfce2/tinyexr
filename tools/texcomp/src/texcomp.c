@@ -3468,12 +3468,96 @@ static void tc_astc_infill_weights(const uint8_t *weights,
  * lerp(lo, hi, w/64) per channel (2x2 normal equations). Returns 0 when the
  * system is degenerate (all weights equal). Magnitude bound: every term is
  * at most 64 * (144*64*255) * (144*64^2) < 2^47, safely inside int64. */
+#if defined(TC_X86)
+/* SIMD accumulation of the normal-equation sums. All partial sums fit
+ * 32-bit lanes: quadratic terms are at most 144*64^2 < 2^20 and the
+ * mixed terms at most 144*64*255 < 2^22. Integer-exact vs the scalar
+ * loop, so results stay byte-identical across backends. */
+TC_TARGET("sse2")
+static void tc_astc_lsq_sums_sse2(const uint8_t block[144][4], uint32_t count,
+                                  const uint8_t wt[144], int64_t *out_saa,
+                                  int64_t *out_sab, int64_t *out_sbb,
+                                  int64_t sap[4], int64_t sbp[4]) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i v64 = _mm_set1_epi16(64);
+    __m128i acc_aa = zero, acc_ab = zero, acc_bb = zero;
+    __m128i acc_ap02 = zero, acc_ap13 = zero;
+    __m128i acc_bp02 = zero, acc_bp13 = zero;
+    uint32_t i = 0, c;
+    for (; i + 8u <= count; i += 8u) {
+        __m128i b16 = _mm_unpacklo_epi8(
+            _mm_loadl_epi64((const __m128i *)(wt + i)), zero);
+        __m128i a16 = _mm_sub_epi16(v64, b16);
+        uint32_t t;
+        acc_aa = _mm_add_epi32(acc_aa, _mm_madd_epi16(a16, a16));
+        acc_ab = _mm_add_epi32(acc_ab, _mm_madd_epi16(a16, b16));
+        acc_bb = _mm_add_epi32(acc_bb, _mm_madd_epi16(b16, b16));
+        for (t = 0; t < 8u; t += 2u) {
+            __m128i px = _mm_unpacklo_epi8(
+                _mm_loadl_epi64((const __m128i *)block[i + t]), zero);
+            /* [w 0 w 0 w' 0 w' 0] against [r g b a r' g' b' a'] makes
+             * madd produce per-channel products in separate lanes. */
+            __m128i bw = _mm_set_epi16(0, (int16_t)wt[i + t + 1u], 0,
+                                       (int16_t)wt[i + t + 1u], 0,
+                                       (int16_t)wt[i + t], 0,
+                                       (int16_t)wt[i + t]);
+            __m128i aw = _mm_sub_epi16(_mm_set_epi16(0, 64, 0, 64, 0, 64, 0, 64),
+                                       bw);
+            __m128i bw_sh = _mm_slli_si128(bw, 2);
+            __m128i aw_sh = _mm_slli_si128(aw, 2);
+            acc_ap02 = _mm_add_epi32(acc_ap02, _mm_madd_epi16(px, aw));
+            acc_ap13 = _mm_add_epi32(acc_ap13, _mm_madd_epi16(px, aw_sh));
+            acc_bp02 = _mm_add_epi32(acc_bp02, _mm_madd_epi16(px, bw));
+            acc_bp13 = _mm_add_epi32(acc_bp13, _mm_madd_epi16(px, bw_sh));
+        }
+    }
+    {
+        int32_t l_aa[4], l_ab[4], l_bb[4], l_ap02[4], l_ap13[4], l_bp02[4],
+            l_bp13[4];
+        _mm_storeu_si128((__m128i *)l_aa, acc_aa);
+        _mm_storeu_si128((__m128i *)l_ab, acc_ab);
+        _mm_storeu_si128((__m128i *)l_bb, acc_bb);
+        _mm_storeu_si128((__m128i *)l_ap02, acc_ap02);
+        _mm_storeu_si128((__m128i *)l_ap13, acc_ap13);
+        _mm_storeu_si128((__m128i *)l_bp02, acc_bp02);
+        _mm_storeu_si128((__m128i *)l_bp13, acc_bp13);
+        *out_saa = (int64_t)l_aa[0] + l_aa[1] + l_aa[2] + l_aa[3];
+        *out_sab = (int64_t)l_ab[0] + l_ab[1] + l_ab[2] + l_ab[3];
+        *out_sbb = (int64_t)l_bb[0] + l_bb[1] + l_bb[2] + l_bb[3];
+        sap[0] = (int64_t)l_ap02[0] + l_ap02[2];
+        sap[2] = (int64_t)l_ap02[1] + l_ap02[3];
+        sap[1] = (int64_t)l_ap13[0] + l_ap13[2];
+        sap[3] = (int64_t)l_ap13[1] + l_ap13[3];
+        sbp[0] = (int64_t)l_bp02[0] + l_bp02[2];
+        sbp[2] = (int64_t)l_bp02[1] + l_bp02[3];
+        sbp[1] = (int64_t)l_bp13[0] + l_bp13[2];
+        sbp[3] = (int64_t)l_bp13[1] + l_bp13[3];
+    }
+    for (; i < count; ++i) {
+        int64_t a = 64 - wt[i];
+        int64_t b = wt[i];
+        *out_saa += a * a;
+        *out_sab += a * b;
+        *out_sbb += b * b;
+        for (c = 0; c < 4u; ++c) {
+            sap[c] += a * block[i][c];
+            sbp[c] += b * block[i][c];
+        }
+    }
+}
+#endif /* TC_X86 */
+
 static int tc_astc_lsq_endpoints(const uint8_t block[144][4], uint32_t count,
                                  const uint8_t wt[144], uint32_t lo[4],
                                  uint32_t hi[4]) {
     int64_t saa = 0, sab = 0, sbb = 0, det;
     int64_t sap[4] = {0, 0, 0, 0}, sbp[4] = {0, 0, 0, 0};
     uint32_t i, c;
+#if defined(TC_X86)
+    if (tc_cpu_caps() & (TC_CPU_SSE2 | TC_CPU_SSE41 | TC_CPU_AVX2)) {
+        tc_astc_lsq_sums_sse2(block, count, wt, &saa, &sab, &sbb, sap, sbp);
+    } else
+#endif
     for (i = 0; i < count; ++i) {
         int64_t a = 64 - wt[i];
         int64_t b = wt[i];
