@@ -4864,6 +4864,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     uint32_t best_block_mode = 66u;
     uint32_t best_quant_method = 2u;
     uint32_t best_weight_count = 16u;
+    const tc_astc_decim_cache_entry *best_decim = NULL;
     int is_opaque = tc_astc_block_is_opaque(block, count);
     int is_luminance = tc_astc_block_is_luminance(block, count);
     int is_rgb_scale = !is_luminance && tc_astc_block_is_rgb_scale(block, count);
@@ -4902,41 +4903,6 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     memset(out, 0, 16u);
     memset(weightbuf, 0, 16u);
     memset(path_out, 0, 16u);
-    /* Multi-partition and dual-plane candidates compete on reconstruction
-     * error against each other and against the single-partition search
-     * below; the lowest error wins the block. Fewer partitions are tried
-     * first and win ties (they leave more bits for color precision). */
-    if (quality > 0 &&
-        tc_encode_astc_partition_rgb_block(block, count, 2u, ctx, cand_out,
-                                           &cand_err) &&
-        cand_err < path_err) {
-        path_err = cand_err;
-        memcpy(path_out, cand_out, 16u);
-        have_path = 1;
-    }
-    if (quality > 1 &&
-        tc_encode_astc_partition_rgb_block(block, count, 3u, ctx, cand_out,
-                                           &cand_err) &&
-        cand_err < path_err) {
-        path_err = cand_err;
-        memcpy(path_out, cand_out, 16u);
-        have_path = 1;
-    }
-    if (quality > 1 &&
-        tc_encode_astc_partition_rgb_block(block, count, 4u, ctx, cand_out,
-                                           &cand_err) &&
-        cand_err < path_err) {
-        path_err = cand_err;
-        memcpy(path_out, cand_out, 16u);
-        have_path = 1;
-    }
-    if (tc_encode_astc_dual_rgba_block(block, count, quality, ctx, cand_out,
-                                       &cand_err) &&
-        cand_err < path_err) {
-        path_err = cand_err;
-        memcpy(path_out, cand_out, 16u);
-        have_path = 1;
-    }
     /* Endpoint lines and projected ideal weights depend only on the axis,
      * not on the candidate's weight grid, so compute them once per block. */
     for (axis = 0; axis < 5u; ++axis) {
@@ -4953,7 +4919,7 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
     candidate_count = tc_astc_get_candidates(ctx, candidate_endpoint_end_bit, &candidates);
     /* Reduced-effort levels only fit the top-ranked viable candidates
      * (candidates whose color budget cannot fit do not use up the cap). */
-    scan_cap = quality > 1 ? candidate_count : (quality > 0 ? 20u : 5u);
+    scan_cap = quality > 1 ? candidate_count : (quality > 0 ? 20u : 3u);
     if (selected_limit > candidate_count) selected_limit = candidate_count;
 
     if (axis_valid[4]) {
@@ -5078,11 +5044,99 @@ static void tc_encode_astc_ldr_block(const uint8_t block[144][4],
                     (uint32_t)candidates[candidate_index].weight_x *
                     candidates[candidate_index].weight_y;
                 color_quant_method = cand_color_quant_method;
+                best_decim = decim;
                 memcpy(lo, cand_lo, sizeof(lo));
                 memcpy(hi, cand_hi, sizeof(hi));
                 memcpy(weights, cand_weights, best_weight_count);
             }
             if (!full_axes) break;
+        }
+    }
+
+    /* Iterative refinement, on the winner only (astcenc's
+     * ideal-endpoints-and-weights loop): re-project the texels onto the
+     * refined endpoint line, refit the weights to that projection, then
+     * re-solve the endpoints; accept while the decoded error improves. */
+    if (best_err != UINT64_MAX && best_decim) {
+        uint32_t round;
+        for (round = 0; round < 2u; ++round) {
+            uint8_t it_ideal[144], it_weights[64];
+            uint8_t wt[144];
+            uint32_t it_lo[4], it_hi[4];
+            uint32_t denom = 0, recip;
+            uint64_t it_err;
+            int improved = 0;
+            for (c = 0; c < 4u; ++c) {
+                uint32_t dd = hi[c] > lo[c] ? hi[c] - lo[c] : lo[c] - hi[c];
+                denom += dd * dd;
+            }
+            if (!denom) break;
+            recip = TC_ASTC_PROJ_RECIP(denom);
+            tc_astc_project_ideal(block, count, lo, hi, recip, it_ideal);
+            (void)tc_astc_fit_from_ideal(ctx, block, count, it_ideal, lo, hi,
+                                         best_quant_method, best_decim,
+                                         best_weight_count, it_weights);
+            tc_astc_infill_weights(it_weights, best_decim, count,
+                                   best_quant_method, wt);
+            it_err = tc_astc_eval_single_sse(ctx, block, count, wt,
+                                             endpoint_format, lo, hi,
+                                             color_quant_method);
+            if (it_err < best_err) {
+                best_err = it_err;
+                memcpy(weights, it_weights, best_weight_count);
+                improved = 1;
+            }
+            if (tc_astc_lsq_endpoints(block, count, wt, it_lo, it_hi)) {
+                uint64_t lsq_err = tc_astc_eval_single_sse(
+                    ctx, block, count, wt, endpoint_format, it_lo, it_hi,
+                    color_quant_method);
+                if (lsq_err < best_err) {
+                    best_err = lsq_err;
+                    memcpy(lo, it_lo, sizeof(lo));
+                    memcpy(hi, it_hi, sizeof(hi));
+                    memcpy(weights, it_weights, best_weight_count);
+                    improved = 1;
+                }
+            }
+            if (!improved) break;
+        }
+    }
+
+    /* Partition and dual-plane searches run only when the single-partition
+     * result still has meaningful error (astcenc's early-out): smooth
+     * blocks skip the whole partition machinery. Fewer partitions are
+     * tried first and win ties (more bits left for color precision). */
+    if (best_err > (uint64_t)count * (quality > 1 ? 4u : 256u)) {
+        if (quality > 0 &&
+            tc_encode_astc_partition_rgb_block(block, count, 2u, ctx, cand_out,
+                                               &cand_err) &&
+            cand_err < path_err) {
+            path_err = cand_err;
+            memcpy(path_out, cand_out, 16u);
+            have_path = 1;
+        }
+        if (quality > 1 &&
+            tc_encode_astc_partition_rgb_block(block, count, 3u, ctx, cand_out,
+                                               &cand_err) &&
+            cand_err < path_err) {
+            path_err = cand_err;
+            memcpy(path_out, cand_out, 16u);
+            have_path = 1;
+        }
+        if (quality > 1 &&
+            tc_encode_astc_partition_rgb_block(block, count, 4u, ctx, cand_out,
+                                               &cand_err) &&
+            cand_err < path_err) {
+            path_err = cand_err;
+            memcpy(path_out, cand_out, 16u);
+            have_path = 1;
+        }
+        if (tc_encode_astc_dual_rgba_block(block, count, quality, ctx,
+                                           cand_out, &cand_err) &&
+            cand_err < path_err) {
+            path_err = cand_err;
+            memcpy(path_out, cand_out, 16u);
+            have_path = 1;
         }
     }
 
