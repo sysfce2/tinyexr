@@ -100,14 +100,15 @@ int main(void) {
         return 1;
     }
 
-    /* (b) smooth HDR gradient: block-average encoding should clear a floor. */
+    /* (b) smooth correlated HDR gradient: the per-texel CEM 11 base+offset
+     * path should reconstruct this well above the void-extent baseline. */
     for (y = 0; y < H; ++y) {
         for (x = 0; x < W; ++x) {
             float t = (float)(x + y) / (float)(2 * (W - 1));
             float *px = src + ((size_t)y * W + x) * 3;
-            px[0] = 0.05f + t * 8.0f;
-            px[1] = 0.02f + (1.0f - t) * 4.0f;
-            px[2] = 0.10f + t * t * 16.0f;
+            px[0] = 0.2f + t * 20.0f;
+            px[1] = 0.15f + t * 15.0f;
+            px[2] = 0.10f + t * 10.0f;
         }
     }
     if (tc_astc_hdr_compress_rgbf(src, W, H, (size_t)W * 3u * sizeof(float),
@@ -121,7 +122,7 @@ int main(void) {
     }
     p = psnr_rgb(src, dec, (size_t)W * H, 24.0);
     printf("astc-hdr gradient 64x64: %.2f dB\n", p);
-    if (p < 30.0) {
+    if (p < 50.0) {
         fprintf(stderr, "FAIL: gradient psnr %.2f dB below floor\n", p);
         return 1;
     }

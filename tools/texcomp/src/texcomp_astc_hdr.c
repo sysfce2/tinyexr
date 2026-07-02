@@ -92,42 +92,285 @@ uint16_t tc_astc_lns16_to_sf16(int p) {
 }
 
 /* ---- CEM 11 (HDR RGB direct) endpoint codec -----------------------------
- * Endpoints are 16-bit LNS values per channel. pack uses the majcomp==3
- * "direct" sub-mode (R/G at 8-bit, B at 7-bit qlog precision); unpack
- * implements the ASTC hdr_rgb decode for that sub-mode. The full 8-mode /
- * base+offset packing (astcenc quantize_hdr_rgb) is a later refinement. */
+ * Endpoints are 16-bit LNS values per channel. This is a scalar port of
+ * astcenc's quantize_hdr_rgb / hdr_rgb_unpack (colour quant fixed at 256, so
+ * astcenc's quant/retain-top-bits helpers are identity and drop out). It tries
+ * the 8 base+offset modes (high precision when the two endpoints are close and
+ * channels correlated), falling back to the majcomp==3 direct sub-mode (R/G
+ * 8-bit, B 7-bit) when no base+offset mode fits. */
+static int tc_rtn(float x) { return (int)(x >= 0.0f ? x + 0.5f : x - 0.5f); }
+static float tc_fclamp(float x, float lo, float hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+static float tc_fabs(float x) { return x < 0.0f ? -x : x; }
+
 void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], uint8_t v[6]) {
-    int r0 = (lns0[0] + 128) >> 8, r1 = (lns1[0] + 128) >> 8;
-    int g0 = (lns0[1] + 128) >> 8, g1 = (lns1[1] + 128) >> 8;
-    int b0 = (lns0[2] + 256) >> 9, b1 = (lns1[2] + 256) >> 9;
-    if (r0 > 255) r0 = 255;
-    if (r1 > 255) r1 = 255;
-    if (g0 > 255) g0 = 255;
-    if (g1 > 255) g1 = 255;
-    if (b0 > 127) b0 = 127;
-    if (b1 > 127) b1 = 127;
-    v[0] = (uint8_t)r0;
-    v[1] = (uint8_t)r1;
-    v[2] = (uint8_t)g0;
-    v[3] = (uint8_t)g1;
-    v[4] = (uint8_t)(b0 | 0x80); /* bit7 = majcomp low  */
-    v[5] = (uint8_t)(b1 | 0x80); /* bit7 = majcomp high -> majcomp==3 */
+    static const int mode_bits[8][4] = {{9, 7, 6, 7},  {9, 8, 6, 6},
+                                        {10, 6, 7, 7}, {10, 7, 7, 6},
+                                        {11, 8, 6, 5}, {11, 6, 8, 6},
+                                        {12, 7, 7, 5}, {12, 6, 7, 6}};
+    static const float mode_cut[8][4] = {
+        {16384, 8192, 8192, 8}, {32768, 8192, 4096, 8}, {4096, 8192, 4096, 4},
+        {8192, 8192, 2048, 4},  {8192, 2048, 512, 2},   {2048, 8192, 1024, 2},
+        {2048, 2048, 256, 1},   {1024, 2048, 512, 1}};
+    static const float mode_scale[8] = {1.0f / 128, 1.0f / 128, 1.0f / 64,
+                                        1.0f / 64,  1.0f / 32,  1.0f / 32,
+                                        1.0f / 16,  1.0f / 16};
+    static const float mode_rscale[8] = {128, 128, 64, 64, 32, 32, 16, 16};
+    float c0[3], c1[3];
+    float a_base, b0b, b1b, cb, d0b, d1b;
+    int majcomp, mode, ci;
+
+    for (ci = 0; ci < 3; ++ci) {
+        c0[ci] = tc_fclamp((float)lns0[ci], 0.0f, 65535.0f);
+        c1[ci] = tc_fclamp((float)lns1[ci], 0.0f, 65535.0f);
+    }
+    if (c1[0] > c1[1] && c1[0] > c1[2])
+        majcomp = 0;
+    else if (c1[1] > c1[2])
+        majcomp = 1;
+    else
+        majcomp = 2;
+    if (majcomp == 1) {
+        float t0 = c0[0], t1 = c1[0];
+        c0[0] = c0[1];
+        c1[0] = c1[1];
+        c0[1] = t0;
+        c1[1] = t1;
+    } else if (majcomp == 2) {
+        float t0 = c0[0], t1 = c1[0];
+        c0[0] = c0[2];
+        c1[0] = c1[2];
+        c0[2] = t0;
+        c1[2] = t1;
+    }
+    a_base = c1[0];
+    b0b = a_base - c1[1];
+    b1b = a_base - c1[2];
+    cb = a_base - c0[0];
+    d0b = a_base - b0b - cb - c0[1];
+    d1b = a_base - b1b - cb - c0[2];
+
+    for (mode = 7; mode >= 0; --mode) {
+        float ms = mode_scale[mode], mr = mode_rscale[mode];
+        int b_ic = 1 << mode_bits[mode][1];
+        int c_ic = 1 << mode_bits[mode][2];
+        int d_ic = 1 << (mode_bits[mode][3] - 1);
+        int a_iv, c_iv, b0_iv, b1_iv, d0_iv, d1_iv;
+        int c_lo, b0_lo, b1_lo, d0_lo, d1_lo, bit0, bit1, bit2, bit3, bit4, bit5;
+        float a_f, c_f, b0_f, b1_f;
+        if (b0b > mode_cut[mode][0] || b1b > mode_cut[mode][0] ||
+            cb > mode_cut[mode][1] || tc_fabs(d0b) > mode_cut[mode][2] ||
+            tc_fabs(d1b) > mode_cut[mode][2])
+            continue;
+
+        a_iv = tc_rtn(a_base * ms);
+        a_f = (float)a_iv * mr;
+        c_f = tc_fclamp(a_f - c0[0], 0.0f, 65535.0f);
+        c_iv = tc_rtn(c_f * ms);
+        if (c_iv >= c_ic) continue;
+        b0_f = tc_fclamp(a_f - c1[1], 0.0f, 65535.0f);
+        b1_f = tc_fclamp(a_f - c1[2], 0.0f, 65535.0f);
+        b0_iv = tc_rtn(b0_f * ms);
+        b1_iv = tc_rtn(b1_f * ms);
+        if (b0_iv >= b_ic || b1_iv >= b_ic) continue;
+        /* recompute d from the (identity-)quantised a/b/c */
+        {
+            float d0_f = tc_fclamp(a_f - (float)b0_iv * mr - (float)c_iv * mr -
+                                       c0[1],
+                                   -65535.0f, 65535.0f);
+            float d1_f = tc_fclamp(a_f - (float)b1_iv * mr - (float)c_iv * mr -
+                                       c0[2],
+                                   -65535.0f, 65535.0f);
+            d0_iv = tc_rtn(d0_f * ms);
+            d1_iv = tc_rtn(d1_f * ms);
+        }
+        if ((d0_iv < 0 ? -d0_iv : d0_iv) >= d_ic ||
+            (d1_iv < 0 ? -d1_iv : d1_iv) >= d_ic)
+            continue;
+
+        c_lo = (c_iv & 0x3f) | ((mode & 1) << 7) | ((a_iv & 0x100) >> 2);
+        b0_lo = b0_iv & 0x3f;
+        b1_lo = b1_iv & 0x3f;
+        bit0 = (mode == 2 || mode == 5 || mode == 7) ? ((a_iv >> 9) & 1)
+                                                     : ((b0_iv >> 6) & 1);
+        if (mode == 2)
+            bit1 = (c_iv >> 6) & 1;
+        else if (mode == 5 || mode == 7)
+            bit1 = (a_iv >> 10) & 1;
+        else
+            bit1 = (b1_iv >> 6) & 1;
+        b0_lo |= (bit0 << 6) | (((mode >> 1) & 1) << 7);
+        b1_lo |= (bit1 << 6) | (((mode >> 2) & 1) << 7);
+
+        d0_lo = d0_iv & 0x1f;
+        d1_lo = d1_iv & 0x1f;
+        if (mode == 0 || mode == 2)
+            bit2 = (d0_iv >> 6) & 1;
+        else if (mode == 1 || mode == 4)
+            bit2 = (b0_iv >> 7) & 1;
+        else if (mode == 3)
+            bit2 = (a_iv >> 9) & 1;
+        else if (mode == 5)
+            bit2 = (c_iv >> 7) & 1;
+        else
+            bit2 = (a_iv >> 11) & 1; /* mode 6,7 */
+        if (mode == 0 || mode == 2)
+            bit3 = (d1_iv >> 6) & 1;
+        else if (mode == 1 || mode == 4)
+            bit3 = (b1_iv >> 7) & 1;
+        else
+            bit3 = (c_iv >> 6) & 1; /* mode 3,5,6,7 */
+        if (mode == 4 || mode == 6) {
+            bit4 = (a_iv >> 9) & 1;
+            bit5 = (a_iv >> 10) & 1;
+        } else {
+            bit4 = (d0_iv >> 5) & 1;
+            bit5 = (d1_iv >> 5) & 1;
+        }
+        d0_lo |= (bit2 << 6) | (bit4 << 5) | ((majcomp & 1) << 7);
+        d1_lo |= (bit3 << 6) | (bit5 << 5) | (((majcomp >> 1) & 1) << 7);
+
+        v[0] = (uint8_t)(a_iv & 0xFF);
+        v[1] = (uint8_t)c_lo;
+        v[2] = (uint8_t)b0_lo;
+        v[3] = (uint8_t)b1_lo;
+        v[4] = (uint8_t)d0_lo;
+        v[5] = (uint8_t)d1_lo;
+        return;
+    }
+
+    /* Flat fallback == majcomp==3 direct (R/G 8-bit, B 7-bit qlog). */
+    {
+        int r0 = tc_rtn(tc_fclamp((float)lns0[0], 0, 65020) / 256.0f);
+        int r1 = tc_rtn(tc_fclamp((float)lns1[0], 0, 65020) / 256.0f);
+        int g0 = tc_rtn(tc_fclamp((float)lns0[1], 0, 65020) / 256.0f);
+        int g1 = tc_rtn(tc_fclamp((float)lns1[1], 0, 65020) / 256.0f);
+        int b0 = tc_rtn(tc_fclamp((float)lns0[2], 0, 65020) / 512.0f) + 128;
+        int b1 = tc_rtn(tc_fclamp((float)lns1[2], 0, 65020) / 512.0f) + 128;
+        if (r0 > 255) r0 = 255;
+        if (r1 > 255) r1 = 255;
+        if (g0 > 255) g0 = 255;
+        if (g1 > 255) g1 = 255;
+        if (b0 > 255) b0 = 255;
+        if (b1 > 255) b1 = 255;
+        v[0] = (uint8_t)r0;
+        v[1] = (uint8_t)r1;
+        v[2] = (uint8_t)g0;
+        v[3] = (uint8_t)g1;
+        v[4] = (uint8_t)b0; /* bit7 set by +128 -> majcomp low  */
+        v[5] = (uint8_t)b1; /* bit7 set by +128 -> majcomp high  */
+    }
 }
 
-/* Decode CEM 11 endpoints to 16-bit LNS per channel. Currently the majcomp==3
- * direct sub-mode (what pack emits); returns 0 for other sub-modes (TODO). */
-int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]) {
-    int majcomp = ((v[4] & 0x80) >> 7) | (((v[5] & 0x80) >> 7) << 1);
+/* Decode CEM 11 endpoints to 16-bit LNS per channel (full ASTC hdr_rgb). */
+static int tc_sclamp(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+int tc_astc_cem11_unpack(const uint8_t vv[6], int out0[3], int out1[3]) {
+    int v0 = vv[0], v1 = vv[1], v2 = vv[2], v3 = vv[3], v4 = vv[4], v5 = vv[5];
+    int modeval = ((v1 & 0x80) >> 7) | (((v2 & 0x80) >> 7) << 1) |
+                  (((v3 & 0x80) >> 7) << 2);
+    int majcomp = ((v4 & 0x80) >> 7) | (((v5 & 0x80) >> 7) << 1);
+    int a, b0, b1, c, d0, d1, dbits, ohmod, valsh, r0, g0, bl0, r1, g1, bl1, t;
+    static const int dbits_tab[8] = {7, 6, 7, 6, 5, 6, 5, 6};
+
     if (majcomp == 3) {
-        out0[0] = v[0] << 8;
-        out0[1] = v[2] << 8;
-        out0[2] = (v[4] & 0x7F) << 9;
-        out1[0] = v[1] << 8;
-        out1[1] = v[3] << 8;
-        out1[2] = (v[5] & 0x7F) << 9;
+        out0[0] = v0 << 8;
+        out0[1] = v2 << 8;
+        out0[2] = (v4 & 0x7F) << 9;
+        out1[0] = v1 << 8;
+        out1[1] = v3 << 8;
+        out1[2] = (v5 & 0x7F) << 9;
         return 1;
     }
-    return 0;
+
+    a = v0 | ((v1 & 0x40) << 2);
+    b0 = v2 & 0x3f;
+    b1 = v3 & 0x3f;
+    c = v1 & 0x3f;
+    d0 = v4 & 0x7f;
+    d1 = v5 & 0x7f;
+    dbits = dbits_tab[modeval];
+    {
+        int bit0 = (v2 >> 6) & 1, bit1 = (v3 >> 6) & 1, bit2 = (v4 >> 6) & 1;
+        int bit3 = (v5 >> 6) & 1, bit4 = (v4 >> 5) & 1, bit5 = (v5 >> 5) & 1;
+        ohmod = 1 << modeval;
+        if (ohmod & 0xA4) a |= bit0 << 9;
+        if (ohmod & 0x8) a |= bit2 << 9;
+        if (ohmod & 0x50) a |= bit4 << 9;
+        if (ohmod & 0x50) a |= bit5 << 10;
+        if (ohmod & 0xA0) a |= bit1 << 10;
+        if (ohmod & 0xC0) a |= bit2 << 11;
+        if (ohmod & 0x4) c |= bit1 << 6;
+        if (ohmod & 0xE8) c |= bit3 << 6;
+        if (ohmod & 0x20) c |= bit2 << 7;
+        if (ohmod & 0x5B) {
+            b0 |= bit0 << 6;
+            b1 |= bit1 << 6;
+        }
+        if (ohmod & 0x12) {
+            b0 |= bit2 << 7;
+            b1 |= bit3 << 7;
+        }
+        if (ohmod & 0xAF) {
+            d0 |= bit4 << 5;
+            d1 |= bit5 << 5;
+        }
+        if (ohmod & 0x5) {
+            d0 |= bit2 << 6;
+            d1 |= bit3 << 6;
+        }
+    }
+    /* sign-extend d0/d1 from dbits, then scale all to the 12-bit domain. */
+    {
+        int sh = 32 - dbits, sc;
+        d0 = (int)((uint32_t)d0 << sh) >> sh;
+        d1 = (int)((uint32_t)d1 << sh) >> sh;
+        valsh = (modeval >> 1) ^ 3;
+        sc = 1 << valsh;
+        a *= sc;
+        b0 *= sc;
+        b1 *= sc;
+        c *= sc;
+        d0 *= sc;
+        d1 *= sc;
+    }
+
+    r1 = a;
+    g1 = a - b0;
+    bl1 = a - b1;
+    r0 = a - c;
+    g0 = a - b0 - c - d0;
+    bl0 = a - b1 - c - d1;
+    r0 = tc_sclamp(r0, 0, 4095);
+    g0 = tc_sclamp(g0, 0, 4095);
+    bl0 = tc_sclamp(bl0, 0, 4095);
+    r1 = tc_sclamp(r1, 0, 4095);
+    g1 = tc_sclamp(g1, 0, 4095);
+    bl1 = tc_sclamp(bl1, 0, 4095);
+    if (majcomp == 1) {
+        t = r0;
+        r0 = g0;
+        g0 = t;
+        t = r1;
+        r1 = g1;
+        g1 = t;
+    } else if (majcomp == 2) {
+        t = r0;
+        r0 = bl0;
+        bl0 = t;
+        t = r1;
+        r1 = bl1;
+        bl1 = t;
+    }
+    out0[0] = r0 << 4;
+    out0[1] = g0 << 4;
+    out0[2] = bl0 << 4;
+    out1[0] = r1 << 4;
+    out1[1] = g1 << 4;
+    out1[2] = bl1 << 4;
+    return 1;
 }
 
 void tc_astc_hdr_options_init(tc_astc_hdr_options *opt) {
