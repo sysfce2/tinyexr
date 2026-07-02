@@ -2346,7 +2346,6 @@ typedef struct tc_astc_candidate_cache_entry {
 typedef struct tc_astc_partition_info {
     uint16_t partition_index;
     uint8_t partition_of_texel[144];
-    uint8_t texels_of_partition[4][144];
     uint8_t partition_texel_count[4];
 } tc_astc_partition_info;
 
@@ -2588,16 +2587,36 @@ static uint8_t tc_astc_select_partition(uint32_t seed, uint32_t x, uint32_t y,
     return 3;
 }
 
+/* First-appearance relabeling of a partition map; two seeds with the same
+ * canonical form assign the same texel sets to (differently numbered)
+ * partitions and are interchangeable for encoding. */
+static uint32_t tc_astc_canonical_partition_map(const uint8_t *map,
+                                                uint32_t texel_count,
+                                                uint8_t canon[144]) {
+    uint8_t remap[4] = {0xff, 0xff, 0xff, 0xff};
+    uint32_t next = 0, i, h = 2166136261u;
+    for (i = 0; i < texel_count; ++i) {
+        uint8_t p = map[i];
+        if (remap[p] == 0xffu) remap[p] = (uint8_t)next++;
+        canon[i] = remap[p];
+        h = (h ^ canon[i]) * 16777619u;
+    }
+    return h;
+}
+
 static void tc_astc_build_partition_cache(tc_astc_encode_context *ctx,
                                           uint32_t partition_count,
                                           tc_astc_partition_info cache[1024],
                                           uint32_t *out_count) {
     uint32_t seed, texel_count = ctx->texel_count;
     int small_block = texel_count < 32u;
+    uint32_t hashes[1024];
     *out_count = 0;
     for (seed = 0; seed < 1024u; ++seed) {
         tc_astc_partition_info *pi = cache + *out_count;
-        uint32_t i, p, counts[4] = {0, 0, 0, 0};
+        uint8_t canon[144];
+        uint32_t i, p, hash, counts[4] = {0, 0, 0, 0};
+        int duplicate = 0;
         for (i = 0; i < texel_count; ++i) {
             uint32_t x = i % ctx->block_x;
             uint32_t y = i / ctx->block_x;
@@ -2605,12 +2624,28 @@ static void tc_astc_build_partition_cache(tc_astc_encode_context *ctx,
                 tc_astc_select_partition(seed, x, y, partition_count, small_block);
             if (part >= partition_count) part = (uint8_t)(partition_count - 1u);
             pi->partition_of_texel[i] = part;
-            pi->texels_of_partition[part][counts[part]++] = (uint8_t)i;
+            ++counts[part];
         }
         for (p = 0; p < partition_count; ++p) {
             if (!counts[p]) break;
         }
         if (p != partition_count) continue;
+        /* Drop seeds whose canonical texel assignment already exists; the
+         * kept (lowest) seed encodes the identical partitioning. */
+        hash = tc_astc_canonical_partition_map(pi->partition_of_texel,
+                                               texel_count, canon);
+        for (i = 0; i < *out_count; ++i) {
+            uint8_t other[144];
+            if (hashes[i] != hash) continue;
+            (void)tc_astc_canonical_partition_map(
+                cache[i].partition_of_texel, texel_count, other);
+            if (memcmp(canon, other, texel_count) == 0) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        hashes[*out_count] = hash;
         pi->partition_index = (uint16_t)seed;
         for (p = 0; p < partition_count; ++p)
             pi->partition_texel_count[p] = (uint8_t)counts[p];
@@ -3261,20 +3296,24 @@ static int tc_astc_find_best_partition(const uint8_t block[144][4],
 
     for (i = 0; i < cache_count; ++i) {
         const tc_astc_partition_info *pi = cache + i;
+        uint64_t sum[4][3], sumsq[4][3];
         uint64_t err = 0;
-        for (p = 0; p < partition_count; ++p) {
-            uint64_t sum[3] = {0, 0, 0}, sumsq[3] = {0, 0, 0};
-            uint32_t n = pi->partition_texel_count[p];
-            uint32_t ti;
-            for (ti = 0; ti < n; ++ti) {
-                uint32_t idx = pi->texels_of_partition[p][ti];
-                for (c = 0; c < 3u; ++c) {
-                    uint32_t v = block[idx][c];
-                    sum[c] += v;
-                    sumsq[c] += (uint64_t)v * v;
-                }
+        uint32_t t;
+        memset(sum, 0, sizeof(sum));
+        memset(sumsq, 0, sizeof(sumsq));
+        /* Single linear texel pass; the per-partition gather table this
+         * replaced cost ~590 KB per cache entry set. */
+        for (t = 0; t < ctx->texel_count; ++t) {
+            uint32_t p2 = pi->partition_of_texel[t];
+            for (c = 0; c < 3u; ++c) {
+                uint32_t v = block[t][c];
+                sum[p2][c] += v;
+                sumsq[p2][c] += (uint64_t)v * v;
             }
-            err += tc_astc_rgb_sse_from_stats(sum, sumsq, n);
+        }
+        for (p = 0; p < partition_count; ++p) {
+            err += tc_astc_rgb_sse_from_stats(sum[p], sumsq[p],
+                                              pi->partition_texel_count[p]);
         }
         if (err < best_err) {
             best_err = err;
