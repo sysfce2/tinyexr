@@ -402,9 +402,9 @@ texcomp-astc-hdr-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc
 # xbc7: BC7 windowed RDO + zstd container. C gate checks the RDO improves
 # zstd compressibility (and rdo=0 is a no-op); the CLI step checks the
 # encode->transcode round-trip is bit-exact standard BC7.
-texcomp-xbc7-gate: lib $(TEXCOMP_OBJ) texcomp tools/texcomp/test/xbc7_gate.c | build/texcomp
+texcomp-xbc7-gate: lib $(TEXCOMP_OBJ) texcomp tools/texcomp/test/xbc7_gate.c tools/texcomp/test/bc7_ref_decode.h | build/texcomp
 	$(AR) rcs build/libtexcomp.a $(TEXCOMP_OBJ)
-	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Ideps/zstd -O2 -g \
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -Ideps/zstd -O2 -g \
 	  tools/texcomp/test/xbc7_gate.c build/libtexcomp.a build/libtinyexr3.a \
 	  -pthread -lm -o build/texcomp/xbc7_gate
 	./build/texcomp/xbc7_gate

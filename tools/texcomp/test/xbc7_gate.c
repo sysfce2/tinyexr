@@ -11,10 +11,42 @@
  */
 #include "texcomp.h"
 #include "tinyexr_zstd.h"
+#include "bc7_ref_decode.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* PSNR (RGB) of a BC7 stream decoded with the reference decoder vs the source. */
+static double bc7_psnr(const uint8_t *img, uint32_t w, uint32_t h,
+                       const uint8_t *bc7) {
+    uint32_t bxc = (w + 3u) / 4u, bx, by, xx, yy;
+    double sse = 0.0;
+    size_t npx = 0;
+    for (by = 0; by < h; by += 4u)
+        for (bx = 0; bx < w; bx += 4u) {
+            uint8_t dec[16][4];
+            size_t bi = ((size_t)(by / 4u) * bxc + bx / 4u) * 16u;
+            tc_bc7_ref_decode_block(bc7 + bi, dec);
+            for (yy = 0; yy < 4u; ++yy)
+                for (xx = 0; xx < 4u; ++xx) {
+                    uint32_t x = bx + xx, y = by + yy;
+                    const uint8_t *s, *d;
+                    int ch;
+                    if (x >= w || y >= h) continue;
+                    s = img + ((size_t)y * w + x) * 4u;
+                    d = dec[yy * 4u + xx];
+                    for (ch = 0; ch < 3; ++ch) {
+                        int e = (int)s[ch] - d[ch];
+                        sse += (double)e * e;
+                    }
+                    ++npx;
+                }
+        }
+    if (sse <= 0.0) return 99.0;
+    return 10.0 * log10(65025.0 / (sse / ((double)npx * 3.0)));
+}
 
 int main(void) {
     enum { W = 128, H = 128 };
@@ -87,6 +119,60 @@ int main(void) {
         fprintf(stderr, "FAIL: rdo did not improve compressibility (%zu >= %zu)\n",
                 zc1, zc0);
         return 1;
+    }
+
+    /* (c) Reference-decoder self-check: a solid-colour block must decode back
+     * exactly, and the RDO must not *raise* PSNR (it only ever trades quality
+     * for size). This validates the decoder end-to-end without any external
+     * reference. */
+    {
+        static uint8_t solid[16 * 16 * 4];
+        uint8_t sb[16], sdec[16][4];
+        tc_bc7_options so;
+        uint32_t t;
+        double pbase, prdo;
+        for (t = 0; t < 16u * 16u; ++t) {
+            solid[t * 4 + 0] = 173u;
+            solid[t * 4 + 1] = 66u;
+            solid[t * 4 + 2] = 214u;
+            solid[t * 4 + 3] = 255u;
+        }
+        tc_bc7_options_init(&so);
+        if (tc_bc7_compress_rgba8(solid, 16, 16, 16 * 4u, &so, base,
+                                  tc_bc7_compressed_size(16, 16)) != TC_SUCCESS) {
+            fprintf(stderr, "FAIL: solid encode\n");
+            return 1;
+        }
+        memcpy(sb, base, 16u);
+        tc_bc7_ref_decode_block(sb, sdec);
+        /* BC7 endpoint quantization can round a solid colour by ~1 LSB, so use
+         * a small tolerance (the decoder itself is bit-exact vs bcdec). */
+        for (t = 0; t < 16u; ++t)
+            if (abs((int)sdec[t][0] - 173) > 2 || abs((int)sdec[t][1] - 66) > 2 ||
+                abs((int)sdec[t][2] - 214) > 2 || sdec[t][3] != 255u) {
+                fprintf(stderr, "FAIL: solid block decoded off (texel %u = "
+                                "%u,%u,%u,%u)\n",
+                        t, sdec[t][0], sdec[t][1], sdec[t][2], sdec[t][3]);
+                return 1;
+            }
+
+        /* rebuild the gradient streams (base was overwritten above). */
+        tc_bc7_options_init(&so);
+        so.rdo = 0;
+        tc_bc7_compress_rgba8(img, W, H, W * 4u, &so, base, need);
+        so.rdo = 8;
+        tc_bc7_compress_rgba8(img, W, H, W * 4u, &so, rdo, need);
+        pbase = bc7_psnr(img, W, H, base);
+        prdo = bc7_psnr(img, W, H, rdo);
+        printf("xbc7 gate PSNR: bc7=%.2f dB  rdo=8=%.2f dB\n", pbase, prdo);
+        if (pbase < 30.0) {
+            fprintf(stderr, "FAIL: base BC7 PSNR too low (%.2f)\n", pbase);
+            return 1;
+        }
+        if (prdo > pbase + 0.1) {
+            fprintf(stderr, "FAIL: rdo raised PSNR (%.2f > %.2f)\n", prdo, pbase);
+            return 1;
+        }
     }
 
     free(base);

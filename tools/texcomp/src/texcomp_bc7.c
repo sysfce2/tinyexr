@@ -630,12 +630,21 @@ static void tc_bc7_rdo_pass(const uint8_t *rgba, uint32_t width,
                 best_slot = (int)k;
             }
         }
-        if (best_slot >= 0 && best <= thresh)
-            memcpy(blocks + (size_t)i * 16u,
-                   blocks + (size_t)ring_idx[best_slot] * 16u, 16u);
         slot = ring_count % TC_BC7_RDO_WINDOW;
-        memcpy(ring[slot], cur, sizeof(cur));
-        ring_idx[slot] = i;
+        if (best_slot >= 0 && best <= thresh) {
+            /* Reuse the representative block's bytes. Compare against, and
+             * propagate, the *representative's* source (stored in the ring),
+             * not the immediate neighbour's -- otherwise reuse chains along a
+             * gradient and the error drifts without bound. Each reused block is
+             * then within the RMS budget of what it actually decodes to. */
+            uint32_t rep = ring_idx[best_slot];
+            memcpy(blocks + (size_t)i * 16u, blocks + (size_t)rep * 16u, 16u);
+            memcpy(ring[slot], ring[best_slot], sizeof(cur));
+            ring_idx[slot] = rep;
+        } else {
+            memcpy(ring[slot], cur, sizeof(cur));
+            ring_idx[slot] = i;
+        }
         ++ring_count;
     }
 }
