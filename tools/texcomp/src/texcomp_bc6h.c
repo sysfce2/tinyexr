@@ -179,6 +179,114 @@ static uint64_t tc_bc6h_choose_selectors_sf16(const int32_t target[16][3],
     return err;
 }
 
+/* Sign-aware rounded integer division (den > 0). */
+static int64_t tc_bc6h_rdiv(int64_t num, int64_t den) {
+    return num >= 0 ? (num + den / 2) / den : -((-num + den / 2) / den);
+}
+
+/* Least-squares endpoint refinement for mode 11: given the current selectors,
+ * re-solve each channel's two 10-bit endpoints (2x2 normal equations in the
+ * quantized domain) so the interpolated palette best fits the block, recompute
+ * the selectors, and keep the result while the (magnitude-domain) error drops.
+ * `maxq` is the endpoint clamp (1023 for uf16, +/-511 for sf16 handled by the
+ * signed variant). Returns the best error found. */
+static uint64_t tc_bc6h_refine_uf16(const uint32_t q[16][3],
+                                    const uint32_t target[16][3], uint32_t lo[3],
+                                    uint32_t hi[3], uint8_t sel[16]) {
+    uint64_t best = tc_bc6h_choose_selectors_uf16(target, lo, hi, sel);
+    int round;
+    for (round = 0; round < 3; ++round) {
+        uint32_t nlo[3], nhi[3];
+        uint8_t nsel[16];
+        uint64_t e;
+        uint32_t c, i;
+        for (c = 0; c < 3u; ++c) {
+            int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+            for (i = 0; i < 16u; ++i) {
+                int64_t b = tc_bc7_weights4[sel[i]], a = 64 - b, p = q[i][c];
+                saa += a * a;
+                sab += a * b;
+                sbb += b * b;
+                sap += a * p;
+                sbp += b * p;
+            }
+            det = saa * sbb - sab * sab;
+            if (det <= 0) {
+                nlo[c] = lo[c];
+                nhi[c] = hi[c];
+                continue;
+            }
+            l = tc_bc6h_rdiv((sap * sbb - sbp * sab) * 64, det);
+            h = tc_bc6h_rdiv((sbp * saa - sap * sab) * 64, det);
+            if (l < 0) l = 0;
+            if (l > 1023) l = 1023;
+            if (h < 0) h = 0;
+            if (h > 1023) h = 1023;
+            nlo[c] = (uint32_t)l;
+            nhi[c] = (uint32_t)h;
+        }
+        e = tc_bc6h_choose_selectors_uf16(target, nlo, nhi, nsel);
+        if (e < best) {
+            best = e;
+            memcpy(lo, nlo, sizeof(nlo));
+            memcpy(hi, nhi, sizeof(nhi));
+            memcpy(sel, nsel, 16u);
+        } else {
+            break;
+        }
+    }
+    return best;
+}
+
+/* Signed (sf16) endpoint refinement, clamped to the [-511,511] mode-11 range. */
+static uint64_t tc_bc6h_refine_sf16(const int32_t q[16][3],
+                                    const int32_t target[16][3], int32_t lo[3],
+                                    int32_t hi[3], uint8_t sel[16]) {
+    uint64_t best = tc_bc6h_choose_selectors_sf16(target, lo, hi, sel);
+    int round;
+    for (round = 0; round < 3; ++round) {
+        int32_t nlo[3], nhi[3];
+        uint8_t nsel[16];
+        uint64_t e;
+        uint32_t c, i;
+        for (c = 0; c < 3u; ++c) {
+            int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+            for (i = 0; i < 16u; ++i) {
+                int64_t b = tc_bc7_weights4[sel[i]], a = 64 - b, p = q[i][c];
+                saa += a * a;
+                sab += a * b;
+                sbb += b * b;
+                sap += a * p;
+                sbp += b * p;
+            }
+            det = saa * sbb - sab * sab;
+            if (det <= 0) {
+                nlo[c] = lo[c];
+                nhi[c] = hi[c];
+                continue;
+            }
+            l = tc_bc6h_rdiv((sap * sbb - sbp * sab) * 64, det);
+            h = tc_bc6h_rdiv((sbp * saa - sap * sab) * 64, det);
+            if (l < -511) l = -511;
+            if (l > 511) l = 511;
+            if (h < -511) h = -511;
+            if (h > 511) h = 511;
+            nlo[c] = (int32_t)l;
+            nhi[c] = (int32_t)h;
+        }
+        e = tc_bc6h_choose_selectors_sf16(target, nlo, nhi, nsel);
+        if (e < best) {
+            best = e;
+            memcpy(lo, nlo, sizeof(nlo));
+            memcpy(hi, nhi, sizeof(nhi));
+            memcpy(sel, nsel, 16u);
+        } else {
+            break;
+        }
+    }
+    return best;
+}
+
 static void tc_encode_bc6h_block_uf16(const float pix[16][3], uint8_t out[16]) {
     uint32_t q[16][3], target[16][3], lo[3], hi[3], luma_lo[3], luma_hi[3];
     uint32_t i, c, bitpos = 0, min_l = UINT_MAX, max_l = 0, min_i = 0, max_i = 0;
@@ -218,6 +326,7 @@ static void tc_encode_bc6h_block_uf16(const float pix[16][3], uint8_t out[16]) {
     } else {
         memcpy(sel, box_sel, sizeof(sel));
     }
+    (void)tc_bc6h_refine_uf16(q, target, lo, hi, sel);
     if (sel[0] & 8u) {
         uint32_t t;
         for (c = 0; c < 3u; ++c) {
@@ -279,6 +388,7 @@ static void tc_encode_bc6h_block_sf16(const float pix[16][3], uint8_t out[16]) {
     } else {
         memcpy(sel, box_sel, sizeof(sel));
     }
+    (void)tc_bc6h_refine_sf16(q, target, lo, hi, sel);
     if (sel[0] & 8u) {
         int32_t t;
         for (c = 0; c < 3u; ++c) {
