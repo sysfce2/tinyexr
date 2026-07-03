@@ -319,26 +319,40 @@ static uint64_t tc_bc6h_choose_selectors_uf16(const uint32_t target[16][3],
     return tc_bc6h_choose_selectors_uf16_scalar(target, lo, hi, sel);
 }
 
-static uint64_t tc_bc6h_choose_selectors_sf16(const int32_t target[16][3],
-                                              const int32_t lo[3],
-                                              const int32_t hi[3],
-                                              uint8_t sel[16]) {
-    int32_t pal[16][3];
-    uint64_t err = 0;
-    uint32_t i, c, s;
+/* Signed palette (sign-magnitude domain) into SoA arrays. */
+static void tc_bc6h_pal16_sf16(const int32_t lo[3], const int32_t hi[3],
+                               int32_t pr[16], int32_t pg[16], int32_t pb[16]) {
+    uint32_t s, c;
     for (s = 0; s < 16u; ++s) {
         uint32_t w = tc_bc7_weights4[s];
+        int32_t *P[3];
+        P[0] = pr;
+        P[1] = pg;
+        P[2] = pb;
         for (c = 0; c < 3u; ++c) {
             int32_t qv = (int32_t)(((int64_t)(64u - w) * lo[c] +
-                                    (int64_t)w * hi[c] + 32) >>
-                                   6);
-            pal[s][c] = tc_bc6h_unquant_sf16_to_smag(qv);
+                                    (int64_t)w * hi[c] + 32) >> 6);
+            P[c][s] = tc_bc6h_unquant_sf16_to_smag(qv);
         }
     }
+}
+
+static uint64_t tc_bc6h_choose_selectors_sf16_scalar(const int32_t target[16][3],
+                                                     const int32_t lo[3],
+                                                     const int32_t hi[3],
+                                                     uint8_t sel[16]) {
+    int32_t pr[16], pg[16], pb[16];
+    uint64_t err = 0;
+    uint32_t i, s;
+    tc_bc6h_pal16_sf16(lo, hi, pr, pg, pb);
     for (i = 0; i < 16u; ++i) {
         uint32_t best = 0, best_err = UINT_MAX;
+        int32_t a[3];
+        a[0] = target[i][0];
+        a[1] = target[i][1];
+        a[2] = target[i][2];
         for (s = 0; s < 16u; ++s) {
-            uint32_t e = tc_bc6h_err3_smag(target[i], pal[s][0], pal[s][1], pal[s][2]);
+            uint32_t e = tc_bc6h_err3_smag(a, pr[s], pg[s], pb[s]);
             if (e < best_err) {
                 best_err = e;
                 best = s;
@@ -348,6 +362,190 @@ static uint64_t tc_bc6h_choose_selectors_sf16(const int32_t target[16][3],
         err += best_err;
     }
     return err;
+}
+
+#if defined(TC_X86)
+/* Signed error can exceed 32 bits (magnitudes span +/-31743, so dr up to
+ * 63486), and the scalar saturates the sum at UINT_MAX. Replicate that with
+ * step-wise unsigned-overflow detection, which is exactly equivalent to the
+ * scalar's int64-sum-then-clamp, keeping every backend bit-identical. */
+TC_TARGET("sse4.1")
+static uint64_t tc_bc6h_choose_selectors_sf16_sse41(const int32_t target[16][3],
+                                                    const int32_t lo[3],
+                                                    const int32_t hi[3],
+                                                    uint8_t sel[16]) {
+    int32_t pr[16], pg[16], pb[16];
+    const __m128i ones = _mm_set1_epi32(-1);
+    uint64_t err = 0;
+    uint32_t i, s;
+    tc_bc6h_pal16_sf16(lo, hi, pr, pg, pb);
+    for (i = 0; i < 16u; i += 4u) {
+        __m128i tr = _mm_set_epi32((int)target[i + 3][0], (int)target[i + 2][0],
+                                   (int)target[i + 1][0], (int)target[i][0]);
+        __m128i tg = _mm_set_epi32((int)target[i + 3][1], (int)target[i + 2][1],
+                                   (int)target[i + 1][1], (int)target[i][1]);
+        __m128i tb = _mm_set_epi32((int)target[i + 3][2], (int)target[i + 2][2],
+                                   (int)target[i + 1][2], (int)target[i][2]);
+        __m128i best = ones, bsel = _mm_setzero_si128();
+        uint32_t k, eb[4], sb[4];
+        for (s = 0; s < 16u; ++s) {
+            __m128i dr = _mm_sub_epi32(tr, _mm_set1_epi32(pr[s]));
+            __m128i dg = _mm_sub_epi32(tg, _mm_set1_epi32(pg[s]));
+            __m128i db = _mm_sub_epi32(tb, _mm_set1_epi32(pb[s]));
+            __m128i er = _mm_mullo_epi32(dr, dr), eg = _mm_mullo_epi32(dg, dg),
+                    eb2 = _mm_mullo_epi32(db, db);
+            __m128i s1 = _mm_add_epi32(er, eg), o1, e, o2, nm, lt;
+            o1 = _mm_andnot_si128(_mm_cmpeq_epi32(s1, er),
+                                  _mm_cmpeq_epi32(_mm_min_epu32(s1, er), s1));
+            s1 = _mm_or_si128(_mm_and_si128(o1, ones), _mm_andnot_si128(o1, s1));
+            e = _mm_add_epi32(s1, eb2);
+            o2 = _mm_andnot_si128(_mm_cmpeq_epi32(e, s1),
+                                  _mm_cmpeq_epi32(_mm_min_epu32(e, s1), e));
+            e = _mm_or_si128(_mm_and_si128(o2, ones), _mm_andnot_si128(o2, e));
+            nm = _mm_min_epu32(best, e);
+            lt = _mm_andnot_si128(_mm_cmpeq_epi32(e, best),
+                                  _mm_cmpeq_epi32(nm, e));
+            bsel = _mm_or_si128(_mm_and_si128(lt, _mm_set1_epi32((int)s)),
+                                _mm_andnot_si128(lt, bsel));
+            best = nm;
+        }
+        _mm_storeu_si128((__m128i *)eb, best);
+        _mm_storeu_si128((__m128i *)sb, bsel);
+        for (k = 0; k < 4u; ++k) {
+            sel[i + k] = (uint8_t)sb[k];
+            err += eb[k];
+        }
+    }
+    return err;
+}
+
+TC_TARGET("avx2")
+static uint64_t tc_bc6h_choose_selectors_sf16_avx2(const int32_t target[16][3],
+                                                   const int32_t lo[3],
+                                                   const int32_t hi[3],
+                                                   uint8_t sel[16]) {
+    int32_t pr[16], pg[16], pb[16];
+    const __m256i ones = _mm256_set1_epi32(-1);
+    uint64_t err = 0;
+    uint32_t i, s;
+    tc_bc6h_pal16_sf16(lo, hi, pr, pg, pb);
+    for (i = 0; i < 16u; i += 8u) {
+        __m256i tr = _mm256_set_epi32(
+            (int)target[i + 7][0], (int)target[i + 6][0], (int)target[i + 5][0],
+            (int)target[i + 4][0], (int)target[i + 3][0], (int)target[i + 2][0],
+            (int)target[i + 1][0], (int)target[i][0]);
+        __m256i tg = _mm256_set_epi32(
+            (int)target[i + 7][1], (int)target[i + 6][1], (int)target[i + 5][1],
+            (int)target[i + 4][1], (int)target[i + 3][1], (int)target[i + 2][1],
+            (int)target[i + 1][1], (int)target[i][1]);
+        __m256i tb = _mm256_set_epi32(
+            (int)target[i + 7][2], (int)target[i + 6][2], (int)target[i + 5][2],
+            (int)target[i + 4][2], (int)target[i + 3][2], (int)target[i + 2][2],
+            (int)target[i + 1][2], (int)target[i][2]);
+        __m256i best = ones, bsel = _mm256_setzero_si256();
+        uint32_t k, eb[8], sb[8];
+        for (s = 0; s < 16u; ++s) {
+            __m256i dr = _mm256_sub_epi32(tr, _mm256_set1_epi32(pr[s]));
+            __m256i dg = _mm256_sub_epi32(tg, _mm256_set1_epi32(pg[s]));
+            __m256i db = _mm256_sub_epi32(tb, _mm256_set1_epi32(pb[s]));
+            __m256i er = _mm256_mullo_epi32(dr, dr),
+                    eg = _mm256_mullo_epi32(dg, dg),
+                    eb2 = _mm256_mullo_epi32(db, db);
+            __m256i s1 = _mm256_add_epi32(er, eg), o1, e, o2, nm, lt;
+            o1 = _mm256_andnot_si256(
+                _mm256_cmpeq_epi32(s1, er),
+                _mm256_cmpeq_epi32(_mm256_min_epu32(s1, er), s1));
+            s1 = _mm256_or_si256(_mm256_and_si256(o1, ones),
+                                 _mm256_andnot_si256(o1, s1));
+            e = _mm256_add_epi32(s1, eb2);
+            o2 = _mm256_andnot_si256(
+                _mm256_cmpeq_epi32(e, s1),
+                _mm256_cmpeq_epi32(_mm256_min_epu32(e, s1), e));
+            e = _mm256_or_si256(_mm256_and_si256(o2, ones),
+                                _mm256_andnot_si256(o2, e));
+            nm = _mm256_min_epu32(best, e);
+            lt = _mm256_andnot_si256(_mm256_cmpeq_epi32(e, best),
+                                     _mm256_cmpeq_epi32(nm, e));
+            bsel = _mm256_or_si256(
+                _mm256_and_si256(lt, _mm256_set1_epi32((int)s)),
+                _mm256_andnot_si256(lt, bsel));
+            best = nm;
+        }
+        _mm256_storeu_si256((__m256i *)eb, best);
+        _mm256_storeu_si256((__m256i *)sb, bsel);
+        for (k = 0; k < 8u; ++k) {
+            sel[i + k] = (uint8_t)sb[k];
+            err += eb[k];
+        }
+    }
+    return err;
+}
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+static uint64_t tc_bc6h_choose_selectors_sf16_neon(const int32_t target[16][3],
+                                                   const int32_t lo[3],
+                                                   const int32_t hi[3],
+                                                   uint8_t sel[16]) {
+    int32_t pr[16], pg[16], pb[16];
+    const uint32x4_t ones = vdupq_n_u32(0xffffffffu);
+    uint64_t err = 0;
+    uint32_t i, s;
+    tc_bc6h_pal16_sf16(lo, hi, pr, pg, pb);
+    for (i = 0; i < 16u; i += 4u) {
+        int32_t tra[4], tga[4], tba[4];
+        int32x4_t tr, tg, tb;
+        uint32x4_t best = ones, bsel = vdupq_n_u32(0);
+        uint32_t k, eb[4], sb[4];
+        for (k = 0; k < 4u; ++k) {
+            tra[k] = target[i + k][0];
+            tga[k] = target[i + k][1];
+            tba[k] = target[i + k][2];
+        }
+        tr = vld1q_s32(tra);
+        tg = vld1q_s32(tga);
+        tb = vld1q_s32(tba);
+        for (s = 0; s < 16u; ++s) {
+            int32x4_t dr = vsubq_s32(tr, vdupq_n_s32(pr[s]));
+            int32x4_t dg = vsubq_s32(tg, vdupq_n_s32(pg[s]));
+            int32x4_t db = vsubq_s32(tb, vdupq_n_s32(pb[s]));
+            uint32x4_t er = vreinterpretq_u32_s32(vmulq_s32(dr, dr));
+            uint32x4_t eg = vreinterpretq_u32_s32(vmulq_s32(dg, dg));
+            uint32x4_t eb2 = vreinterpretq_u32_s32(vmulq_s32(db, db));
+            uint32x4_t s1 = vaddq_u32(er, eg), e, lt;
+            s1 = vbslq_u32(vcltq_u32(s1, er), ones, s1); /* saturate on overflow */
+            e = vaddq_u32(s1, eb2);
+            e = vbslq_u32(vcltq_u32(e, s1), ones, e);
+            lt = vcltq_u32(e, best);
+            bsel = vbslq_u32(lt, vdupq_n_u32(s), bsel);
+            best = vminq_u32(best, e);
+        }
+        vst1q_u32(eb, best);
+        vst1q_u32(sb, bsel);
+        for (k = 0; k < 4u; ++k) {
+            sel[i + k] = (uint8_t)sb[k];
+            err += eb[k];
+        }
+    }
+    return err;
+}
+#endif
+
+static uint64_t tc_bc6h_choose_selectors_sf16(const int32_t target[16][3],
+                                              const int32_t lo[3],
+                                              const int32_t hi[3],
+                                              uint8_t sel[16]) {
+#if defined(TC_X86)
+    if (tc_cpu_caps() & TC_CPU_AVX2)
+        return tc_bc6h_choose_selectors_sf16_avx2(target, lo, hi, sel);
+    if (tc_cpu_caps() & TC_CPU_SSE41)
+        return tc_bc6h_choose_selectors_sf16_sse41(target, lo, hi, sel);
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (tc_cpu_caps() & TC_CPU_NEON)
+        return tc_bc6h_choose_selectors_sf16_neon(target, lo, hi, sel);
+#endif
+    return tc_bc6h_choose_selectors_sf16_scalar(target, lo, hi, sel);
 }
 
 /* Sign-aware rounded integer division (den > 0). */
