@@ -4256,8 +4256,8 @@ uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
  * 4x4 weight grid at weight range {8,5,2,11}/{8,5,2}, with the endpoint range
  * derived by the standard ASTC bit budget (which yields the UASTC endpoint
  * range for each mode). Constant blocks use the solid (void-extent) mode 8.
- * The 2-subset and dual-plane modes are handled by tc_uastc_encode_2subset /
- * tc_uastc_encode_dual below. */
+ * The multi-subset, dual-plane and CEM 4 modes are handled by
+ * tc_uastc_encode_msubset / tc_uastc_encode_dual / tc_uastc_encode_cem4. */
 static int tc_uastc_encode_mode(const uint8_t block[144][4], uint32_t count,
                                 const tc_astc_encode_context *ctx, uint32_t cem,
                                 uint32_t nv, uint32_t qm,
@@ -4338,21 +4338,204 @@ static int tc_uastc_encode_mode(const uint8_t block[144][4], uint32_t count,
     return 1;
 }
 
-/* UASTC 2-subset modes (CEM 8: 2/4/7, CEM 12: 9). Partition-select on the
- * real 8-bit block, per-subset bounding-box endpoints, one weight per texel.
- * Modes where a quantized subset would trip the decoder's blue-contract are
- * skipped (bbox min/max keep endpoints in ascending-sum order almost always).*/
-static int tc_uastc_encode_2subset(const uint8_t block[144][4], uint32_t count,
-                                    const tc_astc_encode_context *ctx,
-                                    uint32_t cem, uint32_t qm, uint8_t out[16],
-                                    uint64_t *out_sse) {
+/* UASTC CEM 4 (luminance+alpha) modes 15/16/17: RGB reconstruct from a single
+ * luminance channel, plus alpha. Values are (L0,L1,A0,A1) per subset with no
+ * blue-contract, so no endpoint swap is needed. `nsub` selects mode 15 (1) or
+ * 16 (2); `dual` selects mode 17 (single subset, alpha on plane 2). */
+static uint32_t tc_uastc_lum(const uint8_t px[4]) {
+    return ((uint32_t)px[0] + px[1] + px[2]) / 3u;
+}
+static int tc_uastc_encode_cem4(const uint8_t block[144][4], uint32_t count,
+                                const tc_astc_encode_context *ctx, uint32_t nsub,
+                                int dual, uint32_t qm, uint8_t out[16],
+                                uint64_t *out_sse) {
     const tc_astc_partition_info *pi = NULL;
-    uint8_t weightbuf[16], sym[16], wsym[16], vals[8];
-    uint32_t qe0[2][4], qe1[2][4], er, weight_bits, color_bits, bm, bitpos;
+    uint8_t weightbuf[16], sym[12], wsym[16], vals[8], dualw[32];
+    uint8_t best_p1[16], best_p2[16];
+    uint32_t qe0[3][4], qe1[3][4], er, weight_bits, color_bits, bm, bitpos;
+    uint32_t nvw = dual ? 32u : 16u, wcount = dual ? 32u : 16u;
+    uint32_t best_ccs = 99u, i, c, s;
+    int dir[3][4];
+    int64_t dl[3] = {0, 0, 0};
+    uint64_t best_sse = (uint64_t)-1, sse = 0;
+
+    bm = dual ? tc_astc_find_dual_grid_mode(qm) : tc_astc_hdr_find_grid_mode(qm);
+    if (!bm) return 0;
+    weight_bits = tc_astc_ise_sequence_bitcount(nvw, qm);
+    if (dual) {
+        if (weight_bits + 2u >= 109u) return 0;
+        color_bits = 109u - weight_bits;
+    } else {
+        uint32_t cfg = (nsub > 1u) ? 99u : 111u;
+        if (weight_bits >= cfg) return 0;
+        color_bits = cfg - weight_bits;
+    }
+    if (!tc_astc_lut_color_quant(ctx, nsub * 4u, color_bits, &er)) return 0;
+    if (nsub > 1u &&
+        !tc_astc_find_best_partition(block, ctx->part2_cache, ctx->part2_count,
+                                     nsub, ctx, &pi))
+        return 0;
+    for (s = 0; s < nsub; ++s) {
+        uint32_t Llo = 255u, Lhi = 0, Alo = 255u, Ahi = 0;
+        int have = 0;
+        for (i = 0; i < count; ++i) {
+            uint32_t L;
+            if (pi && pi->partition_of_texel[i] != s) continue;
+            L = tc_uastc_lum(block[i]);
+            if (L < Llo) Llo = L;
+            if (L > Lhi) Lhi = L;
+            if (block[i][3] < Alo) Alo = block[i][3];
+            if (block[i][3] > Ahi) Ahi = block[i][3];
+            have = 1;
+        }
+        if (!have) return 0;
+        vals[0] = (uint8_t)Llo;
+        vals[1] = (uint8_t)Lhi;
+        vals[2] = (uint8_t)Alo;
+        vals[3] = (uint8_t)Ahi;
+        tc_astc_quantize_color_values(ctx, er, 4u, vals, sym + s * 4u);
+        qe0[s][0] = qe0[s][1] = qe0[s][2] =
+            tc_astc_color_symbol_uquant(er, sym[s * 4u]);
+        qe1[s][0] = qe1[s][1] = qe1[s][2] =
+            tc_astc_color_symbol_uquant(er, sym[s * 4u + 1u]);
+        qe0[s][3] = tc_astc_color_symbol_uquant(er, sym[s * 4u + 2u]);
+        qe1[s][3] = tc_astc_color_symbol_uquant(er, sym[s * 4u + 3u]);
+        for (c = 0; c < 4u; ++c) {
+            dir[s][c] = (int)qe1[s][c] - (int)qe0[s][c];
+            dl[s] += (int64_t)dir[s][c] * dir[s][c];
+        }
+    }
+
+    if (dual) {
+        uint32_t ccs;
+        for (ccs = 0; ccs < 4u; ++ccs) {
+            int64_t d1 = 0, d2 = (int64_t)dir[0][ccs] * dir[0][ccs];
+            uint8_t t1[16], t2[16];
+            uint64_t dsse = 0;
+            for (c = 0; c < 4u; ++c)
+                if (c != ccs) d1 += (int64_t)dir[0][c] * dir[0][c];
+            for (i = 0; i < count; ++i) {
+                int w1 = 0, w2 = 0, u1, u2;
+                if (d1 > 0) {
+                    int64_t dot = 0;
+                    for (c = 0; c < 4u; ++c)
+                        if (c != ccs)
+                            dot += ((int64_t)block[i][c] - (int)qe0[0][c]) *
+                                   dir[0][c];
+                    if (dot < 0) dot = 0;
+                    if (dot > d1) dot = d1;
+                    w1 = (int)((dot * 64 + d1 / 2) / d1);
+                }
+                if (d2 > 0) {
+                    int64_t dot =
+                        ((int64_t)block[i][ccs] - (int)qe0[0][ccs]) * dir[0][ccs];
+                    if (dot < 0) dot = 0;
+                    if (dot > d2) dot = d2;
+                    w2 = (int)((dot * 64 + d2 / 2) / d2);
+                }
+                t1[i] = tc_astc_hdr_quant_weight(w1, qm, tc_astc_quant_levels(qm));
+                t2[i] = tc_astc_hdr_quant_weight(w2, qm, tc_astc_quant_levels(qm));
+                u1 = (int)tc_astc_weight_unquant(t1[i], qm);
+                u2 = (int)tc_astc_weight_unquant(t2[i], qm);
+                for (c = 0; c < 4u; ++c) {
+                    int uq = (c == ccs) ? u2 : u1;
+                    int rec =
+                        ((int)qe0[0][c] * (64 - uq) + (int)qe1[0][c] * uq + 32) >>
+                        6;
+                    int e = (int)block[i][c] - rec;
+                    dsse += (uint64_t)(e * e);
+                }
+            }
+            if (best_ccs == 99u || dsse < best_sse) {
+                best_sse = dsse;
+                best_ccs = ccs;
+                memcpy(best_p1, t1, 16u);
+                memcpy(best_p2, t2, 16u);
+            }
+        }
+        sse = best_sse;
+    } else {
+        for (i = 0; i < count; ++i) {
+            uint32_t s2 = pi ? pi->partition_of_texel[i] : 0u;
+            int w64 = 0, uq;
+            if (dl[s2] > 0) {
+                int64_t dot = 0;
+                for (c = 0; c < 4u; ++c)
+                    dot += ((int64_t)block[i][c] - (int)qe0[s2][c]) * dir[s2][c];
+                if (dot < 0) dot = 0;
+                if (dot > dl[s2]) dot = dl[s2];
+                w64 = (int)((dot * 64 + dl[s2] / 2) / dl[s2]);
+            }
+            wsym[i] = tc_astc_hdr_quant_weight(w64, qm, tc_astc_quant_levels(qm));
+            uq = (int)tc_astc_weight_unquant(wsym[i], qm);
+            for (c = 0; c < 4u; ++c) {
+                int rec =
+                    ((int)qe0[s2][c] * (64 - uq) + (int)qe1[s2][c] * uq + 32) >> 6;
+                int e = (int)block[i][c] - rec;
+                sse += (uint64_t)(e * e);
+            }
+        }
+    }
+    *out_sse = sse;
+
+    memset(out, 0, 16u);
+    memset(weightbuf, 0, sizeof(weightbuf));
+    if (dual) {
+        tc_astc_scramble_weights(best_p1, 16u, qm);
+        tc_astc_scramble_weights(best_p2, 16u, qm);
+        for (i = 0; i < 16u; ++i) {
+            dualw[i * 2u] = best_p1[i];
+            dualw[i * 2u + 1u] = best_p2[i];
+        }
+        (void)tc_astc_ise_encode_bits(qm, 32u, dualw, weightbuf,
+                                      sizeof(weightbuf), 0u);
+    } else {
+        tc_astc_scramble_weights(wsym, 16u, qm);
+        (void)tc_astc_ise_encode_bits(qm, 16u, wsym, weightbuf,
+                                      sizeof(weightbuf), 0u);
+    }
+    for (i = 0; i < 16u; ++i) out[i] = tc_bitrev8(weightbuf[15u - i]);
+    (void)wcount;
+    bitpos = 0;
+    tc_set_bits(out, &bitpos, bm, 11u);
+    if (nsub > 1u) {
+        tc_set_bits(out, &bitpos, nsub - 1u, 2u);
+        tc_set_bits(out, &bitpos, (uint32_t)pi->partition_index & 63u, 6u);
+        tc_set_bits(out, &bitpos, (uint32_t)pi->partition_index >> 6, 4u);
+        bitpos = 23u;
+        tc_set_bits(out, &bitpos, 4u << 2, 6u); /* multi-CEM: all-same CEM 4 */
+        (void)tc_astc_ise_encode_bits(er, nsub * 4u, sym, out, 16u, 29u);
+    } else {
+        tc_set_bits(out, &bitpos, 0u, 2u);
+        tc_set_bits(out, &bitpos, 4u, 4u); /* CEM 4 */
+        if (dual) {
+            bitpos = 128u - weight_bits - 2u;
+            tc_set_bits(out, &bitpos, best_ccs, 2u);
+        }
+        (void)tc_astc_ise_encode_bits(er, 4u, sym, out, 16u, 17u);
+    }
+    return 1;
+}
+
+/* UASTC multi-subset modes (nsub 2: CEM 8 modes 2/4/7, CEM 12 mode 9; nsub 3:
+ * CEM 8 mode 3). Partition-select on the real 8-bit block, per-subset
+ * bounding-box endpoints, one weight per texel. Modes where a quantized subset
+ * would trip the decoder's blue-contract are skipped (bbox min/max keep
+ * endpoints in ascending-sum order almost always). */
+static int tc_uastc_encode_msubset(const uint8_t block[144][4], uint32_t count,
+                                   const tc_astc_encode_context *ctx,
+                                   uint32_t cem, uint32_t nsub, uint32_t qm,
+                                   uint8_t out[16], uint64_t *out_sse) {
+    const tc_astc_partition_info *pi = NULL;
+    const tc_astc_partition_info *cache =
+        (nsub == 3u) ? ctx->part3_cache : ctx->part2_cache;
+    uint32_t cache_count = (nsub == 3u) ? ctx->part3_count : ctx->part2_count;
+    uint8_t weightbuf[16], sym[24], wsym[16], vals[8];
+    uint32_t qe0[3][4], qe1[3][4], er, weight_bits, color_bits, bm, bitpos;
     uint32_t nvs = (cem == 12u) ? 8u : 6u, nch = (cem == 12u) ? 4u : 3u;
     uint32_t i, c, s;
-    int dir[2][4];
-    int64_t dl[2] = {0, 0};
+    int dir[3][4];
+    int64_t dl[3] = {0, 0, 0};
     uint64_t sse = 0;
 
     bm = tc_astc_hdr_find_grid_mode(qm);
@@ -4360,11 +4543,10 @@ static int tc_uastc_encode_2subset(const uint8_t block[144][4], uint32_t count,
     weight_bits = tc_astc_ise_sequence_bitcount(16u, qm);
     if (weight_bits >= 99u) return 0;
     color_bits = 99u - weight_bits;
-    if (!tc_astc_lut_color_quant(ctx, 2u * nvs, color_bits, &er)) return 0;
-    if (!tc_astc_find_best_partition(block, ctx->part2_cache, ctx->part2_count,
-                                     2u, ctx, &pi))
+    if (!tc_astc_lut_color_quant(ctx, nsub * nvs, color_bits, &er)) return 0;
+    if (!tc_astc_find_best_partition(block, cache, cache_count, nsub, ctx, &pi))
         return 0;
-    for (s = 0; s < 2u; ++s) {
+    for (s = 0; s < nsub; ++s) {
         uint32_t lo[4] = {255u, 255u, 255u, 255u}, hi[4] = {0, 0, 0, 0};
         int have = 0;
         for (i = 0; i < count; ++i) {
@@ -4432,12 +4614,12 @@ static int tc_uastc_encode_2subset(const uint8_t block[144][4], uint32_t count,
     for (i = 0; i < 16u; ++i) out[i] = tc_bitrev8(weightbuf[15u - i]);
     bitpos = 0;
     tc_set_bits(out, &bitpos, bm, 11u);
-    tc_set_bits(out, &bitpos, 1u, 2u);
+    tc_set_bits(out, &bitpos, nsub - 1u, 2u);
     tc_set_bits(out, &bitpos, (uint32_t)pi->partition_index & 63u, 6u);
     tc_set_bits(out, &bitpos, (uint32_t)pi->partition_index >> 6, 4u);
     bitpos = 23u;
     tc_set_bits(out, &bitpos, cem << 2, 6u);
-    (void)tc_astc_ise_encode_bits(er, 2u * nvs, sym, out, 16u, 29u);
+    (void)tc_astc_ise_encode_bits(er, nsub * nvs, sym, out, 16u, 29u);
     return 1;
 }
 
@@ -4601,13 +4783,23 @@ static void tc_encode_uastc_ldr_block(const uint8_t block[144][4],
         uint32_t sn = opaque ? 2u : 1u;
         for (i = 0; i < sn; ++i) {
             uint64_t sse;
-            if (tc_uastc_encode_2subset(block, count, ctx, cem, sw[i], tmp,
+            if (tc_uastc_encode_msubset(block, count, ctx, cem, 2u, sw[i], tmp,
                                         &sse) &&
                 (!best_found || sse < best_sse)) {
                 best_sse = sse;
                 best_found = 1;
                 memcpy(out, tmp, 16u);
             }
+        }
+    }
+    /* 3-subset mode (CEM 8: weight range 2, mode 3). */
+    if (opaque) {
+        uint64_t sse;
+        if (tc_uastc_encode_msubset(block, count, ctx, cem, 3u, 2u, tmp, &sse) &&
+            (!best_found || sse < best_sse)) {
+            best_sse = sse;
+            best_found = 1;
+            memcpy(out, tmp, 16u);
         }
     }
     /* dual-plane modes (CEM 8: weight range 2; CEM 12: weight range 2/0). */
@@ -4624,6 +4816,30 @@ static void tc_encode_uastc_ldr_block(const uint8_t block[144][4],
                 best_found = 1;
                 memcpy(out, tmp, 16u);
             }
+        }
+    }
+    /* CEM 4 (luminance+alpha) modes 15/16/17, for non-opaque blocks: single
+     * subset (wr 8), 2-subset (wr 2) and dual-plane (wr 2). SSE decides against
+     * the CEM 12 modes, so these only win on grayscale-with-alpha content. */
+    if (!opaque) {
+        uint64_t sse;
+        if (tc_uastc_encode_cem4(block, count, ctx, 1u, 0, 8u, tmp, &sse) &&
+            (!best_found || sse < best_sse)) {
+            best_sse = sse;
+            best_found = 1;
+            memcpy(out, tmp, 16u);
+        }
+        if (tc_uastc_encode_cem4(block, count, ctx, 2u, 0, 2u, tmp, &sse) &&
+            (!best_found || sse < best_sse)) {
+            best_sse = sse;
+            best_found = 1;
+            memcpy(out, tmp, 16u);
+        }
+        if (tc_uastc_encode_cem4(block, count, ctx, 1u, 1, 2u, tmp, &sse) &&
+            (!best_found || sse < best_sse)) {
+            best_sse = sse;
+            best_found = 1;
+            memcpy(out, tmp, 16u);
         }
     }
     if (!best_found) {
