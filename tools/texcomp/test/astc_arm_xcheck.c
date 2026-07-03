@@ -193,16 +193,25 @@ int main(void) {
         for (b = 0; b + 16 <= un; b += 16) {
             const uint8_t *p = ublk + b;
             unsigned bm = (unsigned)p[0] | ((unsigned)(p[1] & 7u) << 8);
-            unsigned pc, cem;
+            unsigned pc;
             if ((bm & 0x1ffu) == 0x1fcu) continue; /* void-extent (solid) */
             pc = ((unsigned)p[1] >> 3) & 3u; /* partition count - 1 */
-            /* single-subset CEM = bits 13..16 (3 in byte 1, 1 in byte 2). */
-            cem = (((unsigned)p[1] >> 5) & 7u) | (((unsigned)p[2] & 1u) << 3);
-            if (pc != 0u || (cem != 8u && cem != 12u)) {
-                fprintf(stderr,
-                        "FAIL: uastc non-conforming block %zu (pc=%u cem=%u)\n",
-                        b / 16u, pc + 1u, cem);
+            /* UASTC uses at most 2 subsets; single-subset CEM = bits 13..16
+             * (3 in byte 1, 1 in byte 2) and must be RGB (8) or RGBA (12). */
+            if (pc > 1u) {
+                fprintf(stderr, "FAIL: uastc block %zu has %u subsets\n",
+                        b / 16u, pc + 1u);
                 return 1;
+            }
+            if (pc == 0u) {
+                unsigned cem =
+                    (((unsigned)p[1] >> 5) & 7u) | (((unsigned)p[2] & 1u) << 3);
+                if (cem != 8u && cem != 12u) {
+                    fprintf(stderr,
+                            "FAIL: uastc block %zu single-subset CEM %u\n",
+                            b / 16u, cem);
+                    return 1;
+                }
             }
         }
         pu = psnr8(img, dec_tc, sizeof(img));
