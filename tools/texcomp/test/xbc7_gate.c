@@ -162,9 +162,36 @@ int main(void) {
         tc_bc7_compress_rgba8(img, W, H, W * 4u, &so, base, need);
         so.rdo = 8;
         tc_bc7_compress_rgba8(img, W, H, W * 4u, &so, rdo, need);
+        /* The lib's own decoder (tc_bc7_decompress_rgba8, used by the
+         * decoder-driven RDO) must agree bit-exactly with this independent
+         * reference decoder on every pixel. */
+        {
+            static uint8_t libdec[W * H * 4];
+            uint32_t bx, by, xx, yy, bxc = (W + 3u) / 4u;
+            tc_bc7_decompress_rgba8(base, W, H, W * 4u, libdec, sizeof(libdec));
+            for (by = 0; by < H; by += 4u)
+                for (bx = 0; bx < W; bx += 4u) {
+                    uint8_t rd[16][4];
+                    tc_bc7_ref_decode_block(
+                        base + ((size_t)(by / 4u) * bxc + bx / 4u) * 16u, rd);
+                    for (yy = 0; yy < 4u; ++yy)
+                        for (xx = 0; xx < 4u; ++xx) {
+                            uint32_t x = bx + xx, y = by + yy;
+                            if (x >= W || y >= H) continue;
+                            if (memcmp(libdec + ((size_t)y * W + x) * 4u,
+                                       rd[yy * 4u + xx], 4u) != 0) {
+                                fprintf(stderr, "FAIL: lib decoder != reference "
+                                                "at (%u,%u)\n", x, y);
+                                return 1;
+                            }
+                        }
+                }
+        }
+
         pbase = bc7_psnr(img, W, H, base);
         prdo = bc7_psnr(img, W, H, rdo);
-        printf("xbc7 gate PSNR: bc7=%.2f dB  rdo=8=%.2f dB\n", pbase, prdo);
+        printf("xbc7 gate PSNR: bc7=%.2f dB  rdo=8=%.2f dB (lib==ref decoder)\n",
+               pbase, prdo);
         if (pbase < 30.0) {
             fprintf(stderr, "FAIL: base BC7 PSNR too low (%.2f)\n", pbase);
             return 1;

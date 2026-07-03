@@ -140,6 +140,10 @@ tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride,
                                 const tc_bc7_options *opt, uint8_t *out_bc7,
                                 size_t out_size);
+/* Decode a BC7 block stream to RGBA8 (all 8 BPTC modes). */
+tc_result tc_bc7_decompress_rgba8(const uint8_t *bc7, uint32_t width,
+                                  uint32_t height, size_t stride,
+                                  uint8_t *out_rgba, size_t out_size);
 tc_result tc_bc1_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride,
                                 const tc_bc1_options *opt, uint8_t *out_bc1,
