@@ -2,7 +2,7 @@
  * TinyEXR texcomp ASTC quality harness.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Encodes synthetic images with the ASTC encoder, decodes them with the
  * reference decoder from test/astc_ref_decode.h, and prints a PSNR table.

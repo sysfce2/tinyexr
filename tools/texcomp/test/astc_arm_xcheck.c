@@ -1,4 +1,8 @@
-/* Self-contained CI cross-check for the vendored Arm astcenc backend.
+/*
+ * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Self-contained CI cross-check for the vendored Arm astcenc backend.
  *
  * Builds only with -DTEXCOMP_HAVE_ASTCENC. Encodes one deterministic image
  * with both the pure-C `tc` encoder and the vendored astcenc encoder, decodes

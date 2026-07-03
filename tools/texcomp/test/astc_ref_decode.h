@@ -2,7 +2,7 @@
  * Reference ASTC LDR block decoder for TinyEXR texcomp tests and benches.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Implements the ASTC spec bit-level semantics independently of the encoder
  * in src/texcomp.c: ISE decode, bilinear weight infill (spec C.2.18),

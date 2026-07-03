@@ -1,4 +1,7 @@
 /*
+ * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
+ * SPDX-License-Identifier: Apache-2.0
+ *
  * Self-contained CI cross-check for the ASTC HDR (UASTC HDR 4x4) encoder.
  *
  * Builds only with -DTEXCOMP_HAVE_ASTCENC. Encodes deterministic HDR images

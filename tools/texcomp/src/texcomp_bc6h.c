@@ -2,7 +2,11 @@
  * TinyEXR texcomp - BC6H encoder
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The two-region (mode 9) partition table and block bit layout mirror the
+ * corrected BPTC tables and decode in bcdec.h (Sergii Kudlai, MIT). See
+ * tools/texcomp/NOTICE.md.
  */
 
 #include "texcomp.h"

@@ -2,7 +2,11 @@
  * TinyEXR texcomp - ASTC HDR (UASTC HDR 4x4) encoder.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The CEM 7 (base+scale) and CEM 11 (RGB direct) HDR endpoint pack/unpack are
+ * ports of Arm astcenc's quantize_hdr_rgbo / hdr_rgbo_unpack / hdr_rgb_unpack
+ * (Apache-2.0). See tools/texcomp/NOTICE.md.
  *
  * Emits 100%% standard ASTC HDR 4x4 blocks. The current implementation encodes
  * constant-colour (void-extent) FP16 blocks -- the block-average of each 4x4

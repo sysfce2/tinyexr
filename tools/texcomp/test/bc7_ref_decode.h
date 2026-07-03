@@ -1,4 +1,9 @@
 /*
+ * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
+ * SPDX-License-Identifier: Apache-2.0
+ * Portions derive from bcdec.h (Sergii Kudlai, MIT): the corrected BPTC
+ * partition/anchor tables. See tools/texcomp/NOTICE.md.
+ *
  * BC7 (BPTC) reference decoder -- test/validation only, NOT part of the
  * shipped pure-C11 library.
  *

@@ -2,7 +2,7 @@
  * TinyEXR texcomp - BC1 (DXT1) encoder
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "texcomp.h"

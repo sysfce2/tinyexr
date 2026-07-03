@@ -1,4 +1,7 @@
 /*
+ * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
+ * SPDX-License-Identifier: Apache-2.0
+ *
  * Pure-C ASTC HDR reference decoder -- test/validation only. Decodes the HDR
  * blocks the texcomp HDR encoder emits (FP16 void-extent + CEM 11 single-
  * subset, dual-plane and 2-subset) to float RGBA, so texcomp-test can validate

@@ -1,44 +1,105 @@
-# TinyEXR Texcomp Notices
+# TinyEXR texcomp — Licensing and Third-Party Notices
 
-This directory contains TinyEXR BSD-3-Clause code plus CLI-only use of
-`examples/common/stb_image.h` for PNG loading.
+## License of this component
 
-The upstream Arm astcenc encoder is ported wholesale into the tree at
-`deps/astcenc` (Copyright 2011-2024 Arm Limited, Apache-2.0; license text
-in `deps/astcenc/LICENSE.txt`). `make texcomp-arm` builds it as a backend
-for the texcomp CLI, selectable with `--encoder arm`; the default
-`make texcomp` build remains pure C11 with no C++ components.
+The TinyEXR **texcomp** texture-compression suite (everything under
+`tools/texcomp/`) is original work licensed under the **Apache License,
+Version 2.0**.
 
-The BC7 API and QuickBC7 option names are designed for a pure-C11 port of the
-QuickBC7-enabled etcpak fork:
+    Copyright 2014-2026 Syoyo Fujita and TinyEXR authors
+    SPDX-License-Identifier: Apache-2.0
 
-- Paper: QuickBC7: Fast BC7 Texture Compression Heuristics, Hyeon-ki Lee and
-  Jae-Ho Nah, Computer & Graphics 2026.
-- Reference source: https://github.com/gusrlLee/etcpak, inspected at commit
-  `b88c8f4`.
+The full license text is in [`LICENSE`](LICENSE) in this directory, and every
+source file carries an `SPDX-License-Identifier: Apache-2.0` tag.
 
-The current C11 encoder emits valid BC7 modes 0 through 7 and selects the
-lowest reconstructed-error candidate per block using a scalar endpoint search.
-Quick mode ports the QuickBC7 luma/alpha mode predecision and LUT partition
-prediction for two-subset modes 1 and 7. The upstream least-squares endpoint
-optimizer and SIMD kernels remain future optimization work.
+Note: this is a licensing choice for the texcomp subcomponent specifically. The
+rest of the TinyEXR project is BSD-3-Clause; Apache-2.0 is compatible with it
+for combined/redistributed works.
 
-BC5 support is a scalar BC4-pair encoder for unsigned RG data. BC6H support
-currently emits valid unsigned-float and signed-float BC6H using one-region mode
-11 with 4-bit selectors. It evaluates per-channel bounds and luma-axis endpoint
-candidates per block; full multi-mode BC6H rate-distortion search remains
-future work.
+The pure-C11 library (`make texcomp`) has **no third-party runtime
+dependencies**. The pieces below are either (a) vendored elsewhere in the repo
+and only used by optional CLI/test targets, or (b) small ports / spec-data
+transcriptions whose provenance is credited here and in the relevant file
+headers.
 
-The ASTC LDR encoder covers all fourteen 2D footprints with decimated weight
-grids, one to four partitions (per-partition weight fitting on a shared grid),
-dual-plane alpha, and CEM 0/4/6/8/10/12 including mixed per-partition formats.
-Endpoints are refined with an integer least-squares solve and all encoding
-paths compete on quantization-aware reconstruction error. Conformance is
-verified against a reference decoder in test/astc_ref_decode.h and against
-Arm's astcenc (`make texcomp-astc-arm-smoke`); quality is tracked by
-`make texcomp-astc-psnr`. The partition-pattern hash and the ISE/unquant data
-tables follow the Khronos ASTC specification (cross-checked against
-https://github.com/ARM-software/astc-encoder). The projection and
-reconstruction kernels of the encoder search have SSE2 and NEON variants
-that are bit-exact with the scalar forms (enforced by cross-backend parity
-tests); AVX2-widened kernels remain future optimization work.
+---
+
+## Third-party components
+
+### Arm astcenc — Apache-2.0
+- Copyright 2011-2024 Arm Limited. Vendored at `deps/astcenc`; license in
+  `deps/astcenc/LICENSE.txt`.
+- **Optional C++ backend.** `make texcomp-arm` builds astcenc as an alternate
+  encoder selectable with `--encoder arm`. The default `make texcomp` build is
+  pure C11 with no C++ parts.
+- **HDR endpoint codec port.** The ASTC HDR CEM 7 (base+scale) and CEM 11
+  (RGB direct) endpoint pack/unpack in `src/texcomp_astc_hdr.c`
+  (`tc_astc_cem7_pack/unpack`, `tc_astc_cem11_pack/unpack`) are ports of
+  astcenc's `quantize_hdr_rgbo`, `hdr_rgbo_unpack` and `hdr_rgb_unpack`.
+- **Conformance oracle.** The `texcomp-astc-arm-gate` and
+  `texcomp-astc-hdr-gate` tests decode texcomp output with astcenc's conformant
+  decoder to verify correctness.
+
+### bcdec.h — MIT (dual-licensed MIT / Unlicense)
+- Copyright (c) 2022 Sergii Kudlai. https://github.com/iOrange/bcdec
+- The **corrected BPTC (BC7) partition + anchor tables** in
+  `test/bc7_ref_decode.h`, and the **BC6H two-region (mode 9) partition table
+  and block bit layout** in `src/texcomp_bc6h.c`, are transcribed / mirrored
+  from bcdec (the tables published in the Khronos spec contain known errors).
+  bcdec was also used during development to cross-validate texcomp's BC7 and
+  BC6H reference decoders; it is not vendored or shipped.
+
+### Khronos ASTC / BPTC specifications
+- The ISE codec, 2D block-mode tables, partition-pattern hashing, and
+  unquantization tables in `src/texcomp_astc.c`, and the BC6H/BC7 block bit
+  layouts, follow the Khronos Data Format Specification (ASTC) and the BPTC
+  spec. Specification data (constants, bit layouts) is not copyrightable.
+
+### Basis Universal — Apache-2.0
+- Copyright (c) 2019-2024 Binomial LLC. https://github.com/BinomialLLC/basis_universal
+- The UASTC LDR / UASTC HDR 4x4 **mode subsets** implemented by texcomp's
+  `--format uastc_ldr` / `astc_hdr` follow the Basis UASTC specifications (all
+  output is standard ASTC). The `xbc7` format is a texcomp-native take on the
+  XBC7 *idea* (windowed RDO + entropy coding of BC7) — it is **not**
+  bitstream-compatible with Basis XBC7.
+
+### QuickBC7 / etcpak
+- BC7 quick-mode heuristics and API naming derive from a pure-C11 port of the
+  QuickBC7-enabled etcpak fork.
+  - Paper: *QuickBC7: Fast BC7 Texture Compression Heuristics*, Hyeon-ki Lee and
+    Jae-Ho Nah, Computers & Graphics 2026.
+  - Reference source: https://github.com/gusrlLee/etcpak (commit `b88c8f4`).
+
+### Zstandard (zstd) — BSD-3-Clause (dual BSD / GPLv2)
+- Copyright (c) Meta Platforms, Inc. Used via TinyEXR's vendored `deps/zstd`
+  (`tinyexr_zstd`). The `xbc7` container entropy-codes the BC7 stream with zstd.
+  Only the CLI links zstd; the pure-C11 texcomp library does not depend on it.
+
+### stb_image — public domain / MIT
+- Sean Barrett. `examples/common/stb_image.h`, used by the CLI (`texcomp_cli.c`)
+  only, for PNG loading.
+
+---
+
+## Feature status (informational)
+
+- **BC1/BC3/BC5/BC7** direct encoders; BC7 covers all 8 modes with a quick-mode
+  heuristic path and an exhaustive search, plus optional windowed RDO (`--rdo`).
+- **BC6H** (unsigned + signed): one-region mode 11 and two-region mode 9, both
+  with least-squares endpoint refinement; the mode-11 selector search has
+  SSE4.1/AVX2/NEON kernels that are bit-identical to scalar (cross-backend
+  parity tested). The higher-base delta-encoded 2-region modes remain future
+  work.
+- **ETC2 / EAC** encoders.
+- **ASTC LDR**: all fourteen 2D footprints, 1-4 partitions, dual-plane, CEM
+  0/4/6/8/10/12; integer least-squares endpoint refinement; SSE2/SSE4.1/AVX2/
+  NEON kernels bit-identical to scalar. Includes the constrained UASTC LDR
+  19-mode subset (`--format uastc_ldr`).
+- **ASTC HDR** (UASTC HDR 4x4): void-extent + CEM 7 (base+scale) and CEM 11
+  (RGB direct: single / dual-plane / 2-subset), LSQ-refined.
+- **xbc7**: texcomp-native supercompressed BC7 (windowed RDO + zstd), transcodes
+  to standard BC7.
+
+Conformance is verified by in-tree reference decoders (`test/astc_ref_decode.h`,
+`test/bc7_ref_decode.h`, `test/astc_hdr_ref_decode.h`) and by cross-checks
+against astcenc; quality is tracked by `make texcomp-astc-psnr`.

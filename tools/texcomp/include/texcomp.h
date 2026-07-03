@@ -2,7 +2,7 @@
  * TinyEXR texcomp - pure-C11 texture compression helpers.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef TINYEXR_TEXCOMP_H_

@@ -1,4 +1,7 @@
 /*
+ * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
+ * SPDX-License-Identifier: Apache-2.0
+ *
  * Gate for the xbc7 path: BC7 windowed RDO (tc_bc7_options.rdo) + the zstd
  * container round-trip. No BC7 decoder is needed here -- the container is
  * lossless (transcode is a byte-exact zstd decode), and the RDO's distortion

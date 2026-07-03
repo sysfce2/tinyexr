@@ -3,7 +3,7 @@
  * translation units (texcomp.c + texcomp_<codec>.c).
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef TINYEXR_TEXCOMP_INTERNAL_H_
