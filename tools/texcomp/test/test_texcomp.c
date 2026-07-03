@@ -1526,6 +1526,47 @@ int main(void) {
               TC_SUCCESS,
           "bc6h signed dds write");
     CHECK(rd_u32(dds + 112) == 96, "bc6h signed dxgi format");
+    {
+        /* The SIMD BC6H selector search must be byte-identical to scalar. */
+        enum { PW = 8, PH = 8 };
+        static float hp[PW * PH * 3];
+        uint8_t pref[(PW / 4) * (PH / 4) * 16], psimd[sizeof(pref)];
+        uint32_t pi_, avail = tc_backend_available_mask();
+        tc_bc6h_options po;
+        tc_bc6h_options_init(&po);
+        for (pi_ = 0; pi_ < (uint32_t)(PW * PH); ++pi_) {
+            float t = (float)pi_ / (float)(PW * PH);
+            hp[pi_ * 3 + 0] = 0.3f + t * 10.0f;
+            hp[pi_ * 3 + 1] = 0.2f + (1.0f - t) * 6.0f;
+            hp[pi_ * 3 + 2] = t * t * 15.0f;
+        }
+        tc_backend_force_mask(TC_BACKEND_SCALAR);
+        CHECK(tc_bc6h_compress_rgb32f(hp, PW, PH, PW * 3u * sizeof(float), &po,
+                                      pref, sizeof(pref)) == TC_SUCCESS,
+              "bc6h scalar forced");
+        if (avail & TC_BACKEND_SSE41) {
+            tc_backend_force_mask(TC_BACKEND_SSE41);
+            CHECK(tc_bc6h_compress_rgb32f(hp, PW, PH, PW * 3u * sizeof(float),
+                                          &po, psimd, sizeof(psimd)) == TC_SUCCESS,
+                  "bc6h sse4.1 forced");
+            CHECK(memcmp(pref, psimd, sizeof(pref)) == 0, "bc6h sse4.1 parity");
+        }
+        if (avail & TC_BACKEND_AVX2) {
+            tc_backend_force_mask(TC_BACKEND_AVX2);
+            CHECK(tc_bc6h_compress_rgb32f(hp, PW, PH, PW * 3u * sizeof(float),
+                                          &po, psimd, sizeof(psimd)) == TC_SUCCESS,
+                  "bc6h avx2 forced");
+            CHECK(memcmp(pref, psimd, sizeof(pref)) == 0, "bc6h avx2 parity");
+        }
+        if (avail & TC_BACKEND_NEON) {
+            tc_backend_force_mask(TC_BACKEND_NEON);
+            CHECK(tc_bc6h_compress_rgb32f(hp, PW, PH, PW * 3u * sizeof(float),
+                                          &po, psimd, sizeof(psimd)) == TC_SUCCESS,
+                  "bc6h neon forced");
+            CHECK(memcmp(pref, psimd, sizeof(pref)) == 0, "bc6h neon parity");
+        }
+        tc_backend_force_mask(TC_BACKEND_ALL);
+    }
     bc6h_opt.signed_float = 0;
 
     CHECK(tc_dds_write_bc7_memory(bc7, 7, 5, &opt, dds, sizeof(dds)) ==
