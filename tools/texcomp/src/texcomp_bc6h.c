@@ -287,6 +287,290 @@ static uint64_t tc_bc6h_refine_sf16(const int32_t q[16][3],
     return best;
 }
 
+/* --- BC6H mode 9 (two-region, 6.666) --------------------------------------
+ * 32 two-region partitions; each region has its own 6-bit endpoint pair and
+ * 3-bit indices. The block stores region-0 endpoint-0 absolute and the other
+ * three endpoints as 6-bit deltas from it, wrapped mod 64 -- so every pair is
+ * representable (unlike the higher-base 2-region modes whose small deltas only
+ * reach part of the range). Coarser endpoints than mode 11 but two regions, so
+ * it wins on blocks split across a colour/luma boundary that a single line
+ * cannot fit. Values map exactly to bcdec's mode-9 decode. */
+static const uint8_t tc_bc6h_part2[32][16] = {
+    {0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1}, {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1},
+    {0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1}, {0,0,0,1,0,0,1,1,0,0,1,1,0,1,1,1},
+    {0,0,0,0,0,0,0,1,0,0,0,1,0,0,1,1}, {0,0,1,1,0,1,1,1,0,1,1,1,1,1,1,1},
+    {0,0,0,1,0,0,1,1,0,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,1,0,0,1,1,0,1,1,1},
+    {0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,1}, {0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1},
+    {0,0,0,0,0,0,0,1,0,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,0,0,0,0,1,0,1,1,1},
+    {0,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1},
+    {0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1},
+    {0,0,0,0,1,0,0,0,1,1,1,0,1,1,1,1}, {0,1,1,1,0,0,0,1,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,1,0,0,0,1,1,1,0}, {0,1,1,1,0,0,1,1,0,0,0,1,0,0,0,0},
+    {0,0,1,1,0,0,0,1,0,0,0,0,0,0,0,0}, {0,0,0,0,1,0,0,0,1,1,0,0,1,1,1,0},
+    {0,0,0,0,0,0,0,0,1,0,0,0,1,1,0,0}, {0,1,1,1,0,0,1,1,0,0,1,1,0,0,0,1},
+    {0,0,1,1,0,0,0,1,0,0,0,1,0,0,0,0}, {0,0,0,0,1,0,0,0,1,0,0,0,1,1,0,0},
+    {0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0}, {0,0,1,1,0,1,1,0,0,1,1,0,1,1,0,0},
+    {0,0,0,1,0,1,1,1,1,1,1,0,1,0,0,0}, {0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0},
+    {0,1,1,1,0,0,0,1,1,0,0,0,1,1,1,0}, {0,0,1,1,1,0,0,1,1,0,0,1,1,1,0,0},
+};
+static const uint8_t tc_bc6h_part2_anchor[32] = {
+    15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,
+    15,2,8,2,2,8,8,15,2,8,2,2,8,8,2,2};
+
+static uint32_t tc_bc6h_quant_uf16_n(float f, uint32_t bits) {
+    uint16_t h;
+    uint32_t mag;
+    if (!(f > 0.0f)) return 0;
+    h = tc_float_to_half_bits(f);
+    mag = h & 0x7fffu;
+    if (mag > 0x7bffu) mag = 0x7bffu;
+    return (mag * ((1u << bits) - 1u) + 15871u) / 31743u;
+}
+static uint32_t tc_bc6h_unquant_n_to_mag(uint32_t q, uint32_t bits) {
+    uint32_t unq;
+    if (q == 0u) unq = 0u;
+    else if (q >= (1u << bits) - 1u) unq = 0xffffu;
+    else unq = ((q << 16) + 0x8000u) >> bits;
+    return (unq * 31u) >> 6;
+}
+
+/* Per-texel 3-bit selectors + total error for one candidate partition/endpoints
+ * (endpoints ep[region*2 + 0/1], 6-bit). */
+static uint64_t tc_bc6h_mode9_selectors(const uint32_t q[16][3],
+                                        const uint32_t target[16][3],
+                                        const uint8_t part[16],
+                                        const uint32_t ep[4][3], uint8_t sel[16]) {
+    static const uint32_t w3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+    uint32_t pal[2][8][3], r, s, c, i;
+    uint64_t err = 0;
+    (void)q;
+    for (r = 0; r < 2u; ++r)
+        for (s = 0; s < 8u; ++s)
+            for (c = 0; c < 3u; ++c) {
+                uint32_t qv = ((64u - w3[s]) * ep[r * 2][c] + w3[s] * ep[r * 2 + 1][c] +
+                               32u) >> 6;
+                pal[r][s][c] = tc_bc6h_unquant_n_to_mag(qv, 6);
+            }
+    for (i = 0; i < 16u; ++i) {
+        uint32_t reg = part[i], best = 0, berr = UINT_MAX;
+        for (s = 0; s < 8u; ++s) {
+            uint32_t e = tc_bc6h_err3_mag(target[i], pal[reg][s][0], pal[reg][s][1],
+                                          pal[reg][s][2]);
+            if (e < berr) {
+                berr = e;
+                best = s;
+            }
+        }
+        sel[i] = (uint8_t)best;
+        err += berr;
+    }
+    return err;
+}
+
+static void tc_bc6h_w(uint8_t out[16], uint32_t *bp, uint32_t v, uint32_t n) {
+    tc_set_bits(out, bp, v, (int)n);
+}
+
+/* Encode the block as BC6H mode 9; returns the reconstruction error. */
+static uint64_t tc_bc6h_mode9_uf16(const float pix[16][3], uint8_t out[16]) {
+    uint32_t q[16][3], target[16][3], i, c, p;
+    uint32_t bep[4][3];
+    uint8_t bsel[16];
+    int best_p = -1, r;
+    uint64_t best_err = (uint64_t)-1;
+    uint32_t R[4], G[4], B[4], bitpos = 0, anchor;
+    for (i = 0; i < 16u; ++i)
+        for (c = 0; c < 3u; ++c) {
+            q[i][c] = tc_bc6h_quant_uf16_n(pix[i][c], 6);
+            /* error reference at 10-bit precision, so mode-9 and mode-11 errors
+             * are measured against the same target and are comparable. */
+            target[i][c] = tc_bc6h_unquant_uf16_to_mag(tc_bc6h_quant_uf16(pix[i][c]));
+        }
+    /* Two-pass partition search: a cheap per-region bounding-box "spread" score
+     * ranks all 32 partitions, then only the best few get the full selector
+     * search. A partition that splits the block into two tight regions scores
+     * low and is what wins, so the prefilter rarely drops the true best. */
+    {
+        enum { TOPK = 5u };
+        uint32_t cand[TOPK], k, ncand = 0;
+        uint64_t cscore[TOPK];
+        for (p = 0; p < 32u; ++p) {
+            uint32_t rlo[2][3], rhi[2][3];
+            uint64_t score = 0;
+            int have[2] = {0, 0};
+            for (c = 0; c < 3u; ++c) {
+                rlo[0][c] = rlo[1][c] = 63u;
+                rhi[0][c] = rhi[1][c] = 0u;
+            }
+            for (i = 0; i < 16u; ++i) {
+                uint32_t reg = tc_bc6h_part2[p][i];
+                for (c = 0; c < 3u; ++c) {
+                    if (q[i][c] < rlo[reg][c]) rlo[reg][c] = q[i][c];
+                    if (q[i][c] > rhi[reg][c]) rhi[reg][c] = q[i][c];
+                }
+                have[reg] = 1;
+            }
+            if (!have[0] || !have[1]) continue;
+            for (c = 0; c < 3u; ++c) {
+                uint64_t e0 = rhi[0][c] - rlo[0][c], e1 = rhi[1][c] - rlo[1][c];
+                score += e0 * e0 + e1 * e1;
+            }
+            /* insertion into the top-TOPK-smallest-score list */
+            if (ncand < TOPK) {
+                cand[ncand] = p;
+                cscore[ncand] = score;
+                ++ncand;
+            } else {
+                uint32_t worst = 0;
+                for (k = 1; k < TOPK; ++k)
+                    if (cscore[k] > cscore[worst]) worst = k;
+                if (score < cscore[worst]) {
+                    cand[worst] = p;
+                    cscore[worst] = score;
+                }
+            }
+        }
+        for (k = 0; k < ncand; ++k) {
+            uint32_t ep[4][3], rlo[2][3], rhi[2][3];
+            uint8_t sel[16];
+            uint64_t err;
+            p = cand[k];
+            for (c = 0; c < 3u; ++c) {
+                rlo[0][c] = rlo[1][c] = 63u;
+                rhi[0][c] = rhi[1][c] = 0u;
+            }
+            for (i = 0; i < 16u; ++i) {
+                uint32_t reg = tc_bc6h_part2[p][i];
+                for (c = 0; c < 3u; ++c) {
+                    if (q[i][c] < rlo[reg][c]) rlo[reg][c] = q[i][c];
+                    if (q[i][c] > rhi[reg][c]) rhi[reg][c] = q[i][c];
+                }
+            }
+            for (c = 0; c < 3u; ++c) {
+                ep[0][c] = rlo[0][c];
+                ep[1][c] = rhi[0][c];
+                ep[2][c] = rlo[1][c];
+                ep[3][c] = rhi[1][c];
+            }
+            err = tc_bc6h_mode9_selectors(q, target, tc_bc6h_part2[p], ep, sel);
+            if (err < best_err) {
+                best_err = err;
+                best_p = (int)p;
+                memcpy(bep, ep, sizeof(ep));
+                memcpy(bsel, sel, 16u);
+            }
+        }
+    }
+    if (best_p < 0) return (uint64_t)-1;
+
+    /* Per-region least-squares refinement of the winning partition. */
+    {
+        static const uint32_t w3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+        int round, rr;
+        for (round = 0; round < 2; ++round) {
+            uint32_t nep[4][3];
+            uint8_t nsel[16];
+            uint64_t e;
+            for (rr = 0; rr < 2; ++rr)
+                for (c = 0; c < 3u; ++c) {
+                    int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+                    for (i = 0; i < 16u; ++i) {
+                        int64_t bb, a, pp;
+                        if ((int)tc_bc6h_part2[best_p][i] != rr) continue;
+                        bb = w3[bsel[i]];
+                        a = 64 - bb;
+                        pp = q[i][c];
+                        saa += a * a;
+                        sab += a * bb;
+                        sbb += bb * bb;
+                        sap += a * pp;
+                        sbp += bb * pp;
+                    }
+                    det = saa * sbb - sab * sab;
+                    if (det <= 0) {
+                        nep[rr * 2][c] = bep[rr * 2][c];
+                        nep[rr * 2 + 1][c] = bep[rr * 2 + 1][c];
+                        continue;
+                    }
+                    l = tc_bc6h_rdiv((sap * sbb - sbp * sab) * 64, det);
+                    h = tc_bc6h_rdiv((sbp * saa - sap * sab) * 64, det);
+                    if (l < 0) l = 0;
+                    if (l > 63) l = 63;
+                    if (h < 0) h = 0;
+                    if (h > 63) h = 63;
+                    nep[rr * 2][c] = (uint32_t)l;
+                    nep[rr * 2 + 1][c] = (uint32_t)h;
+                }
+            e = tc_bc6h_mode9_selectors(q, target, tc_bc6h_part2[best_p], nep, nsel);
+            if (e < best_err) {
+                best_err = e;
+                memcpy(bep, nep, sizeof(nep));
+                memcpy(bsel, nsel, 16u);
+            } else {
+                break;
+            }
+        }
+    }
+    anchor = tc_bc6h_part2_anchor[best_p];
+
+    /* Anchor fix-up: each region's anchor texel index must have its MSB clear
+     * (it is stored with one fewer bit). Region 0's anchor is texel 0. */
+    for (r = 0; r < 2; ++r) {
+        uint32_t at = (r == 0) ? 0u : anchor;
+        if (bsel[at] & 4u) {
+            for (c = 0; c < 3u; ++c) {
+                uint32_t t = bep[r * 2][c];
+                bep[r * 2][c] = bep[r * 2 + 1][c];
+                bep[r * 2 + 1][c] = t;
+            }
+            for (i = 0; i < 16u; ++i)
+                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+        }
+    }
+
+    /* Mode 9 (like mode 11) stores all four endpoints explicitly at 6 bits --
+     * no delta transform -- so any two regions are representable. */
+    for (c = 0; c < 3u; ++c) {
+        uint32_t *E = (c == 0) ? R : (c == 1) ? G : B;
+        E[0] = bep[0][c];
+        E[1] = bep[1][c];
+        E[2] = bep[2][c];
+        E[3] = bep[3][c];
+    }
+
+    memset(out, 0, 16u);
+    tc_bc6h_w(out, &bitpos, 30u, 5); /* mode 9 code 0b11110 */
+    tc_bc6h_w(out, &bitpos, R[0], 6);              /* rw[5:0] */
+    tc_bc6h_w(out, &bitpos, (G[3] >> 4) & 1u, 1);  /* gz[4]   */
+    tc_bc6h_w(out, &bitpos, B[3] & 1u, 1);         /* bz[0]   */
+    tc_bc6h_w(out, &bitpos, (B[3] >> 1) & 1u, 1);  /* bz[1]   */
+    tc_bc6h_w(out, &bitpos, (B[2] >> 4) & 1u, 1);  /* by[4]   */
+    tc_bc6h_w(out, &bitpos, G[0], 6);              /* gw[5:0] */
+    tc_bc6h_w(out, &bitpos, (G[2] >> 5) & 1u, 1);  /* gy[5]   */
+    tc_bc6h_w(out, &bitpos, (B[2] >> 5) & 1u, 1);  /* by[5]   */
+    tc_bc6h_w(out, &bitpos, (B[3] >> 2) & 1u, 1);  /* bz[2]   */
+    tc_bc6h_w(out, &bitpos, (G[2] >> 4) & 1u, 1);  /* gy[4]   */
+    tc_bc6h_w(out, &bitpos, B[0], 6);              /* bw[5:0] */
+    tc_bc6h_w(out, &bitpos, (G[3] >> 5) & 1u, 1);  /* gz[5]   */
+    tc_bc6h_w(out, &bitpos, (B[3] >> 3) & 1u, 1);  /* bz[3]   */
+    tc_bc6h_w(out, &bitpos, (B[3] >> 5) & 1u, 1);  /* bz[5]   */
+    tc_bc6h_w(out, &bitpos, (B[3] >> 4) & 1u, 1);  /* bz[4]   */
+    tc_bc6h_w(out, &bitpos, R[1], 6);              /* rx[5:0] */
+    tc_bc6h_w(out, &bitpos, G[2] & 0xfu, 4);       /* gy[3:0] */
+    tc_bc6h_w(out, &bitpos, G[1], 6);              /* gx[5:0] */
+    tc_bc6h_w(out, &bitpos, G[3] & 0xfu, 4);       /* gz[3:0] */
+    tc_bc6h_w(out, &bitpos, B[1], 6);              /* bx[5:0] */
+    tc_bc6h_w(out, &bitpos, B[2] & 0xfu, 4);       /* by[3:0] */
+    tc_bc6h_w(out, &bitpos, R[2], 6);              /* ry[5:0] */
+    tc_bc6h_w(out, &bitpos, R[3], 6);              /* rz[5:0] */
+    tc_bc6h_w(out, &bitpos, (uint32_t)best_p, 5);  /* partition */
+    for (i = 0; i < 16u; ++i) {
+        uint32_t nb = (i == 0u || i == anchor) ? 2u : 3u;
+        tc_bc6h_w(out, &bitpos, bsel[i], nb);
+    }
+    return best_err;
+}
+
 static void tc_encode_bc6h_block_uf16(const float pix[16][3], uint8_t out[16]) {
     uint32_t q[16][3], target[16][3], lo[3], hi[3], luma_lo[3], luma_hi[3];
     uint32_t i, c, bitpos = 0, min_l = UINT_MAX, max_l = 0, min_i = 0, max_i = 0;
@@ -326,26 +610,35 @@ static void tc_encode_bc6h_block_uf16(const float pix[16][3], uint8_t out[16]) {
     } else {
         memcpy(sel, box_sel, sizeof(sel));
     }
-    (void)tc_bc6h_refine_uf16(q, target, lo, hi, sel);
-    if (sel[0] & 8u) {
-        uint32_t t;
-        for (c = 0; c < 3u; ++c) {
-            t = lo[c];
-            lo[c] = hi[c];
-            hi[c] = t;
+    {
+        uint64_t err11 = tc_bc6h_refine_uf16(q, target, lo, hi, sel);
+        uint8_t out9[16];
+        if (sel[0] & 8u) {
+            uint32_t t;
+            for (c = 0; c < 3u; ++c) {
+                t = lo[c];
+                lo[c] = hi[c];
+                hi[c] = t;
+            }
+            for (i = 0; i < 16u; ++i) sel[i] = (uint8_t)(15u - sel[i]);
         }
-        for (i = 0; i < 16u; ++i) sel[i] = (uint8_t)(15u - sel[i]);
+        tc_set_bits(out, &bitpos, 0x03u, 5); /* mode 11: bit pattern 00011 */
+        tc_set_bits(out, &bitpos, lo[0], 10);
+        tc_set_bits(out, &bitpos, lo[1], 10);
+        tc_set_bits(out, &bitpos, lo[2], 10);
+        tc_set_bits(out, &bitpos, hi[0], 10);
+        tc_set_bits(out, &bitpos, hi[1], 10);
+        tc_set_bits(out, &bitpos, hi[2], 10);
+        tc_set_bits(out, &bitpos, sel[0], 3);
+        for (i = 1; i < 16u; ++i) tc_set_bits(out, &bitpos, sel[i], 4);
+        /* Two-region mode 9 only helps when a single endpoint line leaves real
+         * error, so skip its partition search on blocks mode 11 already fits
+         * well (~per-channel RMS below ~256 of the 0..31744 magnitude range).
+         * This keeps the common single-region block on the fast path. */
+        if (err11 > 48ull * 256 * 256 &&
+            tc_bc6h_mode9_uf16(pix, out9) < err11)
+            memcpy(out, out9, 16u);
     }
-
-    tc_set_bits(out, &bitpos, 0x03u, 5); /* BC6H mode 11: bit pattern 00011 */
-    tc_set_bits(out, &bitpos, lo[0], 10);
-    tc_set_bits(out, &bitpos, lo[1], 10);
-    tc_set_bits(out, &bitpos, lo[2], 10);
-    tc_set_bits(out, &bitpos, hi[0], 10);
-    tc_set_bits(out, &bitpos, hi[1], 10);
-    tc_set_bits(out, &bitpos, hi[2], 10);
-    tc_set_bits(out, &bitpos, sel[0], 3);
-    for (i = 1; i < 16u; ++i) tc_set_bits(out, &bitpos, sel[i], 4);
 }
 
 static void tc_encode_bc6h_block_sf16(const float pix[16][3], uint8_t out[16]) {
