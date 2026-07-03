@@ -427,6 +427,7 @@ int main(int argc, char **argv) {
         format = "astc";
         astc_opt.block_x = 4;
         astc_opt.block_y = 4;
+        astc_opt.uastc = 1;
     }
     if (strcmp(format, "etc2") == 0 || strcmp(format, "etc2_rgba") == 0) {
         etc2_opt.alpha = 1;

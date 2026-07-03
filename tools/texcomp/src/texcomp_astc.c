@@ -4246,6 +4246,140 @@ uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
     return sse;
 }
 
+/* --- UASTC LDR 4x4 (constrained ASTC LDR) -------------------------------
+ * Encode a 4x4 block using only the UASTC LDR single-subset modes: CEM 8
+ * (opaque RGB) modes 0/1/5/18 or CEM 12 (RGBA) modes 10/12/14, i.e. a fixed
+ * 4x4 weight grid at weight range {8,5,2,11}/{8,5,2}, with the endpoint range
+ * derived by the standard ASTC bit budget (which yields the UASTC endpoint
+ * range for each mode). Constant blocks use the solid (void-extent) mode 8.
+ * Multi-subset and dual-plane UASTC modes are not yet emitted. */
+static int tc_uastc_encode_mode(const uint8_t block[144][4], uint32_t count,
+                                const tc_astc_encode_context *ctx, uint32_t cem,
+                                uint32_t nv, uint32_t qm,
+                                const uint32_t lo[4], const uint32_t hi[4],
+                                uint8_t out[16], uint64_t *out_sse) {
+    uint8_t weightbuf[16], values[8], sym[8], wsym[16];
+    uint32_t qe0[4], qe1[4], er, weight_bits, color_bits, bm, bitpos;
+    uint8_t wt[144];
+    int dir[4], nch = (cem == 12u) ? 4 : 3;
+    int64_t dl = 0;
+    uint32_t i, c;
+
+    bm = tc_astc_hdr_find_grid_mode(qm);
+    if (!bm) return 0;
+    weight_bits = tc_astc_ise_sequence_bitcount(16u, qm);
+    if (weight_bits >= 111u) return 0;
+    color_bits = 111u - weight_bits;
+    if (!tc_astc_lut_color_quant(ctx, nv, color_bits, &er)) return 0;
+
+    values[0] = (uint8_t)lo[0];
+    values[1] = (uint8_t)hi[0];
+    values[2] = (uint8_t)lo[1];
+    values[3] = (uint8_t)hi[1];
+    values[4] = (uint8_t)lo[2];
+    values[5] = (uint8_t)hi[2];
+    if (cem == 12u) {
+        values[6] = (uint8_t)lo[3];
+        values[7] = (uint8_t)hi[3];
+    }
+    tc_astc_quantize_color_values(ctx, er, nv, values, sym);
+    for (c = 0; c < (uint32_t)nch; ++c) {
+        qe0[c] = tc_astc_color_symbol_uquant(er, sym[c * 2u]);
+        qe1[c] = tc_astc_color_symbol_uquant(er, sym[c * 2u + 1u]);
+        dir[c] = (int)qe1[c] - (int)qe0[c];
+        dl += (int64_t)dir[c] * dir[c];
+    }
+    if (cem != 12u) {
+        qe0[3] = 255u;
+        qe1[3] = 255u;
+    }
+    for (i = 0; i < count; ++i) {
+        int w64 = 0;
+        if (dl > 0) {
+            int64_t dot = 0;
+            for (c = 0; c < (uint32_t)nch; ++c)
+                dot += ((int64_t)block[i][c] - (int)qe0[c]) * dir[c];
+            if (dot < 0) dot = 0;
+            if (dot > dl) dot = dl;
+            w64 = (int)((dot * 64 + dl / 2) / dl);
+        }
+        wsym[i] = tc_astc_hdr_quant_weight(w64, qm, tc_astc_quant_levels(qm));
+        wt[i] = (uint8_t)tc_astc_weight_unquant(wsym[i], qm);
+    }
+    *out_sse = tc_astc_recon_sse(block, count, qe0, qe1, wt);
+
+    /* ascending-sum ordering to avoid the decoder's blue-contract path. */
+    if (qe0[0] + qe0[1] + qe0[2] > qe1[0] + qe1[1] + qe1[2]) {
+        uint32_t pc = (cem == 12u) ? 4u : 3u, k;
+        for (k = 0; k < pc; ++k) {
+            uint8_t t = sym[k * 2u];
+            sym[k * 2u] = sym[k * 2u + 1u];
+            sym[k * 2u + 1u] = t;
+        }
+        tc_astc_invert_weights(wsym, 16u, qm);
+    }
+
+    memset(out, 0, 16u);
+    memset(weightbuf, 0, sizeof(weightbuf));
+    tc_astc_scramble_weights(wsym, 16u, qm);
+    (void)tc_astc_ise_encode_bits(qm, 16u, wsym, weightbuf, sizeof(weightbuf),
+                                  0u);
+    for (i = 0; i < 16u; ++i) out[i] = tc_bitrev8(weightbuf[15u - i]);
+    bitpos = 0;
+    tc_set_bits(out, &bitpos, bm, 11u);
+    tc_set_bits(out, &bitpos, 0u, 2u);
+    tc_set_bits(out, &bitpos, cem, 4u);
+    (void)tc_astc_ise_encode_bits(er, nv, sym, out, 16u, 17u);
+    return 1;
+}
+
+static void tc_encode_uastc_ldr_block(const uint8_t block[144][4],
+                                      uint32_t count,
+                                      const tc_astc_encode_context *ctx,
+                                      uint8_t out[16]) {
+    static const uint32_t wr_opaque[4] = {8u, 5u, 2u, 11u};
+    static const uint32_t wr_alpha[3] = {8u, 5u, 2u};
+    uint32_t lo[4] = {255u, 255u, 255u, 255u}, hi[4] = {0, 0, 0, 0};
+    uint32_t i, c, n, opaque, cem, nv, best_found = 0;
+    const uint32_t *wr;
+    uint64_t best_sse = (uint64_t)-1;
+    uint8_t tmp[16];
+
+    if (tc_astc_block_is_solid(block, count)) {
+        uint32_t sum[4] = {0, 0, 0, 0};
+        for (i = 0; i < count; ++i)
+            for (c = 0; c < 4u; ++c) sum[c] += block[i][c];
+        tc_astc_write_const_from_sum(sum, count, out);
+        return;
+    }
+    opaque = (uint32_t)tc_astc_block_is_opaque(block, count);
+    cem = opaque ? 8u : 12u;
+    nv = opaque ? 6u : 8u;
+    wr = opaque ? wr_opaque : wr_alpha;
+    n = opaque ? 4u : 3u;
+    for (i = 0; i < count; ++i)
+        for (c = 0; c < 4u; ++c) {
+            if (block[i][c] < lo[c]) lo[c] = block[i][c];
+            if (block[i][c] > hi[c]) hi[c] = block[i][c];
+        }
+    for (i = 0; i < n; ++i) {
+        uint64_t sse;
+        if (tc_uastc_encode_mode(block, count, ctx, cem, nv, wr[i], lo, hi, tmp,
+                                 &sse) &&
+            (!best_found || sse < best_sse)) {
+            best_sse = sse;
+            best_found = 1;
+            memcpy(out, tmp, 16u);
+        }
+    }
+    if (!best_found) {
+        uint32_t sum[4] = {0, 0, 0, 0};
+        for (i = 0; i < count; ++i)
+            for (c = 0; c < 4u; ++c) sum[c] += block[i][c];
+        tc_astc_write_const_from_sum(sum, count, out);
+    }
+}
+
 #if defined(TC_X86)
 TC_TARGET("sse2")
 static void tc_encode_astc_const_block_sse2(const uint8_t block[16][4],
@@ -4424,7 +4558,10 @@ static tc_result tc_astc_compress_band(tc_astc_encode_context *astc_ctx,
                     ++count;
                 }
             }
-            if (!tc_astc_block_is_solid(block, count)) {
+            if (opt->uastc) {
+                tc_encode_uastc_ldr_block(block, count, astc_ctx,
+                                          out_astc + off);
+            } else if (!tc_astc_block_is_solid(block, count)) {
                 tc_encode_astc_ldr_block(block, count, opt->quality, astc_ctx,
                                          out_astc + off);
             } else {

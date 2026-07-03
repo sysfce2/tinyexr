@@ -70,6 +70,11 @@ typedef struct tc_astc_options {
      * __STDC_NO_THREADS__ always encode serially. Output is byte-identical
      * for any thread count. */
     int threads;
+    /* Constrain the encoder to the UASTC LDR 4x4 mode subset (block must be
+     * 4x4). Currently the single-subset opaque (CEM 8) / alpha (CEM 12) modes
+     * plus the solid mode; the multi-subset and dual-plane UASTC modes are not
+     * yet emitted. Output is still standard ASTC LDR 4x4. */
+    int uastc;
 } tc_astc_options;
 
 /* ASTC HDR (UASTC HDR 4x4). Float RGB(A) input, standard ASTC HDR 4x4 output.

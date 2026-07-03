@@ -169,6 +169,50 @@ int main(void) {
                 parm, ptc, TOL);
         return 1;
     }
+    /* UASTC LDR 4x4: constrained encode must decode cleanly and use only the
+     * single-subset CEM 8/12 modes (or the solid void-extent). */
+    {
+        static uint8_t ublk[(W / 4) * (H / 4) * 16];
+        tc_astc_options uopt;
+        size_t un, b;
+        double pu;
+        tc_astc_options_init(&uopt);
+        uopt.block_x = 4;
+        uopt.block_y = 4;
+        uopt.uastc = 1;
+        un = tc_astc_compressed_size(W, H, &uopt);
+        if (tc_astc_compress_rgba8(img, W, H, W * 4u, &uopt, ublk, un) !=
+            TC_SUCCESS) {
+            fprintf(stderr, "FAIL: uastc encode\n");
+            return 1;
+        }
+        if (astc_decode(ublk, un, W, H, 4, 4, dec_tc) != 0) {
+            fprintf(stderr, "FAIL: uastc decode\n");
+            return 1;
+        }
+        for (b = 0; b + 16 <= un; b += 16) {
+            const uint8_t *p = ublk + b;
+            unsigned bm = (unsigned)p[0] | ((unsigned)(p[1] & 7u) << 8);
+            unsigned pc, cem;
+            if ((bm & 0x1ffu) == 0x1fcu) continue; /* void-extent (solid) */
+            pc = ((unsigned)p[1] >> 3) & 3u; /* partition count - 1 */
+            /* single-subset CEM = bits 13..16 (3 in byte 1, 1 in byte 2). */
+            cem = (((unsigned)p[1] >> 5) & 7u) | (((unsigned)p[2] & 1u) << 3);
+            if (pc != 0u || (cem != 8u && cem != 12u)) {
+                fprintf(stderr,
+                        "FAIL: uastc non-conforming block %zu (pc=%u cem=%u)\n",
+                        b / 16u, pc + 1u, cem);
+                return 1;
+            }
+        }
+        pu = psnr8(img, dec_tc, sizeof(img));
+        printf("uastc-ldr 64x64: %.2f dB (constrained modes)\n", pu);
+        if (pu < FLOOR) {
+            fprintf(stderr, "FAIL: uastc psnr %.2f below floor\n", pu);
+            return 1;
+        }
+    }
+
     printf("astc arm xcheck: OK\n");
     return 0;
 }
