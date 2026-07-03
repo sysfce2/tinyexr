@@ -71,9 +71,10 @@ typedef struct tc_astc_options {
      * for any thread count. */
     int threads;
     /* Constrain the encoder to the UASTC LDR 4x4 mode subset (block must be
-     * 4x4). Emits the single-subset, 2-subset and dual-plane CEM 8 (RGB) /
-     * CEM 12 (RGBA) modes plus the solid mode; the 3-subset and LA (CEM 4)
-     * modes are not yet emitted. Output is still standard ASTC LDR 4x4. */
+     * 4x4). Emits the full 19-mode set: single/2/3-subset and dual-plane
+     * CEM 8 (RGB), CEM 12 (RGBA) and CEM 4 (luminance+alpha) modes plus the
+     * solid mode. Output is standard ASTC LDR 4x4 (endpoints are bbox-fit, not
+     * yet LSQ-refined). */
     int uastc;
 } tc_astc_options;
 
