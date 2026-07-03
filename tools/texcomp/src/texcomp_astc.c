@@ -4015,6 +4015,70 @@ static uint8_t tc_astc_hdr_quant_weight(int w64, uint32_t qm, uint32_t levels) {
     return (uint8_t)best;
 }
 
+/* Least-squares HDR endpoints in the LNS domain: given per-texel interpolation
+ * weights wt[i] (0..64), solve the two LNS endpoints per channel that minimize
+ * the LNS-domain reconstruction error (the same 2x2 normal equations as the LDR
+ * solver, but over 16-bit LNS values). Endpoints are clamped to [0,65535].
+ * A degenerate (zero-determinant) channel keeps its incoming endpoints. */
+static void tc_astc_hdr_lsq(const int lns[16][3], const uint8_t wt[16],
+                            int e0[3], int e1[3]) {
+    int c, i;
+    for (c = 0; c < 3; ++c) {
+        int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+        for (i = 0; i < 16; ++i) {
+            int64_t a = 64 - wt[i], b = wt[i], p = lns[i][c];
+            saa += a * a;
+            sab += a * b;
+            sbb += b * b;
+            sap += a * p;
+            sbp += b * p;
+        }
+        det = saa * sbb - sab * sab;
+        if (det <= 0) continue;
+        l = tc_div_round_s64((sap * sbb - sbp * sab) * 64, det);
+        h = tc_div_round_s64((sbp * saa - sap * sab) * 64, det);
+        if (l < 0) l = 0;
+        if (l > 65535) l = 65535;
+        if (h < 0) h = 0;
+        if (h > 65535) h = 65535;
+        e0[c] = (int)l;
+        e1[c] = (int)h;
+    }
+}
+
+/* Partition-aware LNS least-squares: as tc_astc_hdr_lsq, but summing only the
+ * texels assigned to `subset` (for the 2-subset HDR path). */
+static void tc_astc_hdr_lsq_part(const int lns[16][3], const uint8_t wt[16],
+                                 const uint8_t *pot, int subset, int e0[3],
+                                 int e1[3]) {
+    int c, i;
+    for (c = 0; c < 3; ++c) {
+        int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+        for (i = 0; i < 16; ++i) {
+            int64_t a, b, p;
+            if (pot[i] != subset) continue;
+            a = 64 - wt[i];
+            b = wt[i];
+            p = lns[i][c];
+            saa += a * a;
+            sab += a * b;
+            sbb += b * b;
+            sap += a * p;
+            sbp += b * p;
+        }
+        det = saa * sbb - sab * sab;
+        if (det <= 0) continue;
+        l = tc_div_round_s64((sap * sbb - sbp * sab) * 64, det);
+        h = tc_div_round_s64((sbp * saa - sap * sab) * 64, det);
+        if (l < 0) l = 0;
+        if (l > 65535) l = 65535;
+        if (h < 0) h = 0;
+        if (h > 65535) h = 65535;
+        e0[c] = (int)l;
+        e1[c] = (int)h;
+    }
+}
+
 uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     static uint32_t bm_single = 0xffffffffu, bm_dual = 0xffffffffu;
     uint8_t weightbuf[16], packed[8], sw[16];
@@ -4040,31 +4104,61 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
             if (lns[i][c] < e0[c]) e0[c] = lns[i][c];
             if (lns[i][c] > e1[c]) e1[c] = lns[i][c];
         }
-    tc_astc_cem11_pack(e0, e1, 20, v);
+
+    /* Single-plane fit with LNS least-squares refinement: round 0 uses the
+     * bbox endpoints; each further round re-solves the endpoints against the
+     * current weights, re-packs, and keeps the lowest-SSE quantized result. */
+    {
+        uint8_t best_v[8] = {0}, best_sw[16] = {0};
+        int64_t best_sse = -1;
+        int round;
+        for (round = 0; round < 3; ++round) {
+            uint8_t wt[16];
+            int64_t sse = 0, dl = 0;
+            int q0[3], q1[3], d[3];
+            tc_astc_cem11_pack(e0, e1, 20, v);
+            tc_astc_cem11_unpack(v, q0, q1);
+            for (c = 0; c < 3; ++c) {
+                d[c] = q1[c] - q0[c];
+                dl += (int64_t)d[c] * d[c];
+            }
+            for (i = 0; i < 16; ++i) {
+                int w64 = 0, uq;
+                if (dl > 0) {
+                    int64_t dot = 0;
+                    for (c = 0; c < 3; ++c)
+                        dot += ((int64_t)lns[i][c] - q0[c]) * d[c];
+                    if (dot < 0) dot = 0;
+                    if (dot > dl) dot = dl;
+                    w64 = (int)((dot * 64 + dl / 2) / dl);
+                }
+                sw[i] = tc_astc_hdr_quant_weight(w64, 5u, 8u);
+                uq = (int)tc_astc_weight_unquant(sw[i], 5u);
+                wt[i] = (uint8_t)uq;
+                for (c = 0; c < 3; ++c) {
+                    int64_t rec = q0[c] + ((int64_t)d[c] * uq) / 64;
+                    int64_t e = rec - lns[i][c];
+                    sse += e * e;
+                }
+            }
+            if (best_sse < 0 || sse < best_sse) {
+                best_sse = sse;
+                memcpy(best_v, v, sizeof(best_v));
+                memcpy(best_sw, sw, sizeof(best_sw));
+            } else {
+                break;
+            }
+            if (round + 1 < 3) tc_astc_hdr_lsq(lns, wt, e0, e1);
+        }
+        memcpy(v, best_v, sizeof(v));
+        memcpy(sw, best_sw, sizeof(sw));
+        sse_single = best_sse;
+    }
+    /* qe0/qe1/dir for the dual-plane path use the winning single endpoints. */
     tc_astc_cem11_unpack(v, qe0, qe1);
     for (c = 0; c < 3; ++c) {
         dir[c] = qe1[c] - qe0[c];
         dlen2 += (int64_t)dir[c] * dir[c];
-    }
-
-    /* single plane: project all 3 channels, weights at range 8 (3-bit). */
-    for (i = 0; i < 16; ++i) {
-        int w64 = 0, uq;
-        if (dlen2 > 0) {
-            int64_t dot = 0;
-            for (c = 0; c < 3; ++c)
-                dot += ((int64_t)lns[i][c] - qe0[c]) * dir[c];
-            if (dot < 0) dot = 0;
-            if (dot > dlen2) dot = dlen2;
-            w64 = (int)((dot * 64 + dlen2 / 2) / dlen2);
-        }
-        sw[i] = tc_astc_hdr_quant_weight(w64, 5u, 8u);
-        uq = (int)tc_astc_weight_unquant(sw[i], 5u);
-        for (c = 0; c < 3; ++c) {
-            int64_t rec = qe0[c] + ((int64_t)dir[c] * uq) / 64;
-            int64_t e = rec - lns[i][c];
-            sse_single += e * e;
-        }
     }
 
     /* dual plane: one channel gets its own weight plane. Try each candidate
@@ -4190,46 +4284,75 @@ uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
     if (!tc_astc_lut_color_quant(&tc_hdr_ctx, 12u, 99u - 32u, &clevel))
         return (uint64_t)-1;
 
-    cnt[0] = cnt[1] = 0;
-    for (s = 0; s < 2; ++s) {
-        int e0[3] = {0, 0, 0}, e1[3] = {0, 0, 0}, have = 0;
-        uint8_t vv[6];
-        for (i = 0; i < 16; ++i) {
-            if (pi->partition_of_texel[i] != s) continue;
-            for (c = 0; c < 3; ++c) {
-                if (!have || lns[i][c] < e0[c]) e0[c] = lns[i][c];
-                if (!have || lns[i][c] > e1[c]) e1[c] = lns[i][c];
+    /* Per-subset bbox endpoints, then per-subset LNS least-squares refinement
+     * over a few rounds (keep the lowest-SSE quantized result). */
+    {
+        int rlo[2][3] = {{0, 0, 0}, {0, 0, 0}};
+        int rhi[2][3] = {{0, 0, 0}, {0, 0, 0}};
+        uint8_t best_ev[16] = {0}, best_w[16] = {0};
+        int64_t best_sse = -1;
+        int round;
+        cnt[0] = cnt[1] = 0;
+        for (s = 0; s < 2; ++s) {
+            int have = 0;
+            for (i = 0; i < 16; ++i) {
+                if (pi->partition_of_texel[i] != s) continue;
+                for (c = 0; c < 3; ++c) {
+                    if (!have || lns[i][c] < rlo[s][c]) rlo[s][c] = lns[i][c];
+                    if (!have || lns[i][c] > rhi[s][c]) rhi[s][c] = lns[i][c];
+                }
+                have = 1;
+                cnt[s]++;
             }
-            have = 1;
-            cnt[s]++;
         }
-        tc_astc_cem11_pack(e0, e1, (int)clevel, vv);
-        tc_astc_cem11_unpack(vv, qe0[s], qe1[s]);
-        for (c = 0; c < 6; ++c) ev[s * 6 + c] = vv[c];
-    }
-    if (cnt[0] == 0 || cnt[1] == 0) return (uint64_t)-1;
-
-    for (i = 0; i < 16; ++i) {
-        int s2 = pi->partition_of_texel[i], w64 = 0, uq, d[3];
-        int64_t dl = 0, dot = 0;
-        for (c = 0; c < 3; ++c) {
-            d[c] = qe1[s2][c] - qe0[s2][c];
-            dl += (int64_t)d[c] * d[c];
+        if (cnt[0] == 0 || cnt[1] == 0) return (uint64_t)-1;
+        for (round = 0; round < 3; ++round) {
+            uint8_t wt[16];
+            int64_t rsse = 0;
+            for (s = 0; s < 2; ++s) {
+                uint8_t vv[6];
+                tc_astc_cem11_pack(rlo[s], rhi[s], (int)clevel, vv);
+                tc_astc_cem11_unpack(vv, qe0[s], qe1[s]);
+                for (c = 0; c < 6; ++c) ev[s * 6 + c] = vv[c];
+            }
+            for (i = 0; i < 16; ++i) {
+                int s2 = pi->partition_of_texel[i], w64 = 0, uq, d[3];
+                int64_t dl = 0, dot = 0;
+                for (c = 0; c < 3; ++c) {
+                    d[c] = qe1[s2][c] - qe0[s2][c];
+                    dl += (int64_t)d[c] * d[c];
+                }
+                if (dl > 0) {
+                    for (c = 0; c < 3; ++c)
+                        dot += ((int64_t)lns[i][c] - qe0[s2][c]) * d[c];
+                    if (dot < 0) dot = 0;
+                    if (dot > dl) dot = dl;
+                    w64 = (int)((dot * 64 + dl / 2) / dl);
+                }
+                weights[i] = tc_astc_hdr_quant_weight(w64, 2u, 4u);
+                uq = (int)tc_astc_weight_unquant(weights[i], 2u);
+                wt[i] = (uint8_t)uq;
+                for (c = 0; c < 3; ++c) {
+                    int64_t rec = qe0[s2][c] + ((int64_t)d[c] * uq) / 64;
+                    int64_t e = rec - lns[i][c];
+                    rsse += e * e;
+                }
+            }
+            if (best_sse < 0 || rsse < best_sse) {
+                best_sse = rsse;
+                memcpy(best_ev, ev, 12u);
+                memcpy(best_w, weights, 16u);
+            } else {
+                break;
+            }
+            if (round + 1 < 3)
+                for (s = 0; s < 2; ++s)
+                    tc_astc_hdr_lsq_part(lns, wt, pi->partition_of_texel, s,
+                                         rlo[s], rhi[s]);
         }
-        if (dl > 0) {
-            for (c = 0; c < 3; ++c)
-                dot += ((int64_t)lns[i][c] - qe0[s2][c]) * d[c];
-            if (dot < 0) dot = 0;
-            if (dot > dl) dot = dl;
-            w64 = (int)((dot * 64 + dl / 2) / dl);
-        }
-        weights[i] = tc_astc_hdr_quant_weight(w64, 2u, 4u);
-        uq = (int)tc_astc_weight_unquant(weights[i], 2u);
-        for (c = 0; c < 3; ++c) {
-            int64_t rec = qe0[s2][c] + ((int64_t)d[c] * uq) / 64;
-            int64_t e = rec - lns[i][c];
-            sse += (uint64_t)(e * e);
-        }
+        memcpy(ev, best_ev, 12u);
+        memcpy(weights, best_w, 16u);
+        sse = (uint64_t)best_sse;
     }
 
     memset(out, 0, 16u);
