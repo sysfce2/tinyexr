@@ -425,8 +425,11 @@ static void usage(void) {
             "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr|xbc7] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
             "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
-            "[--quick on|off] [--mode-mask HEX] "
-            "[--linear|--perceptual]\n");
+            "[--quick on|off] [--mode-mask HEX] [--rdo N] "
+            "[--linear|--perceptual]\n"
+            "  xbc7: supercompressed BC7 (windowed RDO + zstd); --rdo N sets the\n"
+            "        max per-channel RMS reuse budget. Transcode back with\n"
+            "        `-i in.xbc7 -o out.dds` (standard BC7, any device reads it).\n");
 }
 
 static int parse_astc_block(const char *s, uint32_t *bx, uint32_t *by) {
