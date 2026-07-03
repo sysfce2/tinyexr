@@ -576,6 +576,70 @@ static void tc_encode_bc7_all_modes_block(const uint8_t pix[16][4],
     memcpy(out, best_block, 16);
 }
 
+/* Gather the 4x4 source block at (bx,by), clamping to the image edge. */
+static void tc_bc7_gather_block(const uint8_t *rgba, uint32_t width,
+                                uint32_t height, size_t stride, uint32_t bx,
+                                uint32_t by, uint8_t out[16][4]) {
+    uint32_t xx, yy, x, y;
+    for (yy = 0; yy < 4u; ++yy) {
+        y = by + yy;
+        if (y >= height) y = height - 1u;
+        for (xx = 0; xx < 4u; ++xx) {
+            x = bx + xx;
+            if (x >= width) x = width - 1u;
+            memcpy(out[yy * 4u + xx], rgba + (size_t)y * stride + (size_t)x * 4u,
+                   4u);
+        }
+    }
+}
+
+/* Windowed rate-distortion pass: for each block, if a block within the last
+ * TC_BC7_RDO_WINDOW has a source close enough (SSE within the RMS budget),
+ * replace this block's encoded bytes with that block's, turning near-duplicate
+ * blocks into exact byte duplicates. zstd then matches them even across long
+ * distances, so the local window converts local coherence into global
+ * compressibility. Output stays valid BC7 (every block is a real encoding). */
+#define TC_BC7_RDO_WINDOW 64u
+static void tc_bc7_rdo_pass(const uint8_t *rgba, uint32_t width,
+                            uint32_t height, size_t stride, int rdo,
+                            uint8_t *blocks) {
+    uint32_t bxc = (width + 3u) / 4u, byc = (height + 3u) / 4u;
+    uint32_t nblocks = bxc * byc, i, ring_count = 0;
+    int64_t thresh = (int64_t)rdo * rdo * 16 * 4; /* budget: RMS <= rdo */
+    uint8_t ring[TC_BC7_RDO_WINDOW][16][4];
+    uint32_t ring_idx[TC_BC7_RDO_WINDOW];
+    for (i = 0; i < nblocks; ++i) {
+        uint8_t cur[16][4];
+        int64_t best = thresh + 1;
+        int best_slot = -1;
+        uint32_t k, slot, lim = ring_count < TC_BC7_RDO_WINDOW
+                                    ? ring_count
+                                    : TC_BC7_RDO_WINDOW;
+        tc_bc7_gather_block(rgba, width, height, stride, (i % bxc) * 4u,
+                            (i / bxc) * 4u, cur);
+        for (k = 0; k < lim; ++k) {
+            int64_t sse = 0;
+            uint32_t t;
+            for (t = 0; t < 64u; ++t) {
+                int d = (int)((const uint8_t *)cur)[t] -
+                        (int)((const uint8_t *)ring[k])[t];
+                sse += (int64_t)d * d;
+            }
+            if (sse < best) {
+                best = sse;
+                best_slot = (int)k;
+            }
+        }
+        if (best_slot >= 0 && best <= thresh)
+            memcpy(blocks + (size_t)i * 16u,
+                   blocks + (size_t)ring_idx[best_slot] * 16u, 16u);
+        slot = ring_count % TC_BC7_RDO_WINDOW;
+        memcpy(ring[slot], cur, sizeof(cur));
+        ring_idx[slot] = i;
+        ++ring_count;
+    }
+}
+
 tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride,
                                 const tc_bc7_options *opt, uint8_t *out_bc7,
@@ -611,6 +675,9 @@ tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
             off += 16u;
         }
     }
+
+    if (opt->rdo > 0)
+        tc_bc7_rdo_pass(rgba, width, height, stride, opt->rdo, out_bc7);
 
     return TC_SUCCESS;
 }

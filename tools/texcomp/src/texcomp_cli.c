@@ -116,6 +116,7 @@ static tc_result tc_cli_astcenc_compress(const uint8_t *rgba, uint32_t w,
 }
 #endif
 #include "exr.h"
+#include "tinyexr_zstd.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -302,9 +303,126 @@ static tc_result write_file(const char *path, const void *data, size_t size) {
     return TC_SUCCESS;
 }
 
+/* --- xbc7: supercompressed BC7 (windowed RDO + zstd) ----------------------
+ * Container: "XBC7" magic, then a 24-byte header, then a zstd frame holding the
+ * raw RDO'd BC7 block stream. Transcoding is just a zstd decode back to a
+ * standard BC7 stream, which any BC7 device/decoder reads directly. This is a
+ * texcomp-native format, not Basis's XBC7 bitstream. */
+#define XBC7_HDR 24u
+static void xbc7_put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+static uint32_t xbc7_get32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+/* Encode RGBA -> RDO'd BC7 -> zstd -> .xbc7 file. */
+static tc_result xbc7_encode(const uint8_t *rgba, uint32_t w, uint32_t h,
+                             const tc_bc7_options *opt, const char *out_path,
+                             const char *raw_path) {
+    size_t bc7_size = tc_bc7_compressed_size(w, h), zbound, zc;
+    uint8_t *bc7, *xf;
+    tc_result tr;
+    if (!bc7_size) return TC_ERROR_INVALID_ARGUMENT;
+    bc7 = (uint8_t *)malloc(bc7_size);
+    if (!bc7) return TC_ERROR_OUT_OF_MEMORY;
+    tr = tc_bc7_compress_rgba8(rgba, w, h, (size_t)w * 4u, opt, bc7, bc7_size);
+    if (tr != TC_SUCCESS) {
+        free(bc7);
+        return tr;
+    }
+    zbound = tinyexr_zstd_compress_bound(bc7_size);
+    xf = (uint8_t *)malloc(XBC7_HDR + zbound);
+    if (!xf) {
+        free(bc7);
+        return TC_ERROR_OUT_OF_MEMORY;
+    }
+    zc = tinyexr_zstd_compress(xf + XBC7_HDR, zbound, bc7, bc7_size, 19);
+    if (tinyexr_zstd_is_error(zc)) {
+        free(bc7);
+        free(xf);
+        return TC_ERROR_CORRUPT;
+    }
+    memcpy(xf, "XBC7", 4u);
+    xf[4] = 1u;      /* version */
+    xf[5] = 1u;      /* flags: zstd */
+    xf[6] = 4u;      /* block_x */
+    xf[7] = 4u;      /* block_y */
+    xbc7_put32(xf + 8, w);
+    xbc7_put32(xf + 12, h);
+    xbc7_put32(xf + 16, (uint32_t)bc7_size);
+    xbc7_put32(xf + 20, (uint32_t)zc);
+    tr = write_file(out_path, xf, XBC7_HDR + zc);
+    if (tr == TC_SUCCESS && raw_path)
+        tr = write_file(raw_path, bc7, bc7_size);
+    if (tr == TC_SUCCESS)
+        printf("xbc7: %ux%u  rdo=%d  BC7=%zu -> xbc7=%zu (%.1f%%, %.3f bpp)\n", w,
+               h, opt->rdo, bc7_size, (size_t)(XBC7_HDR + zc),
+               100.0 * (double)(XBC7_HDR + zc) / (double)bc7_size,
+               (double)(XBC7_HDR + zc) * 8.0 / ((double)w * h));
+    free(bc7);
+    free(xf);
+    return tr;
+}
+
+/* Transcode a .xbc7 file back to a standard BC7 DDS (or raw .bc7). */
+static tc_result xbc7_transcode(const char *in_path, const char *out_path,
+                                const char *raw_path) {
+    FILE *f = fopen(in_path, "rb");
+    uint8_t hdr[XBC7_HDR];
+    uint8_t *comp = NULL, *bc7 = NULL, *dds = NULL;
+    uint32_t w, h, raw_size, comp_size;
+    size_t got, dds_size;
+    tc_result tr = TC_ERROR_CORRUPT;
+    tc_bc7_options bopt;
+    if (!f) return TC_ERROR_IO;
+    if (fread(hdr, 1u, XBC7_HDR, f) != XBC7_HDR || memcmp(hdr, "XBC7", 4u) != 0) {
+        fclose(f);
+        return TC_ERROR_CORRUPT;
+    }
+    w = xbc7_get32(hdr + 8);
+    h = xbc7_get32(hdr + 12);
+    raw_size = xbc7_get32(hdr + 16);
+    comp_size = xbc7_get32(hdr + 20);
+    comp = (uint8_t *)malloc(comp_size);
+    bc7 = (uint8_t *)malloc(raw_size);
+    if (!comp || !bc7) {
+        fclose(f);
+        free(comp);
+        free(bc7);
+        return TC_ERROR_OUT_OF_MEMORY;
+    }
+    got = fread(comp, 1u, comp_size, f);
+    fclose(f);
+    if (got != comp_size) goto done;
+    if (tinyexr_zstd_decompress(bc7, raw_size, comp, comp_size) != raw_size)
+        goto done;
+    tc_bc7_options_init(&bopt);
+    dds_size = tc_dds_bc7_size(w, h);
+    dds = (uint8_t *)malloc(dds_size);
+    if (!dds) {
+        tr = TC_ERROR_OUT_OF_MEMORY;
+        goto done;
+    }
+    tr = tc_dds_write_bc7_memory(bc7, w, h, &bopt, dds, dds_size);
+    if (tr == TC_SUCCESS) tr = write_file(out_path, dds, dds_size);
+    if (tr == TC_SUCCESS && raw_path) tr = write_file(raw_path, bc7, raw_size);
+    if (tr == TC_SUCCESS)
+        printf("xbc7 transcode: %ux%u -> BC7 DDS %zu bytes\n", w, h, dds_size);
+done:
+    free(comp);
+    free(bc7);
+    free(dds);
+    return tr;
+}
+
 static void usage(void) {
     fprintf(stderr,
-            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr] "
+            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr|xbc7] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
             "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
             "[--quick on|off] [--mode-mask HEX] "
@@ -406,6 +524,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--quick") == 0 && i + 1 < argc) bc7_opt.quick = strcmp(argv[++i], "off") != 0;
         else if (strcmp(argv[i], "--mode-mask") == 0 && i + 1 < argc)
             bc7_opt.mode_mask = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (strcmp(argv[i], "--rdo") == 0 && i + 1 < argc)
+            bc7_opt.rdo = atoi(argv[++i]);
         else {
             usage();
             return 2;
@@ -414,6 +534,15 @@ int main(int argc, char **argv) {
     if (!in || !out) {
         usage();
         return 2;
+    }
+
+    /* Transcode mode: a .xbc7 input is decoded back to a standard BC7 DDS. */
+    if (ends_with(in, ".xbc7")) {
+        tr = xbc7_transcode(in, out, raw);
+        if (tr != TC_SUCCESS)
+            fprintf(stderr, "texcomp: xbc7 transcode failed: %s\n",
+                    tc_result_string(tr));
+        return tr == TC_SUCCESS ? 0 : 1;
     }
 
     if (strcmp(format, "bc6") == 0) format = "bc6h";
@@ -450,6 +579,19 @@ int main(int argc, char **argv) {
     if (tr != TC_SUCCESS) {
         fprintf(stderr, "texcomp: load failed: %s\n", tc_result_string(tr));
         return 1;
+    }
+
+    /* xbc7: supercompressed BC7 (windowed RDO + zstd). Default to a moderate
+     * RDO budget when the user didn't request one. */
+    if (strcmp(format, "xbc7") == 0) {
+        if (bc7_opt.rdo <= 0) bc7_opt.rdo = 16;
+        tr = xbc7_encode(rgba, w, h, &bc7_opt, out, raw);
+        if (tr != TC_SUCCESS)
+            fprintf(stderr, "texcomp: xbc7 encode failed: %s\n",
+                    tc_result_string(tr));
+        free(rgba);
+        free(rgbf);
+        return tr == TC_SUCCESS ? 0 : 1;
     }
 
     if (strcmp(format, "bc7") == 0) {

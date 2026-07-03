@@ -36,6 +36,14 @@ typedef struct tc_bc7_options {
     int quick;
     int threads;
     uint32_t mode_mask; /* bit N enables BC7 mode N; 0 means all modes */
+    /* Windowed rate-distortion optimization: after encoding, replace a block
+     * with a recently-seen block's bytes when the two source blocks are close
+     * enough, lowering the stream's entropy so an entropy coder (zstd, the
+     * xbc7 container) compresses it far better. The value is the maximum
+     * allowed per-channel RMS deviation for such a reuse (0 = off; larger =
+     * smaller/lossier). Output is still standard BC7, decodable by any BC7
+     * device. */
+    int rdo;
 } tc_bc7_options;
 
 typedef struct tc_bc1_options {

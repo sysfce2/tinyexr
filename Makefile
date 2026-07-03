@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -398,6 +398,24 @@ texcomp-astc-hdr-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc
 	$(CXX) build/texcomp/astc_hdr_xcheck.o $(TEXCOMP_OBJ) \
 	  build/libtexcomp_astcenc.a -lm -o build/texcomp/astc_hdr_xcheck
 	./build/texcomp/astc_hdr_xcheck
+
+# xbc7: BC7 windowed RDO + zstd container. C gate checks the RDO improves
+# zstd compressibility (and rdo=0 is a no-op); the CLI step checks the
+# encode->transcode round-trip is bit-exact standard BC7.
+texcomp-xbc7-gate: lib $(TEXCOMP_OBJ) texcomp tools/texcomp/test/xbc7_gate.c | build/texcomp
+	$(AR) rcs build/libtexcomp.a $(TEXCOMP_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Ideps/zstd -O2 -g \
+	  tools/texcomp/test/xbc7_gate.c build/libtexcomp.a build/libtinyexr3.a \
+	  -pthread -lm -o build/texcomp/xbc7_gate
+	./build/texcomp/xbc7_gate
+	@echo "--- xbc7 CLI encode -> transcode round-trip ---"
+	./build/texcomp/texcomp -i asakusa.png -o build/texcomp/rt.xbc7 \
+	  --format xbc7 --rdo 16 --raw build/texcomp/rt_enc.bc7
+	./build/texcomp/texcomp -i build/texcomp/rt.xbc7 -o build/texcomp/rt.dds \
+	  --raw build/texcomp/rt_dec.bc7
+	@cmp -s build/texcomp/rt_enc.bc7 build/texcomp/rt_dec.bc7 \
+	  && echo "xbc7 CLI round-trip: OK (transcode is bit-exact BC7)" \
+	  || { echo "FAIL: xbc7 round-trip differs"; exit 1; }
 
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:
