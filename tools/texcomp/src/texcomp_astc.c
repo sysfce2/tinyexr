@@ -4256,7 +4256,8 @@ uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
  * 4x4 weight grid at weight range {8,5,2,11}/{8,5,2}, with the endpoint range
  * derived by the standard ASTC bit budget (which yields the UASTC endpoint
  * range for each mode). Constant blocks use the solid (void-extent) mode 8.
- * Multi-subset and dual-plane UASTC modes are not yet emitted. */
+ * The 2-subset and dual-plane modes are handled by tc_uastc_encode_2subset /
+ * tc_uastc_encode_dual below. */
 static int tc_uastc_encode_mode(const uint8_t block[144][4], uint32_t count,
                                 const tc_astc_encode_context *ctx, uint32_t cem,
                                 uint32_t nv, uint32_t qm,
