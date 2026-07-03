@@ -4744,13 +4744,14 @@ static int tc_uastc_encode_dual(const uint8_t block[144][4], uint32_t count,
                                 const tc_astc_encode_context *ctx, uint32_t cem,
                                 uint32_t qm, uint8_t out[16], uint64_t *out_sse) {
     uint8_t weightbuf[16], sym[8], vals[8], dualw[32];
-    uint8_t best_p1[16], best_p2[16];
+    uint8_t best_p1[16], best_p2[16], best_sym[8];
+    uint8_t best_wt1[144], best_wt2[144];
     uint32_t qe0[4], qe1[4], er, weight_bits, color_bits, bm, bitpos, ccs;
     uint32_t nv = (cem == 12u) ? 8u : 6u, nch = (cem == 12u) ? 4u : 3u;
     uint32_t nccs = nch, best_ccs = 99u;
-    uint32_t lo[4] = {255u, 255u, 255u, 255u}, hi[4] = {0, 0, 0, 0};
-    uint32_t i, c;
-    uint64_t best_sse = (uint64_t)-1;
+    uint32_t rlo[4], rhi[4];
+    uint32_t i, c, round;
+    uint64_t best = (uint64_t)-1;
 
     bm = tc_astc_find_dual_grid_mode(qm);
     if (!bm) return 0;
@@ -4758,77 +4759,126 @@ static int tc_uastc_encode_dual(const uint8_t block[144][4], uint32_t count,
     if (weight_bits + 2u >= 109u) return 0;
     color_bits = 109u - weight_bits; /* 128 - 17 (config) - 2 (ccs) */
     if (!tc_astc_lut_color_quant(ctx, nv, color_bits, &er)) return 0;
-    for (i = 0; i < count; ++i)
+    {
+        uint32_t lo[4] = {255u, 255u, 255u, 255u}, hi[4] = {0, 0, 0, 0};
+        for (i = 0; i < count; ++i)
+            for (c = 0; c < 4u; ++c) {
+                if (block[i][c] < lo[c]) lo[c] = block[i][c];
+                if (block[i][c] > hi[c]) hi[c] = block[i][c];
+            }
         for (c = 0; c < 4u; ++c) {
-            if (block[i][c] < lo[c]) lo[c] = block[i][c];
-            if (block[i][c] > hi[c]) hi[c] = block[i][c];
+            rlo[c] = lo[c];
+            rhi[c] = hi[c];
         }
-    vals[0] = (uint8_t)lo[0];
-    vals[1] = (uint8_t)hi[0];
-    vals[2] = (uint8_t)lo[1];
-    vals[3] = (uint8_t)hi[1];
-    vals[4] = (uint8_t)lo[2];
-    vals[5] = (uint8_t)hi[2];
-    if (cem == 12u) {
-        vals[6] = (uint8_t)lo[3];
-        vals[7] = (uint8_t)hi[3];
     }
-    tc_astc_quantize_color_values(ctx, er, nv, vals, sym);
-    for (c = 0; c < nch; ++c) {
-        qe0[c] = tc_astc_color_symbol_uquant(er, sym[c * 2u]);
-        qe1[c] = tc_astc_color_symbol_uquant(er, sym[c * 2u + 1u]);
-    }
-    if (cem != 12u) {
-        qe0[3] = 255u;
-        qe1[3] = 255u;
-    }
-    if (qe0[0] + qe0[1] + qe0[2] > qe1[0] + qe1[1] + qe1[2]) return 0;
-    for (ccs = 0; ccs < nccs; ++ccs) {
-        int dir[4];
-        int64_t d1 = 0, d2;
-        uint8_t t1[16], t2[16];
-        uint64_t dsse = 0;
+    /* Round 0 = bbox; later rounds re-solve the (shared) endpoints by least
+     * squares -- the RGB channels from the colour plane's weights and the CCS
+     * channel from the alpha plane's weights -- then re-quantize. */
+    for (round = 0; round < 3u; ++round) {
+        uint32_t rbest_ccs = 99u;
+        uint64_t rbest = (uint64_t)-1;
+        uint8_t rp1[16] = {0}, rp2[16] = {0}, rwt1[144] = {0}, rwt2[144] = {0};
+        vals[0] = (uint8_t)rlo[0];
+        vals[1] = (uint8_t)rhi[0];
+        vals[2] = (uint8_t)rlo[1];
+        vals[3] = (uint8_t)rhi[1];
+        vals[4] = (uint8_t)rlo[2];
+        vals[5] = (uint8_t)rhi[2];
+        if (cem == 12u) {
+            vals[6] = (uint8_t)rlo[3];
+            vals[7] = (uint8_t)rhi[3];
+        }
+        tc_astc_quantize_color_values(ctx, er, nv, vals, sym);
         for (c = 0; c < nch; ++c) {
-            dir[c] = (int)qe1[c] - (int)qe0[c];
-            if (c != ccs) d1 += (int64_t)dir[c] * dir[c];
+            qe0[c] = tc_astc_color_symbol_uquant(er, sym[c * 2u]);
+            qe1[c] = tc_astc_color_symbol_uquant(er, sym[c * 2u + 1u]);
         }
-        d2 = (int64_t)dir[ccs] * dir[ccs];
-        for (i = 0; i < count; ++i) {
-            int w1 = 0, w2 = 0, u1, u2;
-            if (d1 > 0) {
-                int64_t dot = 0;
-                for (c = 0; c < nch; ++c)
-                    if (c != ccs)
-                        dot += ((int64_t)block[i][c] - (int)qe0[c]) * dir[c];
-                if (dot < 0) dot = 0;
-                if (dot > d1) dot = d1;
-                w1 = (int)((dot * 64 + d1 / 2) / d1);
-            }
-            if (d2 > 0) {
-                int64_t dot = ((int64_t)block[i][ccs] - (int)qe0[ccs]) * dir[ccs];
-                if (dot < 0) dot = 0;
-                if (dot > d2) dot = d2;
-                w2 = (int)((dot * 64 + d2 / 2) / d2);
-            }
-            t1[i] = tc_astc_hdr_quant_weight(w1, qm, tc_astc_quant_levels(qm));
-            t2[i] = tc_astc_hdr_quant_weight(w2, qm, tc_astc_quant_levels(qm));
-            u1 = (int)tc_astc_weight_unquant(t1[i], qm);
-            u2 = (int)tc_astc_weight_unquant(t2[i], qm);
+        if (cem != 12u) {
+            qe0[3] = 255u;
+            qe1[3] = 255u;
+        }
+        if (qe0[0] + qe0[1] + qe0[2] > qe1[0] + qe1[1] + qe1[2]) break;
+        for (ccs = 0; ccs < nccs; ++ccs) {
+            int dir[4];
+            int64_t d1 = 0, d2;
+            uint8_t t1[16], t2[16], wt1[144], wt2[144];
+            uint64_t dsse = 0;
             for (c = 0; c < nch; ++c) {
-                int uq = (c == ccs) ? u2 : u1;
-                int rec = ((int)qe0[c] * (64 - uq) + (int)qe1[c] * uq + 32) >> 6;
-                int e = (int)block[i][c] - rec;
-                dsse += (uint64_t)(e * e);
+                dir[c] = (int)qe1[c] - (int)qe0[c];
+                if (c != ccs) d1 += (int64_t)dir[c] * dir[c];
+            }
+            d2 = (int64_t)dir[ccs] * dir[ccs];
+            for (i = 0; i < count; ++i) {
+                int w1 = 0, w2 = 0, u1, u2;
+                if (d1 > 0) {
+                    int64_t dot = 0;
+                    for (c = 0; c < nch; ++c)
+                        if (c != ccs)
+                            dot += ((int64_t)block[i][c] - (int)qe0[c]) * dir[c];
+                    if (dot < 0) dot = 0;
+                    if (dot > d1) dot = d1;
+                    w1 = (int)((dot * 64 + d1 / 2) / d1);
+                }
+                if (d2 > 0) {
+                    int64_t dot =
+                        ((int64_t)block[i][ccs] - (int)qe0[ccs]) * dir[ccs];
+                    if (dot < 0) dot = 0;
+                    if (dot > d2) dot = d2;
+                    w2 = (int)((dot * 64 + d2 / 2) / d2);
+                }
+                t1[i] = tc_astc_hdr_quant_weight(w1, qm, tc_astc_quant_levels(qm));
+                t2[i] = tc_astc_hdr_quant_weight(w2, qm, tc_astc_quant_levels(qm));
+                u1 = (int)tc_astc_weight_unquant(t1[i], qm);
+                u2 = (int)tc_astc_weight_unquant(t2[i], qm);
+                wt1[i] = (uint8_t)u1;
+                wt2[i] = (uint8_t)u2;
+                for (c = 0; c < nch; ++c) {
+                    int uq = (c == ccs) ? u2 : u1;
+                    int rec =
+                        ((int)qe0[c] * (64 - uq) + (int)qe1[c] * uq + 32) >> 6;
+                    int e = (int)block[i][c] - rec;
+                    dsse += (uint64_t)(e * e);
+                }
+            }
+            if (rbest_ccs == 99u || dsse < rbest) {
+                rbest = dsse;
+                rbest_ccs = ccs;
+                memcpy(rp1, t1, 16u);
+                memcpy(rp2, t2, 16u);
+                memcpy(rwt1, wt1, count);
+                memcpy(rwt2, wt2, count);
             }
         }
-        if (best_ccs == 99u || dsse < best_sse) {
-            best_sse = dsse;
-            best_ccs = ccs;
-            memcpy(best_p1, t1, 16u);
-            memcpy(best_p2, t2, 16u);
+        if (rbest < best) {
+            best = rbest;
+            best_ccs = rbest_ccs;
+            memcpy(best_sym, sym, nv);
+            memcpy(best_p1, rp1, 16u);
+            memcpy(best_p2, rp2, 16u);
+            memcpy(best_wt1, rwt1, count);
+            memcpy(best_wt2, rwt2, count);
+        } else {
+            break;
+        }
+        if (round + 1u < 3u) {
+            uint32_t lo1[4], hi1[4], lo2[4], hi2[4];
+            if (!tc_astc_lsq_endpoints(block, count, best_wt1, lo1, hi1) ||
+                !tc_astc_lsq_endpoints(block, count, best_wt2, lo2, hi2))
+                break;
+            for (c = 0; c < 4u; ++c) {
+                if (c == best_ccs) {
+                    rlo[c] = lo2[c];
+                    rhi[c] = hi2[c];
+                } else {
+                    rlo[c] = lo1[c];
+                    rhi[c] = hi1[c];
+                }
+            }
         }
     }
-    *out_sse = best_sse;
+    if (best == (uint64_t)-1) return 0;
+    *out_sse = best;
+    memcpy(sym, best_sym, nv);
 
     memset(out, 0, 16u);
     memset(weightbuf, 0, sizeof(weightbuf));
