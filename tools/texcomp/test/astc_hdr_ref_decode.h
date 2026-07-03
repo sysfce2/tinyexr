@@ -102,7 +102,7 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
         for (i = 0; i < part_count; ++i) cems[i] = cf >> 2;
     }
     for (i = 0; i < part_count; ++i)
-        if (cems[i] != 11u) return 0; /* only CEM 11 is supported here */
+        if (cems[i] != 11u && cems[i] != 7u) return 0; /* CEM 7 / 11 only */
 
     if (dual) {
         ccs_bits = 2u;
@@ -110,7 +110,7 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
         ccs = aref_rd_bits(block, 128u - weight_bits - 2u, 2);
     }
 
-    vcount = part_count * 6u; /* CEM 11 = 6 values per subset */
+    vcount = part_count * (cems[0] == 7u ? 4u : 6u); /* CEM 7=4, CEM 11=6 */
     used = color_start + weight_bits + ccs_bits;
     if (used > 128u) return 0;
     avail = 128u - used;
@@ -127,8 +127,16 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
     for (i = 0; i < vcount; ++i)
         vals[i] = (cq == 20) ? csyms[i] : aref_color_unquant[cq - 4][csyms[i]];
 
-    for (i = 0; i < part_count; ++i)
-        tc_astc_cem11_unpack(vals + i * 6u, lns0[i], lns1[i]);
+    {
+        uint32_t off = 0;
+        for (i = 0; i < part_count; ++i) {
+            if (cems[i] == 7u)
+                tc_astc_cem7_unpack(vals + off, lns0[i], lns1[i]);
+            else
+                tc_astc_cem11_unpack(vals + off, lns0[i], lns1[i]);
+            off += (cems[i] == 7u) ? 4u : 6u;
+        }
+    }
 
     small_block = bx * by < 32u;
     for (y = 0; y < by; ++y)

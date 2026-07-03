@@ -78,6 +78,12 @@ int tc_astc_hdr_color_roundtrip(uint32_t level, int value);
 void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], int level,
                         uint8_t v[6]);
 int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]);
+/* CEM 7 (HDR RGB base+scale, 4 values) pack/unpack; LNS domain like CEM 11. */
+void tc_astc_cem7_pack(const int e0[3], const int e1[3], int level,
+                       uint8_t v[4]);
+int tc_astc_cem7_unpack(const uint8_t v[4], int out0[3], int out1[3]);
+/* Single-subset CEM 7 (base+scale) 4x4 block encoder. */
+uint64_t tc_encode_astc_hdr_cem7_block(const int lns[16][3], uint8_t out[16]);
 /* Per-texel CEM 11 4x4 block encoder (defined in texcomp_astc.c, which owns
  * the ASTC block/ISE machinery). `lns` is 16 texels of 16-bit LNS RGB; returns
  * the reconstruction SSE in the LNS domain (for mode selection). */

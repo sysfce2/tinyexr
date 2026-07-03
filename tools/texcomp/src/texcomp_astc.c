@@ -4244,6 +4244,91 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     return (uint64_t)sse_single;
 }
 
+/* Single-subset CEM 7 (HDR RGB base+scale) block. Fits base+scale to the LNS
+ * bounding box, refines by least squares, and stores just 4 endpoint values at
+ * colour quant 256 -- the 2 values saved vs CEM 11's direct RGB pay for a finer
+ * 4x4 range-16 (4-bit) weight grid instead of CEM 11's range-8 (3-bit). So it
+ * wins on smooth blocks whose two endpoints differ by a near-uniform luminance
+ * shift, where the extra weight precision beats direct RGB endpoints. Returns
+ * the LNS-domain SSE. */
+#define TC_HDR_CEM7_WQM 8u /* weight quant_method 8 = range 16 (4-bit) */
+uint64_t tc_encode_astc_hdr_cem7_block(const int lns[16][3], uint8_t out[16]) {
+    static uint32_t bm_single = 0xffffffffu;
+    uint8_t weightbuf[16], packed[8], sw[16], v[8];
+    uint8_t best_v[8] = {0}, best_sw[16] = {0};
+    int e0[3], e1[3], i, c, round;
+    int64_t best_sse = -1;
+    uint32_t bitpos;
+
+    if (bm_single == 0xffffffffu)
+        bm_single = tc_astc_hdr_find_grid_mode(TC_HDR_CEM7_WQM);
+    if (!bm_single) return (uint64_t)-1;
+    tc_hdr_ctx_ensure();
+
+    for (c = 0; c < 3; ++c) {
+        e0[c] = lns[0][c];
+        e1[c] = lns[0][c];
+    }
+    for (i = 1; i < 16; ++i)
+        for (c = 0; c < 3; ++c) {
+            if (lns[i][c] < e0[c]) e0[c] = lns[i][c];
+            if (lns[i][c] > e1[c]) e1[c] = lns[i][c];
+        }
+    for (round = 0; round < 3; ++round) {
+        uint8_t wt[16];
+        int64_t sse = 0, dl = 0;
+        int q0[3], q1[3], d[3];
+        tc_astc_cem7_pack(e0, e1, 20, v);
+        tc_astc_cem7_unpack(v, q0, q1);
+        for (c = 0; c < 3; ++c) {
+            d[c] = q1[c] - q0[c];
+            dl += (int64_t)d[c] * d[c];
+        }
+        for (i = 0; i < 16; ++i) {
+            int w64 = 0, uq;
+            if (dl > 0) {
+                int64_t dot = 0;
+                for (c = 0; c < 3; ++c)
+                    dot += ((int64_t)lns[i][c] - q0[c]) * d[c];
+                if (dot < 0) dot = 0;
+                if (dot > dl) dot = dl;
+                w64 = (int)((dot * 64 + dl / 2) / dl);
+            }
+            sw[i] = tc_astc_hdr_quant_weight(w64, TC_HDR_CEM7_WQM, 16u);
+            uq = (int)tc_astc_weight_unquant(sw[i], TC_HDR_CEM7_WQM);
+            wt[i] = (uint8_t)uq;
+            for (c = 0; c < 3; ++c) {
+                int64_t rec = q0[c] + ((int64_t)d[c] * uq) / 64;
+                int64_t e = rec - lns[i][c];
+                sse += e * e;
+            }
+        }
+        if (best_sse < 0 || sse < best_sse) {
+            best_sse = sse;
+            memcpy(best_v, v, 4u);
+            memcpy(best_sw, sw, 16u);
+        } else {
+            break;
+        }
+        if (round + 1 < 3) tc_astc_hdr_lsq(lns, wt, e0, e1);
+    }
+    memcpy(v, best_v, 4u);
+    memcpy(sw, best_sw, 16u);
+
+    memset(out, 0, 16u);
+    memset(weightbuf, 0, sizeof(weightbuf));
+    tc_astc_scramble_weights(sw, 16u, TC_HDR_CEM7_WQM);
+    (void)tc_astc_ise_encode_bits(TC_HDR_CEM7_WQM, 16u, sw, weightbuf, sizeof(weightbuf), 0u);
+    for (i = 0; i < 16; ++i) out[i] = tc_bitrev8(weightbuf[15 - i]);
+    bitpos = 0;
+    tc_set_bits(out, &bitpos, bm_single, 11u);
+    tc_set_bits(out, &bitpos, 0u, 2u);
+    tc_set_bits(out, &bitpos, 7u, 4u); /* CEM 7 */
+    tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 4u, v, packed);
+    (void)tc_astc_ise_encode_bits(20u, 4u, packed, out, 16u, 17u);
+    return (uint64_t)best_sse;
+}
+
 /* Two-subset CEM 11 block. Each subset gets its own HDR endpoint pair (12
  * values total), stored at a lower colour quant (to fit the 4x4 budget) via
  * the quant-aware packer; a 10-bit partition index selects the region split.

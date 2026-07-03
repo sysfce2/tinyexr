@@ -391,6 +391,247 @@ int tc_astc_cem11_unpack(const uint8_t vv[6], int out0[3], int out1[3]) {
     return 1;
 }
 
+/* CEM 7 (HDR RGB base+scale, "RGBO"): decode 4 packed values to two LNS
+ * endpoints. Endpoint1 = base RGB, endpoint0 = base - scale (uniform). Mirrors
+ * astcenc hdr_rgbo_unpack; output is 16-bit LNS (value << 4), same scale as
+ * tc_astc_cem11_unpack. */
+int tc_astc_cem7_unpack(const uint8_t vv[4], int out0[3], int out1[3]) {
+    static const int shamts[6] = {1, 1, 2, 3, 4, 5};
+    int v0 = vv[0], v1 = vv[1], v2 = vv[2], v3 = vv[3];
+    int modeval = ((v0 & 0xC0) >> 6) | (((v1 & 0x80) >> 7) << 2) |
+                  (((v2 & 0x80) >> 7) << 3);
+    int majcomp, mode, oh, sh;
+    int red = v0 & 0x3F, green = v1 & 0x1F, blue = v2 & 0x1F, scale = v3 & 0x1F;
+    int bit0 = (v1 >> 6) & 1, bit1 = (v1 >> 5) & 1, bit2 = (v2 >> 6) & 1;
+    int bit3 = (v2 >> 5) & 1, bit4 = (v3 >> 7) & 1, bit5 = (v3 >> 6) & 1;
+    int bit6 = (v3 >> 5) & 1;
+    int r0, g0, b0;
+    if ((modeval & 0xC) != 0xC) {
+        majcomp = modeval >> 2;
+        mode = modeval & 3;
+    } else if (modeval != 0xF) {
+        majcomp = modeval & 3;
+        mode = 4;
+    } else {
+        majcomp = 0;
+        mode = 5;
+    }
+    oh = 1 << mode;
+    if (oh & 0x30) green |= bit0 << 6;
+    if (oh & 0x3A) green |= bit1 << 5;
+    if (oh & 0x30) blue |= bit2 << 6;
+    if (oh & 0x3A) blue |= bit3 << 5;
+    if (oh & 0x3D) scale |= bit6 << 5;
+    if (oh & 0x2D) scale |= bit5 << 6;
+    if (oh & 0x04) scale |= bit4 << 7;
+    if (oh & 0x3B) red |= bit4 << 6;
+    if (oh & 0x04) red |= bit3 << 6;
+    if (oh & 0x10) red |= bit5 << 7;
+    if (oh & 0x0F) red |= bit2 << 7;
+    if (oh & 0x05) red |= bit1 << 8;
+    if (oh & 0x0A) red |= bit0 << 8;
+    if (oh & 0x05) red |= bit0 << 9;
+    if (oh & 0x02) red |= bit6 << 9;
+    if (oh & 0x01) red |= bit3 << 10;
+    if (oh & 0x02) red |= bit5 << 10;
+    sh = shamts[mode];
+    red <<= sh;
+    green <<= sh;
+    blue <<= sh;
+    scale <<= sh;
+    if (mode != 5) {
+        green = red - green;
+        blue = red - blue;
+    }
+    if (majcomp == 1) {
+        int t = red;
+        red = green;
+        green = t;
+    } else if (majcomp == 2) {
+        int t = red;
+        red = blue;
+        blue = t;
+    }
+    r0 = red - scale;
+    g0 = green - scale;
+    b0 = blue - scale;
+    if (red < 0) red = 0;
+    if (green < 0) green = 0;
+    if (blue < 0) blue = 0;
+    if (r0 < 0) r0 = 0;
+    if (g0 < 0) g0 = 0;
+    if (b0 < 0) b0 = 0;
+    out0[0] = r0 << 4;
+    out0[1] = g0 << 4;
+    out0[2] = b0 << 4;
+    out1[0] = red << 4;
+    out1[1] = green << 4;
+    out1[2] = blue << 4;
+    return 1;
+}
+
+/* CEM 7 pack: fit base+scale to the two LNS endpoints (base = e1, scale =
+ * mean(e1-e0)) and quantize with the astcenc quantize_hdr_rgbo mode search. */
+void tc_astc_cem7_pack(const int e0[3], const int e1[3], int level,
+                       uint8_t v[4]) {
+    static const int mode_bits[5][3] = {{11, 5, 7}, {11, 6, 5}, {10, 5, 8},
+                                        {9, 6, 7},  {8, 7, 6}};
+    static const float mode_cut[5][2] = {{1024, 4096},  {2048, 1024},
+                                         {2048, 16384}, {8192, 16384},
+                                         {32768, 16384}};
+    static const float mode_rscale[5] = {32.0f, 32.0f, 64.0f, 128.0f, 256.0f};
+    static const float mode_scale[5] = {1.0f / 32,  1.0f / 32, 1.0f / 64,
+                                        1.0f / 128, 1.0f / 256};
+    float color[4], bak[4], r_base, g_base, b_base, s_base, s = 0.0f;
+    int majcomp, mode, c;
+    for (c = 0; c < 3; ++c) s += (float)(e1[c] - e0[c]);
+    s *= 1.0f / 3.0f;
+    if (s < 0.0f) s = 0.0f;
+    for (c = 0; c < 3; ++c) color[c] = (float)e1[c] - s; /* += s -> base below */
+    color[3] = s;
+    for (c = 0; c < 3; ++c) color[c] += color[3];
+    for (c = 0; c < 4; ++c) {
+        if (color[c] < 0.0f) color[c] = 0.0f;
+        if (color[c] > 65535.0f) color[c] = 65535.0f;
+        bak[c] = color[c];
+    }
+    if (color[0] > color[1] && color[0] > color[2])
+        majcomp = 0;
+    else if (color[1] > color[2])
+        majcomp = 1;
+    else
+        majcomp = 2;
+    if (majcomp == 1) {
+        float t = color[0];
+        color[0] = color[1];
+        color[1] = t;
+    } else if (majcomp == 2) {
+        float t = color[0];
+        color[0] = color[2];
+        color[2] = t;
+    }
+    r_base = color[0];
+    g_base = color[0] - color[1];
+    b_base = color[0] - color[2];
+    s_base = color[3];
+    for (mode = 0; mode < 5; ++mode) {
+        float ms = mode_scale[mode], mr = mode_rscale[mode], r_fval, g_fval,
+              b_fval, s_fval, rgb_err;
+        int mode_enc, gb_ic, s_ic, r_intval, r_lowbits, r_q, g_intval, b_intval;
+        int g_lowbits, b_lowbits, g_q, b_q, s_intval, s_lowbits, s_q;
+        int bit0 = 0, bit1 = 0, bit2 = 0, bit3 = 0, bit4 = 0, bit5 = 0, bit6 = 0;
+        if (g_base > mode_cut[mode][0] || b_base > mode_cut[mode][0] ||
+            s_base > mode_cut[mode][1])
+            continue;
+        mode_enc = mode < 4 ? (mode | (majcomp << 2)) : (majcomp | 0xC);
+        gb_ic = 1 << mode_bits[mode][1];
+        s_ic = 1 << mode_bits[mode][2];
+        r_intval = (int)(r_base * ms + 0.5f);
+        r_lowbits = (r_intval & 0x3f) | ((mode_enc & 3) << 6);
+        r_q = tc_cem11_retain(level, r_lowbits, 0xC0);
+        r_intval = (r_intval & ~0x3f) | (r_q & 0x3f);
+        r_fval = (float)r_intval * mr;
+        g_fval = r_fval - color[1];
+        b_fval = r_fval - color[2];
+        if (g_fval < 0.0f) g_fval = 0.0f;
+        if (g_fval > 65535.0f) g_fval = 65535.0f;
+        if (b_fval < 0.0f) b_fval = 0.0f;
+        if (b_fval > 65535.0f) b_fval = 65535.0f;
+        g_intval = (int)(g_fval * ms + 0.5f);
+        b_intval = (int)(b_fval * ms + 0.5f);
+        if (g_intval >= gb_ic || b_intval >= gb_ic) continue;
+        g_lowbits = g_intval & 0x1f;
+        b_lowbits = b_intval & 0x1f;
+        switch (mode) {
+            case 0:
+            case 2: bit0 = (r_intval >> 9) & 1; break;
+            case 1:
+            case 3: bit0 = (r_intval >> 8) & 1; break;
+            case 4: bit0 = (g_intval >> 6) & 1; break;
+        }
+        switch (mode) {
+            case 1:
+            case 2:
+            case 3: bit2 = (r_intval >> 7) & 1; break;
+            case 4: bit2 = (b_intval >> 6) & 1; break;
+        }
+        switch (mode) {
+            case 0:
+            case 2: bit1 = (r_intval >> 8) & 1; break;
+            default: bit1 = (g_intval >> 5) & 1; break;
+        }
+        switch (mode) {
+            case 0: bit3 = (r_intval >> 10) & 1; break;
+            case 2: bit3 = (r_intval >> 6) & 1; break;
+            default: bit3 = (b_intval >> 5) & 1; break;
+        }
+        g_lowbits |= (mode_enc & 0x4) << 5;
+        b_lowbits |= (mode_enc & 0x8) << 4;
+        g_lowbits |= bit0 << 6;
+        g_lowbits |= bit1 << 5;
+        b_lowbits |= bit2 << 6;
+        b_lowbits |= bit3 << 5;
+        g_q = tc_cem11_retain(level, g_lowbits, 0xF0);
+        b_q = tc_cem11_retain(level, b_lowbits, 0xF0);
+        g_intval = (g_intval & ~0x1f) | (g_q & 0x1f);
+        b_intval = (b_intval & ~0x1f) | (b_q & 0x1f);
+        g_fval = (float)g_intval * mr;
+        b_fval = (float)b_intval * mr;
+        rgb_err = (r_fval - color[0]) + (r_fval - g_fval - color[1]) +
+                  (r_fval - b_fval - color[2]);
+        s_fval = s_base + rgb_err * (1.0f / 3.0f);
+        if (s_fval < 0.0f) s_fval = 0.0f;
+        if (s_fval > 1e9f) s_fval = 1e9f;
+        s_intval = (int)(s_fval * ms + 0.5f);
+        if (s_intval >= s_ic) continue;
+        s_lowbits = s_intval & 0x1f;
+        switch (mode) {
+            case 1: bit6 = (r_intval >> 9) & 1; break;
+            default: bit6 = (s_intval >> 5) & 1; break;
+        }
+        switch (mode) {
+            case 4: bit5 = (r_intval >> 7) & 1; break;
+            case 1: bit5 = (r_intval >> 10) & 1; break;
+            default: bit5 = (s_intval >> 6) & 1; break;
+        }
+        switch (mode) {
+            case 2: bit4 = (s_intval >> 7) & 1; break;
+            default: bit4 = (r_intval >> 6) & 1; break;
+        }
+        s_lowbits |= bit6 << 5;
+        s_lowbits |= bit5 << 6;
+        s_lowbits |= bit4 << 7;
+        s_q = tc_cem11_retain(level, s_lowbits, 0xF0);
+        v[0] = (uint8_t)r_q;
+        v[1] = (uint8_t)g_q;
+        v[2] = (uint8_t)b_q;
+        v[3] = (uint8_t)s_q;
+        return;
+    }
+    /* fallback: mode 5 (absolute, 9-bit). */
+    {
+        float vals[4], cvals[3], rgb_err;
+        int ivals[4], enc[4];
+        for (c = 0; c < 4; ++c) vals[c] = bak[c];
+        for (c = 0; c < 3; ++c) {
+            if (vals[c] < 0.0f) vals[c] = 0.0f;
+            if (vals[c] > 65020.0f) vals[c] = 65020.0f;
+            ivals[c] = (int)(vals[c] * (1.0f / 512.0f) + 0.5f);
+            cvals[c] = (float)ivals[c] * 512.0f;
+        }
+        rgb_err = (cvals[0] - vals[0]) + (cvals[1] - vals[1]) + (cvals[2] - vals[2]);
+        vals[3] += rgb_err * (1.0f / 3.0f);
+        if (vals[3] < 0.0f) vals[3] = 0.0f;
+        if (vals[3] > 65020.0f) vals[3] = 65020.0f;
+        ivals[3] = (int)(vals[3] * (1.0f / 512.0f) + 0.5f);
+        enc[0] = (ivals[0] & 0x3f) | 0xC0;
+        enc[1] = (ivals[1] & 0x7f) | 0x80;
+        enc[2] = (ivals[2] & 0x7f) | 0x80;
+        enc[3] = (ivals[3] & 0x7f) | ((ivals[0] & 0x40) << 1);
+        for (c = 0; c < 4; ++c) v[c] = (uint8_t)tc_cem11_retain(level, enc[c], 0xF0);
+    }
+}
+
 void tc_astc_hdr_options_init(tc_astc_hdr_options *opt) {
     if (!opt) return;
     memset(opt, 0, sizeof(*opt));
@@ -486,19 +727,24 @@ tc_result tc_astc_hdr_compress_rgbf(const float *rgb, uint32_t width,
                 /* Try CEM 11 (single/dual plane), 2-subset partitions, and a
                  * constant (block-mean void-extent); keep whichever
                  * reconstructs the block with the least LNS-domain error. */
-                uint8_t cem[16], sub[16];
-                uint64_t cem_sse, sub_sse, ve_sse = 0, best_sse;
+                uint8_t cem[16], sub[16], cem7[16];
+                uint64_t cem_sse, sub_sse, cem7_sse, ve_sse = 0, best_sse;
                 const uint8_t *best_buf;
                 int mean[3];
                 int64_t sum[3] = {0, 0, 0};
                 int i, cc;
                 cem_sse = tc_encode_astc_hdr_cem11_block(lns, cem);
                 sub_sse = tc_encode_astc_hdr_cem11_2subset_block(lns, sub);
+                cem7_sse = tc_encode_astc_hdr_cem7_block(lns, cem7);
                 best_buf = cem;
                 best_sse = cem_sse;
                 if (sub_sse < best_sse) {
                     best_sse = sub_sse;
                     best_buf = sub;
+                }
+                if (cem7_sse < best_sse) {
+                    best_sse = cem7_sse;
+                    best_buf = cem7;
                 }
                 for (i = 0; i < 16; ++i)
                     for (cc = 0; cc < 3; ++cc) sum[cc] += lns[i][cc];

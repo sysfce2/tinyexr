@@ -230,6 +230,57 @@ int main(void) {
         return 1;
     }
 
+    /* (e) fixed near-gray hue with a per-block multiplicative brightness ramp:
+     * a near-uniform LNS offset between the two endpoints, so CEM 7 (base+scale,
+     * 4 values -> a finer weight grid) should win over CEM 11 here. Assert at
+     * least one CEM 7 block is emitted, that it round-trips through astcenc, and
+     * that the pure-C decoder agrees. */
+    {
+        uint32_t seen_cem7 = 0, b;
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                float bmul = 1.0f + 3.0f * (float)((x & 3u) + (y & 3u)) / 6.0f;
+                float *px = src + ((size_t)y * W + x) * 3;
+                px[0] = 1.0f * bmul;
+                px[1] = 0.92f * bmul;
+                px[2] = 0.85f * bmul;
+            }
+        if (tc_astc_hdr_compress_rgbf(src, W, H, (size_t)W * 3u * sizeof(float),
+                                      &opt, blocks, need) != TC_SUCCESS) {
+            fprintf(stderr, "FAIL: hdr encode (brightness ramp)\n");
+            return 1;
+        }
+        if (astc_hdr_decode(blocks, need, W, H, dec) != 0) {
+            fprintf(stderr, "FAIL: astcenc hdr decode (brightness ramp)\n");
+            return 1;
+        }
+        for (b = 0; b + 16u <= need; b += 16u) {
+            const uint8_t *p = blocks + b;
+            unsigned bm = (unsigned)p[0] | ((unsigned)(p[1] & 7u) << 8);
+            if ((bm & 0x1ffu) == 0x1fcu) continue; /* void-extent */
+            if (((p[1] >> 3) & 3u) != 0u) continue; /* single-subset only */
+            if (((((unsigned)p[1] >> 5) & 7u) | (((unsigned)p[2] & 1u) << 3)) ==
+                7u)
+                seen_cem7 = 1;
+        }
+        p = psnr_rgb(src, dec, (size_t)W * H, 4.0);
+        printf("astc-hdr brightness-ramp 64x64: %.2f dB (cem7 used=%u)\n", p,
+               seen_cem7);
+        if (!seen_cem7) {
+            fprintf(stderr, "FAIL: no CEM 7 block emitted on base+scale content\n");
+            return 1;
+        }
+        if (!hdr_xcheck_refdec(blocks, W, H, dec)) {
+            fprintf(stderr, "FAIL: pure-C HDR decoder disagrees with astcenc "
+                            "(brightness-ramp/CEM 7)\n");
+            return 1;
+        }
+        if (p < 32.0) {
+            fprintf(stderr, "FAIL: brightness-ramp psnr %.2f dB below floor\n", p);
+            return 1;
+        }
+    }
+
     printf("astc hdr xcheck: OK\n");
     return 0;
 }
