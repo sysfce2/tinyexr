@@ -224,32 +224,75 @@ int main(int argc, char **argv) {
                                    bc_size, iters)) return 1;
     }
     bench_astc_ise_pow2();
-    iters = 5;
-    t0 = now_sec();
-    for (i = 0; i < (size_t)iters; ++i) {
-        if (tc_bc6h_compress_rgb32f(rgbf, w, h, (size_t)w * 3u * sizeof(float),
-                                    &bc6h_opt, bc, bc_size) != TC_SUCCESS) {
-            return 1;
-        }
+
+    {
+        tc_bc1_options bc1_opt;
+        tc_bc3_options bc3_opt;
+        tc_astc_hdr_options hdr_opt;
+        tc_bc1_options_init(&bc1_opt);
+        tc_bc3_options_init(&bc3_opt);
+        tc_astc_hdr_options_init(&hdr_opt);
+        iters = 10;
+        t0 = now_sec();
+        for (i = 0; i < (size_t)iters; ++i)
+            if (tc_bc1_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc1_opt, bc,
+                                      bc_size) != TC_SUCCESS)
+                return 1;
+        t1 = now_sec();
+        mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
+        printf("texcomp bc1 scalar: %.2f MPix/s (%ux%u x %d)\n", mpix, w, h,
+               iters);
+        t0 = now_sec();
+        for (i = 0; i < (size_t)iters; ++i)
+            if (tc_bc3_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc3_opt, bc,
+                                      bc_size) != TC_SUCCESS)
+                return 1;
+        t1 = now_sec();
+        mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
+        printf("texcomp bc3 scalar: %.2f MPix/s (%ux%u x %d)\n", mpix, w, h,
+               iters);
+        iters = 5;
+        t0 = now_sec();
+        for (i = 0; i < (size_t)iters; ++i)
+            if (tc_astc_hdr_compress_rgbf(rgbf, w, h, (size_t)w * 3u * sizeof(float),
+                                          &hdr_opt, bc, bc_size) != TC_SUCCESS)
+                return 1;
+        t1 = now_sec();
+        mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
+        printf("texcomp astc hdr 4x4: %.2f MPix/s (%ux%u x %d)\n", mpix, w, h,
+               iters);
     }
-    t1 = now_sec();
-    mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
-    printf("texcomp bc6h mode11 scalar: %.2f MPix/s (%ux%u x %d)\n", mpix, w, h,
-           iters);
-    for (i = 0; i < n * 3u; ++i)
-        if (i & 1u) rgbf[i] = -rgbf[i];
-    bc6h_opt.signed_float = 1;
-    t0 = now_sec();
-    for (i = 0; i < (size_t)iters; ++i) {
-        if (tc_bc6h_compress_rgb32f(rgbf, w, h, (size_t)w * 3u * sizeof(float),
-                                    &bc6h_opt, bc, bc_size) != TC_SUCCESS) {
-            return 1;
+
+    /* BC6H: benched per SIMD backend (its selector search is vectorized). */
+    {
+        static const uint32_t bmask[3] = {TC_BACKEND_SCALAR, TC_BACKEND_SSE41,
+                                          TC_BACKEND_AVX2};
+        static const char *const bname[3] = {"scalar", "sse4.1", "avx2"};
+        uint32_t avail = tc_backend_available_mask(), sgn, mi;
+        iters = 8;
+        for (sgn = 0; sgn < 2u; ++sgn) {
+            bc6h_opt.signed_float = (int)sgn;
+            for (mi = 0; mi < 3u; ++mi) {
+                if (mi > 0u && !(avail & bmask[mi])) continue;
+                tc_backend_force_mask(bmask[mi]);
+                t0 = now_sec();
+                for (i = 0; i < (size_t)iters; ++i)
+                    if (tc_bc6h_compress_rgb32f(rgbf, w, h,
+                                                (size_t)w * 3u * sizeof(float),
+                                                &bc6h_opt, bc, bc_size) !=
+                        TC_SUCCESS)
+                        return 1;
+                t1 = now_sec();
+                mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
+                printf("texcomp bc6h%s mode11 %s: %.2f MPix/s (%ux%u x %d)\n",
+                       sgn ? " signed" : "", bname[mi], mpix, w, h, iters);
+            }
+            if (sgn == 0u)
+                for (i = 0; i < n * 3u; ++i)
+                    if (i & 1u) rgbf[i] = -rgbf[i];
         }
+        tc_backend_force_mask(TC_BACKEND_ALL);
     }
-    t1 = now_sec();
-    mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
-    printf("texcomp bc6h signed mode11 scalar: %.2f MPix/s (%ux%u x %d)\n", mpix,
-           w, h, iters);
     free(rgba);
     free(rgba_solid);
     free(rgbf);
