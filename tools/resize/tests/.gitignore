@@ -1,0 +1,4 @@
+# Third-party benchmark comparison header, fetched on demand for
+# `make resize-bench STB=1`. Not vendored (public domain, but kept out of
+# the tree to avoid shipping a 10k-line dependency the library never uses).
+stb_image_resize2.h

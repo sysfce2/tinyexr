@@ -310,6 +310,64 @@ See [`sandbox/tocio/`](sandbox/tocio/) for the engine and
 
 ---
 
+# tir — tiny content-aware image resize
+
+The repo also ships **tir** (`tools/resize/`): a small, fast, **pure-C11**
+image resizer that is HDR-, normal-map-, and displacement/height-map-aware.
+Standalone (no dependency on the EXR codec — only the CLI and benchmark link
+`libtinyexr3.a` for file I/O), one arena allocation per resize, with runtime
+SIMD dispatch. Separable two-pass resampling over f32 with precomputed,
+edge-folded, zero-padded coefficient tables and a streaming ring buffer
+(O(support) memory).
+
+```c
+#include "tir.h"
+tir_image_view src = {pixels, w, h, 4, TIR_F32, 0};
+tir_image_view dst = {out, w/2, h/2, 4, TIR_F32, 0};
+tir_options o; tir_options_init(&o);
+o.filter_x = o.filter_y = TIR_FILTER_LANCZOS3;
+o.antiring  = 1.0f;   /* confine ringing to the local source range */
+o.clamp_min = 0.0f;   /* hard guarantee: no negative pixels */
+tir_resize(NULL, &src, &dst, &o);
+```
+
+Highlights:
+
+| Area | Support |
+|---|---|
+| **Language** | Pure C11, `-Wall -Wextra -Werror` clean, overflow-checked size arithmetic; own prefix / allocator hook, zero external dependencies |
+| **HDR-aware** | Values never clamped by default; negative-lobe ringing confined by `antiring` (blend toward a reduced-footprint min/max, applied **once after both passes**), so `antiring=1` + `clamp_min=0` is a hard no-negative-pixels guarantee; optional OIIO/SPI highlight compression |
+| **Content modes** | **Normal maps** (snorm / unorm / NVTT-C127 / 2-channel RG with `z` reconstructed; renormalized once, `|N|` side output for Toksvig); **height/displacement** (mean-preserving area downscale, grid-vertex registration for 2ⁿ+1 terrains); correct **premultiplied-alpha** filtering; NaN/Inf scrub policies (`zero` / 3×3 `repair` / `error`) |
+| **Filters / edges** | Box, triangle, B-spline, Gaussian, Mitchell, Catmull-Rom, Lanczos-2/3; clamp / reflect / wrap; f32 / f16 / u8 / u16 pixel I/O |
+| **SIMD** | Runtime **SSE2 / SSE4.1 / AVX2 (+FMA, F16C)**, compile-time **NEON**, **SVE 1.0** behind a `HWCAP_SVE` gate; `deterministic=1` pins scalar kernels for bit-identical output across platforms / levels / thread counts |
+| **API** | One-shot `tir_resize`, reusable sampler, **streaming** `push_row`/`pull_row` (O(support) memory), and optional C11-threads band parallelism (byte-identical to serial) |
+
+Beats the in-tree `exr_resize_float` by **2–5×** and is competitive with
+stb_image_resize2 (wins every 4-channel/HDR case on the Zen2 bench).
+Validated against an independent double-precision reference resampler under the
+full sanitizer matrix (ASan / UBSan / LeakSanitizer / ThreadSanitizer), an
+exhaustive f16↔f32 converter sweep, and a libFuzzer harness.
+
+Build & test:
+
+```sh
+make resize-lib          # build/libtir.a
+make resize-cli          # build/tir_resize (EXR in/out)
+make resize-test         # unit tests (ASan+UBSan) vs a double-precision oracle
+make resize-test-tsan    # ThreadSanitizer
+make resize-bench        # MP/s vs exr_resize_float (STB=1 adds stb2)
+make resize-fuzz-corpus  # deterministic fuzz replay (ASan+UBSan)
+```
+
+```sh
+./build/tir_resize in.exr -o out.exr --scale 0.5 --filter lanczos3 \
+    --antiring 1 --clamp-min 0 --stats
+```
+
+See [`tools/resize/`](tools/resize/) for the library and its README.
+
+---
+
 # v1 — single-header C++ (stable)
 
 The original single-header C++ API (`tinyexr.h`) is the **old but stable**
