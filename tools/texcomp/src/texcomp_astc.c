@@ -4385,13 +4385,15 @@ static int tc_uastc_encode_cem4(const uint8_t block[144][4], uint32_t count,
                                 uint64_t *out_sse) {
     const tc_astc_partition_info *pi = NULL;
     uint8_t weightbuf[16], sym[12], wsym[16], vals[8], dualw[32];
-    uint8_t best_p1[16], best_p2[16];
+    uint8_t best_p1[16], best_p2[16], best_sym[12], best_wsym[16], wt[144];
+    uint8_t blk_lum[144][4];
     uint32_t qe0[3][4], qe1[3][4], er, weight_bits, color_bits, bm, bitpos;
     uint32_t nvw = dual ? 32u : 16u, wcount = dual ? 32u : 16u;
-    uint32_t best_ccs = 99u, i, c, s;
+    uint32_t rlo[3][4], rhi[3][4];
+    uint32_t best_ccs = 99u, i, c, s, round, rounds;
     int dir[3][4];
     int64_t dl[3] = {0, 0, 0};
-    uint64_t best_sse = (uint64_t)-1, sse = 0;
+    uint64_t best_sse = (uint64_t)-1, best = (uint64_t)-1, sse = 0;
 
     bm = dual ? tc_astc_find_dual_grid_mode(qm) : tc_astc_hdr_find_grid_mode(qm);
     if (!bm) return 0;
@@ -4409,6 +4411,13 @@ static int tc_uastc_encode_cem4(const uint8_t block[144][4], uint32_t count,
         !tc_astc_find_best_partition(block, ctx->part2_cache, ctx->part2_count,
                                      nsub, ctx, &pi))
         return 0;
+    /* Luminance block (RGB collapsed to one channel) is what CEM 4 can
+     * represent, and the target for the least-squares endpoint solve. */
+    for (i = 0; i < count; ++i) {
+        uint8_t L = (uint8_t)tc_uastc_lum(block[i]);
+        blk_lum[i][0] = blk_lum[i][1] = blk_lum[i][2] = L;
+        blk_lum[i][3] = block[i][3];
+    }
     for (s = 0; s < nsub; ++s) {
         uint32_t Llo = 255u, Lhi = 0, Alo = 255u, Ahi = 0;
         int have = 0;
@@ -4423,20 +4432,74 @@ static int tc_uastc_encode_cem4(const uint8_t block[144][4], uint32_t count,
             have = 1;
         }
         if (!have) return 0;
-        vals[0] = (uint8_t)Llo;
-        vals[1] = (uint8_t)Lhi;
-        vals[2] = (uint8_t)Alo;
-        vals[3] = (uint8_t)Ahi;
-        tc_astc_quantize_color_values(ctx, er, 4u, vals, sym + s * 4u);
-        qe0[s][0] = qe0[s][1] = qe0[s][2] =
-            tc_astc_color_symbol_uquant(er, sym[s * 4u]);
-        qe1[s][0] = qe1[s][1] = qe1[s][2] =
-            tc_astc_color_symbol_uquant(er, sym[s * 4u + 1u]);
-        qe0[s][3] = tc_astc_color_symbol_uquant(er, sym[s * 4u + 2u]);
-        qe1[s][3] = tc_astc_color_symbol_uquant(er, sym[s * 4u + 3u]);
-        for (c = 0; c < 4u; ++c) {
-            dir[s][c] = (int)qe1[s][c] - (int)qe0[s][c];
-            dl[s] += (int64_t)dir[s][c] * dir[s][c];
+        rlo[s][0] = rlo[s][1] = rlo[s][2] = Llo;
+        rlo[s][3] = Alo;
+        rhi[s][0] = rhi[s][1] = rhi[s][2] = Lhi;
+        rhi[s][3] = Ahi;
+    }
+    /* Dual plane keeps the bbox endpoints (a per-plane solve is not worth the
+     * complexity for this niche mode); single/2-subset refine by least squares
+     * against the luminance block over a few rounds. */
+    rounds = dual ? 1u : 3u;
+    for (round = 0; round < rounds; ++round) {
+        for (s = 0; s < nsub; ++s) {
+            vals[0] = (uint8_t)rlo[s][0];
+            vals[1] = (uint8_t)rhi[s][0];
+            vals[2] = (uint8_t)rlo[s][3];
+            vals[3] = (uint8_t)rhi[s][3];
+            tc_astc_quantize_color_values(ctx, er, 4u, vals, sym + s * 4u);
+            qe0[s][0] = qe0[s][1] = qe0[s][2] =
+                tc_astc_color_symbol_uquant(er, sym[s * 4u]);
+            qe1[s][0] = qe1[s][1] = qe1[s][2] =
+                tc_astc_color_symbol_uquant(er, sym[s * 4u + 1u]);
+            qe0[s][3] = tc_astc_color_symbol_uquant(er, sym[s * 4u + 2u]);
+            qe1[s][3] = tc_astc_color_symbol_uquant(er, sym[s * 4u + 3u]);
+            dl[s] = 0;
+            for (c = 0; c < 4u; ++c) {
+                dir[s][c] = (int)qe1[s][c] - (int)qe0[s][c];
+                dl[s] += (int64_t)dir[s][c] * dir[s][c];
+            }
+        }
+        if (dual) break; /* dual scoring/assembly handled below */
+        sse = 0;
+        for (i = 0; i < count; ++i) {
+            uint32_t s2 = pi ? pi->partition_of_texel[i] : 0u;
+            int w64 = 0, uq;
+            if (dl[s2] > 0) {
+                int64_t dot = 0;
+                for (c = 0; c < 4u; ++c)
+                    dot += ((int64_t)block[i][c] - (int)qe0[s2][c]) * dir[s2][c];
+                if (dot < 0) dot = 0;
+                if (dot > dl[s2]) dot = dl[s2];
+                w64 = (int)((dot * 64 + dl[s2] / 2) / dl[s2]);
+            }
+            wsym[i] =
+                tc_astc_hdr_quant_weight(w64, qm, tc_astc_quant_levels(qm));
+            uq = (int)tc_astc_weight_unquant(wsym[i], qm);
+            wt[i] = (uint8_t)uq;
+            for (c = 0; c < 4u; ++c) {
+                int rec =
+                    ((int)qe0[s2][c] * (64 - uq) + (int)qe1[s2][c] * uq + 32) >> 6;
+                int e = (int)block[i][c] - rec;
+                sse += (uint64_t)(e * e);
+            }
+        }
+        if (sse < best) {
+            best = sse;
+            memcpy(best_sym, sym, nsub * 4u);
+            memcpy(best_wsym, wsym, 16u);
+        } else {
+            break;
+        }
+        if (round + 1u < rounds) {
+            for (s = 0; s < nsub; ++s) {
+                if (pi)
+                    (void)tc_astc_lsq_endpoints_partition(blk_lum, count, pi, s,
+                                                          wt, rlo[s], rhi[s]);
+                else
+                    (void)tc_astc_lsq_endpoints(blk_lum, count, wt, rlo[s],
+                                                rhi[s]);
+            }
         }
     }
 
@@ -4489,26 +4552,10 @@ static int tc_uastc_encode_cem4(const uint8_t block[144][4], uint32_t count,
         }
         sse = best_sse;
     } else {
-        for (i = 0; i < count; ++i) {
-            uint32_t s2 = pi ? pi->partition_of_texel[i] : 0u;
-            int w64 = 0, uq;
-            if (dl[s2] > 0) {
-                int64_t dot = 0;
-                for (c = 0; c < 4u; ++c)
-                    dot += ((int64_t)block[i][c] - (int)qe0[s2][c]) * dir[s2][c];
-                if (dot < 0) dot = 0;
-                if (dot > dl[s2]) dot = dl[s2];
-                w64 = (int)((dot * 64 + dl[s2] / 2) / dl[s2]);
-            }
-            wsym[i] = tc_astc_hdr_quant_weight(w64, qm, tc_astc_quant_levels(qm));
-            uq = (int)tc_astc_weight_unquant(wsym[i], qm);
-            for (c = 0; c < 4u; ++c) {
-                int rec =
-                    ((int)qe0[s2][c] * (64 - uq) + (int)qe1[s2][c] * uq + 32) >> 6;
-                int e = (int)block[i][c] - rec;
-                sse += (uint64_t)(e * e);
-            }
-        }
+        if (best == (uint64_t)-1) return 0;
+        sse = best;
+        memcpy(sym, best_sym, nsub * 4u);
+        memcpy(wsym, best_wsym, 16u);
     }
     *out_sse = sse;
 
@@ -4565,12 +4612,12 @@ static int tc_uastc_encode_msubset(const uint8_t block[144][4], uint32_t count,
         (nsub == 3u) ? ctx->part3_cache : ctx->part2_cache;
     uint32_t cache_count = (nsub == 3u) ? ctx->part3_count : ctx->part2_count;
     uint8_t weightbuf[16], sym[24], wsym[16], vals[8];
+    uint8_t best_sym[24], best_wsym[16], wt[144];
     uint32_t qe0[3][4], qe1[3][4], er, weight_bits, color_bits, bm, bitpos;
     uint32_t nvs = (cem == 12u) ? 8u : 6u, nch = (cem == 12u) ? 4u : 3u;
-    uint32_t i, c, s;
-    int dir[3][4];
-    int64_t dl[3] = {0, 0, 0};
-    uint64_t sse = 0;
+    uint32_t rlo[3][4], rhi[3][4];
+    uint64_t best = (uint64_t)-1;
+    uint32_t i, c, s, round;
 
     bm = tc_astc_hdr_find_grid_mode(qm);
     if (!bm) return 0;
@@ -4592,53 +4639,87 @@ static int tc_uastc_encode_msubset(const uint8_t block[144][4], uint32_t count,
             have = 1;
         }
         if (!have) return 0;
-        vals[0] = (uint8_t)lo[0];
-        vals[1] = (uint8_t)hi[0];
-        vals[2] = (uint8_t)lo[1];
-        vals[3] = (uint8_t)hi[1];
-        vals[4] = (uint8_t)lo[2];
-        vals[5] = (uint8_t)hi[2];
-        if (cem == 12u) {
-            vals[6] = (uint8_t)lo[3];
-            vals[7] = (uint8_t)hi[3];
-        }
-        tc_astc_quantize_color_values(ctx, er, nvs, vals, sym + s * nvs);
-        for (c = 0; c < nch; ++c) {
-            qe0[s][c] = tc_astc_color_symbol_uquant(er, sym[s * nvs + c * 2u]);
-            qe1[s][c] =
-                tc_astc_color_symbol_uquant(er, sym[s * nvs + c * 2u + 1u]);
-            dir[s][c] = (int)qe1[s][c] - (int)qe0[s][c];
-            dl[s] += (int64_t)dir[s][c] * dir[s][c];
-        }
-        if (cem != 12u) {
-            qe0[s][3] = 255u;
-            qe1[s][3] = 255u;
-        }
-        if (qe0[s][0] + qe0[s][1] + qe0[s][2] >
-            qe1[s][0] + qe1[s][1] + qe1[s][2])
-            return 0;
-    }
-    for (i = 0; i < count; ++i) {
-        uint32_t s2 = pi->partition_of_texel[i];
-        int w64 = 0, uq;
-        if (dl[s2] > 0) {
-            int64_t dot = 0;
-            for (c = 0; c < nch; ++c)
-                dot += ((int64_t)block[i][c] - (int)qe0[s2][c]) * dir[s2][c];
-            if (dot < 0) dot = 0;
-            if (dot > dl[s2]) dot = dl[s2];
-            w64 = (int)((dot * 64 + dl[s2] / 2) / dl[s2]);
-        }
-        wsym[i] = tc_astc_hdr_quant_weight(w64, qm, tc_astc_quant_levels(qm));
-        uq = (int)tc_astc_weight_unquant(wsym[i], qm);
-        for (c = 0; c < nch; ++c) {
-            int rec = ((int)qe0[s2][c] * (64 - uq) + (int)qe1[s2][c] * uq + 32) >>
-                      6;
-            int e = (int)block[i][c] - rec;
-            sse += (uint64_t)(e * e);
+        for (c = 0; c < 4u; ++c) {
+            rlo[s][c] = lo[c];
+            rhi[s][c] = hi[c];
         }
     }
-    *out_sse = sse;
+    /* Round 0 = bbox endpoints; later rounds re-solve each subset's endpoints
+     * by least squares against the shared weights and keep the best. */
+    for (round = 0; round < 3u; ++round) {
+        int dir[3][4], valid = 1;
+        int64_t dl[3] = {0, 0, 0};
+        uint64_t sse = 0;
+        for (s = 0; s < nsub; ++s) {
+            vals[0] = (uint8_t)rlo[s][0];
+            vals[1] = (uint8_t)rhi[s][0];
+            vals[2] = (uint8_t)rlo[s][1];
+            vals[3] = (uint8_t)rhi[s][1];
+            vals[4] = (uint8_t)rlo[s][2];
+            vals[5] = (uint8_t)rhi[s][2];
+            if (cem == 12u) {
+                vals[6] = (uint8_t)rlo[s][3];
+                vals[7] = (uint8_t)rhi[s][3];
+            }
+            tc_astc_quantize_color_values(ctx, er, nvs, vals, sym + s * nvs);
+            for (c = 0; c < nch; ++c) {
+                qe0[s][c] =
+                    tc_astc_color_symbol_uquant(er, sym[s * nvs + c * 2u]);
+                qe1[s][c] =
+                    tc_astc_color_symbol_uquant(er, sym[s * nvs + c * 2u + 1u]);
+                dir[s][c] = (int)qe1[s][c] - (int)qe0[s][c];
+                dl[s] += (int64_t)dir[s][c] * dir[s][c];
+            }
+            if (cem != 12u) {
+                qe0[s][3] = 255u;
+                qe1[s][3] = 255u;
+            }
+            if (qe0[s][0] + qe0[s][1] + qe0[s][2] >
+                qe1[s][0] + qe1[s][1] + qe1[s][2]) {
+                valid = 0;
+                break;
+            }
+        }
+        if (!valid) break;
+        for (i = 0; i < count; ++i) {
+            uint32_t s2 = pi->partition_of_texel[i];
+            int w64 = 0, uq;
+            if (dl[s2] > 0) {
+                int64_t dot = 0;
+                for (c = 0; c < nch; ++c)
+                    dot += ((int64_t)block[i][c] - (int)qe0[s2][c]) * dir[s2][c];
+                if (dot < 0) dot = 0;
+                if (dot > dl[s2]) dot = dl[s2];
+                w64 = (int)((dot * 64 + dl[s2] / 2) / dl[s2]);
+            }
+            wsym[i] =
+                tc_astc_hdr_quant_weight(w64, qm, tc_astc_quant_levels(qm));
+            uq = (int)tc_astc_weight_unquant(wsym[i], qm);
+            wt[i] = (uint8_t)uq;
+            for (c = 0; c < nch; ++c) {
+                int rec =
+                    ((int)qe0[s2][c] * (64 - uq) + (int)qe1[s2][c] * uq + 32) >>
+                    6;
+                int e = (int)block[i][c] - rec;
+                sse += (uint64_t)(e * e);
+            }
+        }
+        if (sse < best) {
+            best = sse;
+            memcpy(best_sym, sym, nsub * nvs);
+            memcpy(best_wsym, wsym, 16u);
+        } else {
+            break;
+        }
+        if (round + 1u < 3u)
+            for (s = 0; s < nsub; ++s)
+                (void)tc_astc_lsq_endpoints_partition(block, count, pi, s, wt,
+                                                      rlo[s], rhi[s]);
+    }
+    if (best == (uint64_t)-1) return 0;
+    *out_sse = best;
+    memcpy(sym, best_sym, nsub * nvs);
+    memcpy(wsym, best_wsym, 16u);
 
     memset(out, 0, 16u);
     memset(weightbuf, 0, sizeof(weightbuf));
