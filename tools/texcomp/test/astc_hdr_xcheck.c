@@ -11,11 +11,37 @@
  */
 #include "astcenc.h"
 #include "texcomp.h"
+#include "astc_hdr_ref_decode.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Cross-check the pure-C HDR reference decoder against astcenc: decode every
+ * block both ways and require the floats to match exactly. */
+static int hdr_xcheck_refdec(const uint8_t *blocks, uint32_t w, uint32_t h,
+                             const float *astc_dec) {
+    uint32_t bxc = (w + 3u) / 4u, bx, by, xx, yy;
+    for (by = 0; by < h; by += 4u)
+        for (bx = 0; bx < w; bx += 4u) {
+            float dec[16 * 4];
+            if (!ahref_decode_block_hdr(
+                    blocks + ((size_t)(by / 4u) * bxc + bx / 4u) * 16u, 4, 4,
+                    dec))
+                return 0;
+            for (yy = 0; yy < 4u; ++yy)
+                for (xx = 0; xx < 4u; ++xx) {
+                    uint32_t x = bx + xx, y = by + yy, c;
+                    if (x >= w || y >= h) continue;
+                    for (c = 0; c < 3u; ++c)
+                        if (dec[(yy * 4u + xx) * 4u + c] !=
+                            astc_dec[((size_t)y * w + x) * 4u + c])
+                            return 0;
+                }
+        }
+    return 1;
+}
 
 /* Decode ASTC HDR blocks to float RGBA via astcenc (HDR profile). */
 static int astc_hdr_decode(const uint8_t *blocks, size_t len, uint32_t w,
@@ -95,6 +121,10 @@ int main(void) {
     }
     p = psnr_rgb(src, dec, (size_t)W * H, 12.0);
     printf("astc-hdr const 64x64: %.2f dB\n", p);
+    if (!hdr_xcheck_refdec(blocks, W, H, dec)) {
+        fprintf(stderr, "FAIL: pure-C HDR decoder disagrees with astcenc (const/void-extent)\n");
+        return 1;
+    }
     if (p < 60.0) {
         fprintf(stderr, "FAIL: const-colour void-extent round-trip %.2f dB\n", p);
         return 1;
@@ -122,6 +152,10 @@ int main(void) {
     }
     p = psnr_rgb(src, dec, (size_t)W * H, 24.0);
     printf("astc-hdr gradient 64x64: %.2f dB\n", p);
+    if (!hdr_xcheck_refdec(blocks, W, H, dec)) {
+        fprintf(stderr, "FAIL: pure-C HDR decoder disagrees with astcenc (gradient/single-subset)\n");
+        return 1;
+    }
     if (p < 50.0) {
         fprintf(stderr, "FAIL: gradient psnr %.2f dB below floor\n", p);
         return 1;
@@ -150,6 +184,10 @@ int main(void) {
     }
     p = psnr_rgb(src, dec, (size_t)W * H, 24.0);
     printf("astc-hdr anti-correlated 64x64: %.2f dB\n", p);
+    if (!hdr_xcheck_refdec(blocks, W, H, dec)) {
+        fprintf(stderr, "FAIL: pure-C HDR decoder disagrees with astcenc (anti-correlated/dual-plane)\n");
+        return 1;
+    }
     if (p < 46.0) {
         fprintf(stderr, "FAIL: anti-correlated psnr %.2f dB below floor\n", p);
         return 1;
@@ -183,6 +221,10 @@ int main(void) {
     }
     p = psnr_rgb(src, dec, (size_t)W * H, 24.0);
     printf("astc-hdr two-gradient 64x64: %.2f dB\n", p);
+    if (!hdr_xcheck_refdec(blocks, W, H, dec)) {
+        fprintf(stderr, "FAIL: pure-C HDR decoder disagrees with astcenc (two-gradient/2-subset)\n");
+        return 1;
+    }
     if (p < 20.0) {
         fprintf(stderr, "FAIL: two-gradient psnr %.2f dB below floor\n", p);
         return 1;

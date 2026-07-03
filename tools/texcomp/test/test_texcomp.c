@@ -10,6 +10,7 @@
 #include "../src/texcomp_internal.h"
 
 #include "astc_ref_decode.h"
+#include "astc_hdr_ref_decode.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -809,6 +810,56 @@ int main(void) {
         CHECK(hblk[0] == 0xFCu && hblk[1] == 0xFFu, "astc hdr void-extent marker");
         CHECK((hblk[14] | (hblk[15] << 8)) == 0x3C00u, "astc hdr alpha = 1.0");
         CHECK((hblk[8] | (hblk[9] << 8)) != 0u, "astc hdr red nonzero");
+    }
+
+    /* Pure-C HDR round-trip: encode a small HDR gradient and decode it with the
+     * pure-C HDR reference decoder (no astcenc), checking a PSNR floor -- the
+     * core suite's HDR coverage, mirroring the LDR aref_decode_image tests. */
+    {
+        enum { HW = 16, HH = 16 };
+        static float hsrc[HW * HH * 3];
+        static uint8_t hblocks[(HW / 4) * (HH / 4) * 16];
+        float hdec[16 * 4];
+        tc_astc_hdr_options hopt;
+        uint32_t hx, hy, bxc = HW / 4u;
+        double sse = 0.0, peak = 0.0, psnr;
+        tc_astc_hdr_options_init(&hopt);
+        for (hy = 0; hy < HH; ++hy)
+            for (hx = 0; hx < HW; ++hx) {
+                float t = (float)(hx + hy) / (float)(2 * (HW - 1));
+                float *p = hsrc + ((size_t)hy * HW + hx) * 3;
+                p[0] = 0.2f + t * 20.0f;
+                p[1] = 0.15f + t * 12.0f;
+                p[2] = 0.1f + t * 8.0f;
+            }
+        CHECK(tc_astc_hdr_compress_rgbf(hsrc, HW, HH,
+                                        (size_t)HW * 3u * sizeof(float), &hopt,
+                                        hblocks, sizeof(hblocks)) == TC_SUCCESS,
+              "astc hdr encode (gradient)");
+        for (hy = 0; hy < HH; hy += 4)
+            for (hx = 0; hx < HW; hx += 4) {
+                uint32_t yy, xx;
+                CHECK(ahref_decode_block_hdr(
+                          hblocks + ((size_t)(hy / 4u) * bxc + hx / 4u) * 16u, 4,
+                          4, hdec),
+                      "astc hdr pure-C ref decode");
+                for (yy = 0; yy < 4u; ++yy)
+                    for (xx = 0; xx < 4u; ++xx) {
+                        const float *s =
+                            hsrc + ((size_t)(hy + yy) * HW + (hx + xx)) * 3;
+                        const float *d = hdec + (yy * 4u + xx) * 4u;
+                        int c;
+                        for (c = 0; c < 3; ++c) {
+                            double e = (double)s[c] - d[c];
+                            sse += e * e;
+                            if (s[c] > peak) peak = s[c];
+                        }
+                    }
+            }
+        psnr = sse > 0.0
+                   ? 10.0 * log10(peak * peak / (sse / ((double)HW * HH * 3)))
+                   : 99.0;
+        CHECK(psnr > 45.0, "astc hdr gradient pure-C decode psnr");
     }
 
     /* ASTC HDR CEM 11 (HDR RGB direct) endpoint codec round-trip: encode two
