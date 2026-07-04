@@ -78,6 +78,13 @@ int tc_astc_hdr_color_roundtrip(uint32_t level, int value);
 void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], int level,
                         uint8_t v[6]);
 int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]);
+/* HDR alpha endpoint codec (extra 2 values of CEM 14/15) + CEM 15 (HDR RGB +
+ * HDR alpha, 8 values) wrappers. LNS domain like CEM 11. */
+void tc_astc_hdr_alpha_pack(int alns0, int alns1, uint8_t out[2]);
+void tc_astc_hdr_alpha_unpack(const uint8_t in[2], int *out0, int *out1);
+void tc_astc_cem15_pack(const int lns0[3], const int lns1[3], int alns0,
+                        int alns1, int level, uint8_t v[8]);
+int tc_astc_cem15_unpack(const uint8_t v[8], int out0[4], int out1[4]);
 /* CEM 7 (HDR RGB base+scale, 4 values) pack/unpack; LNS domain like CEM 11. */
 void tc_astc_cem7_pack(const int e0[3], const int e1[3], int level,
                        uint8_t v[4]);

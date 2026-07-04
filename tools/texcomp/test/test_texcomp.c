@@ -913,6 +913,42 @@ int main(void) {
         }
     }
 
+    /* CEM 15 = CEM 11 RGB + HDR alpha (8 values). RGB round-trips as CEM 11;
+     * additionally check the HDR alpha pair packs/unpacks to fp16 within the
+     * delta-submode precision (flat fallback on far-apart alphas is coarser). */
+    {
+        static const float apairs[5][2] = {{100.0f, 130.0f}, {1.0f, 1.05f},
+                                           {4000.0f, 4200.0f}, {0.5f, 0.5f},
+                                           {8000.0f, 200.0f}};
+        int kp;
+        for (kp = 0; kp < 5; ++kp) {
+            int rgb0[3] = {2000, 2000, 2000}, rgb1[3] = {2200, 2200, 2200};
+            int d0[4], d1[4];
+            uint8_t v[8];
+            float la0 = apairs[kp][0], la1 = apairs[kp][1];
+            /* alpha endpoints live in the LNS16 domain, like RGB. */
+            int alns0 = tc_astc_float_to_lns16(la0);
+            int alns1 = tc_astc_float_to_lns16(la1);
+            double close = fabs(la0 - la1) / (la0 + 1.0f) < 0.5 ? 0.06 : 0.40;
+            int cc;
+            tc_astc_cem15_pack(rgb0, rgb1, alns0, alns1, 20, v);
+            CHECK(tc_astc_cem15_unpack(v, d0, d1) == 1, "cem15 unpack");
+            /* RGB carried through unchanged from CEM 11. */
+            for (cc = 0; cc < 3; ++cc)
+                CHECK(d0[cc] >= 0 && tc_astc_lns16_to_sf16(d0[cc]) <= 0x7BFFu,
+                      "cem15 rgb valid half");
+            {
+                float ra0 = half_bits_to_float(tc_astc_lns16_to_sf16(d0[3]));
+                float ra1 = half_bits_to_float(tc_astc_lns16_to_sf16(d1[3]));
+                double e0 = fabs((double)ra0 - la0) / (la0 + 1e-3);
+                double e1 = fabs((double)ra1 - la1) / (la1 + 1e-3);
+                CHECK(tc_astc_lns16_to_sf16(d0[3]) <= 0x7BFFu,
+                      "cem15 alpha valid half");
+                CHECK(e0 < close && e1 < close, "cem15 alpha round-trip");
+            }
+        }
+    }
+
     CHECK(tc_etc2_compress_rgba8(rgba, 7, 5, 7 * 4, &etc2_opt, etc2,
                                  sizeof(etc2)) == TC_SUCCESS,
           "etc2 rgba compress");

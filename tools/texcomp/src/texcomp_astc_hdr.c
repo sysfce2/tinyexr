@@ -395,6 +395,81 @@ int tc_astc_cem11_unpack(const uint8_t vv[6], int out0[3], int out1[3]) {
     return 1;
 }
 
+/* HDR alpha endpoint codec (the extra 2 values of CEM 14/15), ports of astcenc
+ * quantize_hdr_alpha / hdr_alpha_unpack. Colour quant is fixed at 256 in the
+ * texcomp HDR path (level 20), where quant_color is the identity -- so the
+ * pack's quantize+reconstruct-check steps drop out and the delta submode
+ * succeeds whenever its range check passes, matching astcenc at that level.
+ * Output is 16-bit LNS (12-bit qlog << 4), the same scale as the CEM 11 unpack,
+ * so tc_astc_lns16_to_sf16 turns it into fp16. */
+void tc_astc_hdr_alpha_pack(int alns0, int alns1, uint8_t out[2]) {
+    int ia0, ia1, val0, val1, diffval, v6, v7, i, cutoff, mask;
+    /* alns are LNS16-domain alpha endpoints (same domain as the RGB endpoints,
+     * i.e. tc_astc_float_to_lns16 output), clamped to the encodable range. */
+    ia0 = tc_rtn(tc_fclamp((float)alns0, 0.0f, 65280.0f));
+    ia1 = tc_rtn(tc_fclamp((float)alns1, 0.0f, 65280.0f));
+    /* delta submodes, decreasing precision */
+    for (i = 2; i >= 0; --i) {
+        val0 = (ia0 + (128 >> i)) >> (8 - i);
+        val1 = (ia1 + (128 >> i)) >> (8 - i);
+        v6 = (val0 & 0x7F) | ((i & 1) << 7);
+        /* quant_color identity at 256: v6d == v6, so val0 is unchanged. */
+        diffval = val1 - val0;
+        cutoff = 32 >> i;
+        mask = 2 * cutoff - 1;
+        if (diffval < -cutoff || diffval >= cutoff) continue;
+        v7 = ((i & 2) << 6) | ((val0 >> 7) << (6 - i)) | (diffval & mask);
+        out[0] = (uint8_t)v6;
+        out[1] = (uint8_t)v7;
+        return;
+    }
+    /* flat fallback */
+    val0 = (ia0 + 256) >> 9;
+    val1 = (ia1 + 256) >> 9;
+    out[0] = (uint8_t)(val0 | 0x80);
+    out[1] = (uint8_t)(val1 | 0x80);
+}
+
+void tc_astc_hdr_alpha_unpack(const uint8_t in[2], int *out0, int *out1) {
+    int v6 = in[0], v7 = in[1];
+    int modeval = ((v6 >> 7) & 1) | ((v7 >> 6) & 2);
+    v6 &= 0x7F;
+    v7 &= 0x7F;
+    if (modeval == 3) {
+        *out0 = (v6 << 5) << 4; /* 12-bit qlog << 4 -> 16-bit LNS */
+        *out1 = (v7 << 5) << 4;
+    } else {
+        v6 |= (v7 << (modeval + 1)) & 0x780;
+        v7 &= (0x3F >> modeval);
+        v7 ^= 32 >> modeval;
+        v7 -= 32 >> modeval;
+        v6 = v6 << (4 - modeval);
+        /* signed left shift via unsigned to stay UB-free (v7 may be negative) */
+        v7 = (int)((uint32_t)v7 << (4 - modeval));
+        v7 = tc_sclamp(v6 + v7, 0, 0xFFF);
+        *out0 = v6 << 4;
+        *out1 = v7 << 4;
+    }
+}
+
+/* CEM 15 = HDR RGB direct (6 values, CEM 11) + HDR alpha (2 values). Endpoints
+ * are LNS; pack/unpack are the CEM 11 RGB codec plus the HDR alpha codec above.
+ * lns0/lns1[3] are RGB LNS16 endpoints, a0/a1 the (float) alpha endpoints. */
+void tc_astc_cem15_pack(const int lns0[3], const int lns1[3], int alns0,
+                        int alns1, int level, uint8_t out[8]) {
+    tc_astc_cem11_pack(lns0, lns1, level, out);
+    tc_astc_hdr_alpha_pack(alns0, alns1, out + 6);
+}
+
+int tc_astc_cem15_unpack(const uint8_t v[8], int out0[4], int out1[4]) {
+    int rgb0[3], rgb1[3];
+    if (!tc_astc_cem11_unpack(v, rgb0, rgb1)) return 0;
+    out0[0] = rgb0[0]; out0[1] = rgb0[1]; out0[2] = rgb0[2];
+    out1[0] = rgb1[0]; out1[1] = rgb1[1]; out1[2] = rgb1[2];
+    tc_astc_hdr_alpha_unpack(v + 6, &out0[3], &out1[3]);
+    return 1;
+}
+
 /* CEM 7 (HDR RGB base+scale, "RGBO"): decode 4 packed values to two LNS
  * endpoints. Endpoint1 = base RGB, endpoint0 = base - scale (uniform). Mirrors
  * astcenc hdr_rgbo_unpack; output is 16-bit LNS (value << 4), same scale as
