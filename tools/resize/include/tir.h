@@ -184,8 +184,11 @@ typedef struct tir_options {
     tir_filter filter_y;
     tir_edge_mode edge_x;       /* CLAMP */
     tir_edge_mode edge_y;
-    float filter_scale;         /* 1.0; >1 widens the kernel (blurs) */
-    float gaussian_sigma;       /* 0.5 */
+    float filter_scale;         /* 1.0; >1 widens the kernel (blurs). Must be
+                                 * in (0, 64]; outside that resize() returns
+                                 * TIR_ERROR_INVALID_ARGUMENT. */
+    float gaussian_sigma;       /* 0.5; must be in (0, 32] (else
+                                 * TIR_ERROR_INVALID_ARGUMENT). */
 
     /* -- content mode ---------------------------------------------------- */
     tir_mode mode;              /* GENERAL */
