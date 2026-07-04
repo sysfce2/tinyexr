@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -232,7 +232,7 @@ TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
   tools/texcomp/src/texcomp_bc5.c tools/texcomp/src/texcomp_bc6h.c \
   tools/texcomp/src/texcomp_bc7.c tools/texcomp/src/texcomp_etc2.c \
   tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c \
-  tools/texcomp/src/texcomp_astc_hdr.c
+  tools/texcomp/src/texcomp_astc_hdr.c tools/texcomp/src/texcomp_uni.c
 TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
 TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
 TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))
@@ -331,6 +331,11 @@ texcomp-test: $(TEXCOMP_TEST_OBJ) tools/texcomp/test/test_texcomp.c | build/texc
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) -pthread \
 	  tools/texcomp/test/test_texcomp.c $(TEXCOMP_TEST_OBJ) -lm -o build/test_texcomp
 	./build/test_texcomp
+
+texcomp-uni-gate: $(TEXCOMP_OBJ) tools/texcomp/test/uni_gate.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O2 -g \
+	  tools/texcomp/test/uni_gate.c $(TEXCOMP_OBJ) -lm -o build/texcomp/uni_gate
+	./build/texcomp/uni_gate
 
 texcomp-bench: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_bench.c | build/texcomp
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O3 \

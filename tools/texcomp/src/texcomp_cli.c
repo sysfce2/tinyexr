@@ -430,7 +430,7 @@ done:
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr|xbc7] "
+            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr|xbc7|uni] "
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
             "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
             "[--quick on|off] [--mode-mask HEX] [--rdo N] "
@@ -622,6 +622,24 @@ int main(int argc, char **argv) {
                     tc_result_string(tr));
         free(rgba);
         free(rgbf);
+        return tr == TC_SUCCESS ? 0 : 1;
+    }
+
+    /* uni: universal transcodable intermediate. Write a tiny container
+     * ("TUNI" + w,h + blocks); transcode at load with tc_uni_transcode_*. */
+    if (strcmp(format, "uni") == 0) {
+        size_t usz = tc_uni_compressed_size(w, h);
+        uint8_t *u = (uint8_t *)malloc(12u + usz), hdr[12];
+        if (!u) { fprintf(stderr, "oom\n"); free(rgba); free(rgbf); return 1; }
+        tr = tc_uni_compress_rgba8(rgba, w, h, (size_t)w * 4u, u + 12u, usz);
+        memcpy(hdr, "TUNI", 4);
+        hdr[4]=(uint8_t)w; hdr[5]=(uint8_t)(w>>8); hdr[6]=(uint8_t)(w>>16); hdr[7]=(uint8_t)(w>>24);
+        hdr[8]=(uint8_t)h; hdr[9]=(uint8_t)(h>>8); hdr[10]=(uint8_t)(h>>16); hdr[11]=(uint8_t)(h>>24);
+        memcpy(u, hdr, 12);
+        if (tr == TC_SUCCESS) tr = write_file(out, u, 12u + usz);
+        if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: uni encode failed\n");
+        else printf("wrote %s (universal intermediate, %ux%u, %zu bytes; transcode with tc_uni_transcode_bc7/bc1)\n", out, w, h, usz);
+        free(u); free(rgba); free(rgbf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 

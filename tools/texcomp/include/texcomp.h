@@ -129,6 +129,9 @@ void tc_astc_options_init(tc_astc_options *opt);
 void tc_astc_hdr_options_init(tc_astc_hdr_options *opt);
 
 size_t tc_bc7_compressed_size(uint32_t width, uint32_t height);
+/* "uni": compact universal transcodable intermediate (16 bytes/block). Encode
+ * once, then transcode cheaply (no re-encode) to a GPU block format. */
+size_t tc_uni_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc1_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc3_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc5_compressed_size(uint32_t width, uint32_t height);
@@ -154,6 +157,21 @@ tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
 tc_result tc_bc7_decompress_rgba8(const uint8_t *bc7, uint32_t width,
                                   uint32_t height, size_t stride,
                                   uint8_t *out_rgba, size_t out_size);
+/* Encode RGBA8 to the universal intermediate. */
+tc_result tc_uni_compress_rgba8(const uint8_t *rgba, uint32_t width,
+                                uint32_t height, size_t stride, uint8_t *out,
+                                size_t out_size);
+/* Decode the intermediate to RGBA8 (reference / quality checks). */
+tc_result tc_uni_decompress_rgba8(const uint8_t *uni, uint32_t width,
+                                  uint32_t height, size_t stride, uint8_t *out,
+                                  size_t out_size);
+/* Cheap transcodes to final GPU formats (no decode+re-encode search). Output
+ * sizes are the usual tc_bc7/bc1 sizes. */
+tc_result tc_uni_transcode_bc7(const uint8_t *uni, uint32_t width,
+                               uint32_t height, uint8_t *out, size_t out_size);
+tc_result tc_uni_transcode_bc1(const uint8_t *uni, uint32_t width,
+                               uint32_t height, uint8_t *out, size_t out_size);
+
 tc_result tc_bc1_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride,
                                 const tc_bc1_options *opt, uint8_t *out_bc1,
