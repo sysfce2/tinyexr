@@ -155,6 +155,59 @@ em_result em_irradiance_cube(const tir_allocator *a, const em_image *src,
     return EM_SUCCESS;
 }
 
+void em_shade_point(const em_image *spec_levels, int num_levels,
+                    const em_image *irradiance, const float *brdf_lut,
+                    int lut_size, const float N[3], const float V[3],
+                    const float albedo[3], float roughness, float metallic,
+                    float out_rgb[3]) {
+    float ndotv = dot3(N, V);
+    float R[3], irr[3], spec[3], F0[3];
+    float lod, f, A, B;
+    int l0, l1, bx, by, c;
+    if (ndotv < 1e-4f) ndotv = 1e-4f;
+    if (ndotv > 1.0f) ndotv = 1.0f;
+
+    /* diffuse: irradiance stored as E/pi, Lambert = albedo * (E/pi). */
+    em_sample(irradiance, N, irr);
+
+    /* specular: reflect V about N, sample the roughness chain (trilinear over
+     * the two bracketing levels). */
+    R[0] = 2.0f * ndotv * N[0] - V[0];
+    R[1] = 2.0f * ndotv * N[1] - V[1];
+    R[2] = 2.0f * ndotv * N[2] - V[2];
+    lod = roughness * (float)(num_levels - 1);
+    if (lod < 0.0f) lod = 0.0f;
+    l0 = (int)lod;
+    if (l0 > num_levels - 1) l0 = num_levels - 1;
+    l1 = l0 + 1 < num_levels ? l0 + 1 : num_levels - 1;
+    f = lod - (float)l0;
+    {
+        float s0[3], s1[3];
+        em_sample(&spec_levels[l0], R, s0);
+        em_sample(&spec_levels[l1], R, s1);
+        spec[0] = s0[0] * (1 - f) + s1[0] * f;
+        spec[1] = s0[1] * (1 - f) + s1[1] * f;
+        spec[2] = s0[2] * (1 - f) + s1[2] * f;
+    }
+
+    for (c = 0; c < 3; ++c) F0[c] = 0.04f * (1.0f - metallic) + albedo[c] * metallic;
+
+    bx = (int)(ndotv * lut_size);
+    by = (int)(roughness * lut_size);
+    if (bx < 0) bx = 0;
+    if (bx > lut_size - 1) bx = lut_size - 1;
+    if (by < 0) by = 0;
+    if (by > lut_size - 1) by = lut_size - 1;
+    A = brdf_lut[(by * lut_size + bx) * 2 + 0];
+    B = brdf_lut[(by * lut_size + bx) * 2 + 1];
+
+    for (c = 0; c < 3; ++c) {
+        float diffuse = albedo[c] * (1.0f - metallic) * irr[c];
+        float specular = spec[c] * (F0[c] * A + B);
+        out_rgb[c] = diffuse + specular;
+    }
+}
+
 static float g_smith_ibl(float ndotv, float ndotl, float roughness) {
     float a = roughness * roughness;
     float k = a * a / 2.0f;

@@ -477,7 +477,7 @@ ENVMAP_LIB_SRC = tools/envmap/src/envmap_proj.c tools/envmap/src/envmap_sample.c
 ENVMAP_HDRS = tools/envmap/include/envmap.h
 ENVMAP_OBJ = $(patsubst tools/envmap/src/%.c,build/envmap/%.o,$(ENVMAP_LIB_SRC))
 
-.PHONY: envmap envmap-c11-gate envmap-test
+.PHONY: envmap envmap-c11-gate envmap-test envmap-pbr-test
 
 build/envmap:
 	@mkdir -p build/envmap
@@ -509,6 +509,13 @@ envmap-test: resize-lib tools/envmap/test/test_envmap.c $(ENVMAP_HDRS) | build/e
 	  tools/envmap/test/test_envmap.c $(ENVMAP_LIB_SRC) build/libtir.a -lm \
 	  -o build/test_envmap
 	./build/test_envmap
+
+# PBR validation harness: shade under IBL with source vs BC7-decoded material.
+envmap-pbr-test: resize-lib texcomp tools/envmap/test/test_pbr.c $(ENVMAP_HDRS) | build/envmap
+	$(CC) $(V3_CSTD) -Wall -Wextra $(ENVMAP_INC) -O1 -g $(SAN) -pthread \
+	  tools/envmap/test/test_pbr.c $(ENVMAP_LIB_SRC) build/libtir.a \
+	  build/libtexcomp.a -lm -o build/test_pbr
+	./build/test_pbr
 
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:

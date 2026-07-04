@@ -1,0 +1,166 @@
+/*
+ * TinyEXR envmap - PBR validation harness.
+ *
+ * Builds a float IBL from a synthetic env, then shades a set of surface samples
+ * under it with SOURCE vs BC7-compressed-then-decoded material, and reports the
+ * shaded-image PSNR plus normal-map angular error. This is the "does texture
+ * compression hurt the final PBR image" gate.
+ *
+ * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include "envmap.h"
+#include "texcomp.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_fail = 0;
+#define CHECK(c, m)                                                            \
+    do { if (!(c)) { printf("FAIL: %s (%s:%d)\n", (m), __FILE__, __LINE__); g_fail = 1; } } while (0)
+
+/* Synthetic HDR env: dim ambient + two bright directional spots. */
+static void make_env(em_image *eq) {
+    int x, y;
+    em_image_alloc(NULL, eq, EM_PROJ_EQUIRECT, 128, 64, 3);
+    for (y = 0; y < 64; ++y)
+        for (x = 0; x < 128; ++x) {
+            float u = (x + 0.5f) / 128.0f, v = (y + 0.5f) / 64.0f, d[3];
+            float *t = em_image_texel(eq, 0, x, y);
+            float val = 0.3f;
+            em_uv_to_dir(EM_PROJ_EQUIRECT, 0, u, v, d);
+            if (d[1] > 0.85f) val += 6.0f;             /* overhead light */
+            if (d[0] > 0.9f) val += 3.0f;              /* side light */
+            t[0] = val; t[1] = val * 0.95f; t[2] = val * 0.9f;
+        }
+}
+
+static double psnr(const float *a, const float *b, int n) {
+    double mse = 0.0;
+    int i;
+    for (i = 0; i < n; ++i) { double d = a[i] - b[i]; mse += d * d; }
+    mse /= n;
+    if (mse <= 0.0) return 1e9;
+    return 10.0 * log10(1.0 / mse); /* signals ~[0,1]-ish */
+}
+
+/* Grid of sphere normals facing V=+Z. */
+static int sphere_normals(float *N, int grid) {
+    int c = 0, i, j;
+    for (j = 0; j < grid; ++j)
+        for (i = 0; i < grid; ++i) {
+            float sx = (i + 0.5f) / grid * 2.0f - 1.0f;
+            float sy = (j + 0.5f) / grid * 2.0f - 1.0f;
+            float r2 = sx * sx + sy * sy;
+            if (r2 > 1.0f) continue;
+            N[c * 3 + 0] = sx; N[c * 3 + 1] = sy; N[c * 3 + 2] = sqrtf(1.0f - r2);
+            ++c;
+        }
+    return c;
+}
+
+static void test_albedo_compression_shading(void) {
+    em_image env, spec[8], irr;
+    float *brdf;
+    int levels = 6, lut = 32, i, np;
+    /* material albedo texture (RGBA8) */
+    int W = 64, H = 64;
+    uint8_t *alb = (uint8_t *)malloc((size_t)W * H * 4);
+    uint8_t *dec = (uint8_t *)malloc((size_t)W * H * 4);
+    uint8_t *bc7 = (uint8_t *)malloc(tc_bc7_compressed_size(W, H));
+    float *Ns, *shade_src, *shade_dec;
+    int x, y, grid = 48;
+    double p;
+
+    make_env(&env);
+    CHECK(EM_OK(em_prefilter_specular(NULL, &env, 32, levels, 32, spec)), "prefilter");
+    memset(&irr, 0, sizeof(irr));
+    CHECK(EM_OK(em_irradiance_cube(NULL, &env, 16, 64, &irr)), "irradiance");
+    brdf = (float *)malloc((size_t)lut * lut * 2 * sizeof(float));
+    em_brdf_lut(lut, 128, brdf);
+
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            uint8_t *p2 = alb + (y * W + x) * 4;
+            p2[0] = (uint8_t)(40 + x * 3); p2[1] = (uint8_t)(30 + y * 3);
+            p2[2] = (uint8_t)(120 + ((x + y) & 63)); p2[3] = 255;
+        }
+    CHECK(tc_bc7_compress_rgba8(alb, W, H, W * 4, NULL, bc7, tc_bc7_compressed_size(W, H)) == TC_SUCCESS, "bc7 encode albedo");
+    CHECK(tc_bc7_decompress_rgba8(bc7, W, H, W * 4, dec, (size_t)W * H * 4) == TC_SUCCESS, "bc7 decode albedo");
+
+    Ns = (float *)malloc((size_t)grid * grid * 3 * sizeof(float));
+    np = sphere_normals(Ns, grid);
+    shade_src = (float *)malloc((size_t)np * 3 * sizeof(float));
+    shade_dec = (float *)malloc((size_t)np * 3 * sizeof(float));
+    for (i = 0; i < np; ++i) {
+        float V[3] = {0, 0, 1};
+        const float *N = &Ns[i * 3];
+        /* sample albedo at the normal's screen position */
+        int tx = (int)((N[0] * 0.5f + 0.5f) * (W - 1));
+        int ty = (int)((N[1] * 0.5f + 0.5f) * (H - 1));
+        const uint8_t *as = alb + (ty * W + tx) * 4;
+        const uint8_t *ad = dec + (ty * W + tx) * 4;
+        float alb_s[3] = {as[0] / 255.0f, as[1] / 255.0f, as[2] / 255.0f};
+        float alb_d[3] = {ad[0] / 255.0f, ad[1] / 255.0f, ad[2] / 255.0f};
+        float rough = 0.35f, metal = (i & 8) ? 1.0f : 0.0f;
+        em_shade_point(spec, levels, &irr, brdf, lut, N, V, alb_s, rough, metal, &shade_src[i * 3]);
+        em_shade_point(spec, levels, &irr, brdf, lut, N, V, alb_d, rough, metal, &shade_dec[i * 3]);
+    }
+    p = psnr(shade_src, shade_dec, np * 3);
+    printf("  albedo BC7 -> PBR shade PSNR = %.1f dB (%d samples)\n", p, np);
+    CHECK(p >= 40.0, "BC7 albedo barely changes the shaded image (>=40 dB)");
+
+    for (i = 0; i < levels; ++i) em_image_free(NULL, &spec[i]);
+    em_image_free(NULL, &irr);
+    em_image_free(NULL, &env);
+    free(brdf); free(alb); free(dec); free(bc7); free(Ns); free(shade_src); free(shade_dec);
+}
+
+static void test_normal_bc7_angular_error(void) {
+    /* Encode a UNORM normal map to BC7, decode, report max angular error. */
+    int W = 64, H = 64, x, y;
+    uint8_t *nm = (uint8_t *)malloc((size_t)W * H * 4);
+    uint8_t *dec = (uint8_t *)malloc((size_t)W * H * 4);
+    uint8_t *bc7 = (uint8_t *)malloc(tc_bc7_compressed_size(W, H));
+    double max_deg = 0.0, mean_deg = 0.0;
+    int cnt = 0;
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            float fx = (x / (float)(W - 1)) * 2 - 1, fy = (y / (float)(H - 1)) * 2 - 1;
+            float nx = 0.6f * fx, ny = 0.6f * fy, nz = 1.0f, l = sqrtf(nx*nx+ny*ny+nz*nz);
+            uint8_t *p = nm + (y * W + x) * 4;
+            nx /= l; ny /= l; nz /= l;
+            p[0] = (uint8_t)((nx * 0.5f + 0.5f) * 255); p[1] = (uint8_t)((ny * 0.5f + 0.5f) * 255);
+            p[2] = (uint8_t)((nz * 0.5f + 0.5f) * 255); p[3] = 255;
+        }
+    tc_bc7_compress_rgba8(nm, W, H, W * 4, NULL, bc7, tc_bc7_compressed_size(W, H));
+    tc_bc7_decompress_rgba8(bc7, W, H, W * 4, dec, (size_t)W * H * 4);
+    for (y = 0; y < H * W; ++y) {
+        float a[3], b[3], la, lb, d, ang;
+        int k;
+        for (k = 0; k < 3; ++k) { a[k] = nm[y*4+k]/255.0f*2-1; b[k] = dec[y*4+k]/255.0f*2-1; }
+        la = sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]); lb = sqrtf(b[0]*b[0]+b[1]*b[1]+b[2]*b[2]);
+        if (la < 1e-4f || lb < 1e-4f) continue;
+        d = (a[0]*b[0]+a[1]*b[1]+a[2]*b[2])/(la*lb);
+        if (d > 1) d = 1;
+        if (d < -1) d = -1;
+        ang = acosf(d) * 180.0f / 3.14159265f;
+        if (ang > max_deg) max_deg = ang;
+        mean_deg += ang; ++cnt;
+    }
+    mean_deg /= cnt;
+    printf("  normal BC7 angular error: mean=%.2f deg max=%.2f deg\n", mean_deg, max_deg);
+    CHECK(max_deg < 10.0, "BC7 normal angular error bounded (informational; BC5 is better)");
+    free(nm); free(dec); free(bc7);
+}
+
+int main(void) {
+    printf("envmap PBR validation harness\n");
+    test_albedo_compression_shading();
+    test_normal_bc7_angular_error();
+    if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
+    printf("ALL TESTS PASSED\n");
+    return 0;
+}

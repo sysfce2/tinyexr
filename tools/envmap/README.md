@@ -22,6 +22,12 @@ only the CLI does HDR EXR I/O.
   specular radiance as a roughness-indexed **BC6H cube KTX2**, cosine-convolved
   diffuse **irradiance** cube, and the split-sum **BRDF DFG LUT** (R=scale,
   G=bias). Together these are the split-sum inputs a PBR shader samples.
+- **Reference PBR renderer** (`shade`) — builds the float IBL from an env and
+  renders a lit sphere (split-sum diffuse + specular) to an HDR EXR. Doubles as
+  the ground truth for the validation harness (`make envmap-pbr-test`), which
+  shades under the IBL with **source vs BC7-compressed material** and reports the
+  shaded-image PSNR + normal angular error — the "does compression hurt the final
+  image" gate.
 
 `sh`/`sg` also write `<out>_recon.exr`, an equirect reconstruction from the
 coefficients for eyeballing quality.
@@ -51,6 +57,7 @@ envmap sg -i env.exr --lobes 24 -o env.sg
 envmap ibl -i env.exr --face 128 --samples 64 -o spec.ktx2    # BC6H roughness cube
 envmap irradiance -i env.exr --face 32 -o irr.ktx2            # BC6H diffuse cube
 envmap brdflut --size 256 -o brdf.exr                        # DFG LUT (R=scale G=bias)
+envmap shade -i env.exr --albedo 0.9,0.3,0.2 --roughness 0.25 --metallic 0 -o sphere.exr
 ```
 
 ## Pipeline into texpipe (HDR mip + compress)

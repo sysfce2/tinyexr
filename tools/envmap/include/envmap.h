@@ -180,6 +180,18 @@ em_result em_irradiance_cube(const tir_allocator *a, const em_image *src,
  * scale, G = bias, indexed [roughness][NdotV] row-major. */
 void em_brdf_lut(int size, int num_samples, float *out_rg);
 
+/* Evaluate split-sum image-based-lighting PBR shading for one surface sample:
+ *   diffuse  = albedo * (1-metallic) * irradiance(N)
+ *   specular = prefiltered(R, roughness) * (F0*A + B),  F0 = mix(0.04,albedo,metallic)
+ * `spec_levels` is the roughness cube chain (level 0 = sharpest), `irradiance`
+ * the diffuse cube, `brdf_lut` the size*size*2 DFG table. N and V are unit
+ * vectors. */
+void em_shade_point(const em_image *spec_levels, int num_levels,
+                    const em_image *irradiance, const float *brdf_lut,
+                    int lut_size, const float N[3], const float V[3],
+                    const float albedo[3], float roughness, float metallic,
+                    float out_rgb[3]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -10,6 +10,7 @@
 #include "texpipe.h"
 #include "exr.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,7 +166,10 @@ static void usage(void) {
         "  envmap irradiance -i env.exr [--face N] [--samples N] -o irr.ktx2\n"
         "    diffuse irradiance -> BC6H cube KTX2\n"
         "  envmap brdflut [--size N] [--samples N] -o brdf.exr\n"
-        "    split-sum DFG LUT (R=scale G=bias)\n");
+        "    split-sum DFG LUT (R=scale G=bias)\n"
+        "  envmap shade -i env.exr [--albedo r,g,b] [--roughness R] [--metallic M]\n"
+        "               [--size N] [--face N] -o sphere.exr\n"
+        "    reference split-sum PBR render of a lit sphere (HDR EXR)\n");
 }
 
 static int cmd_convert(int argc, char **argv) {
@@ -480,11 +484,75 @@ static int cmd_brdflut(int argc, char **argv) {
     return 0;
 }
 
+/* Reference PBR renderer: build the float IBL from an env and shade a sphere. */
+static int cmd_shade(int argc, char **argv) {
+    const char *in = NULL, *out = NULL;
+    em_proj from = EM_PROJ_EQUIRECT;
+    int size = 512, face = 64, samples = 64, levels, i, x, y;
+    float albedo[3] = {0.8f, 0.8f, 0.8f}, roughness = 0.3f, metallic = 0.0f;
+    em_image src, spec[16], irr, img;
+    float *brdf;
+    int lut = 128;
+    for (i = 0; i < argc; ++i) {
+        const char *a = argv[i];
+#define NEXT() (++i < argc ? argv[i] : NULL)
+        if (!strcmp(a, "-i")) in = NEXT();
+        else if (!strcmp(a, "-o")) out = NEXT();
+        else if (!strcmp(a, "--from")) { const char *v = NEXT(); if (!v || !parse_proj(v, &from)) { usage(); return 2; } }
+        else if (!strcmp(a, "--size")) { const char *v = NEXT(); if (!v) { usage(); return 2; } size = atoi(v); }
+        else if (!strcmp(a, "--face")) { const char *v = NEXT(); if (!v) { usage(); return 2; } face = atoi(v); }
+        else if (!strcmp(a, "--samples")) { const char *v = NEXT(); if (!v) { usage(); return 2; } samples = atoi(v); }
+        else if (!strcmp(a, "--roughness")) { const char *v = NEXT(); if (!v) { usage(); return 2; } roughness = (float)atof(v); }
+        else if (!strcmp(a, "--metallic")) { const char *v = NEXT(); if (!v) { usage(); return 2; } metallic = (float)atof(v); }
+        else if (!strcmp(a, "--albedo")) { const char *v = NEXT(); if (!v || sscanf(v, "%f,%f,%f", &albedo[0], &albedo[1], &albedo[2]) != 3) { usage(); return 2; } }
+        else { fprintf(stderr, "unknown arg: %s\n", a); usage(); return 2; }
+#undef NEXT
+    }
+    if (!in || !out || size < 1 || face < 1) { usage(); return 2; }
+    memset(&src, 0, sizeof(src));
+    memset(&irr, 0, sizeof(irr));
+    memset(&img, 0, sizeof(img));
+    if (!load_exr(in, from, &src)) { fprintf(stderr, "failed to load %s\n", in); return 1; }
+    levels = 1; while ((face >> levels) >= 1) ++levels;
+    if (levels > 16) levels = 16;
+    if (!EM_OK(em_prefilter_specular(NULL, &src, face, levels, samples, spec)) ||
+        !EM_OK(em_irradiance_cube(NULL, &src, 32, 128, &irr))) {
+        fprintf(stderr, "IBL build failed\n"); em_image_free(NULL, &src); return 1;
+    }
+    brdf = (float *)malloc((size_t)lut * lut * 2 * sizeof(float));
+    if (!brdf) { em_image_free(NULL, &src); return 1; }
+    em_brdf_lut(lut, 512, brdf);
+    em_image_alloc(NULL, &img, EM_PROJ_EQUIRECT, size, size, 3);
+    for (y = 0; y < size; ++y)
+        for (x = 0; x < size; ++x) {
+            float sx = (x + 0.5f) / size * 2.0f - 1.0f;
+            float sy = 1.0f - (y + 0.5f) / size * 2.0f;
+            float r2 = sx * sx + sy * sy;
+            float *t = em_image_texel(&img, 0, x, y);
+            if (r2 > 1.0f) { t[0] = t[1] = t[2] = 0.0f; continue; }
+            {
+                float N[3] = {sx, sy, sqrtf(1.0f - r2)}, V[3] = {0, 0, 1}, rgb[3];
+                em_shade_point(spec, levels, &irr, brdf, lut, N, V, albedo, roughness, metallic, rgb);
+                t[0] = rgb[0]; t[1] = rgb[1]; t[2] = rgb[2];
+            }
+        }
+    if (save_exr_face(out, &img, 0))
+        printf("wrote %s (shaded sphere %dx%d, rough=%.2f metal=%.2f)\n", out, size, size, roughness, metallic);
+    else fprintf(stderr, "failed to write %s\n", out);
+    for (i = 0; i < levels; ++i) em_image_free(NULL, &spec[i]);
+    em_image_free(NULL, &irr);
+    em_image_free(NULL, &img);
+    em_image_free(NULL, &src);
+    free(brdf);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
     if (!strcmp(argv[1], "convert")) return cmd_convert(argc - 2, argv + 2);
     if (!strcmp(argv[1], "sh")) return cmd_sh(argc - 2, argv + 2);
     if (!strcmp(argv[1], "sg")) return cmd_sg(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "shade")) return cmd_shade(argc - 2, argv + 2);
     if (!strcmp(argv[1], "ibl")) return cmd_ibl(argc - 2, argv + 2);
     if (!strcmp(argv[1], "irradiance")) return cmd_irradiance(argc - 2, argv + 2);
     if (!strcmp(argv[1], "brdflut")) return cmd_brdflut(argc - 2, argv + 2);
