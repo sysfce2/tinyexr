@@ -325,6 +325,33 @@ int main(void) {
             fprintf(stderr, "FAIL: cem15 rgba psnr %.2f dB below floor\n", pa);
             return 1;
         }
+        /* Independent pure-C decode must match astcenc on all four channels
+         * (including alpha) -- validates the pure-C CEM 15 decode path. */
+        {
+            uint32_t bxc = (W + 3u) / 4u, bx, by, xx, yy;
+            for (by = 0; by < H; by += 4u)
+                for (bx = 0; bx < W; bx += 4u) {
+                    float d4[16 * 4];
+                    if (!ahref_decode_block_hdr(
+                            blocks + ((size_t)(by / 4u) * bxc + bx / 4u) * 16u,
+                            4, 4, d4)) {
+                        fprintf(stderr, "FAIL: pure-C cem15 decode failed\n");
+                        return 1;
+                    }
+                    for (yy = 0; yy < 4u; ++yy)
+                        for (xx = 0; xx < 4u; ++xx) {
+                            uint32_t px = bx + xx, py = by + yy, c;
+                            if (px >= W || py >= H) continue;
+                            for (c = 0; c < 4u; ++c)
+                                if (d4[(yy * 4u + xx) * 4u + c] !=
+                                    dec[((size_t)py * W + px) * 4u + c]) {
+                                    fprintf(stderr, "FAIL: pure-C CEM 15 decoder "
+                                                    "disagrees with astcenc\n");
+                                    return 1;
+                                }
+                        }
+                }
+        }
     }
 
     printf("astc hdr xcheck: OK\n");

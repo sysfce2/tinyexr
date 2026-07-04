@@ -9,7 +9,9 @@
  * ISE / partition machinery from astc_ref_decode.h; the CEM 11 endpoint unpack
  * (tc_astc_cem11_unpack) and LNS->sf16 conversion (tc_astc_lns16_to_sf16) come
  * from the library and are themselves cross-checked against deps/astcenc in the
- * astc-hdr gate. Only CEM 11 is handled (the HDR encoder emits no other CEM).
+ * astc-hdr gate. Handles the CEMs the HDR encoder emits: void-extent, CEM 7
+ * (RGB base+scale), CEM 11 (RGB direct, single/dual/2-subset) and CEM 15
+ * (RGB direct + HDR alpha).
  */
 #ifndef TC_ASTC_HDR_REF_DECODE_H
 #define TC_ASTC_HDR_REF_DECODE_H
@@ -58,7 +60,8 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
     uint32_t part_count, weight_count, weight_bits;
     uint32_t pindex = 0, color_start, ccs = 3u, ccs_bits = 0;
     uint32_t cems[4] = {0, 0, 0, 0};
-    int lns0[4][3], lns1[4][3]; /* per-subset LNS endpoints */
+    int lns0[4][4], lns1[4][4]; /* per-subset LNS endpoints (RGBA for CEM 15) */
+    int has_alpha;
     uint8_t rev[16], wsyms[64], wgrid[2][64], csyms[18], vals[18];
     uint32_t vcount = 0, used, avail, i, x, y;
     int cq = -1, small_block;
@@ -105,7 +108,9 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
         for (i = 0; i < part_count; ++i) cems[i] = cf >> 2;
     }
     for (i = 0; i < part_count; ++i)
-        if (cems[i] != 11u && cems[i] != 7u) return 0; /* CEM 7 / 11 only */
+        if (cems[i] != 11u && cems[i] != 7u && cems[i] != 15u)
+            return 0; /* CEM 7 / 11 / 15 only */
+    has_alpha = (cems[0] == 15u);
 
     if (dual) {
         ccs_bits = 2u;
@@ -113,7 +118,8 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
         ccs = aref_rd_bits(block, 128u - weight_bits - 2u, 2);
     }
 
-    vcount = part_count * (cems[0] == 7u ? 4u : 6u); /* CEM 7=4, CEM 11=6 */
+    /* values per subset: CEM 7 = 4, CEM 11 = 6, CEM 15 = 8 */
+    vcount = part_count * (cems[0] == 7u ? 4u : cems[0] == 15u ? 8u : 6u);
     used = color_start + weight_bits + ccs_bits;
     if (used > 128u) return 0;
     avail = 128u - used;
@@ -133,11 +139,16 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
     {
         uint32_t off = 0;
         for (i = 0; i < part_count; ++i) {
-            if (cems[i] == 7u)
+            if (cems[i] == 7u) {
                 tc_astc_cem7_unpack(vals + off, lns0[i], lns1[i]);
-            else
+                off += 4u;
+            } else if (cems[i] == 15u) {
+                tc_astc_cem15_unpack(vals + off, lns0[i], lns1[i]);
+                off += 8u;
+            } else {
                 tc_astc_cem11_unpack(vals + off, lns0[i], lns1[i]);
-            off += (cems[i] == 7u) ? 4u : 6u;
+                off += 6u;
+            }
         }
     }
 
@@ -160,7 +171,13 @@ static int ahref_decode_block_hdr(const uint8_t block[16], uint32_t bx,
                            32) >> 6;
                 o[c] = ahref_half_to_float(tc_astc_lns16_to_sf16(rec));
             }
-            o[3] = 1.0f; /* HDR CEM 11 has no alpha; astcenc yields 1.0 */
+            if (has_alpha) { /* CEM 15: alpha shares the single weight plane */
+                int rec = (lns0[part][3] * (int)(64u - w0) +
+                           lns1[part][3] * (int)w0 + 32) >> 6;
+                o[3] = ahref_half_to_float(tc_astc_lns16_to_sf16(rec));
+            } else {
+                o[3] = 1.0f; /* CEM 7/11 have no alpha; astcenc yields 1.0 */
+            }
         }
     return 1;
 }
