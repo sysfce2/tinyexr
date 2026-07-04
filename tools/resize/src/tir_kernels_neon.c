@@ -299,6 +299,55 @@ static void f32_to_f16_neon(uint16_t *dst, const float *src, size_t n) {
 }
 #endif
 
+/* Anti-ringing per-tap min/max, RGBA (ch==4) vectorized (exact); other channel
+ * counts stay scalar to avoid over-reading the last tap. Scalar on every ISA
+ * before this. */
+static void h_minmax_neon(float *mn, float *mx, const float *src,
+                          const int32_t *start, const int32_t *count, int x0,
+                          int x1, int ch) {
+    int x;
+    if (ch != 4) {
+        tir__h_minmax_sc(mn, mx, src, start, count, x0, x1, ch);
+        return;
+    }
+    for (x = x0; x < x1; ++x) {
+        const float *sp = src + (size_t)start[x] * 4;
+        int n = count[x], t;
+        float32x4_t lo = vld1q_f32(sp), hi = lo;
+        for (t = 1; t < n; ++t) {
+            float32x4_t v = vld1q_f32(sp + (size_t)t * 4);
+            lo = vminq_f32(lo, v);
+            hi = vmaxq_f32(hi, v);
+        }
+        vst1q_f32(mn + (size_t)x * 4, lo);
+        vst1q_f32(mx + (size_t)x * 4, hi);
+    }
+}
+
+/* RGBA premultiply / un-premultiply (NEON lacked these -> was scalar on ARM).
+ * Alpha (lane 3) is preserved; a==0 keeps the filtered RGB (matches scalar). */
+static void premult4_neon(float *rgba, size_t npix) {
+    size_t i;
+    for (i = 0; i < npix; ++i) {
+        float32x4_t p = vld1q_f32(rgba + i * 4);
+        float a = vgetq_lane_f32(p, 3);
+        float32x4_t m = vmulq_n_f32(p, a);
+        vst1q_f32(rgba + i * 4, vsetq_lane_f32(a, m, 3));
+    }
+}
+
+static void unpremult4_neon(float *rgba, size_t npix) {
+    size_t i;
+    for (i = 0; i < npix; ++i) {
+        float32x4_t p = vld1q_f32(rgba + i * 4);
+        float a = vgetq_lane_f32(p, 3);
+        if (a != 0.0f) {
+            float32x4_t m = vmulq_n_f32(p, 1.0f / a);
+            vst1q_f32(rgba + i * 4, vsetq_lane_f32(a, m, 3));
+        } /* a==0: keep filtered RGB untouched */
+    }
+}
+
 void tir__kernels_set_neon(tir_kernels *k) {
     k->v_mul = v_mul_neon;
     k->v_fma = v_fma_neon;
@@ -307,9 +356,12 @@ void tir__kernels_set_neon(tir_kernels *k) {
     k->h_dot[1] = h_dot2_neon;
     k->h_dot[2] = h_dot3_neon;
     k->h_dot[3] = h_dot4_neon;
+    k->h_minmax = h_minmax_neon;
     k->minmax_combine = minmax_combine_neon;
     k->antiring_apply = antiring_apply_neon;
     k->clamp_range = clamp_range_neon;
+    k->premult4 = premult4_neon;
+    k->unpremult4 = unpremult4_neon;
     k->u8_to_f32 = u8_to_f32_neon;
     k->u16_to_f32 = u16_to_f32_neon;
     k->f32_to_u8 = f32_to_u8_neon;
