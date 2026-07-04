@@ -48,6 +48,16 @@ Implemented:
   reduce specular aliasing, and `l` (default) stays linear.
 - **Texture arrays** (`tp_write_ktx2_array`): pack N compressed chains into one
   KTX2 with `layerCount = N`.
+- **Min-max height pyramid** (`--minmax`, `tp_build_minmax_pyramid`): a 2-channel
+  (min,max) conservative height pyramid for parallax-occlusion / relief /
+  cone-step mapping, stored as BC5. Bounds nest across levels and the coarsest
+  level bounds the whole field.
+- **Gutter dilation** (`--dilate N`, `tp_dilate`): flood valid texels into the
+  alpha<0.5 gutter so mips/bilinear don't bleed background across atlas or
+  lightmap chart borders (alpha preserved).
+- **Vector displacement**: 3-channel float via the BC6H/ASTC-HDR path resizes
+  mean-preserving (averaging keeps the mean displacement — correct, unlike
+  normals which renormalize).
 - **Multi-mip DDS** (DX10) for the BC family and **multi-mip KTX2** (Vulkan
   formats, native cube/mip/array) for BC/ETC2/EAC/ASTC.
 - Codecs: BC1/BC3/BC5/BC7/BC6H, ETC2 RGB/RGBA, EAC R11/RG11, ASTC LDR (any

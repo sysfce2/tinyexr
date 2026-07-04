@@ -58,4 +58,7 @@ tp_result tp_ktx2_write(const tp_blocks *b, const tp_options *opt, uint8_t *out,
 void tp_wr_u32(uint8_t *p, uint32_t v);
 void tp_wr_u64(uint8_t *p, uint64_t v);
 
+/* Read a sample from any-type view as float (handles tight stride). */
+float tp_read_view_sample(const tir_image_view *v, int x, int y, int c);
+
 #endif /* TINYEXR_TEXPIPE_INTERNAL_H_ */

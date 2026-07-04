@@ -260,6 +260,24 @@ float tp_alpha_coverage(const tp_surface *s, float threshold);
 tp_result tp_alpha_scale_to_coverage(tp_surface *s, float target,
                                      float threshold);
 
+/* Min-max height pyramid (for parallax-occlusion / relief / cone-step mapping):
+ * builds a 2-channel chain (R=min height, G=max height over the footprint) by
+ * conservative min/max reduction from the previous level. `channel` selects the
+ * height channel of the base. The bounds are conservative in float; if you then
+ * block-compress, widen them (min down / max up) to stay conservative. Free
+ * with tp_mip_chain_free. */
+tp_result tp_build_minmax_pyramid(const tir_allocator *a,
+                                  const tir_image_view *height, int channel,
+                                  int max_levels, tp_mip_chain *out);
+
+/* Gutter dilation: flood the colour channels of texels whose `valid_channel`
+ * is below `threshold` from their valid neighbours, `iters` passes (each grows
+ * the valid region by one texel). Run on the base before mipping so bilinear /
+ * minification don't bleed background across atlas/lightmap chart borders. The
+ * valid_channel itself (e.g. alpha) is left unchanged. */
+tp_result tp_dilate(tp_surface *s, int valid_channel, float threshold,
+                    int iters);
+
 /* Seam-free cubemap fixup: average the shared edge and corner texels across
  * the 6 cube faces (order +X,-X,+Y,-Y,+Z,-Z) so borders become bit-identical
  * between adjacent faces. Operates in-place on the float surfaces; faces must

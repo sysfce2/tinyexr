@@ -296,7 +296,10 @@ static void usage(void) {
         "    --octa               fold-seam-aware mips for an octahedral 2D map\n"
         "  packed material maps (ORM/mask):\n"
         "    --channel-ops l,l,m,l  per-channel R,G,B,A: l=linear, m=majority(binary), r=roughness\n"
-        "  --srgb-resize          decode sRGB->linear, filter, re-encode (correct albedo mips)\n");
+        "  --srgb-resize          decode sRGB->linear, filter, re-encode (correct albedo mips)\n"
+        "  displacement / atlas:\n"
+        "    --minmax             build a (min,max) height pyramid (BC5) for POM/relief\n"
+        "    --dilate N           flood valid texels into alpha<0.5 gutter N passes\n");
 }
 
 int main(int argc, char **argv) {
@@ -319,6 +322,7 @@ int main(int argc, char **argv) {
     int chan_ops[4] = {0, 0, 0, 0};
     int have_chan_ops = 0;
     int srgb_resize = 0;
+    int dilate = 0, minmax = 0;
     const char *cube_files[6] = {0};
     int cube_n = 0;
     int cube_layout = -1; /* -1 = none */
@@ -373,6 +377,8 @@ int main(int argc, char **argv) {
             have_chan_ops = 1;
         }
         else if (!strcmp(a, "--srgb-resize")) { srgb_resize = 1; srgb = 1; }
+        else if (!strcmp(a, "--dilate")) { const char *v = NEXT(); if (!v) { usage(); return 2; } dilate = atoi(v); }
+        else if (!strcmp(a, "--minmax")) minmax = 1;
         else if (!strcmp(a, "--normal-enc")) { const char *v = NEXT(); if (!v || !parse_normal_enc(v, &normal_enc)) { usage(); return 2; } }
         else if (!strcmp(a, "--bake-roughness")) bake_roughness = 1;
         else if (!strcmp(a, "--base-roughness")) { const char *v = NEXT(); if (!v) { usage(); return 2; } base_roughness = (float)atof(v); }
@@ -382,8 +388,10 @@ int main(int argc, char **argv) {
 #undef NEXT
     }
 
-    if (!out || !fmt) { usage(); return 2; }
-    if (!parse_codec(fmt, &codec, &is_hdr)) { fprintf(stderr, "bad --format %s\n", fmt); return 2; }
+    if (!out) { usage(); return 2; }
+    if (minmax) { codec = TP_CODEC_BC5; is_hdr = 0; } /* min-max forces BC5 */
+    else if (!fmt) { usage(); return 2; }
+    else if (!parse_codec(fmt, &codec, &is_hdr)) { fprintf(stderr, "bad --format %s\n", fmt); return 2; }
 
     if (cube_n > 0 || cube_layout >= 0) {
         num_faces = 6;
@@ -450,6 +458,45 @@ int main(int argc, char **argv) {
         opt.normal_encoding = normal_enc;
         opt.base_roughness = base_roughness;
         opt.bake_toksvig_roughness = bake_roughness;
+    }
+
+    /* Gutter dilation pre-pass on the (LDR) base so mips don't bleed borders. */
+    if (dilate > 0 && num_faces == 1 && view.type == TIR_U8 && view.channels == 4) {
+        int W = view.width, H = view.height, k;
+        uint8_t *u = (uint8_t *)view.data;
+        float *fd = (float *)malloc((size_t)W * H * 4 * sizeof(float));
+        if (fd) {
+            tp_surface s;
+            for (k = 0; k < W * H * 4; ++k) fd[k] = u[k] / 255.0f;
+            s.width = W; s.height = H; s.channels = 4;
+            s.data = fd; s.stride = (size_t)W * 4 * sizeof(float);
+            tp_dilate(&s, 3, 0.5f, dilate);
+            for (k = 0; k < W * H; ++k) {
+                u[k * 4 + 0] = to_u8(fd[k * 4 + 0]);
+                u[k * 4 + 1] = to_u8(fd[k * 4 + 1]);
+                u[k * 4 + 2] = to_u8(fd[k * 4 + 2]);
+            }
+            free(fd);
+        }
+    }
+
+    /* Min-max height pyramid (POM/relief): 2-channel (min,max) -> BC5. */
+    if (minmax && num_faces == 1) {
+        tp_mip_chain mm;
+        memset(&mm, 0, sizeof(mm));
+        r = tp_build_minmax_pyramid(NULL, &view, 0, opt.max_levels, &mm);
+        for (i = 0; i < 6; ++i) free(face_data[i]);
+        if (!TP_OK(r)) { fprintf(stderr, "texpipe: %s\n", tp_result_string(r)); return 1; }
+        opt.codec = TP_CODEC_BC5;
+        if (!emit_container(&mm, &opt, out)) {
+            fprintf(stderr, "texpipe: failed to write %s\n", out);
+            tp_mip_chain_free(NULL, &mm);
+            return 1;
+        }
+        printf("wrote %s (min-max height pyramid, BC5, %s, %ux%u)\n", out,
+               opt.container == TP_CONTAINER_DDS ? "dds" : "ktx2", w, h);
+        tp_mip_chain_free(NULL, &mm);
+        return 0;
     }
 
     /* Staged: build the chain once so we can also emit a roughness companion. */

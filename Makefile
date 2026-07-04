@@ -425,7 +425,7 @@ TEXPIPE_INC = -Itools/texpipe/include -Itools/resize/include \
   -Itools/texcomp/include -Iinclude -Isrc -Iexamples/common
 TEXPIPE_LIB_SRC = tools/texpipe/src/texpipe.c tools/texpipe/src/texpipe_mip.c \
   tools/texpipe/src/texpipe_alpha.c tools/texpipe/src/texpipe_cube.c \
-  tools/texpipe/src/texpipe_octa.c \
+  tools/texpipe/src/texpipe_octa.c tools/texpipe/src/texpipe_disp.c \
   tools/texpipe/src/texpipe_normal.c tools/texpipe/src/texpipe_container.c
 TEXPIPE_HDRS = tools/texpipe/include/texpipe.h tools/texpipe/src/texpipe_internal.h
 TEXPIPE_OBJ = $(patsubst tools/texpipe/src/%.c,build/texpipe/%.o,$(TEXPIPE_LIB_SRC))

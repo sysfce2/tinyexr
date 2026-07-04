@@ -67,6 +67,11 @@ static float tp_read_sample(const tir_image_view *v, int x, int y, int c) {
     return 0.0f;
 }
 
+/* Exposed for texpipe_disp.c (min-max pyramid reads the base). */
+float tp_read_view_sample(const tir_image_view *v, int x, int y, int c) {
+    return tp_read_sample(v, x, y, c);
+}
+
 /* ------------------------------------------------------- surface alloc */
 
 static tp_result tp_surface_alloc(const tir_allocator *a, tp_surface *s, int w,

@@ -810,6 +810,134 @@ static void test_roughness_variance(void) {
     free(img);
 }
 
+static void test_minmax_pyramid(void) {
+    /* Random-ish height map; each level's (min,max) must conservatively bound
+     * the base heights it covers, and nest across levels. */
+    tir_image_view v;
+    tp_mip_chain c;
+    uint8_t *img = (uint8_t *)malloc((size_t)64 * 64 * 4);
+    int x, y, l, ok_nest = 1, ok_cover = 1;
+    float base_min = 1e9f, base_max = -1e9f;
+    for (y = 0; y < 64; ++y)
+        for (x = 0; x < 64; ++x) {
+            uint8_t *p = img + (y * 64 + x) * 4;
+            uint8_t h = (uint8_t)(((x * 37 + y * 101) ^ (x * y)) & 0xff);
+            p[0] = h; p[1] = h; p[2] = h; p[3] = 255;
+            if (h / 255.0f < base_min) base_min = h / 255.0f;
+            if (h / 255.0f > base_max) base_max = h / 255.0f;
+        }
+    view_u8(&v, img, 64, 64);
+    memset(&c, 0, sizeof(c));
+    CHECK(TP_OK(tp_build_minmax_pyramid(NULL, &v, 0, 0, &c)), "build minmax");
+    CHECK(c.channels == 2, "minmax is 2-channel");
+    /* nesting: level l bounds must contain level l-1 bounds over each footprint */
+    for (l = 1; l < c.num_levels; ++l) {
+        const tp_surface *s = &c.level[l], *p = &c.level[l - 1];
+        for (y = 0; y < s->height; ++y)
+            for (x = 0; x < s->width; ++x) {
+                const float *d = s->data + (y * s->width + x) * 2;
+                int cx = x * 2 < p->width ? x * 2 : p->width - 1;
+                int cy = y * 2 < p->height ? y * 2 : p->height - 1;
+                const float *cc = p->data + (cy * p->width + cx) * 2;
+                if (d[0] > cc[0] + 1e-6f) ok_nest = 0; /* min must not rise */
+                if (d[1] < cc[1] - 1e-6f) ok_nest = 0; /* max must not fall */
+            }
+    }
+    /* coarsest level must bound the whole base */
+    {
+        const tp_surface *top = &c.level[c.num_levels - 1];
+        const float *d = top->data;
+        if (d[0] > base_min + 1e-4f || d[1] < base_max - 1e-4f) ok_cover = 0;
+    }
+    CHECK(ok_nest, "minmax bounds nest across levels");
+    CHECK(ok_cover, "coarsest minmax bounds the whole height field");
+    printf("  minmax height pyramid: ok (base [%.2f,%.2f])\n", base_min, base_max);
+    tp_mip_chain_free(NULL, &c);
+    free(img);
+}
+
+static void test_dilate(void) {
+    /* A valid red disc on transparent (alpha 0) background. After dilation the
+     * gutter ring must take the disc colour (red), not the background. */
+    int W = 48, H = 48, x, y;
+    tp_surface s;
+    int gutter_ok = 1, checked = 0;
+    s.width = W; s.height = H; s.channels = 4;
+    s.stride = (size_t)W * 4 * sizeof(float);
+    s.data = (float *)malloc(s.stride * H);
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            float dx = x - W * 0.5f, dy = y - H * 0.5f;
+            int inside = dx * dx + dy * dy <= (W * 0.3f) * (W * 0.3f);
+            float *p = s.data + (y * W + x) * 4;
+            if (inside) { p[0] = 1; p[1] = 0; p[2] = 0; p[3] = 1; }
+            else { p[0] = 0; p[1] = 0; p[2] = 1; p[3] = 0; } /* blue bg, alpha 0 */
+        }
+    CHECK(TP_OK(tp_dilate(&s, 3, 0.5f, 6)), "dilate");
+    /* Texels just outside the disc should now be reddish (pulled from the disc,
+     * not the blue background), with alpha untouched (still 0). */
+    {
+        int red = 0, alpha_ok = 1;
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                float dx = x - W * 0.5f, dy = y - H * 0.5f;
+                float r = sqrtf(dx * dx + dy * dy), edge = W * 0.3f;
+                const float *p = s.data + (y * W + x) * 4;
+                if (r > edge && r < edge + 2.0f) { /* gutter ring */
+                    ++checked;
+                    if (p[0] > p[2]) ++red;        /* red dominates blue bg */
+                    if (p[3] > 0.001f) alpha_ok = 0; /* alpha preserved (0) */
+                }
+            }
+        gutter_ok = alpha_ok && checked > 0 && red >= (int)(0.9 * checked);
+        printf("  gutter dilation: %d/%d ring texels filled from disc, alpha_ok=%d\n",
+               red, checked, alpha_ok);
+    }
+    CHECK(gutter_ok, "dilation fills gutter with disc colour, keeps alpha");
+    free(s.data);
+}
+
+static void test_vector_displacement_mean(void) {
+    /* Vector displacement (3-ch float) resizes mean-preserving via BC6H HDR path
+     * (averaging keeps the mean vector — correct for displacement). */
+    tir_image_view v;
+    tp_options opt;
+    tp_mip_chain c;
+    float *img = (float *)malloc((size_t)64 * 64 * 3 * sizeof(float));
+    double bx = 0, by = 0, bz = 0;
+    int x, y, i;
+    for (y = 0; y < 64; ++y)
+        for (x = 0; x < 64; ++x) {
+            float *p = img + (y * 64 + x) * 3;
+            p[0] = 0.5f + 0.4f * sinf(x * 0.3f);
+            p[1] = 0.2f + 0.1f * cosf(y * 0.2f);
+            p[2] = 0.7f;
+            bx += p[0]; by += p[1]; bz += p[2];
+        }
+    bx /= 4096; by /= 4096; bz /= 4096;
+    v.data = img; v.width = 64; v.height = 64; v.channels = 3; v.type = TIR_F32; v.row_stride_bytes = 0;
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC6H);
+    memset(&c, 0, sizeof(c));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &c)), "build vector-disp mips");
+    /* mid level mean should match base mean (mean-preserving) */
+    i = 2;
+    {
+        const tp_surface *s = &c.level[i];
+        double mx = 0, my = 0, mz = 0, n = (double)s->width * s->height;
+        int xx, yy;
+        for (yy = 0; yy < s->height; ++yy) {
+            const float *row = (const float *)((const uint8_t *)s->data + (size_t)yy * s->stride);
+            for (xx = 0; xx < s->width; ++xx) { mx += row[xx*3]; my += row[xx*3+1]; mz += row[xx*3+2]; }
+        }
+        mx /= n; my /= n; mz /= n;
+        CHECK(fabs(mx - bx) < 0.02 && fabs(my - by) < 0.02 && fabs(mz - bz) < 0.02,
+              "vector displacement mip preserves the mean vector");
+    }
+    printf("  vector displacement mean-preserving: ok (base %.3f,%.3f,%.3f)\n", bx, by, bz);
+    tp_mip_chain_free(NULL, &c);
+    free(img);
+}
+
 int main(void) {
     printf("texpipe unit tests\n");
     test_octa_seam();
@@ -817,6 +945,9 @@ int main(void) {
     test_array_ktx2();
     test_srgb_aware_resize();
     test_roughness_variance();
+    test_minmax_pyramid();
+    test_dilate();
+    test_vector_displacement_mean();
     test_mip_geometry();
     test_bc7_roundtrip_psnr();
     test_alpha_scale_helper();
