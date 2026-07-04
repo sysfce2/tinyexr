@@ -236,12 +236,42 @@ static void unpremult4_sse2(float *rgba, size_t npix) {
     }
 }
 
+/* Anti-ringing per-tap min/max. The RGBA (ch==4) case is one vminps/vmaxps per
+ * tap across the 4 channel lanes; other channel counts stay scalar (the taps
+ * are not 16-byte aligned per lane, and a wide load would over-read the last
+ * tap). min/max are exact, so this is within the ULP budget. This slot was
+ * scalar on every ISA before -- the antiring HDR/RGBA path now vectorizes. */
+TIR_TGT("sse2")
+static void h_minmax_sse2(float *mn, float *mx, const float *src,
+                          const int32_t *start, const int32_t *count, int x0,
+                          int x1, int ch) {
+    int x;
+    if (ch != 4) {
+        tir__h_minmax_sc(mn, mx, src, start, count, x0, x1, ch);
+        return;
+    }
+    for (x = x0; x < x1; ++x) {
+        const float *sp = src + (size_t)start[x] * 4;
+        int n = count[x], t;
+        __m128 lo = _mm_loadu_ps(sp);
+        __m128 hi = lo;
+        for (t = 1; t < n; ++t) {
+            __m128 v = _mm_loadu_ps(sp + (size_t)t * 4);
+            lo = _mm_min_ps(lo, v);
+            hi = _mm_max_ps(hi, v);
+        }
+        _mm_storeu_ps(mn + (size_t)x * 4, lo);
+        _mm_storeu_ps(mx + (size_t)x * 4, hi);
+    }
+}
+
 void tir__kernels_set_sse2(tir_kernels *k) {
     k->v_mul = v_mul_sse2;
     k->v_fma = v_fma_sse2;
     k->v_fma4 = v_fma4_sse2;
     k->h_dot[0] = h_dot1_sse2;
     k->h_dot[3] = h_dot4_sse2;
+    k->h_minmax = h_minmax_sse2;
     k->minmax_combine = minmax_combine_sse2;
     k->antiring_apply = antiring_apply_sse2;
     k->clamp_range = clamp_range_sse2;

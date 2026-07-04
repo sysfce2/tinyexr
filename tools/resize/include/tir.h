@@ -121,7 +121,9 @@ typedef enum tir_filter {
     TIR_FILTER_MITCHELL = 5,    /* cubic B=C=1/3; good general default */
     TIR_FILTER_CATMULL_ROM = 6, /* interpolating cubic (B=0,C=0.5) */
     TIR_FILTER_LANCZOS2 = 7,
-    TIR_FILTER_LANCZOS3 = 8
+    TIR_FILTER_LANCZOS3 = 8,
+    TIR_FILTER_KAISER = 9       /* Kaiser-windowed sinc (radius 3, beta 8): sharp
+                                 * with lower ringing than Lanczos3 */
 } tir_filter;
 
 typedef enum tir_edge_mode {
@@ -182,8 +184,11 @@ typedef struct tir_options {
     tir_filter filter_y;
     tir_edge_mode edge_x;       /* CLAMP */
     tir_edge_mode edge_y;
-    float filter_scale;         /* 1.0; >1 widens the kernel (blurs) */
-    float gaussian_sigma;       /* 0.5 */
+    float filter_scale;         /* 1.0; >1 widens the kernel (blurs). Must be
+                                 * in (0, 64]; outside that resize() returns
+                                 * TIR_ERROR_INVALID_ARGUMENT. */
+    float gaussian_sigma;       /* 0.5; must be in (0, 32] (else
+                                 * TIR_ERROR_INVALID_ARGUMENT). */
 
     /* -- content mode ---------------------------------------------------- */
     tir_mode mode;              /* GENERAL */

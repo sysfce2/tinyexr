@@ -11,6 +11,7 @@
 CC  ?= gcc
 CXX ?= g++
 EMCC ?= emcc
+EMAR ?= emar
 
 CFLAGS   ?= -O2
 CXXFLAGS ?= -O2 -std=c++11
@@ -21,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -33,6 +34,21 @@ miniz.o: $(MINIZ_SRC)
 
 test: $(TARGET)
 	./$(TARGET) asakusa.exr
+
+# ---- aggregate: all self-contained tool gates -----------------------------
+# CI entry point for tools/ (texcomp, resize/tir, texpipe, envmap). `tools-test`
+# runs the pure-C11 gates only (no C++ / no astcenc); `tools-test-all` also runs
+# the astcenc conformance cross-checks (astcenc is vendored in deps/, but the
+# gate compiles its C++ so it needs a C++ toolchain).
+.PHONY: tools-test tools-test-all
+tools-test: texcomp-c11-gate texcomp-test texcomp-uni-gate texcomp-xbc7-gate \
+            resize-c11-gate resize-test \
+            texpipe-c11-gate texpipe-test \
+            envmap-c11-gate envmap-test envmap-pbr-test
+	@echo "tools-test: all self-contained tool gates passed"
+
+tools-test-all: tools-test texcomp-astc-hdr-gate texcomp-astc-arm-gate
+	@echo "tools-test-all: all tool gates (incl. astcenc cross-checks) passed"
 
 # ---- pure-C11 v3 library + tests ------------------------------------------
 V3_INC   = -Iinclude -Isrc -Ideps/zstd
@@ -221,6 +237,305 @@ test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/unit/test_e
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) \
 	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_v3
 	ASAN_OPTIONS=detect_leaks=0 ./build/test_exr_v3
+
+# ---- tools/texcomp: pure-C11 BC/ETC/ASTC texture compression --------------
+# One translation unit per codec, plus texcomp.c for the shared core
+# (backend dispatch, options, sizes, DDS/KTX/ASTC containers).
+TEXCOMP_INC = -Itools/texcomp/include -Iinclude -Isrc -Iexamples/common
+TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
+  tools/texcomp/src/texcomp_bc1.c tools/texcomp/src/texcomp_bc3.c \
+  tools/texcomp/src/texcomp_bc5.c tools/texcomp/src/texcomp_bc6h.c \
+  tools/texcomp/src/texcomp_bc7.c tools/texcomp/src/texcomp_etc2.c \
+  tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c \
+  tools/texcomp/src/texcomp_astc_hdr.c tools/texcomp/src/texcomp_uni.c
+TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
+TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
+TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))
+TEXCOMP_OPT ?= -O3
+TEXCOMP_WASM_OPT ?= -O3
+TEXCOMP_WASM_CACHE ?= /tmp/tinyexr-emcc-cache
+TEXCOMP_WASM_EMCC = EM_CACHE=$(TEXCOMP_WASM_CACHE) $(EMCC)
+TEXCOMP_WASM_COMMON = $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(TEXCOMP_WASM_OPT) -DTC_NO_THREADS=1
+TEXCOMP_WASM_CLI_WARN = -Wno-unused-function -Wno-macro-redefined
+TEXCOMP_WASM_SIMD = -msimd128
+TEXCOMP_WASM_EXR_SRC = $(V3_CORE_SRC) src/exr_stdio.c $(ZSTD_SRC)
+TEXCOMP_WASM_EXPORTS = ['_tc_result_string','_tc_backend_name','_tc_backend_available_mask','_tc_backend_force_mask','_tc_bc7_options_init','_tc_bc1_options_init','_tc_bc3_options_init','_tc_bc5_options_init','_tc_bc6h_options_init','_tc_etc2_options_init','_tc_astc_options_init','_tc_astc_hdr_options_init','_tc_bc7_compressed_size','_tc_bc1_compressed_size','_tc_bc3_compressed_size','_tc_bc5_compressed_size','_tc_bc6h_compressed_size','_tc_etc2_rgb_compressed_size','_tc_etc2_rgba_compressed_size','_tc_eac_r11_compressed_size','_tc_eac_rg11_compressed_size','_tc_astc_compressed_size','_tc_astc_hdr_compressed_size','_tc_astc_ise_sequence_bitcount','_tc_astc_ise_encode_bits','_tc_bc7_compress_rgba8','_tc_bc7_decompress_rgba8','_tc_bc1_compress_rgba8','_tc_bc3_compress_rgba8','_tc_bc5_compress_rg8','_tc_bc5_compress_rgba8','_tc_bc6h_compress_rgb32f','_tc_etc2_compress_rgba8','_tc_eac_compress_rgba8','_tc_astc_compress_rgba8','_tc_astc_hdr_compress_rgbf','_tc_dds_bc7_size','_tc_dds_bc1_size','_tc_dds_bc3_size','_tc_dds_bc5_size','_tc_dds_bc6h_size','_tc_ktx_etc2_size','_tc_astc_file_size','_tc_dds_write_bc7_memory','_tc_dds_write_bc1_memory','_tc_dds_write_bc3_memory','_tc_dds_write_bc5_memory','_tc_dds_write_bc6h_memory','_tc_ktx_write_etc2_memory','_tc_ktx_write_eac_memory','_tc_astc_write_file_memory','_malloc','_free']
+TEXCOMP_WASM_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','HEAPU32','UTF8ToString','stringToUTF8','lengthBytesUTF8','ccall','cwrap']
+
+build/texcomp:
+	@mkdir -p build/texcomp
+
+build/texcomp/wasm build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE):
+	@mkdir -p $@
+
+build/texcomp/%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) $(TEXCOMP_OPT) -g -c $< -o $@
+
+build/texcomp/test-%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) -c $< -o $@
+
+texcomp: lib $(TEXCOMP_OBJ) tools/texcomp/src/texcomp_cli.c | build/texcomp
+	$(AR) rcs build/libtexcomp.a $(TEXCOMP_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  tools/texcomp/src/texcomp_cli.c build/libtexcomp.a build/libtinyexr3.a \
+	  -pthread -lm -o build/texcomp/texcomp
+
+TEXCOMP_WASM_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/wasm/%.o,$(TEXCOMP_SRC))
+TEXCOMP_WASM_SIMD_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/wasm-simd/%.o,$(TEXCOMP_SRC))
+
+build/texcomp/wasm/%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp/wasm $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) -c $< -o $@
+
+build/texcomp/wasm-simd/%.o: tools/texcomp/src/%.c $(TEXCOMP_HDRS) | build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) $(TEXCOMP_WASM_SIMD) -c $< -o $@
+
+build/texcomp/wasm/libtexcomp.a: $(TEXCOMP_WASM_OBJ)
+	$(EMAR) rcs $@ $^
+
+build/texcomp/wasm-simd/libtexcomp.a: $(TEXCOMP_WASM_SIMD_OBJ)
+	$(EMAR) rcs $@ $^
+
+build/texcomp/wasm/texcomp.mjs: $(TEXCOMP_WASM_OBJ) | $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_OPT) $(TEXCOMP_WASM_OBJ) \
+	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
+	  -s "EXPORTED_FUNCTIONS=$(TEXCOMP_WASM_EXPORTS)" \
+	  -s "EXPORTED_RUNTIME_METHODS=$(TEXCOMP_WASM_RUNTIME)" \
+	  -o $@
+
+build/texcomp/wasm-simd/texcomp.mjs: $(TEXCOMP_WASM_SIMD_OBJ) | $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_OPT) $(TEXCOMP_WASM_SIMD) $(TEXCOMP_WASM_SIMD_OBJ) \
+	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
+	  -s "EXPORTED_FUNCTIONS=$(TEXCOMP_WASM_EXPORTS)" \
+	  -s "EXPORTED_RUNTIME_METHODS=$(TEXCOMP_WASM_RUNTIME)" \
+	  -o $@
+
+build/texcomp/wasm/texcomp_cli.js: tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_HDRS) $(TEXCOMP_WASM_EXR_SRC) | build/texcomp/wasm $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) $(TEXCOMP_WASM_CLI_WARN) $(V3_INC) \
+	  tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_WASM_EXR_SRC) \
+	  -s FORCE_FILESYSTEM=1 -s NODERAWFS=1 -s ALLOW_MEMORY_GROWTH=1 \
+	  -s EXIT_RUNTIME=1 -s ENVIRONMENT=node \
+	  -o $@
+
+build/texcomp/wasm-simd/texcomp_cli.js: tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_HDRS) $(TEXCOMP_WASM_EXR_SRC) | build/texcomp/wasm-simd $(TEXCOMP_WASM_CACHE)
+	$(TEXCOMP_WASM_EMCC) $(TEXCOMP_WASM_COMMON) $(TEXCOMP_WASM_CLI_WARN) $(TEXCOMP_WASM_SIMD) $(V3_INC) \
+	  tools/texcomp/src/texcomp_cli.c $(TEXCOMP_SRC) $(TEXCOMP_WASM_EXR_SRC) \
+	  -s FORCE_FILESYSTEM=1 -s NODERAWFS=1 -s ALLOW_MEMORY_GROWTH=1 \
+	  -s EXIT_RUNTIME=1 -s ENVIRONMENT=node \
+	  -o $@
+
+texcomp-wasm: build/texcomp/wasm/libtexcomp.a build/texcomp/wasm/texcomp.mjs build/texcomp/wasm/texcomp_cli.js
+	@echo "built build/texcomp/wasm/libtexcomp.a, texcomp.mjs/.wasm, texcomp_cli.js/.wasm"
+
+texcomp-wasm-simd: build/texcomp/wasm-simd/libtexcomp.a build/texcomp/wasm-simd/texcomp.mjs build/texcomp/wasm-simd/texcomp_cli.js
+	@echo "built build/texcomp/wasm-simd/libtexcomp.a, texcomp.mjs/.wasm, texcomp_cli.js/.wasm"
+
+wasm-texcomp: texcomp-wasm
+
+wasm-texcomp-simd: texcomp-wasm-simd
+
+texcomp-c11-gate: | build/texcomp
+	for f in $(TEXCOMP_SRC); do \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXCOMP_INC) $(V3_INC) -O1 -fsyntax-only tools/texcomp/src/texcomp_cli.c
+	@echo "texcomp pure-C11 gate: OK"
+
+texcomp-test: $(TEXCOMP_TEST_OBJ) tools/texcomp/test/test_texcomp.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O1 -g $(SAN) -pthread \
+	  tools/texcomp/test/test_texcomp.c $(TEXCOMP_TEST_OBJ) -lm -o build/test_texcomp
+	./build/test_texcomp
+
+texcomp-uni-gate: $(TEXCOMP_OBJ) tools/texcomp/test/uni_gate.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O2 -g \
+	  tools/texcomp/test/uni_gate.c $(TEXCOMP_OBJ) -lm -o build/texcomp/uni_gate
+	./build/texcomp/uni_gate
+
+texcomp-bench: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_bench.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O3 \
+	  tools/texcomp/bench/texcomp_bench.c $(TEXCOMP_OBJ) -lm -o build/texcomp_bench
+	./build/texcomp_bench
+
+texcomp-astc-psnr: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_psnr.c tools/texcomp/test/astc_ref_decode.h | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -O2 \
+	  tools/texcomp/bench/texcomp_psnr.c $(TEXCOMP_OBJ) -lm -o build/texcomp_psnr
+	./build/texcomp_psnr
+
+# ---- vendored Arm astcenc backend (deps/astcenc, Apache-2.0) ---------------
+# Full port of the upstream Arm encoder, selectable at runtime with
+# `texcomp-arm --encoder arm`. Portable SSE2 baseline on x86, NEON on
+# aarch64; the default `make texcomp` stays pure C11 with no C++ parts.
+ASTCENC_LIB_SRC = $(wildcard deps/astcenc/*.cpp)
+ASTCENC_LIB_OBJ = $(patsubst deps/astcenc/%.cpp,build/astcenc/%.o,$(ASTCENC_LIB_SRC))
+ifeq ($(shell uname -m),aarch64)
+  ASTCENC_DEFS = -DASTCENC_SSE=0 -DASTCENC_AVX=0 -DASTCENC_NEON=1 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
+else
+  ASTCENC_DEFS = -DASTCENC_SSE=20 -DASTCENC_AVX=0 -DASTCENC_NEON=0 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
+endif
+
+build/astcenc/%.o: deps/astcenc/%.cpp
+	@mkdir -p build/astcenc
+	$(CXX) -std=c++14 -O3 -g -w $(ASTCENC_DEFS) -Ideps/astcenc -c $< -o $@
+
+texcomp-arm: lib $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/src/texcomp_cli.c | build/texcomp
+	$(AR) rcs build/libtexcomp_astcenc.a $(ASTCENC_LIB_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  -DTEXCOMP_HAVE_ASTCENC -Ideps/astcenc \
+	  -c tools/texcomp/src/texcomp_cli.c -o build/texcomp/texcomp_cli_arm.o
+	$(CXX) build/texcomp/texcomp_cli_arm.o $(TEXCOMP_OBJ) \
+	  build/libtexcomp_astcenc.a build/libtinyexr3.a \
+	  -pthread -lm -o build/texcomp/texcomp-arm
+
+ASTCENC ?= /tmp/astc-encoder/build/Source/astcenc-native
+
+texcomp-astc-arm-smoke: texcomp
+	@test -x "$(ASTCENC)" || { echo "set ASTCENC=/path/to/astcenc-native"; exit 77; }
+	./build/texcomp/texcomp -i issue40.exr -o build/texcomp/arm_smoke_6x6.astc --format astc --astc-block 6x6 --quality normal
+	"$(ASTCENC)" -dl build/texcomp/arm_smoke_6x6.astc build/texcomp/arm_smoke_6x6.png -silent
+
+# Self-contained CI gate for the vendored astcenc backend: builds the C++
+# encoder, encodes one image with both the pure-C `tc` path and astcenc, and
+# cross-checks their PSNR using astcenc's own decoder. No external binaries or
+# image assets, so it runs anywhere the backend compiles.
+texcomp-astc-arm-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc_arm_xcheck.c | build/texcomp
+	$(AR) rcs build/libtexcomp_astcenc.a $(ASTCENC_LIB_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test \
+	  -DTEXCOMP_HAVE_ASTCENC -Ideps/astcenc -O2 -g -c \
+	  tools/texcomp/test/astc_arm_xcheck.c -o build/texcomp/astc_arm_xcheck.o
+	$(CXX) build/texcomp/astc_arm_xcheck.o $(TEXCOMP_OBJ) \
+	  build/libtexcomp_astcenc.a -lm -o build/texcomp/astc_arm_xcheck
+	./build/texcomp/astc_arm_xcheck
+
+# Self-contained CI gate for the ASTC HDR encoder: encodes deterministic HDR
+# images with the pure-C tc encoder and verifies them with astcenc's conformant
+# HDR decoder (const-colour round-trip + gradient PSNR floor).
+texcomp-astc-hdr-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc_hdr_xcheck.c | build/texcomp
+	$(AR) rcs build/libtexcomp_astcenc.a $(ASTCENC_LIB_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test \
+	  -DTEXCOMP_HAVE_ASTCENC -Ideps/astcenc -O2 -g -c \
+	  tools/texcomp/test/astc_hdr_xcheck.c -o build/texcomp/astc_hdr_xcheck.o
+	$(CXX) build/texcomp/astc_hdr_xcheck.o $(TEXCOMP_OBJ) \
+	  build/libtexcomp_astcenc.a -lm -o build/texcomp/astc_hdr_xcheck
+	./build/texcomp/astc_hdr_xcheck
+
+# xbc7: BC7 windowed RDO + zstd container. C gate checks the RDO improves
+# zstd compressibility (and rdo=0 is a no-op); the CLI step checks the
+# encode->transcode round-trip is bit-exact standard BC7.
+texcomp-xbc7-gate: lib $(TEXCOMP_OBJ) texcomp tools/texcomp/test/xbc7_gate.c tools/texcomp/test/bc7_ref_decode.h | build/texcomp
+	$(AR) rcs build/libtexcomp.a $(TEXCOMP_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -Ideps/zstd -O2 -g \
+	  tools/texcomp/test/xbc7_gate.c build/libtexcomp.a build/libtinyexr3.a \
+	  -pthread -lm -o build/texcomp/xbc7_gate
+	./build/texcomp/xbc7_gate
+	@echo "--- xbc7 CLI encode -> transcode round-trip ---"
+	./build/texcomp/texcomp -i asakusa.png -o build/texcomp/rt.xbc7 \
+	  --format xbc7 --rdo 16 --raw build/texcomp/rt_enc.bc7
+	./build/texcomp/texcomp -i build/texcomp/rt.xbc7 -o build/texcomp/rt.dds \
+	  --raw build/texcomp/rt_dec.bc7
+	@cmp -s build/texcomp/rt_enc.bc7 build/texcomp/rt_dec.bc7 \
+	  && echo "xbc7 CLI round-trip: OK (transcode is bit-exact BC7)" \
+	  || { echo "FAIL: xbc7 round-trip differs"; exit 1; }
+
+# ---- tools/texpipe: resize-aware texture compression ----------------------
+# Ties tir (resize) + texcomp (block compression) into content-aware mip
+# chains serialized to multi-mip DDS / KTX2 containers. Pure C11 library
+# (no <stdio.h> in src/); only texpipe_cli.c does file I/O.
+TEXPIPE_INC = -Itools/texpipe/include -Itools/resize/include \
+  -Itools/texcomp/include -Iinclude -Isrc -Iexamples/common
+TEXPIPE_LIB_SRC = tools/texpipe/src/texpipe.c tools/texpipe/src/texpipe_mip.c \
+  tools/texpipe/src/texpipe_alpha.c tools/texpipe/src/texpipe_cube.c \
+  tools/texpipe/src/texpipe_octa.c tools/texpipe/src/texpipe_disp.c \
+  tools/texpipe/src/texpipe_normal.c tools/texpipe/src/texpipe_container.c
+TEXPIPE_HDRS = tools/texpipe/include/texpipe.h tools/texpipe/src/texpipe_internal.h
+TEXPIPE_OBJ = $(patsubst tools/texpipe/src/%.c,build/texpipe/%.o,$(TEXPIPE_LIB_SRC))
+
+.PHONY: texpipe texpipe-c11-gate texpipe-test
+
+build/texpipe:
+	@mkdir -p build/texpipe
+
+build/texpipe/%.o: tools/texpipe/src/%.c $(TEXPIPE_HDRS) | build/texpipe
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) -O2 -g -c $< -o $@
+
+# Full CLI: base image -> content-aware mip chain -> compressed container.
+texpipe: lib resize-lib texcomp $(TEXPIPE_OBJ) tools/texpipe/src/texpipe_cli.c | build/texpipe
+	$(AR) rcs build/libtexpipe.a $(TEXPIPE_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXPIPE_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  tools/texpipe/src/texpipe_cli.c build/libtexpipe.a build/libtir.a \
+	  build/libtexcomp.a build/libtinyexr3.a -pthread -lm \
+	  -o build/texpipe/texpipe
+	@echo "built build/texpipe/texpipe"
+
+# Strict pure-C11 gate: syntax-check each lib TU with -Werror and forbid
+# <stdio.h> outside the CLI.
+texpipe-c11-gate: | build/texpipe
+	@for f in $(TEXPIPE_LIB_SRC); do \
+	  echo "  c11-gate $$f"; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	@bad=`grep -rl --exclude=texpipe_cli.c '<stdio.h>' tools/texpipe/src/ || true`; \
+	  if [ -n "$$bad" ]; then echo "FAIL: <stdio.h> in texpipe src: $$bad"; exit 1; fi
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) $(V3_INC) -O1 -fsyntax-only \
+	  tools/texpipe/src/texpipe_cli.c
+	@echo "texpipe pure-C11 gate: OK"
+
+# Unit tests: per-mip round-trip PSNR (BC7 shipped decoder) + alpha coverage.
+texpipe-test: resize-lib texcomp tools/texpipe/test/test_texpipe.c $(TEXPIPE_HDRS) | build/texpipe
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXPIPE_INC) -Itools/texcomp/test -O1 -g $(SAN) -pthread \
+	  tools/texpipe/test/test_texpipe.c $(TEXPIPE_LIB_SRC) build/libtir.a \
+	  build/libtexcomp.a -lm -o build/test_texpipe
+	./build/test_texpipe
+
+# ---- tools/envmap: environment-map projections, SH, spherical gaussians ----
+# Pure C11. Links tir + texcomp + texpipe + libtinyexr3 (CLI does HDR EXR I/O).
+ENVMAP_INC = -Itools/envmap/include -Itools/resize/include \
+  -Itools/texcomp/include -Itools/texpipe/include -Iinclude -Isrc -Iexamples/common
+ENVMAP_LIB_SRC = tools/envmap/src/envmap_proj.c tools/envmap/src/envmap_sample.c \
+  tools/envmap/src/envmap_sh.c tools/envmap/src/envmap_sg.c \
+  tools/envmap/src/envmap_ibl.c
+ENVMAP_HDRS = tools/envmap/include/envmap.h
+ENVMAP_OBJ = $(patsubst tools/envmap/src/%.c,build/envmap/%.o,$(ENVMAP_LIB_SRC))
+
+.PHONY: envmap envmap-c11-gate envmap-test envmap-pbr-test
+
+build/envmap:
+	@mkdir -p build/envmap
+
+build/envmap/%.o: tools/envmap/src/%.c $(ENVMAP_HDRS) | build/envmap
+	$(CC) $(V3_CSTD) $(V3_WARN) $(ENVMAP_INC) -O2 -g -c $< -o $@
+
+envmap: lib resize-lib texcomp texpipe $(ENVMAP_OBJ) tools/envmap/src/envmap_cli.c | build/envmap
+	$(AR) rcs build/libenvmap.a $(ENVMAP_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(ENVMAP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  tools/envmap/src/envmap_cli.c build/libenvmap.a build/libtexpipe.a \
+	  build/libtir.a build/libtexcomp.a build/libtinyexr3.a -pthread -lm \
+	  -o build/envmap/envmap
+	@echo "built build/envmap/envmap"
+
+envmap-c11-gate: | build/envmap
+	@for f in $(ENVMAP_LIB_SRC); do \
+	  echo "  c11-gate $$f"; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(ENVMAP_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	@bad=`grep -rl --exclude=envmap_cli.c '<stdio.h>' tools/envmap/src/ || true`; \
+	  if [ -n "$$bad" ]; then echo "FAIL: <stdio.h> in envmap src: $$bad"; exit 1; fi
+	$(CC) $(V3_CSTD) $(V3_WARN) $(ENVMAP_INC) $(V3_INC) -O1 -fsyntax-only \
+	  tools/envmap/src/envmap_cli.c
+	@echo "envmap pure-C11 gate: OK"
+
+envmap-test: resize-lib tools/envmap/test/test_envmap.c $(ENVMAP_HDRS) | build/envmap
+	$(CC) $(V3_CSTD) -Wall -Wextra $(ENVMAP_INC) -O1 -g $(SAN) -pthread \
+	  tools/envmap/test/test_envmap.c $(ENVMAP_LIB_SRC) build/libtir.a -lm \
+	  -o build/test_envmap
+	./build/test_envmap
+
+# PBR validation harness: shade under IBL with source vs BC7-decoded material.
+envmap-pbr-test: resize-lib texcomp tools/envmap/test/test_pbr.c $(ENVMAP_HDRS) | build/envmap
+	$(CC) $(V3_CSTD) -Wall -Wextra $(ENVMAP_INC) -O1 -g $(SAN) -pthread \
+	  tools/envmap/test/test_pbr.c $(ENVMAP_LIB_SRC) build/libtir.a \
+	  build/libtexcomp.a -lm -o build/test_pbr
+	./build/test_pbr
 
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:
@@ -765,6 +1080,18 @@ help:
 	@echo "make test-c-tsan - threaded unit tests under ThreadSanitizer"
 	@echo "make c11-gate - strict C11 -Werror compile of all src/*.c"
 	@echo "make bench  - codec/SIMD throughput benchmark (incl. HTJ2K SIMD tiers)"
+	@echo "make tools-test - run all self-contained tool gates (texcomp/resize/texpipe/envmap)"
+	@echo "make tools-test-all - tools-test + astcenc conformance cross-checks (needs C++)"
+	@echo "make texcomp - build tools/texcomp BC7 CLI (build/texcomp/texcomp)"
+	@echo "make texcomp-c11-gate - strict C11 -Werror compile of texcomp"
+	@echo "make texcomp-test - run texcomp unit tests (ASan+UBSan)"
+	@echo "make texcomp-bench - run texcomp BC7 throughput benchmark"
+	@echo "make texcomp-astc-psnr - ASTC encode/reference-decode PSNR table"
+	@echo "make texcomp-arm - texcomp CLI with the vendored Arm astcenc backend (--encoder arm)"
+	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
+	@echo "make texcomp-astc-arm-gate - self-contained astcenc build + PSNR cross-check (CI gate)"
+	@echo "make texcomp-wasm - Emscripten texcomp C API + Node CLI (scalar wasm)"
+	@echo "make texcomp-wasm-simd - Emscripten texcomp C API + Node CLI (-msimd128)"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
 	@echo "make fuzz   - build libFuzzer target (build/fuzz_v3)"
 	@echo "make fuzz-corpus - replay regression corpus under ASan+UBSan+LSan"

@@ -43,6 +43,27 @@ static double kd_lanczos(double a, double lobes) {
     return kd_sinc(a) * kd_sinc(a / lobes);
 }
 
+/* Modified Bessel function of the first kind, order 0 (series). */
+static double kd_bessel_i0(double x) {
+    double sum = 1.0, term = 1.0, xx = 0.25 * x * x;
+    int k;
+    for (k = 1; k < 30; ++k) {
+        term *= xx / ((double)k * (double)k);
+        sum += term;
+        if (term < 1e-12 * sum) break;
+    }
+    return sum;
+}
+
+/* Kaiser-windowed sinc of half-width `radius`. */
+static double kd_kaiser(double a, double radius, double beta) {
+    double t;
+    if (a >= radius) return 0.0;
+    t = a / radius;
+    return kd_sinc(a) * kd_bessel_i0(beta * sqrt(1.0 - t * t)) /
+           kd_bessel_i0(beta);
+}
+
 static double kd_weight(tir_filter f, double t, double sigma) {
     double a = t < 0.0 ? -t : t;
     switch (f) {
@@ -60,6 +81,8 @@ static double kd_weight(tir_filter f, double t, double sigma) {
             return kd_lanczos(a, 2.0);
         case TIR_FILTER_LANCZOS3:
             return kd_lanczos(a, 3.0);
+        case TIR_FILTER_KAISER:
+            return kd_kaiser(a, 3.0, 8.0);
         default: /* box is special-cased (exact interval overlap) */
             return a <= 0.5 ? 1.0 : 0.0;
     }
@@ -75,6 +98,7 @@ static double filter_radius(tir_filter f, double sigma) {
             /* truncate at 3 sigma (<= 0.3% tail, renormalized away) */
             return 3.0 * sigma < 0.5 ? 0.5 : 3.0 * sigma;
         case TIR_FILTER_LANCZOS3:
+        case TIR_FILTER_KAISER:
             return 3.0;
         default: /* cubics, lanczos2 */
             return 2.0;
