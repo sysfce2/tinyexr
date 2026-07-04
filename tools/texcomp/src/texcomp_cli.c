@@ -288,6 +288,54 @@ static tc_result load_exr_rgbf(const char *path, int part_index, float **rgb,
     return TC_SUCCESS;
 }
 
+/* Load an EXR as float RGBA (for HDR-alpha / CEM 15). A defaults to 1.0 when the
+ * part has no alpha channel. */
+static tc_result load_exr_rgbaf(const char *path, int part_index, float **rgba,
+                                uint32_t *w, uint32_t *h) {
+    exr_image img;
+    exr_part *part;
+    int r, g, b, a;
+    size_t i, n;
+    exr_result er;
+    memset(&img, 0, sizeof(img));
+    er = exr_load_from_file(path, NULL, &img);
+    if (!EXR_OK(er)) return TC_ERROR_CORRUPT;
+    if (part_index < 0) part_index = 0;
+    if (part_index >= img.num_parts) {
+        exr_image_free(&img);
+        return TC_ERROR_INVALID_ARGUMENT;
+    }
+    part = &img.parts[part_index];
+    if (part->is_deep || !part->images || part->width <= 0 || part->height <= 0) {
+        exr_image_free(&img);
+        return TC_ERROR_UNSUPPORTED;
+    }
+    r = channel_index(part, "R");
+    g = channel_index(part, "G");
+    b = channel_index(part, "B");
+    a = channel_index(part, "A");
+    if (r < 0 || g < 0 || b < 0) {
+        exr_image_free(&img);
+        return TC_ERROR_UNSUPPORTED;
+    }
+    n = (size_t)part->width * (size_t)part->height;
+    *rgba = (float *)malloc(n * 4u * sizeof(float));
+    if (!*rgba) {
+        exr_image_free(&img);
+        return TC_ERROR_OUT_OF_MEMORY;
+    }
+    for (i = 0; i < n; ++i) {
+        (*rgba)[i * 4u + 0u] = read_exr_sample(part, r, i);
+        (*rgba)[i * 4u + 1u] = read_exr_sample(part, g, i);
+        (*rgba)[i * 4u + 2u] = read_exr_sample(part, b, i);
+        (*rgba)[i * 4u + 3u] = (a >= 0) ? read_exr_sample(part, a, i) : 1.0f;
+    }
+    *w = (uint32_t)part->width;
+    *h = (uint32_t)part->height;
+    exr_image_free(&img);
+    return TC_SUCCESS;
+}
+
 static tc_result rgba_to_rgbf(const uint8_t *rgba, uint32_t w, uint32_t h,
                               float **rgb) {
     size_t i, n = (size_t)w * (size_t)h;
@@ -834,6 +882,8 @@ static void usage(void) {
             "        ASTC (astcenc/--encoder arm); e.g. 2,2,1,1 favours R,G.\n"
             "  --bc7-pca: also seed BC7 endpoints from the weighted principal\n"
             "        color axis, keep-best (off by default; ~+0.09 dB, ~1.7x slower).\n"
+            "  --hdr-alpha: for --format astc_hdr on an EXR, encode the alpha\n"
+            "        channel too (ASTC HDR CEM 15); default is RGB-only.\n"
             "  uni: universal transcodable intermediate. `--format uni -o x.uni`\n"
             "        (raw, level 0) or `-o x.ktx2` (KTX2, full mip chain, Zstd-\n"
             "        supercompressed; add --basis[/--basis-cap N] for a BasisLZ-\n"
@@ -864,7 +914,8 @@ int main(int argc, char **argv) {
     int uni_basis = 0;
     float uni_rdo = 0.0f;
     uint8_t *rgba = NULL, *compressed = NULL, *container = NULL;
-    float *rgbf = NULL;
+    float *rgbf = NULL, *rgbaf = NULL;
+    int hdr_alpha = 0;
     uint32_t w = 0, h = 0;
     size_t compressed_size, container_size;
     tc_bc7_options bc7_opt;
@@ -945,6 +996,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--rdo") == 0 && i + 1 < argc)
             bc7_opt.rdo = atoi(argv[++i]);
         else if (strcmp(argv[i], "--bc7-pca") == 0) bc7_opt.pca_endpoints = 1;
+        else if (strcmp(argv[i], "--hdr-alpha") == 0) hdr_alpha = 1;
         else if (strcmp(argv[i], "--basis") == 0) uni_basis = 2048; /* codebook cap */
         else if (strcmp(argv[i], "--basis-cap") == 0 && i + 1 < argc) uni_basis = atoi(argv[++i]);
         else if (strcmp(argv[i], "--basis-rdo") == 0 && i + 1 < argc) uni_rdo = (float)atof(argv[++i]);
@@ -1048,8 +1100,10 @@ int main(int argc, char **argv) {
     } else if (strcmp(format, "etc2_rg11") == 0) {
         format = "eac_rg11";
     }
-    if ((strcmp(format, "bc6h") == 0 || strcmp(format, "astc_hdr") == 0) &&
-        ends_with(in, ".exr")) {
+    if (strcmp(format, "astc_hdr") == 0 && hdr_alpha && ends_with(in, ".exr")) {
+        tr = load_exr_rgbaf(in, part, &rgbaf, &w, &h);
+    } else if ((strcmp(format, "bc6h") == 0 || strcmp(format, "astc_hdr") == 0) &&
+               ends_with(in, ".exr")) {
         tr = load_exr_rgbf(in, part, &rgbf, &w, &h);
     } else {
         if (ends_with(in, ".png")) tr = load_png_rgba(in, &rgba, &w, &h);
@@ -1070,7 +1124,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "texcomp: xbc7 encode failed: %s\n",
                     tc_result_string(tr));
         free(rgba);
-        free(rgbf);
+        free(rgbf); free(rgbaf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
@@ -1107,7 +1161,7 @@ int main(int argc, char **argv) {
             free(u);
         }
         if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: uni encode failed\n");
-        free(rgba); free(rgbf);
+        free(rgba); free(rgbf); free(rgbaf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
@@ -1149,13 +1203,13 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "texcomp: unsupported format: %s\n", format);
         free(rgba);
-        free(rgbf);
+        free(rgbf); free(rgbaf);
         return 1;
     }
     if (!compressed_size || !container_size) {
         fprintf(stderr, "texcomp: invalid output size for format: %s\n", format);
         free(rgba);
-        free(rgbf);
+        free(rgbf); free(rgbaf);
         return 1;
     }
     compressed = (uint8_t *)malloc(compressed_size);
@@ -1163,7 +1217,7 @@ int main(int argc, char **argv) {
     if (!compressed || !container) {
         fprintf(stderr, "texcomp: out of memory\n");
         free(rgba);
-        free(rgbf);
+        free(rgbf); free(rgbaf);
         free(compressed);
         free(container);
         return 1;
@@ -1208,11 +1262,18 @@ int main(int argc, char **argv) {
         tc_astc_options_init(&hdr4);
         hdr4.block_x = 4;
         hdr4.block_y = 4;
-        if (!rgbf) tr = rgba_to_rgbf(rgba, w, h, &rgbf);
-        if (tr == TC_SUCCESS)
-            tr = tc_astc_hdr_compress_rgbf(rgbf, w, h,
-                                           (size_t)w * 3u * sizeof(float),
-                                           &hdr_opt, compressed, compressed_size);
+        if (rgbaf) {
+            tr = tc_astc_hdr_compress_rgbaf(rgbaf, w, h,
+                                            (size_t)w * 4u * sizeof(float),
+                                            &hdr_opt, compressed, compressed_size);
+        } else {
+            if (!rgbf) tr = rgba_to_rgbf(rgba, w, h, &rgbf);
+            if (tr == TC_SUCCESS)
+                tr = tc_astc_hdr_compress_rgbf(rgbf, w, h,
+                                               (size_t)w * 3u * sizeof(float),
+                                               &hdr_opt, compressed,
+                                               compressed_size);
+        }
         if (tr == TC_SUCCESS)
             tr = tc_astc_write_file_memory(compressed, w, h, &hdr4, container,
                                            container_size);
@@ -1246,7 +1307,7 @@ int main(int argc, char **argv) {
     if (tr == TC_SUCCESS && raw) tr = write_file(raw, compressed, compressed_size);
     if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: write failed: %s\n", tc_result_string(tr));
     free(rgba);
-    free(rgbf);
+    free(rgbf); free(rgbaf);
     free(compressed);
     free(container);
     return tr == TC_SUCCESS ? 0 : 1;
