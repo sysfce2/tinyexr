@@ -27,7 +27,8 @@ only the CLI does HDR EXR I/O.
   the ground truth for the validation harness (`make envmap-pbr-test`), which
   shades under the IBL with **source vs BC7-compressed material** and reports the
   shaded-image PSNR + normal angular error — the "does compression hurt the final
-  image" gate.
+  image" gate. It also demonstrates **PBR-tuned format choice**: BC5 (2-channel,
+  reconstruct-Z) vs BC7 for normals — BC5 mean 0.35°/max 0.99° vs BC7 1.39°/8.00°.
 
 `sh`/`sg` also write `<out>_recon.exr`, an equirect reconstruction from the
 coefficients for eyeballing quality.

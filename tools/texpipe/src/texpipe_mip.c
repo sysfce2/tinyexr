@@ -6,6 +6,7 @@
  */
 #include "texpipe_internal.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -91,6 +92,16 @@ static void tp_copy_base(const tir_image_view *src, tp_surface *dst) {
     }
 }
 
+static float tp_srgb_to_linear(float c) {
+    if (c <= 0.04045f) return c / 12.92f;
+    return powf((c + 0.055f) / 1.055f, 2.4f);
+}
+static float tp_linear_to_srgb(float c) {
+    if (c <= 0.0f) return 0.0f;
+    if (c <= 0.0031308f) return c * 12.92f;
+    return 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+
 static tir_mode tp_tir_mode(tp_content content) {
     switch (content) {
     case TP_CONTENT_NORMAL: return TIR_MODE_NORMAL_MAP;
@@ -172,7 +183,8 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
     for (face = 0; face < num_faces; ++face) {
         const tir_image_view *base = &faces[face];
         tir_image_view src_base = *base;
-        float *base3 = NULL;
+        float *base3 = NULL, *lin_base = NULL, *sq_base = NULL;
+        int srgb_aware = 0, rough_op = 0;
         float base_coverage = 0.0f;
         int do_coverage = (opt->content == TP_CONTENT_ALPHA_TESTED &&
                            opt->preserve_alpha_coverage != 0 && channels == 4);
@@ -195,6 +207,46 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
             src_base.row_stride_bytes = 0;
         }
 
+        /* sRGB-aware albedo: a linear-light copy of the base to filter in. */
+        {
+            int cc;
+            srgb_aware = (opt->srgb_aware && opt->content == TP_CONTENT_COLOR &&
+                          channels == 4);
+            for (cc = 0; cc < 4; ++cc)
+                if (opt->channel_op[cc] == TP_CH_ROUGHNESS) rough_op = 1;
+            rough_op = rough_op && channels == 4 &&
+                       (opt->content == TP_CONTENT_COLOR ||
+                        opt->content == TP_CONTENT_ALPHA_TESTED);
+            if (srgb_aware) {
+                int bx, by;
+                lin_base = (float *)tp_alloc(a, (size_t)base->width *
+                                                    (size_t)base->height * 4 *
+                                                    sizeof(float));
+                if (!lin_base) { tp_dealloc(a, base3); tp_mip_chain_free(a, out); return TP_ERROR_OUT_OF_MEMORY; }
+                for (by = 0; by < base->height; ++by)
+                    for (bx = 0; bx < base->width; ++bx) {
+                        size_t o = ((size_t)by * base->width + bx) * 4;
+                        lin_base[o + 0] = tp_srgb_to_linear(tp_read_sample(base, bx, by, 0));
+                        lin_base[o + 1] = tp_srgb_to_linear(tp_read_sample(base, bx, by, 1));
+                        lin_base[o + 2] = tp_srgb_to_linear(tp_read_sample(base, bx, by, 2));
+                        lin_base[o + 3] = tp_read_sample(base, bx, by, 3);
+                    }
+            }
+            if (rough_op) {
+                int bx, by, bc;
+                sq_base = (float *)tp_alloc(a, (size_t)base->width *
+                                                   (size_t)base->height * 4 *
+                                                   sizeof(float));
+                if (!sq_base) { tp_dealloc(a, lin_base); tp_dealloc(a, base3); tp_mip_chain_free(a, out); return TP_ERROR_OUT_OF_MEMORY; }
+                for (by = 0; by < base->height; ++by)
+                    for (bx = 0; bx < base->width; ++bx)
+                        for (bc = 0; bc < 4; ++bc) {
+                            float v = tp_read_sample(base, bx, by, bc);
+                            sq_base[((size_t)by * base->width + bx) * 4 + bc] = v * v;
+                        }
+            }
+        }
+
         for (level = 0; level < num_levels; ++level) {
             int idx = face * num_levels + level;
             tp_surface *s = &out->level[idx];
@@ -204,6 +256,8 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
             pr = tp_surface_alloc(a, s, w, h, channels);
             if (!TP_OK(pr)) {
                 tp_dealloc(a, base3);
+                tp_dealloc(a, lin_base);
+                tp_dealloc(a, sq_base);
                 tp_mip_chain_free(a, out);
                 return pr;
             }
@@ -244,11 +298,19 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
                  * map it in place (Toksvig). */
                 topt.normal_length_out = rough;
 
-                if (opt->mip_source == TP_MIP_FROM_PREVIOUS)
+                if (srgb_aware) {
+                    /* Filter in linear light (forces from-base). */
+                    srcv = *base;
+                    srcv.data = lin_base;
+                    srcv.channels = channels;
+                    srcv.type = TIR_F32;
+                    srcv.row_stride_bytes = 0;
+                } else if (opt->mip_source == TP_MIP_FROM_PREVIOUS) {
                     tp_view_of_surface(&out->level[face * num_levels + level - 1],
                                        &srcv);
-                else
+                } else {
                     srcv = src_base;
+                }
                 tp_view_of_surface(s, &dstv);
 
                 tr = tir_resize(a, &srcv, &dstv, &topt);
@@ -279,9 +341,62 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
                         }
                     }
                 }
+                /* Roughness-variance packing: replace ROUGHNESS channels with
+                 * the RMS roughness sqrt(E[c^2]) (>= filtered mean), so minified
+                 * roughness reduces specular aliasing. E[c^2] = resized squared
+                 * base. */
+                if (rough_op) {
+                    tir_options ropt;
+                    tir_image_view sqv, e2v;
+                    tp_surface e2s;
+                    if (TP_OK(tp_surface_alloc(a, &e2s, w, h, 4))) {
+                        tir_options_init(&ropt);
+                        ropt.filter_x = opt->filter;
+                        ropt.filter_y = opt->filter;
+                        ropt.edge_x = opt->edge_x;
+                        ropt.edge_y = opt->edge_y;
+                        sqv = *base;
+                        sqv.data = sq_base; sqv.channels = 4; sqv.type = TIR_F32;
+                        sqv.row_stride_bytes = 0;
+                        tp_view_of_surface(&e2s, &e2v);
+                        if (TIR_OK(tir_resize(a, &sqv, &e2v, &ropt))) {
+                            int cc2, xx, yy;
+                            for (cc2 = 0; cc2 < 4; ++cc2) {
+                                if (opt->channel_op[cc2] != TP_CH_ROUGHNESS) continue;
+                                for (yy = 0; yy < h; ++yy) {
+                                    float *row = (float *)((uint8_t *)s->data + (size_t)yy * s->stride);
+                                    const float *e2r = (const float *)((uint8_t *)e2s.data + (size_t)yy * e2s.stride);
+                                    for (xx = 0; xx < w; ++xx) {
+                                        float e2 = e2r[xx * 4 + cc2];
+                                        if (e2 < 0.0f) e2 = 0.0f;
+                                        if (e2 > 1.0f) e2 = 1.0f;
+                                        row[xx * channels + cc2] = sqrtf(e2);
+                                    }
+                                }
+                            }
+                        }
+                        tp_dealloc(a, e2s.data);
+                    }
+                }
+                /* sRGB-aware: re-encode the linear-filtered RGB back to sRGB so a
+                 * hardware sRGB sampler decodes the correctly-filtered value. */
+                if (srgb_aware) {
+                    int xx, yy;
+                    for (yy = 0; yy < h; ++yy) {
+                        float *row = (float *)((uint8_t *)s->data + (size_t)yy * s->stride);
+                        for (xx = 0; xx < w; ++xx) {
+                            float *px = row + xx * channels;
+                            px[0] = tp_linear_to_srgb(px[0]);
+                            px[1] = tp_linear_to_srgb(px[1]);
+                            px[2] = tp_linear_to_srgb(px[2]);
+                        }
+                    }
+                }
             }
         }
         tp_dealloc(a, base3);
+        tp_dealloc(a, lin_base);
+        tp_dealloc(a, sq_base);
     }
 
     /* Cube seam fixup: make face borders bit-identical per mip level, after all

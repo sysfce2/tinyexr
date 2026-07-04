@@ -38,9 +38,14 @@ Implemented:
   map (the square's outer border folds onto itself), so an HDR octahedral
   environment stays coherent across LODs under BC6H/ASTC-HDR. Pairs with the
   `envmap` tool's `convert --to octa`.
+- **sRGB-aware albedo resize** (`--srgb-resize`): decode sRGB→linear, filter,
+  re-encode, so albedo mips preserve linear-light energy (a black/white checker
+  averages to linear 0.5, not the darkened 0.21 of naive sRGB-space filtering).
 - **Packed material maps** (`--channel-ops l,l,m,l`): per-channel downsample
-  rules so a single ORM/mask texture minifies correctly — `majority` thresholds
-  a binary metallic/mask channel (stays crisp) while others stay linear.
+  rules so a single ORM/mask texture minifies correctly — `m` (majority)
+  thresholds a binary metallic/mask channel (stays crisp), `r` (roughness)
+  replaces the channel with its RMS `sqrt(E[c²])` so minified roughness rises to
+  reduce specular aliasing, and `l` (default) stays linear.
 - **Texture arrays** (`tp_write_ktx2_array`): pack N compressed chains into one
   KTX2 with `layerCount = N`.
 - **Multi-mip DDS** (DX10) for the BC family and **multi-mip KTX2** (Vulkan

@@ -715,11 +715,108 @@ static void test_array_ktx2(void) {
     free(img);
 }
 
+static float srgb_to_lin(float c) {
+    return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static void test_srgb_aware_resize(void) {
+    /* Black/white sRGB checker. Naive filtering in sRGB space gives ~0.5 sRGB
+     * (linear 0.21). sRGB-aware gives linear 0.5 -> sRGB ~0.735. Test that the
+     * linear-decoded mean of the sRGB-aware mip is ~0.5 (energy preserved). */
+    tir_image_view v;
+    tp_options opt;
+    tp_mip_chain aware, naive;
+    uint8_t *img = (uint8_t *)malloc((size_t)64 * 64 * 4);
+    int x, y, i;
+    double lin_aware = 0, lin_naive = 0, n;
+    for (y = 0; y < 64; ++y)
+        for (x = 0; x < 64; ++x) {
+            uint8_t *p = img + (y * 64 + x) * 4;
+            uint8_t c = ((x ^ y) & 1) ? 255 : 0;
+            p[0] = p[1] = p[2] = c; p[3] = 255;
+        }
+    view_u8(&v, img, 64, 64);
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    opt.srgb_aware = 1;
+    memset(&aware, 0, sizeof(aware));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &aware)), "build srgb-aware");
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    memset(&naive, 0, sizeof(naive));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &naive)), "build naive");
+    /* use a mid level (fully averaged checker) */
+    i = 3;
+    {
+        const tp_surface *sa = &aware.level[i], *sn = &naive.level[i];
+        int xx, yy;
+        n = (double)sa->width * sa->height;
+        for (yy = 0; yy < sa->height; ++yy) {
+            const float *ra = (const float *)((const uint8_t *)sa->data + (size_t)yy * sa->stride);
+            const float *rn = (const float *)((const uint8_t *)sn->data + (size_t)yy * sn->stride);
+            for (xx = 0; xx < sa->width; ++xx) {
+                lin_aware += srgb_to_lin(ra[xx * sa->channels]);
+                lin_naive += srgb_to_lin(rn[xx * sn->channels]);
+            }
+        }
+        lin_aware /= n; lin_naive /= n;
+    }
+    printf("  srgb-aware resize: linear mean aware=%.3f naive=%.3f (target 0.5)\n",
+           lin_aware, lin_naive);
+    CHECK(fabs(lin_aware - 0.5) < 0.03, "sRGB-aware mip preserves linear energy (~0.5)");
+    CHECK(lin_naive < 0.35, "naive sRGB filtering darkens (linear ~0.21)");
+    tp_mip_chain_free(NULL, &aware);
+    tp_mip_chain_free(NULL, &naive);
+    free(img);
+}
+
+static void test_roughness_variance(void) {
+    /* Roughness channel varying 0..1; RMS packing must raise coarse-mip
+     * roughness above the plain average. */
+    tir_image_view v;
+    tp_options opt;
+    tp_mip_chain rms, lin;
+    uint8_t *img = (uint8_t *)malloc((size_t)64 * 64 * 4);
+    int x, y, i;
+    double mean_rms = 0, mean_lin = 0, n;
+    for (y = 0; y < 64; ++y)
+        for (x = 0; x < 64; ++x) {
+            uint8_t *p = img + (y * 64 + x) * 4;
+            p[0] = 128; p[1] = ((x ^ y) & 1) ? 230 : 30; /* rough in G, high variance */
+            p[2] = 0; p[3] = 255;
+        }
+    view_u8(&v, img, 64, 64);
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    opt.channel_op[1] = TP_CH_ROUGHNESS;
+    memset(&rms, 0, sizeof(rms));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &rms)), "build rough-rms");
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    memset(&lin, 0, sizeof(lin));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &lin)), "build rough-linear");
+    i = 3;
+    {
+        const tp_surface *sr = &rms.level[i], *sl = &lin.level[i];
+        int xx, yy;
+        n = (double)sr->width * sr->height;
+        for (yy = 0; yy < sr->height; ++yy) {
+            const float *rr = (const float *)((const uint8_t *)sr->data + (size_t)yy * sr->stride);
+            const float *rl = (const float *)((const uint8_t *)sl->data + (size_t)yy * sl->stride);
+            for (xx = 0; xx < sr->width; ++xx) { mean_rms += rr[xx * sr->channels + 1]; mean_lin += rl[xx * sl->channels + 1]; }
+        }
+        mean_rms /= n; mean_lin /= n;
+    }
+    printf("  roughness variance packing: rms=%.3f linear=%.3f\n", mean_rms, mean_lin);
+    CHECK(mean_rms > mean_lin + 0.02, "RMS roughness > plain average under variance");
+    tp_mip_chain_free(NULL, &rms);
+    tp_mip_chain_free(NULL, &lin);
+    free(img);
+}
+
 int main(void) {
     printf("texpipe unit tests\n");
     test_octa_seam();
     test_channel_majority();
     test_array_ktx2();
+    test_srgb_aware_resize();
+    test_roughness_variance();
     test_mip_geometry();
     test_bc7_roundtrip_psnr();
     test_alpha_scale_helper();

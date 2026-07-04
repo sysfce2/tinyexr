@@ -295,7 +295,8 @@ static void usage(void) {
         "  octahedral env map:\n"
         "    --octa               fold-seam-aware mips for an octahedral 2D map\n"
         "  packed material maps (ORM/mask):\n"
-        "    --channel-ops l,l,m,l  per-channel R,G,B,A: l=linear, m=majority(binary)\n");
+        "    --channel-ops l,l,m,l  per-channel R,G,B,A: l=linear, m=majority(binary), r=roughness\n"
+        "  --srgb-resize          decode sRGB->linear, filter, re-encode (correct albedo mips)\n");
 }
 
 int main(int argc, char **argv) {
@@ -317,6 +318,7 @@ int main(int argc, char **argv) {
     int octa = 0;
     int chan_ops[4] = {0, 0, 0, 0};
     int have_chan_ops = 0;
+    int srgb_resize = 0;
     const char *cube_files[6] = {0};
     int cube_n = 0;
     int cube_layout = -1; /* -1 = none */
@@ -363,12 +365,14 @@ int main(int argc, char **argv) {
             /* comma list of l|m per channel R,G,B,A (l=linear, m=majority) */
             while (*vv && ci < 4) {
                 if (*vv == 'm' || *vv == 'M') chan_ops[ci++] = 1;
+                else if (*vv == 'r' || *vv == 'R') chan_ops[ci++] = 2;
                 else if (*vv == 'l' || *vv == 'L') chan_ops[ci++] = 0;
                 else if (*vv == ',') { ++vv; continue; }
                 ++vv;
             }
             have_chan_ops = 1;
         }
+        else if (!strcmp(a, "--srgb-resize")) { srgb_resize = 1; srgb = 1; }
         else if (!strcmp(a, "--normal-enc")) { const char *v = NEXT(); if (!v || !parse_normal_enc(v, &normal_enc)) { usage(); return 2; } }
         else if (!strcmp(a, "--bake-roughness")) bake_roughness = 1;
         else if (!strcmp(a, "--base-roughness")) { const char *v = NEXT(); if (!v) { usage(); return 2; } base_roughness = (float)atof(v); }
@@ -437,8 +441,11 @@ int main(int argc, char **argv) {
     if (have_chan_ops) {
         int ci;
         for (ci = 0; ci < 4; ++ci)
-            opt.channel_op[ci] = chan_ops[ci] ? TP_CH_MAJORITY : TP_CH_LINEAR;
+            opt.channel_op[ci] = (chan_ops[ci] == 2) ? TP_CH_ROUGHNESS
+                                 : (chan_ops[ci] == 1) ? TP_CH_MAJORITY
+                                                       : TP_CH_LINEAR;
     }
+    if (srgb_resize) opt.srgb_aware = 1;
     if (content == TP_CONTENT_NORMAL) {
         opt.normal_encoding = normal_enc;
         opt.base_roughness = base_roughness;

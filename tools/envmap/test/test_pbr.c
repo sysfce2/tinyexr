@@ -156,10 +156,89 @@ static void test_normal_bc7_angular_error(void) {
     free(nm); free(dec); free(bc7);
 }
 
+/* BC4 block decode matching texcomp's encoder (endpoint0=max, endpoint1=min,
+ * 8-value interpolation, 48 bits of 3-bit indices). */
+static void bc4_decode(const uint8_t *blk, uint8_t out[16]) {
+    int mx = blk[0], mn = blk[1], pal[8], i;
+    uint64_t bits = 0;
+    pal[0] = mx; pal[1] = mn;
+    for (i = 1; i <= 6; ++i) pal[i + 1] = ((7 - i) * mx + i * mn + 3) / 7;
+    for (i = 0; i < 6; ++i) bits |= (uint64_t)blk[2 + i] << (8 * i);
+    for (i = 0; i < 16; ++i) out[i] = (uint8_t)pal[(bits >> (3 * i)) & 7];
+}
+
+static double normal_angle_deg(const float a[3], const float b[3]) {
+    float la = sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);
+    float lb = sqrtf(b[0]*b[0]+b[1]*b[1]+b[2]*b[2]), d;
+    if (la < 1e-6f || lb < 1e-6f) return 0.0;
+    d = (a[0]*b[0]+a[1]*b[1]+a[2]*b[2])/(la*lb);
+    if (d > 1) d = 1;
+    if (d < -1) d = -1;
+    return acosf(d) * 180.0 / 3.14159265;
+}
+
+/* PBR-tuned compression: BC5 (2-channel, reconstruct Z) should beat BC7 for
+ * normal maps. Encode a normal map both ways, decode, compare angular error. */
+static void test_normal_bc5_vs_bc7(void) {
+    int W = 64, H = 64, x, y, bx, by;
+    uint8_t *nm = (uint8_t *)malloc((size_t)W * H * 4);
+    uint8_t *rg = (uint8_t *)malloc((size_t)W * H * 2);
+    uint8_t *bc5 = (uint8_t *)malloc(tc_bc5_compressed_size(W, H));
+    uint8_t *bc7 = (uint8_t *)malloc(tc_bc7_compressed_size(W, H));
+    uint8_t *dec7 = (uint8_t *)malloc((size_t)W * H * 4);
+    double bc5_mean = 0, bc7_mean = 0, bc5_max = 0, bc7_max = 0;
+    int cnt = 0;
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            float fx = (x / (float)(W - 1)) * 2 - 1, fy = (y / (float)(H - 1)) * 2 - 1;
+            float nx = 0.7f * sinf(fx * 3.0f), ny = 0.7f * sinf(fy * 3.0f), nz = 1.0f;
+            float l = sqrtf(nx*nx+ny*ny+nz*nz);
+            uint8_t *p = nm + (y * W + x) * 4;
+            nx /= l; ny /= l; nz /= l;
+            p[0] = (uint8_t)((nx*0.5f+0.5f)*255); p[1] = (uint8_t)((ny*0.5f+0.5f)*255);
+            p[2] = (uint8_t)((nz*0.5f+0.5f)*255); p[3] = 255;
+            rg[(y * W + x) * 2 + 0] = p[0];
+            rg[(y * W + x) * 2 + 1] = p[1];
+        }
+    tc_bc5_compress_rg8(rg, W, H, W * 2, NULL, bc5, tc_bc5_compressed_size(W, H));
+    tc_bc7_compress_rgba8(nm, W, H, W * 4, NULL, bc7, tc_bc7_compressed_size(W, H));
+    tc_bc7_decompress_rgba8(bc7, W, H, W * 4, dec7, (size_t)W * H * 4);
+    for (by = 0; by < H; by += 4)
+        for (bx = 0; bx < W; bx += 4) {
+            uint8_t r[16], g[16];
+            const uint8_t *blk = bc5 + (size_t)((by / 4) * (W / 4) + bx / 4) * 16;
+            int i;
+            bc4_decode(blk, r); bc4_decode(blk + 8, g);
+            for (i = 0; i < 16; ++i) {
+                int lx = bx + (i % 4), ly = by + (i / 4);
+                const uint8_t *src = nm + (ly * W + lx) * 4;
+                const uint8_t *d7 = dec7 + (ly * W + lx) * 4;
+                float ns[3] = {src[0]/255.f*2-1, src[1]/255.f*2-1, src[2]/255.f*2-1};
+                float n5[3], n7[3], zx, zy;
+                zx = r[i]/255.f*2-1; zy = g[i]/255.f*2-1;
+                n5[0]=zx; n5[1]=zy; n5[2]=sqrtf(1-zx*zx-zy*zy>0?1-zx*zx-zy*zy:0);
+                n7[0]=d7[0]/255.f*2-1; n7[1]=d7[1]/255.f*2-1; n7[2]=d7[2]/255.f*2-1;
+                {
+                    double a5 = normal_angle_deg(ns, n5), a7 = normal_angle_deg(ns, n7);
+                    bc5_mean += a5; bc7_mean += a7;
+                    if (a5 > bc5_max) bc5_max = a5;
+                    if (a7 > bc7_max) bc7_max = a7;
+                    ++cnt;
+                }
+            }
+        }
+    bc5_mean /= cnt; bc7_mean /= cnt;
+    printf("  normal BC5 vs BC7 angular error: BC5 mean=%.2f max=%.2f | BC7 mean=%.2f max=%.2f\n",
+           bc5_mean, bc5_max, bc7_mean, bc7_max);
+    CHECK(bc5_mean < bc7_mean, "BC5 beats BC7 for normal maps (PBR-tuned format choice)");
+    free(nm); free(rg); free(bc5); free(bc7); free(dec7);
+}
+
 int main(void) {
     printf("envmap PBR validation harness\n");
     test_albedo_compression_shading();
     test_normal_bc7_angular_error();
+    test_normal_bc5_vs_bc7();
     if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

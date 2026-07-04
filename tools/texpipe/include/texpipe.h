@@ -93,8 +93,11 @@ typedef enum tp_projection {
  * to a 4-channel COLOR surface so each packed channel minifies correctly. */
 typedef enum tp_channel_op {
     TP_CH_LINEAR = 0,   /* filtered average (AO, linear data) — default */
-    TP_CH_MAJORITY = 1  /* threshold to {0,1} at 0.5 (binary metallic / mask):
+    TP_CH_MAJORITY = 1, /* threshold to {0,1} at 0.5 (binary metallic / mask):
                          * keeps edges crisp instead of averaging to gray */
+    TP_CH_ROUGHNESS = 2 /* variance-aware roughening: bump the channel by its
+                         * footprint variance so minified roughness reduces
+                         * specular aliasing (roughness = sqrt(mean^2 + var)) */
 } tp_channel_op;
 
 /* Cubemap face input layout (Phase 3). Kept here so the option struct is
@@ -121,7 +124,9 @@ typedef struct tp_options {
     tir_edge_mode edge_y;       /* CLAMP */
 
     /* -- color / alpha --------------------------------------------------- */
-    int srgb;                   /* tag container sRGB (Phase 0: tag only) */
+    int srgb;                   /* tag container sRGB */
+    int srgb_aware;             /* COLOR: decode sRGB->linear, filter, re-encode
+                                 * (correct albedo mips); implies srgb tag */
     tir_alpha_mode alpha;       /* PREMULTIPLY */
     float alpha_test_threshold; /* 0.5 */
     int preserve_alpha_coverage;/* auto-on for ALPHA_TESTED; -1 = auto */
