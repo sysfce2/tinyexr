@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -42,6 +42,7 @@ test: $(TARGET)
 # gate compiles its C++ so it needs a C++ toolchain).
 .PHONY: tools-test tools-test-all
 tools-test: texcomp-c11-gate texcomp-test texcomp-uni-gate texcomp-xbc7-gate \
+            texcomp-bc6h-gate \
             resize-c11-gate resize-test \
             texpipe-c11-gate texpipe-test \
             envmap-c11-gate envmap-test envmap-pbr-test
@@ -351,6 +352,13 @@ texcomp-uni-gate: $(TEXCOMP_OBJ) tools/texcomp/test/uni_gate.c | build/texcomp
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O2 -g \
 	  tools/texcomp/test/uni_gate.c $(TEXCOMP_OBJ) -lm -o build/texcomp/uni_gate
 	./build/texcomp/uni_gate
+
+# BC6H conformance + quality gate: encode HDR, decode every block with an
+# independent reference decoder (bcdec port) and check PSNR vs source.
+texcomp-bc6h-gate: $(TEXCOMP_OBJ) tools/texcomp/test/bc6h_gate.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -O2 -g \
+	  tools/texcomp/test/bc6h_gate.c $(TEXCOMP_OBJ) -lm -o build/texcomp/bc6h_gate
+	./build/texcomp/bc6h_gate
 
 texcomp-bench: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_bench.c | build/texcomp
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O3 \
