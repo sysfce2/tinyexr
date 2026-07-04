@@ -81,6 +81,22 @@ typedef enum tp_mip_source {
     TP_MIP_FROM_PREVIOUS = 1  /* resample the previous level (lower quality)    */
 } tp_mip_source;
 
+/* Texture projection. TP_PROJ_OCTA runs an octahedral fold-seam fixup per mip
+ * so the map's outer border stays coherent across LODs (like the cube fixup).
+ * Cubemaps are selected by num_faces == 6, not here. */
+typedef enum tp_projection {
+    TP_PROJ_2D = 0,
+    TP_PROJ_OCTA = 1
+} tp_projection;
+
+/* Per-channel downsample rule for packed material maps (ORM / masks). Applied
+ * to a 4-channel COLOR surface so each packed channel minifies correctly. */
+typedef enum tp_channel_op {
+    TP_CH_LINEAR = 0,   /* filtered average (AO, linear data) — default */
+    TP_CH_MAJORITY = 1  /* threshold to {0,1} at 0.5 (binary metallic / mask):
+                         * keeps edges crisp instead of averaging to gray */
+} tp_channel_op;
+
 /* Cubemap face input layout (Phase 3). Kept here so the option struct is
  * stable; only TP_CUBE_SEPARATE is honored today. Face order is the KTX/D3D/GL
  * convention +X,-X,+Y,-Y,+Z,-Z. */
@@ -121,6 +137,13 @@ typedef struct tp_options {
     tp_cube_layout cube_layout;
     int cube_seam_fixup;        /* 1 */
     int cube_fixup_max_level;   /* -1 = all */
+
+    /* -- octahedral ------------------------------------------------------ */
+    tp_projection projection;   /* TP_PROJ_2D */
+    int octa_seam_fixup;        /* 1; fold-edge fixup per mip when OCTA */
+
+    /* -- packed material channels (ORM/mask) ----------------------------- */
+    tp_channel_op channel_op[4];/* per-channel downsample rule; default LINEAR */
 
     /* -- codec knobs (forwarded verbatim to texcomp) --------------------- */
     tc_bc7_options bc7;
@@ -209,6 +232,15 @@ tp_result tp_process(const tir_allocator *a, const tir_image_view *faces,
                      size_t *out_size);
 void tp_free(const tir_allocator *a, void *ptr);
 
+/* Texture arrays: write `num_layers` compressed chains (all same codec / faces /
+ * levels / dimensions) into one KTX2 with layerCount = num_layers. Layers are
+ * interleaved per level per the KTX2 order (layer, face, z). */
+size_t tp_ktx2_array_size(const tp_blocks *layers, int num_layers,
+                          const tp_options *opt);
+tp_result tp_write_ktx2_array(const tp_blocks *layers, int num_layers,
+                              const tp_options *opt, uint8_t *out,
+                              size_t out_size, size_t *written);
+
 /* ===========================================================================
  * Leaf helpers (also the Phase 1 test surface)
  * ========================================================================= */
@@ -240,6 +272,13 @@ tp_result tp_cube_seam_fixup(tp_surface faces[6], const tp_options *opt);
  * geometry doesn't fit the layout (needs square, equal faces). */
 tp_result tp_cube_split(const tir_image_view *src, tp_cube_layout layout,
                         tir_image_view out[6]);
+
+/* Octahedral fold-seam fixup: mirror-average the square map's outer border
+ * (top/bottom rows and left/right columns fold onto themselves reversed; the 4
+ * corners meet at one pole) so borders are coherent across LODs. In-place per
+ * mip. tp_build_mips applies this automatically when opt->projection ==
+ * TP_PROJ_OCTA. Same post-compression seam caveat as the cube fixup. */
+tp_result tp_octa_seam_fixup(tp_surface *s, const tp_options *opt);
 
 /* Toksvig roughness (Toksvig 2005, "Mipmapping Normal Maps"): map per-texel
  * averaged-normal length |N| in (0,1] to an effective roughness, given a base

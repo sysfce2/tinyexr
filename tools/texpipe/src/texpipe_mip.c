@@ -262,6 +262,23 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
                                                opt->alpha_test_threshold);
                 if (rough)
                     tp_toksvig_roughness(rough, w * h, opt->base_roughness, rough);
+                /* Per-channel packed-map rule: threshold MAJORITY channels so a
+                 * binary metallic/mask stays crisp instead of averaging gray. */
+                if ((opt->content == TP_CONTENT_COLOR ||
+                     opt->content == TP_CONTENT_ALPHA_TESTED) && channels == 4) {
+                    int cc, xx, yy;
+                    for (cc = 0; cc < 4; ++cc) {
+                        if (opt->channel_op[cc] != TP_CH_MAJORITY) continue;
+                        for (yy = 0; yy < h; ++yy) {
+                            float *row = (float *)((uint8_t *)s->data +
+                                                   (size_t)yy * s->stride);
+                            for (xx = 0; xx < w; ++xx) {
+                                float *px = row + xx * channels;
+                                px[cc] = px[cc] >= 0.5f ? 1.0f : 0.0f;
+                            }
+                        }
+                    }
+                }
             }
         }
         tp_dealloc(a, base3);
@@ -278,6 +295,12 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
             for (fi = 0; fi < 6; ++fi) fs[fi] = out->level[fi * num_levels + level];
             tp_cube_seam_fixup(fs, opt);
         }
+    }
+
+    /* Octahedral fold-seam fixup: per-mip border coherence for a 2D octa map. */
+    if (num_faces == 1 && opt->projection == TP_PROJ_OCTA && opt->octa_seam_fixup) {
+        for (level = 0; level < num_levels; ++level)
+            tp_octa_seam_fixup(&out->level[level], opt);
     }
     return TP_SUCCESS;
 }

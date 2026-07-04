@@ -333,6 +333,8 @@ void tp_options_init(tp_options *opt, tp_content content, tp_codec codec) {
     opt->cube_layout = TP_CUBE_SEPARATE;
     opt->cube_seam_fixup = 1;
     opt->cube_fixup_max_level = -1;
+    opt->projection = TP_PROJ_2D;
+    opt->octa_seam_fixup = 1;
     tc_bc7_options_init(&opt->bc7);
     tc_bc1_options_init(&opt->bc1);
     tc_bc3_options_init(&opt->bc3);

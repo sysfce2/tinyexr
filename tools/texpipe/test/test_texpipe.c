@@ -602,8 +602,124 @@ static void test_heightmap_mean(void) {
     free(img);
 }
 
+/* Octahedral (Y-up) decode, matching tools/envmap octa convention. */
+static void octa_dir(float u01, float v01, float d[3]) {
+    float u = 2 * u01 - 1, v = 2 * v01 - 1, x = u, z = v, y = 1 - fabsf(u) - fabsf(v), l;
+    if (y < 0) { x = (1 - fabsf(v)) * (u >= 0 ? 1.f : -1.f); z = (1 - fabsf(u)) * (v >= 0 ? 1.f : -1.f); }
+    l = sqrtf(x * x + y * y + z * z);
+    d[0] = x / l; d[1] = y / l; d[2] = z / l;
+}
+
+static void test_octa_seam(void) {
+    tp_surface s;
+    int n = 64, x, y, c;
+    float max_dev = 0.0f;
+    s.width = n; s.height = n; s.channels = 4;
+    s.stride = (size_t)n * 4 * sizeof(float);
+    s.data = (float *)malloc(s.stride * n);
+    /* fill with a smooth direction field */
+    for (y = 0; y < n; ++y)
+        for (x = 0; x < n; ++x) {
+            float d[3], *p = s.data + (y * n + x) * 4;
+            octa_dir((x + 0.5f) / n, (y + 0.5f) / n, d);
+            p[0] = 0.5f + 0.5f * d[0]; p[1] = 0.5f + 0.5f * d[1];
+            p[2] = 0.5f + 0.5f * d[2]; p[3] = 1.0f;
+        }
+    CHECK(TP_OK(tp_octa_seam_fixup(&s, NULL)), "octa seam fixup");
+    /* Border texels must stay near their true direction value (correct pairing);
+     * a wrong fold rule would average unrelated texels and deviate a lot. */
+    for (y = 0; y < n; ++y)
+        for (x = 0; x < n; ++x) {
+            int border = (x == 0 || x == n - 1 || y == 0 || y == n - 1);
+            float d[3], *p;
+            if (!border) continue;
+            octa_dir((x + 0.5f) / n, (y + 0.5f) / n, d);
+            p = s.data + (y * n + x) * 4;
+            for (c = 0; c < 3; ++c) {
+                float ref = 0.5f + 0.5f * d[c];
+                float dv = fabsf(p[c] - ref);
+                if (dv > max_dev) max_dev = dv;
+            }
+        }
+    printf("  octa seam fixup: ok (max border dev=%.4f)\n", max_dev);
+    CHECK(max_dev < 0.05f, "octa fold pairing keeps borders near true direction");
+    free(s.data);
+}
+
+static void test_channel_majority(void) {
+    /* R = binary checkerboard mask; MAJORITY must keep it binary at every mip,
+     * while LINEAR would produce gray. */
+    tir_image_view v;
+    tp_options opt;
+    tp_mip_chain chain;
+    uint8_t *img = (uint8_t *)malloc((size_t)64 * 64 * 4);
+    int x, y, i, nonbinary = 0;
+    for (y = 0; y < 64; ++y)
+        for (x = 0; x < 64; ++x) {
+            uint8_t *p = img + (y * 64 + x) * 4;
+            p[0] = ((x ^ y) & 1) ? 255 : 0; /* mask */
+            p[1] = (uint8_t)(x * 4);        /* linear */
+            p[2] = 0; p[3] = 255;
+        }
+    view_u8(&v, img, 64, 64);
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    opt.channel_op[0] = TP_CH_MAJORITY;
+    memset(&chain, 0, sizeof(chain));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &chain)), "build packed mips");
+    for (i = 1; i < chain.num_levels; ++i) {
+        const tp_surface *s = &chain.level[i];
+        for (y = 0; y < s->height; ++y) {
+            const float *row = (const float *)((const uint8_t *)s->data + (size_t)y * s->stride);
+            for (x = 0; x < s->width; ++x) {
+                float r = row[x * s->channels + 0];
+                if (r > 1e-4f && r < 1.0f - 1e-4f) nonbinary = 1;
+            }
+        }
+    }
+    CHECK(!nonbinary, "MAJORITY channel stays binary across mips");
+    printf("  channel majority packing: ok (nonbinary=%d)\n", nonbinary);
+    tp_mip_chain_free(NULL, &chain);
+    free(img);
+}
+
+static void test_array_ktx2(void) {
+    tir_image_view v;
+    tp_options opt;
+    tp_mip_chain chain;
+    tp_blocks b, layers[3];
+    uint8_t *img = make_gradient(64, 64);
+    uint8_t *buf = NULL;
+    size_t need, wrote = 0;
+    view_u8(&v, img, 64, 64);
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    memset(&chain, 0, sizeof(chain));
+    memset(&b, 0, sizeof(b));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &chain)), "array: build");
+    CHECK(TP_OK(tp_compress_chain(NULL, &chain, &opt, &b)), "array: compress");
+    layers[0] = b; layers[1] = b; layers[2] = b; /* 3 layers reuse same blocks */
+    need = tp_ktx2_array_size(layers, 3, &opt);
+    CHECK(need > 0, "array size");
+    buf = (uint8_t *)malloc(need);
+    CHECK(TP_OK(tp_write_ktx2_array(layers, 3, &opt, buf, need, &wrote)), "array: write");
+    if (buf) {
+        CHECK(rd_u32(buf + 32) == 3u, "ktx2 layerCount == 3");
+        CHECK(rd_u32(buf + 40) == 7u, "ktx2 levelCount == 7");
+        CHECK(rd_u64(buf + 88) == 3u * tc_bc7_compressed_size(64, 64),
+              "ktx2 array level0 length = 3 layers");
+        CHECK(rd_u64(buf + 80) + rd_u64(buf + 88) <= wrote, "array level0 in bounds");
+    }
+    printf("  array ktx2 (layerCount=3): ok\n");
+    free(buf);
+    tp_blocks_free(NULL, &b);
+    tp_mip_chain_free(NULL, &chain);
+    free(img);
+}
+
 int main(void) {
     printf("texpipe unit tests\n");
+    test_octa_seam();
+    test_channel_majority();
+    test_array_ktx2();
     test_mip_geometry();
     test_bc7_roundtrip_psnr();
     test_alpha_scale_helper();

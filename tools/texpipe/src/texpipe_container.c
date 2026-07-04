@@ -264,3 +264,93 @@ tp_result tp_ktx2_write(const tp_blocks *b, const tp_options *opt, uint8_t *out,
     if (written) *written = need;
     return TP_SUCCESS;
 }
+
+/* ---- KTX2 texture arrays (layerCount) ---- */
+
+static size_t tp_ktx2_array_layout(const tp_blocks *layers, int num_layers,
+                                   const tp_codec_desc *d, uint64_t *level_off,
+                                   uint64_t *level_len) {
+    size_t idx_bytes = (size_t)layers[0].num_levels * 24u;
+    size_t align = (size_t)d->block_bytes;
+    size_t cursor = 80u + idx_bytes + TP_DFD_TOTAL;
+    int ll;
+    if (align < 4u) align = 4u;
+    for (ll = layers[0].num_levels - 1; ll >= 0; --ll) {
+        size_t len = (size_t)num_layers * tp_ktx2_level_len(&layers[0], ll);
+        cursor = tp_align_up(cursor, align);
+        if (level_off) level_off[ll] = cursor;
+        if (level_len) level_len[ll] = len;
+        cursor += len;
+    }
+    return cursor;
+}
+
+size_t tp_ktx2_array_size(const tp_blocks *layers, int num_layers,
+                          const tp_options *opt) {
+    tp_codec_desc d;
+    if (!layers || num_layers < 1 || !opt) return 0;
+    if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u) return 0;
+    return tp_ktx2_array_layout(layers, num_layers, &d, NULL, NULL);
+}
+
+tp_result tp_write_ktx2_array(const tp_blocks *layers, int num_layers,
+                              const tp_options *opt, uint8_t *out,
+                              size_t out_size, size_t *written) {
+    static const uint8_t id[12] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32,
+                                   0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    tp_codec_desc d;
+    uint64_t level_off[32], level_len[32];
+    size_t need, idx_base, dfd_off;
+    int ll, layer, face, nlev, nface, li;
+    if (!layers || num_layers < 1 || !opt || !out) return TP_ERROR_INVALID_ARGUMENT;
+    nlev = layers[0].num_levels;
+    nface = layers[0].num_faces;
+    if (nlev > 32) return TP_ERROR_UNSUPPORTED;
+    for (li = 1; li < num_layers; ++li)
+        if (layers[li].num_levels != nlev || layers[li].num_faces != nface ||
+            layers[li].codec != layers[0].codec)
+            return TP_ERROR_INVALID_ARGUMENT;
+    if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u)
+        return TP_ERROR_UNSUPPORTED;
+    need = tp_ktx2_array_layout(layers, num_layers, &d, level_off, level_len);
+    if (out_size < need) return TP_ERROR_INVALID_ARGUMENT;
+    memset(out, 0, need);
+
+    memcpy(out, id, 12);
+    tp_wr_u32(out + 12, d.vk_format);
+    tp_wr_u32(out + 16, 1u);
+    tp_wr_u32(out + 20, layers[0].blk[0].width);
+    tp_wr_u32(out + 24, layers[0].blk[0].height);
+    tp_wr_u32(out + 28, 0u);
+    tp_wr_u32(out + 32, (uint32_t)num_layers); /* layerCount */
+    tp_wr_u32(out + 36, (uint32_t)nface);
+    tp_wr_u32(out + 40, (uint32_t)nlev);
+    tp_wr_u32(out + 44, 0u);
+    idx_base = 80u;
+    dfd_off = idx_base + (size_t)nlev * 24u;
+    tp_wr_u32(out + 48, (uint32_t)dfd_off);
+    tp_wr_u32(out + 52, TP_DFD_TOTAL);
+    tp_wr_u32(out + 56, 0u);
+    tp_wr_u32(out + 60, 0u);
+    tp_wr_u64(out + 64, 0u);
+    tp_wr_u64(out + 72, 0u);
+    for (ll = 0; ll < nlev; ++ll) {
+        uint8_t *e = out + idx_base + (size_t)ll * 24u;
+        tp_wr_u64(e + 0, level_off[ll]);
+        tp_wr_u64(e + 8, level_len[ll]);
+        tp_wr_u64(e + 16, level_len[ll]);
+    }
+    tp_write_dfd(out + dfd_off, &d, opt->codec, opt->srgb);
+    /* Level data: for each level, layer-major then face (KTX2 order). */
+    for (ll = 0; ll < nlev; ++ll) {
+        size_t off = (size_t)level_off[ll];
+        for (layer = 0; layer < num_layers; ++layer)
+            for (face = 0; face < nface; ++face) {
+                const tp_block_level *bl = &layers[layer].blk[face * nlev + ll];
+                memcpy(out + off, bl->data, bl->size);
+                off += bl->size;
+            }
+    }
+    if (written) *written = need;
+    return TP_SUCCESS;
+}

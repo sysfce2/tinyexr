@@ -425,6 +425,7 @@ TEXPIPE_INC = -Itools/texpipe/include -Itools/resize/include \
   -Itools/texcomp/include -Iinclude -Isrc -Iexamples/common
 TEXPIPE_LIB_SRC = tools/texpipe/src/texpipe.c tools/texpipe/src/texpipe_mip.c \
   tools/texpipe/src/texpipe_alpha.c tools/texpipe/src/texpipe_cube.c \
+  tools/texpipe/src/texpipe_octa.c \
   tools/texpipe/src/texpipe_normal.c tools/texpipe/src/texpipe_container.c
 TEXPIPE_HDRS = tools/texpipe/include/texpipe.h tools/texpipe/src/texpipe_internal.h
 TEXPIPE_OBJ = $(patsubst tools/texpipe/src/%.c,build/texpipe/%.o,$(TEXPIPE_LIB_SRC))
@@ -465,6 +466,48 @@ texpipe-test: resize-lib texcomp tools/texpipe/test/test_texpipe.c $(TEXPIPE_HDR
 	  tools/texpipe/test/test_texpipe.c $(TEXPIPE_LIB_SRC) build/libtir.a \
 	  build/libtexcomp.a -lm -o build/test_texpipe
 	./build/test_texpipe
+
+# ---- tools/envmap: environment-map projections, SH, spherical gaussians ----
+# Pure C11. Links tir + texcomp + texpipe + libtinyexr3 (CLI does HDR EXR I/O).
+ENVMAP_INC = -Itools/envmap/include -Itools/resize/include \
+  -Itools/texcomp/include -Itools/texpipe/include -Iinclude -Isrc -Iexamples/common
+ENVMAP_LIB_SRC = tools/envmap/src/envmap_proj.c tools/envmap/src/envmap_sample.c \
+  tools/envmap/src/envmap_sh.c tools/envmap/src/envmap_sg.c
+ENVMAP_HDRS = tools/envmap/include/envmap.h
+ENVMAP_OBJ = $(patsubst tools/envmap/src/%.c,build/envmap/%.o,$(ENVMAP_LIB_SRC))
+
+.PHONY: envmap envmap-c11-gate envmap-test
+
+build/envmap:
+	@mkdir -p build/envmap
+
+build/envmap/%.o: tools/envmap/src/%.c $(ENVMAP_HDRS) | build/envmap
+	$(CC) $(V3_CSTD) $(V3_WARN) $(ENVMAP_INC) -O2 -g -c $< -o $@
+
+envmap: lib resize-lib texcomp texpipe $(ENVMAP_OBJ) tools/envmap/src/envmap_cli.c | build/envmap
+	$(AR) rcs build/libenvmap.a $(ENVMAP_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(ENVMAP_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  tools/envmap/src/envmap_cli.c build/libenvmap.a build/libtexpipe.a \
+	  build/libtir.a build/libtexcomp.a build/libtinyexr3.a -pthread -lm \
+	  -o build/envmap/envmap
+	@echo "built build/envmap/envmap"
+
+envmap-c11-gate: | build/envmap
+	@for f in $(ENVMAP_LIB_SRC); do \
+	  echo "  c11-gate $$f"; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(ENVMAP_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	@bad=`grep -rl --exclude=envmap_cli.c '<stdio.h>' tools/envmap/src/ || true`; \
+	  if [ -n "$$bad" ]; then echo "FAIL: <stdio.h> in envmap src: $$bad"; exit 1; fi
+	$(CC) $(V3_CSTD) $(V3_WARN) $(ENVMAP_INC) $(V3_INC) -O1 -fsyntax-only \
+	  tools/envmap/src/envmap_cli.c
+	@echo "envmap pure-C11 gate: OK"
+
+envmap-test: resize-lib tools/envmap/test/test_envmap.c $(ENVMAP_HDRS) | build/envmap
+	$(CC) $(V3_CSTD) -Wall -Wextra $(ENVMAP_INC) -O1 -g $(SAN) -pthread \
+	  tools/envmap/test/test_envmap.c $(ENVMAP_LIB_SRC) build/libtir.a -lm \
+	  -o build/test_envmap
+	./build/test_envmap
 
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:

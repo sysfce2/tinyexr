@@ -34,6 +34,15 @@ Implemented:
   pre-renormalize |N| and maps it to a **Toksvig** roughness (Toksvig 2005),
   written as a companion EAC_R11 KTX2 mip chain so specular highlights don't
   alias into shimmer at distance.
+- **Octahedral env maps** (`--octa`): fold-seam-aware mips for a 2D octahedral
+  map (the square's outer border folds onto itself), so an HDR octahedral
+  environment stays coherent across LODs under BC6H/ASTC-HDR. Pairs with the
+  `envmap` tool's `convert --to octa`.
+- **Packed material maps** (`--channel-ops l,l,m,l`): per-channel downsample
+  rules so a single ORM/mask texture minifies correctly — `majority` thresholds
+  a binary metallic/mask channel (stays crisp) while others stay linear.
+- **Texture arrays** (`tp_write_ktx2_array`): pack N compressed chains into one
+  KTX2 with `layerCount = N`.
 - **Multi-mip DDS** (DX10) for the BC family and **multi-mip KTX2** (Vulkan
   formats, native cube/mip/array) for BC/ETC2/EAC/ASTC.
 - Codecs: BC1/BC3/BC5/BC7/BC6H, ETC2 RGB/RGBA, EAC R11/RG11, ASTC LDR (any

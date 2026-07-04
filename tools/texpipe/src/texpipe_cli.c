@@ -291,7 +291,11 @@ static void usage(void) {
         "  cubemap (seam-free LOD):\n"
         "    --cube-face <+x|-x|+y|-y|+z|-z> FILE   (give all 6; square, equal size)\n"
         "    --cube-layout cross_h|cross_v|strip_h|strip_v  (split single -i input)\n"
-        "    --no-seam-fixup      disable cross-face edge/corner averaging\n");
+        "    --no-seam-fixup      disable cross-face edge/corner averaging\n"
+        "  octahedral env map:\n"
+        "    --octa               fold-seam-aware mips for an octahedral 2D map\n"
+        "  packed material maps (ORM/mask):\n"
+        "    --channel-ops l,l,m,l  per-channel R,G,B,A: l=linear, m=majority(binary)\n");
 }
 
 int main(int argc, char **argv) {
@@ -310,6 +314,9 @@ int main(int argc, char **argv) {
     int alpha_mode = -1; /* -1 default */
     uint32_t astc_bx = 4, astc_by = 4;
     int seam_fixup = 1;
+    int octa = 0;
+    int chan_ops[4] = {0, 0, 0, 0};
+    int have_chan_ops = 0;
     const char *cube_files[6] = {0};
     int cube_n = 0;
     int cube_layout = -1; /* -1 = none */
@@ -348,6 +355,20 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--cube-face")) { const char *nm = NEXT(); const char *fl = NEXT(); int idx; if (!nm || !fl || (idx = cube_face_index(nm)) < 0) { usage(); return 2; } cube_files[idx] = fl; ++cube_n; }
         else if (!strcmp(a, "--cube-layout")) { const char *v = NEXT(); if (!v || !parse_cube_layout(v, (tp_cube_layout *)&cube_layout)) { usage(); return 2; } }
         else if (!strcmp(a, "--no-seam-fixup")) seam_fixup = 0;
+        else if (!strcmp(a, "--octa")) octa = 1;
+        else if (!strcmp(a, "--channel-ops")) {
+            const char *vv = NEXT();
+            int ci = 0;
+            if (!vv) { usage(); return 2; }
+            /* comma list of l|m per channel R,G,B,A (l=linear, m=majority) */
+            while (*vv && ci < 4) {
+                if (*vv == 'm' || *vv == 'M') chan_ops[ci++] = 1;
+                else if (*vv == 'l' || *vv == 'L') chan_ops[ci++] = 0;
+                else if (*vv == ',') { ++vv; continue; }
+                ++vv;
+            }
+            have_chan_ops = 1;
+        }
         else if (!strcmp(a, "--normal-enc")) { const char *v = NEXT(); if (!v || !parse_normal_enc(v, &normal_enc)) { usage(); return 2; } }
         else if (!strcmp(a, "--bake-roughness")) bake_roughness = 1;
         else if (!strcmp(a, "--base-roughness")) { const char *v = NEXT(); if (!v) { usage(); return 2; } base_roughness = (float)atof(v); }
@@ -412,6 +433,12 @@ int main(int argc, char **argv) {
     opt.threads = threads;
     opt.is_cube = (num_faces == 6);
     opt.cube_seam_fixup = seam_fixup;
+    if (octa) { opt.projection = TP_PROJ_OCTA; opt.octa_seam_fixup = seam_fixup; }
+    if (have_chan_ops) {
+        int ci;
+        for (ci = 0; ci < 4; ++ci)
+            opt.channel_op[ci] = chan_ops[ci] ? TP_CH_MAJORITY : TP_CH_LINEAR;
+    }
     if (content == TP_CONTENT_NORMAL) {
         opt.normal_encoding = normal_enc;
         opt.base_roughness = base_roughness;
