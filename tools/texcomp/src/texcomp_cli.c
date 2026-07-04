@@ -428,6 +428,115 @@ done:
     return tr;
 }
 
+/* --- uni universal intermediate: KTX2 (Zstd-supercompressed) container ---- */
+
+static void uni_put64(uint8_t *p, uint64_t v) {
+    xbc7_put32(p, (uint32_t)v);
+    xbc7_put32(p + 4, (uint32_t)(v >> 32));
+}
+static uint64_t uni_get64(const uint8_t *p) {
+    return (uint64_t)xbc7_get32(p) | ((uint64_t)xbc7_get32(p + 4) << 32);
+}
+static uint8_t *read_whole_file(const char *path, size_t *out_size) {
+    FILE *f = fopen(path, "rb");
+    long sz;
+    uint8_t *buf;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return NULL; }
+    buf = (uint8_t *)malloc((size_t)sz);
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return NULL; }
+    fclose(f);
+    *out_size = (size_t)sz;
+    return buf;
+}
+
+/* Write the uni block stream as a KTX2 with vkFormat=UNDEFINED and
+ * supercompressionScheme=2 (Zstandard). Our loader identifies it by that pair
+ * and transcodes; a standard KTX2 tool sees a Zstd-supercompressed transcode
+ * source (DFD colourModel = UASTC). */
+static tc_result write_uni_ktx2(const char *path, const uint8_t *uni,
+                                size_t uni_size, uint32_t w, uint32_t h) {
+    static const uint8_t id[12] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32,
+                                   0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    size_t bound = tinyexr_zstd_compress_bound(uni_size), zc;
+    size_t dfd_off = 104u, dfd_len = 44u, data_off = 148u, total;
+    uint8_t *comp = (uint8_t *)malloc(bound), *ktx;
+    tc_result r;
+    if (!comp) return TC_ERROR_OUT_OF_MEMORY;
+    zc = tinyexr_zstd_compress(comp, bound, uni, uni_size, 19);
+    if (tinyexr_zstd_is_error(zc)) { free(comp); return TC_ERROR_UNSUPPORTED; }
+    total = data_off + zc;
+    ktx = (uint8_t *)calloc(1, total);
+    if (!ktx) { free(comp); return TC_ERROR_OUT_OF_MEMORY; }
+    memcpy(ktx, id, 12);
+    xbc7_put32(ktx + 12, 0u);    /* vkFormat = UNDEFINED */
+    xbc7_put32(ktx + 16, 1u);    /* typeSize */
+    xbc7_put32(ktx + 20, w);
+    xbc7_put32(ktx + 24, h);
+    xbc7_put32(ktx + 36, 1u);    /* faceCount */
+    xbc7_put32(ktx + 40, 1u);    /* levelCount */
+    xbc7_put32(ktx + 44, 2u);    /* supercompressionScheme = Zstandard */
+    xbc7_put32(ktx + 48, (uint32_t)dfd_off);
+    xbc7_put32(ktx + 52, (uint32_t)dfd_len);
+    /* level index (1 level): byteOffset, byteLength(compressed), uncompressed */
+    uni_put64(ktx + 80, data_off);
+    uni_put64(ktx + 88, zc);
+    uni_put64(ktx + 96, uni_size);
+    /* minimal DFD (44 bytes), colourModel 166 = UASTC (transcode source) */
+    xbc7_put32(ktx + dfd_off, 44u);
+    xbc7_put32(ktx + dfd_off + 8, 2u | (40u << 16));
+    ktx[dfd_off + 12] = 166u; ktx[dfd_off + 13] = 1u; ktx[dfd_off + 14] = 1u;
+    ktx[dfd_off + 16] = 3u; ktx[dfd_off + 17] = 3u; ktx[dfd_off + 20] = 16u;
+    ktx[dfd_off + 30] = 127u; xbc7_put32(ktx + dfd_off + 40, 0xffffffffu);
+    memcpy(ktx + data_off, comp, zc);
+    r = write_file(path, ktx, total);
+    if (r == TC_SUCCESS)
+        printf("wrote %s (uni KTX2, Zstd-supercompressed: %zu -> %zu bytes)\n",
+               path, uni_size, zc);
+    free(comp); free(ktx);
+    return r;
+}
+
+/* Read a uni KTX2 back into the raw uni block stream (Zstd-decompressed). */
+static uint8_t *read_uni_ktx2(const char *path, size_t *out_size, uint32_t *w,
+                              uint32_t *h) {
+    size_t fsz;
+    uint8_t *buf = read_whole_file(path, &fsz), *uni;
+    uint64_t off, clen, ulen;
+    size_t dec;
+    if (!buf) return NULL;
+    if (fsz < 104u || xbc7_get32(buf + 12) != 0u || xbc7_get32(buf + 44) != 2u ||
+        xbc7_get32(buf + 40) < 1u) { free(buf); return NULL; }
+    *w = xbc7_get32(buf + 20); *h = xbc7_get32(buf + 24);
+    off = uni_get64(buf + 80); clen = uni_get64(buf + 88); ulen = uni_get64(buf + 96);
+    if (off + clen > fsz || ulen == 0) { free(buf); return NULL; }
+    uni = (uint8_t *)malloc((size_t)ulen);
+    if (!uni) { free(buf); return NULL; }
+    dec = tinyexr_zstd_decompress(uni, (size_t)ulen, buf + off, (size_t)clen);
+    free(buf);
+    if (tinyexr_zstd_is_error(dec) || dec != ulen) { free(uni); return NULL; }
+    *out_size = (size_t)ulen;
+    return uni;
+}
+
+/* Transcode a uni block stream to the --format target and write raw blocks. */
+static tc_result transcode_uni(const uint8_t *ubuf, uint32_t uw, uint32_t uh,
+                               const char *format, const char *out) {
+    uint8_t *ob = NULL;
+    size_t osz = 0;
+    tc_result tr;
+    if (!strcmp(format, "bc7")) { osz = tc_bc7_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc7(ubuf, uw, uh, ob, osz); }
+    else if (!strcmp(format, "bc1") || !strcmp(format, "dxt1")) { osz = tc_bc1_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc1(ubuf, uw, uh, ob, osz); }
+    else if (!strcmp(format, "astc")) { tc_astc_options ao; tc_astc_options_init(&ao); ao.block_x = 4; ao.block_y = 4; ao.uastc = 1; osz = tc_astc_compressed_size(uw, uh, &ao); ob = malloc(osz); tr = tc_uni_transcode_astc(ubuf, uw, uh, ob, osz); }
+    else if (!strcmp(format, "etc2") || !strcmp(format, "etc2_rgba")) { osz = tc_etc2_rgba_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_etc2(ubuf, uw, uh, 1, ob, osz); }
+    else { fprintf(stderr, "texcomp: --format for uni transcode must be bc7|bc1|astc|etc2\n"); return TC_ERROR_INVALID_ARGUMENT; }
+    if (tr == TC_SUCCESS && ob) tr = write_file(out, ob, osz);
+    if (tr == TC_SUCCESS) printf("transcoded -> %s (%s, %ux%u, %zu bytes)\n", out, format, uw, uh, osz);
+    free(ob);
+    return tr;
+}
+
 static void usage(void) {
     fprintf(stderr,
             "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr|xbc7|uni] "
@@ -438,6 +547,9 @@ static void usage(void) {
             "[--linear|--perceptual]\n"
             "  --channel-weights: per-channel error weights for BC7 (pure-C) and\n"
             "        ASTC (astcenc/--encoder arm); e.g. 2,2,1,1 favours R,G.\n"
+            "  uni: universal transcodable intermediate. `--format uni -o x.uni`\n"
+            "        (raw) or `-o x.ktx2` (KTX2, Zstd-supercompressed). Transcode\n"
+            "        with `-i x.{uni,ktx2} -o out.bin --format bc7|bc1|astc|etc2`.\n"
             "  xbc7: supercompressed BC7 (windowed RDO + zstd); --rdo N sets the\n"
             "        max per-channel RMS reuse budget. Transcode back with\n"
             "        `-i in.xbc7 -o out.dds` (standard BC7, any device reads it).\n");
@@ -576,35 +688,30 @@ int main(int argc, char **argv) {
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
-    /* Transcode mode: a .uni universal intermediate -> the --format target
-     * (raw block stream). BC7/BC1 are cheap repacks; astc/etc2 re-encode. */
-    if (ends_with(in, ".uni")) {
-        FILE *f = fopen(in, "rb");
-        uint8_t hdr[12], *ubuf = NULL, *ob = NULL;
-        long fsz;
-        uint32_t uw, uh;
-        size_t osz = 0;
-        if (!f) { fprintf(stderr, "texcomp: open %s failed\n", in); return 1; }
-        fseek(f, 0, SEEK_END); fsz = ftell(f); fseek(f, 0, SEEK_SET);
-        if (fsz < 12 || fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "TUNI", 4) != 0) {
-            fclose(f); fprintf(stderr, "texcomp: not a .uni file\n"); return 1;
+    /* Transcode mode: a uni intermediate (.uni raw, or .ktx2 Zstd-supercompressed)
+     * -> the --format target. BC7/BC1 are cheap repacks; astc/etc2 re-encode. */
+    if (ends_with(in, ".uni") || ends_with(in, ".ktx2")) {
+        uint8_t *ubuf = NULL;
+        uint32_t uw = 0, uh = 0;
+        size_t usz = 0;
+        if (ends_with(in, ".ktx2")) {
+            ubuf = read_uni_ktx2(in, &usz, &uw, &uh);
+            if (!ubuf) { fprintf(stderr, "texcomp: %s is not a uni KTX2\n", in); return 1; }
+        } else {
+            size_t fsz;
+            uint8_t *raw = read_whole_file(in, &fsz);
+            if (!raw || fsz < 12u || memcmp(raw, "TUNI", 4) != 0) { free(raw); fprintf(stderr, "texcomp: not a .uni file\n"); return 1; }
+            uw = xbc7_get32(raw + 4); uh = xbc7_get32(raw + 8);
+            usz = fsz - 12u;
+            ubuf = (uint8_t *)malloc(usz);
+            if (ubuf) memcpy(ubuf, raw + 12u, usz);
+            free(raw);
+            if (!ubuf) return 1;
         }
-        uw = hdr[4] | ((uint32_t)hdr[5]<<8) | ((uint32_t)hdr[6]<<16) | ((uint32_t)hdr[7]<<24);
-        uh = hdr[8] | ((uint32_t)hdr[9]<<8) | ((uint32_t)hdr[10]<<16) | ((uint32_t)hdr[11]<<24);
-        ubuf = (uint8_t *)malloc((size_t)fsz - 12u);
-        if (!ubuf || fread(ubuf, 1, (size_t)fsz - 12u, f) != (size_t)fsz - 12u) {
-            fclose(f); free(ubuf); fprintf(stderr, "texcomp: read failed\n"); return 1;
-        }
-        fclose(f);
-        if (!strcmp(format, "bc7")) { osz = tc_bc7_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc7(ubuf, uw, uh, ob, osz); }
-        else if (!strcmp(format, "bc1") || !strcmp(format, "dxt1")) { osz = tc_bc1_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc1(ubuf, uw, uh, ob, osz); }
-        else if (!strcmp(format, "astc")) { tc_astc_options ao; tc_astc_options_init(&ao); ao.block_x = 4; ao.block_y = 4; ao.uastc = 1; osz = tc_astc_compressed_size(uw, uh, &ao); ob = malloc(osz); tr = tc_uni_transcode_astc(ubuf, uw, uh, ob, osz); }
-        else if (!strcmp(format, "etc2") || !strcmp(format, "etc2_rgba")) { osz = tc_etc2_rgba_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_etc2(ubuf, uw, uh, 1, ob, osz); }
-        else { fprintf(stderr, "texcomp: --format for .uni transcode must be bc7|bc1|astc|etc2\n"); free(ubuf); return 2; }
-        if (tr == TC_SUCCESS && ob) tr = write_file(out, ob, osz);
-        if (tr == TC_SUCCESS) printf("transcoded %s -> %s (%s, %ux%u, %zu bytes)\n", in, out, format, uw, uh, osz);
-        else fprintf(stderr, "texcomp: uni transcode failed\n");
-        free(ubuf); free(ob);
+        (void)usz;
+        tr = transcode_uni(ubuf, uw, uh, format, out);
+        if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: uni transcode failed\n");
+        free(ubuf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
@@ -661,16 +768,24 @@ int main(int argc, char **argv) {
      * ("TUNI" + w,h + blocks); transcode at load with tc_uni_transcode_*. */
     if (strcmp(format, "uni") == 0) {
         size_t usz = tc_uni_compressed_size(w, h);
-        uint8_t *u = (uint8_t *)malloc(12u + usz), hdr[12];
+        uint8_t *u = (uint8_t *)malloc(usz);
         if (!u) { fprintf(stderr, "oom\n"); free(rgba); free(rgbf); return 1; }
-        tr = tc_uni_compress_rgba8(rgba, w, h, (size_t)w * 4u, u + 12u, usz);
-        memcpy(hdr, "TUNI", 4);
-        hdr[4]=(uint8_t)w; hdr[5]=(uint8_t)(w>>8); hdr[6]=(uint8_t)(w>>16); hdr[7]=(uint8_t)(w>>24);
-        hdr[8]=(uint8_t)h; hdr[9]=(uint8_t)(h>>8); hdr[10]=(uint8_t)(h>>16); hdr[11]=(uint8_t)(h>>24);
-        memcpy(u, hdr, 12);
-        if (tr == TC_SUCCESS) tr = write_file(out, u, 12u + usz);
+        tr = tc_uni_compress_rgba8(rgba, w, h, (size_t)w * 4u, u, usz);
+        if (tr == TC_SUCCESS && ends_with(out, ".ktx2")) {
+            /* Zstd-supercompressed KTX2 (KTX2 supercompressionScheme = 2). */
+            tr = write_uni_ktx2(out, u, usz, w, h);
+        } else if (tr == TC_SUCCESS) {
+            /* raw TUNI container: "TUNI" + w,h + blocks */
+            uint8_t *f = (uint8_t *)malloc(12u + usz);
+            if (!f) { free(u); free(rgba); free(rgbf); return 1; }
+            memcpy(f, "TUNI", 4);
+            xbc7_put32(f + 4, w); xbc7_put32(f + 8, h);
+            memcpy(f + 12, u, usz);
+            tr = write_file(out, f, 12u + usz);
+            if (tr == TC_SUCCESS) printf("wrote %s (universal intermediate, %ux%u, %zu bytes)\n", out, w, h, usz);
+            free(f);
+        }
         if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: uni encode failed\n");
-        else printf("wrote %s (universal intermediate, %ux%u, %zu bytes; transcode with tc_uni_transcode_bc7/bc1)\n", out, w, h, usz);
         free(u); free(rgba); free(rgbf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
