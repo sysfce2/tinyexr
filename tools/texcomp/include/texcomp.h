@@ -171,6 +171,15 @@ tc_result tc_uni_transcode_bc7(const uint8_t *uni, uint32_t width,
                                uint32_t height, uint8_t *out, size_t out_size);
 tc_result tc_uni_transcode_bc1(const uint8_t *uni, uint32_t width,
                                uint32_t height, uint8_t *out, size_t out_size);
+/* Mobile targets. ASTC/ETC don't share uni's endpoint-line, so these are
+ * re-encode transcoders (decode + encode) rather than cheap bit-repacks;
+ * output is conformant. ASTC is 4x4 single-subset (UASTC LDR); out sizes are the
+ * usual tc_astc/etc2 sizes. */
+tc_result tc_uni_transcode_astc(const uint8_t *uni, uint32_t width,
+                                uint32_t height, uint8_t *out, size_t out_size);
+tc_result tc_uni_transcode_etc2(const uint8_t *uni, uint32_t width,
+                                uint32_t height, int alpha, uint8_t *out,
+                                size_t out_size);
 
 tc_result tc_bc1_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride,

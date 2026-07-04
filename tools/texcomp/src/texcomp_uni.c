@@ -16,6 +16,7 @@
  */
 #include "texcomp.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* uni block: ep0[4] ep1[4] then 16*4-bit weights (little-endian nibbles). */
@@ -210,4 +211,56 @@ tc_result tc_uni_transcode_bc1(const uint8_t *uni, uint32_t width,
         o[6] = (uint8_t)((idx >> 16) & 0xff); o[7] = (uint8_t)((idx >> 24) & 0xff);
     }
     return TC_SUCCESS;
+}
+
+/* ---- mobile targets: ASTC 4x4 and ETC2 ----
+ * The BC family shares uni's endpoint-line, so those transcode by direct
+ * re-pack. ASTC's ISE weight/endpoint layout and ETC's base+modifier structure
+ * do NOT, so cheap bit-repack isn't possible from this single-line intermediate
+ * (that is exactly what Basis's purpose-built UASTC block solves). These are
+ * "re-encode" transcoders instead: decode the intermediate, then encode the
+ * mobile block with the tested encoder -- conformant output, still one shipped
+ * artifact, but a higher transcode-time cost than the BC path. ASTC routes
+ * through the single-subset UASTC LDR path, which matches uni's structure so
+ * fidelity is preserved. */
+
+tc_result tc_uni_transcode_astc(const uint8_t *uni, uint32_t width,
+                                uint32_t height, uint8_t *out, size_t out_size) {
+    uint8_t *rgba;
+    tc_astc_options ao;
+    tc_result r;
+    size_t n = (size_t)width * height * 4u;
+    if (!uni || !out || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    rgba = (uint8_t *)malloc(n);
+    if (!rgba) return TC_ERROR_OUT_OF_MEMORY;
+    r = tc_uni_decompress_rgba8(uni, width, height, (size_t)width * 4u, rgba, n);
+    if (r == TC_SUCCESS) {
+        tc_astc_options_init(&ao);
+        ao.block_x = 4u; ao.block_y = 4u; ao.uastc = 1; /* single-subset LDR */
+        r = tc_astc_compress_rgba8(rgba, width, height, (size_t)width * 4u, &ao,
+                                   out, out_size);
+    }
+    free(rgba);
+    return r;
+}
+
+tc_result tc_uni_transcode_etc2(const uint8_t *uni, uint32_t width,
+                                uint32_t height, int alpha, uint8_t *out,
+                                size_t out_size) {
+    uint8_t *rgba;
+    tc_etc2_options eo;
+    tc_result r;
+    size_t n = (size_t)width * height * 4u;
+    if (!uni || !out || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    rgba = (uint8_t *)malloc(n);
+    if (!rgba) return TC_ERROR_OUT_OF_MEMORY;
+    r = tc_uni_decompress_rgba8(uni, width, height, (size_t)width * 4u, rgba, n);
+    if (r == TC_SUCCESS) {
+        tc_etc2_options_init(&eo);
+        eo.alpha = alpha ? 1 : 0;
+        r = tc_etc2_compress_rgba8(rgba, width, height, (size_t)width * 4u, &eo,
+                                   out, out_size);
+    }
+    free(rgba);
+    return r;
 }

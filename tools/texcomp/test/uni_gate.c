@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "texcomp.h"
+#include "astc_ref_decode.h" /* test-only ASTC decoder */
 
 #include <math.h>
 #include <stdio.h>
@@ -93,6 +94,30 @@ int main(void) {
     CHECK(p_uni >= 30.0, "uni intermediate reasonable quality");
     CHECK(p_tb7 >= 44.0, "uni->BC7 transcode is near-lossless + decoder-valid");
     CHECK(p_bc1 >= 28.0, "uni->BC1 transcode is BC1-class");
+
+    /* mobile: uni -> ASTC 4x4, decode with the reference decoder, PSNR vs uni. */
+    {
+        tc_astc_options ao;
+        uint8_t *astc, *astcd = malloc((size_t)W*H*4);
+        size_t asz;
+        double p_astc;
+        tc_astc_options_init(&ao); ao.block_x = 4; ao.block_y = 4; ao.uastc = 1;
+        asz = tc_astc_compressed_size(W, H, &ao);
+        astc = malloc(asz);
+        CHECK(tc_uni_transcode_astc(uni, W, H, astc, asz) == TC_SUCCESS, "transcode astc");
+        CHECK(aref_decode_image(astc, W, H, 4, 4, astcd) == 1, "astc decodes (valid block)");
+        p_astc = psnr(unid, astcd, (size_t)W*H, 4, 4);
+        printf("uni->ASTC vs uni recon PSNR = %.1f dB (re-encode transcode)\n", p_astc);
+        CHECK(p_astc >= 38.0, "uni->ASTC preserves uni fidelity");
+        free(astc); free(astcd);
+    }
+    /* mobile: uni -> ETC2 RGBA (conformant; encoder is separately gated). */
+    {
+        uint8_t *etc = malloc(tc_etc2_rgba_compressed_size(W, H));
+        CHECK(tc_uni_transcode_etc2(uni, W, H, 1, etc, tc_etc2_rgba_compressed_size(W,H)) == TC_SUCCESS, "transcode etc2");
+        printf("uni->ETC2 RGBA: encoded %zu bytes\n", tc_etc2_rgba_compressed_size(W,H));
+        free(etc);
+    }
 
     free(img); free(unid); free(bc7d); free(bc1d); free(uni); free(bc7); free(bc1);
     if (g_fail) { printf("UNI GATE: FAIL\n"); return 1; }

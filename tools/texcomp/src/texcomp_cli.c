@@ -576,6 +576,38 @@ int main(int argc, char **argv) {
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
+    /* Transcode mode: a .uni universal intermediate -> the --format target
+     * (raw block stream). BC7/BC1 are cheap repacks; astc/etc2 re-encode. */
+    if (ends_with(in, ".uni")) {
+        FILE *f = fopen(in, "rb");
+        uint8_t hdr[12], *ubuf = NULL, *ob = NULL;
+        long fsz;
+        uint32_t uw, uh;
+        size_t osz = 0;
+        if (!f) { fprintf(stderr, "texcomp: open %s failed\n", in); return 1; }
+        fseek(f, 0, SEEK_END); fsz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (fsz < 12 || fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "TUNI", 4) != 0) {
+            fclose(f); fprintf(stderr, "texcomp: not a .uni file\n"); return 1;
+        }
+        uw = hdr[4] | ((uint32_t)hdr[5]<<8) | ((uint32_t)hdr[6]<<16) | ((uint32_t)hdr[7]<<24);
+        uh = hdr[8] | ((uint32_t)hdr[9]<<8) | ((uint32_t)hdr[10]<<16) | ((uint32_t)hdr[11]<<24);
+        ubuf = (uint8_t *)malloc((size_t)fsz - 12u);
+        if (!ubuf || fread(ubuf, 1, (size_t)fsz - 12u, f) != (size_t)fsz - 12u) {
+            fclose(f); free(ubuf); fprintf(stderr, "texcomp: read failed\n"); return 1;
+        }
+        fclose(f);
+        if (!strcmp(format, "bc7")) { osz = tc_bc7_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc7(ubuf, uw, uh, ob, osz); }
+        else if (!strcmp(format, "bc1") || !strcmp(format, "dxt1")) { osz = tc_bc1_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc1(ubuf, uw, uh, ob, osz); }
+        else if (!strcmp(format, "astc")) { tc_astc_options ao; tc_astc_options_init(&ao); ao.block_x = 4; ao.block_y = 4; ao.uastc = 1; osz = tc_astc_compressed_size(uw, uh, &ao); ob = malloc(osz); tr = tc_uni_transcode_astc(ubuf, uw, uh, ob, osz); }
+        else if (!strcmp(format, "etc2") || !strcmp(format, "etc2_rgba")) { osz = tc_etc2_rgba_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_etc2(ubuf, uw, uh, 1, ob, osz); }
+        else { fprintf(stderr, "texcomp: --format for .uni transcode must be bc7|bc1|astc|etc2\n"); free(ubuf); return 2; }
+        if (tr == TC_SUCCESS && ob) tr = write_file(out, ob, osz);
+        if (tr == TC_SUCCESS) printf("transcoded %s -> %s (%s, %ux%u, %zu bytes)\n", in, out, format, uw, uh, osz);
+        else fprintf(stderr, "texcomp: uni transcode failed\n");
+        free(ubuf); free(ob);
+        return tr == TC_SUCCESS ? 0 : 1;
+    }
+
     if (strcmp(format, "bc6") == 0) format = "bc6h";
     if (strcmp(format, "dxt1") == 0) format = "bc1";
     if (strcmp(format, "dxt5") == 0) format = "bc3";
