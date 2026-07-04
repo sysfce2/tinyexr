@@ -35,6 +35,21 @@ miniz.o: $(MINIZ_SRC)
 test: $(TARGET)
 	./$(TARGET) asakusa.exr
 
+# ---- aggregate: all self-contained tool gates -----------------------------
+# CI entry point for tools/ (texcomp, resize/tir, texpipe, envmap). `tools-test`
+# runs the pure-C11 gates only (no C++ / no astcenc); `tools-test-all` also runs
+# the astcenc conformance cross-checks (astcenc is vendored in deps/, but the
+# gate compiles its C++ so it needs a C++ toolchain).
+.PHONY: tools-test tools-test-all
+tools-test: texcomp-c11-gate texcomp-test texcomp-uni-gate texcomp-xbc7-gate \
+            resize-c11-gate resize-test \
+            texpipe-c11-gate texpipe-test \
+            envmap-c11-gate envmap-test envmap-pbr-test
+	@echo "tools-test: all self-contained tool gates passed"
+
+tools-test-all: tools-test texcomp-astc-hdr-gate texcomp-astc-arm-gate
+	@echo "tools-test-all: all tool gates (incl. astcenc cross-checks) passed"
+
 # ---- pure-C11 v3 library + tests ------------------------------------------
 V3_INC   = -Iinclude -Isrc -Ideps/zstd
 V3_CSTD  = -std=c11
@@ -1065,6 +1080,8 @@ help:
 	@echo "make test-c-tsan - threaded unit tests under ThreadSanitizer"
 	@echo "make c11-gate - strict C11 -Werror compile of all src/*.c"
 	@echo "make bench  - codec/SIMD throughput benchmark (incl. HTJ2K SIMD tiers)"
+	@echo "make tools-test - run all self-contained tool gates (texcomp/resize/texpipe/envmap)"
+	@echo "make tools-test-all - tools-test + astcenc conformance cross-checks (needs C++)"
 	@echo "make texcomp - build tools/texcomp BC7 CLI (build/texcomp/texcomp)"
 	@echo "make texcomp-c11-gate - strict C11 -Werror compile of texcomp"
 	@echo "make texcomp-test - run texcomp unit tests (ASan+UBSan)"
