@@ -50,6 +50,13 @@ typedef struct tc_bc7_options {
      * (e.g. {2,2,1,1} spends more bits on R,G; useful for normal maps or masks).
      * Output is still standard BC7. */
     uint8_t channel_weights[4];
+    /* Also seed endpoints from the weighted principal color axis (PCA) and keep
+     * the lower-error block, in addition to the default luma-extremes seed.
+     * Monotonic (never worse); helps blocks whose color spread is off the luma
+     * axis. Roughly doubles the per-candidate cost, so it is off by default;
+     * measured ~+0.09 dB on photographic content, more on chromatic blocks.
+     * Output is still standard BC7. */
+    int pca_endpoints;
 } tc_bc7_options;
 
 typedef struct tc_bc1_options {

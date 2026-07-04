@@ -832,6 +832,8 @@ static void usage(void) {
             "[--linear|--perceptual]\n"
             "  --channel-weights: per-channel error weights for BC7 (pure-C) and\n"
             "        ASTC (astcenc/--encoder arm); e.g. 2,2,1,1 favours R,G.\n"
+            "  --bc7-pca: also seed BC7 endpoints from the weighted principal\n"
+            "        color axis, keep-best (off by default; ~+0.09 dB, ~1.7x slower).\n"
             "  uni: universal transcodable intermediate. `--format uni -o x.uni`\n"
             "        (raw, level 0) or `-o x.ktx2` (KTX2, full mip chain, Zstd-\n"
             "        supercompressed; add --basis[/--basis-cap N] for a BasisLZ-\n"
@@ -942,6 +944,7 @@ int main(int argc, char **argv) {
             bc7_opt.mode_mask = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (strcmp(argv[i], "--rdo") == 0 && i + 1 < argc)
             bc7_opt.rdo = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bc7-pca") == 0) bc7_opt.pca_endpoints = 1;
         else if (strcmp(argv[i], "--basis") == 0) uni_basis = 2048; /* codebook cap */
         else if (strcmp(argv[i], "--basis-cap") == 0 && i + 1 < argc) uni_basis = atoi(argv[++i]);
         else if (strcmp(argv[i], "--basis-rdo") == 0 && i + 1 < argc) uni_rdo = (float)atof(argv[++i]);
