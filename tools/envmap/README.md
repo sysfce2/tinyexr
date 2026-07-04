@@ -94,3 +94,28 @@ preserved with bounded ripple.
 
 Apache-2.0. Depends on `tir` (BSD-3), `texcomp`/`texpipe` (Apache-2.0),
 TinyEXR core (BSD-3).
+
+## Third-party notices
+
+envmap is original work and ships **no third-party code** — the library is pure
+C11 and the CLI reads/writes HDR images through the TinyEXR core (`exr.h`) only.
+It does implement several published algorithms; credit is due to their authors
+(techniques/math, independently implemented — no code copied):
+
+- **Split-sum image-based lighting** (`src/envmap_ibl.c`): Karis, *"Real Shading
+  in Unreal Engine 4"*, SIGGRAPH 2013 course notes — GGX importance sampling,
+  the prefiltered environment map, and the environment BRDF LUT.
+- **Octahedral unit-vector mapping** (`src/envmap_proj.c`): Cigolle, Donow,
+  Evangelakos, Mara, McGuire & Meyer, *"A Survey of Efficient Representations
+  for Independent Unit Vectors"*, JCGT 2014 (building on Meyer et al., 2010).
+- **Hammersley / van der Corput low-discrepancy sequence** (`src/envmap_sample.c`):
+  the standard radical-inverse construction.
+- **Real spherical harmonics** (`src/envmap_sh.c`): Ramamoorthi & Hanrahan,
+  *"An Efficient Representation for Irradiance Environment Maps"*, SIGGRAPH 2001;
+  Sloan, *"Stupid Spherical Harmonics (SH) Tricks"*, GDC 2008.
+- **Spherical Gaussians** (`src/envmap_sg.c`): Wang, Ren, Gong, Snyder & Guo,
+  *"All-Frequency Rendering of Dynamic, Spatially-Varying Reflectance"*,
+  SIGGRAPH Asia 2009 (SG lighting representation); Green, *"Spherical Harmonic
+  Lighting"*, GDC 2003.
+- **Dependencies:** `tir` (BSD-3-Clause), `texcomp`/`texpipe` (Apache-2.0),
+  TinyEXR core (BSD-3-Clause).

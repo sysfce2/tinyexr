@@ -5,6 +5,10 @@
  * over the sphere; project and eval use the same convention so round-trips are
  * self-consistent. Supports order up to EM_SH_MAX_ORDER.
  *
+ * Real-SH formulation follows Ramamoorthi & Hanrahan, "An Efficient
+ * Representation for Irradiance Environment Maps" (SIGGRAPH 2001), and Sloan,
+ * "Stupid Spherical Harmonics (SH) Tricks" (GDC 2008).
+ *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
  * SPDX-License-Identifier: Apache-2.0
  */

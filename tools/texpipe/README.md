@@ -146,3 +146,25 @@ plus leaf helpers: `tp_alpha_coverage()` / `tp_alpha_scale_to_coverage()`
 
 Apache-2.0 (matches `texcomp`). Depends on `tir` (BSD-3-Clause) and `texcomp`
 (Apache-2.0); both permissive and compatible for combined works.
+
+## Third-party notices
+
+texpipe's library (`libtexpipe`) is original work with no third-party runtime
+dependencies. The pieces below are either bundled code used by the CLI only, or
+published techniques whose provenance is credited here and in the file headers.
+
+- **stb_image** — public domain / MIT, by Sean Barrett. Bundled at
+  `examples/common/stb_image.h` and compiled into `texpipe_cli.c` (LDR PNG
+  loading). Not used by the library.
+- **AMD CubeMapGen edge fixup** — the seam-free cubemap LOD in
+  `src/texpipe_cube.c` follows the edge/corner averaging technique popularized by
+  AMD CubeMapGen (technique, independently implemented from the standard cube
+  face convention; no code copied).
+- **Toksvig roughness** — the normal-length → roughness mapping in
+  `src/texpipe_normal.c` implements Toksvig, *"Mipmapping Normal Maps"*, Journal
+  of Graphics Tools, 2005.
+- **Octahedral maps** — the fold-seam fixup in `src/texpipe_octa.c` uses the
+  standard octahedral unit-vector parameterization (see the envmap notices for
+  the survey reference).
+- **Dependencies:** `tir` (BSD-3-Clause), `texcomp` (Apache-2.0, see its
+  `NOTICE.md` for BC/ETC/ASTC third-party credits), TinyEXR core (BSD-3-Clause).

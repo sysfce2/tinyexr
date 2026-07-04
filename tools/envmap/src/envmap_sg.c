@@ -4,7 +4,9 @@
  * Fixed Fibonacci-distributed lobe axes with a shared sharpness (~N/2 so lobes
  * tile the sphere), amplitudes solved by weighted least squares (normal
  * equations + ridge, non-negativity clamp). A compact all-frequency-ish
- * environment representation for analytic lighting.
+ * environment representation for analytic lighting, after Wang et al.,
+ * "All-Frequency Rendering of Dynamic, Spatially-Varying Reflectance"
+ * (SIGGRAPH Asia 2009).
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
  * SPDX-License-Identifier: Apache-2.0

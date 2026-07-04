@@ -62,6 +62,15 @@ headers.
   output is standard ASTC). The `xbc7` format is a texcomp-native take on the
   XBC7 *idea* (windowed RDO + entropy coding of BC7) — it is **not**
   bitstream-compatible with Basis XBC7.
+- The `uni` universal-transcodable intermediate (`--format uni`,
+  `src/texcomp_uni.c`: encode once, transcode at load to BC7/BC1/ASTC/ETC2)
+  follows the *concept* pioneered by Basis Universal / UASTC — a canonical
+  single-subset block re-packed cheaply to the device's GPU format. It is a
+  texcomp-native intermediate and is **not** the Basis `.basis`/UASTC bitstream.
+  Its optional codebook supercompression (`--basis`) is a BasisLZ-*style*
+  endpoint/selector deduplication with RDO; it is **not** the Basis ETC1S codec
+  and does not emit KTX2 `supercompressionScheme=1` (BasisLZ) — the KTX2 output
+  uses Zstd (scheme 2) with the codebook as an inner pre-transform.
 
 ### QuickBC7 / etcpak
 - BC7 quick-mode heuristics and API naming derive from a pure-C11 port of the
@@ -72,8 +81,10 @@ headers.
 
 ### Zstandard (zstd) — BSD-3-Clause (dual BSD / GPLv2)
 - Copyright (c) Meta Platforms, Inc. Used via TinyEXR's vendored `deps/zstd`
-  (`tinyexr_zstd`). The `xbc7` container entropy-codes the BC7 stream with zstd.
-  Only the CLI links zstd; the pure-C11 texcomp library does not depend on it.
+  (`tinyexr_zstd`). The `xbc7` container entropy-codes the BC7 stream with zstd,
+  and the `uni` KTX2 writer uses zstd for per-level supercompression
+  (`supercompressionScheme=2`). Only the CLI links zstd; the pure-C11 texcomp
+  library does not depend on it.
 
 ### stb_image — public domain / MIT
 - Sean Barrett. `examples/common/stb_image.h`, used by the CLI (`texcomp_cli.c`)
@@ -99,6 +110,8 @@ headers.
   (RGB direct: single / dual-plane / 2-subset), LSQ-refined.
 - **xbc7**: texcomp-native supercompressed BC7 (windowed RDO + zstd), transcodes
   to standard BC7.
+- **uni**: universal transcodable intermediate — encode once, transcode at load
+  to BC7/BC1/ASTC/ETC2; optional codebook (`--basis`) + Zstd KTX2 mip chain.
 
 Conformance is verified by in-tree reference decoders (`test/astc_ref_decode.h`,
 `test/bc7_ref_decode.h`, `test/astc_hdr_ref_decode.h`) and by cross-checks

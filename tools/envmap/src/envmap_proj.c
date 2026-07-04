@@ -7,6 +7,10 @@
  *   +X:( 1,-v,-u) -X:(-1,-v, u) +Y:( u, 1, v)
  *   -Y:( u,-1,-v) +Z:( u,-v, 1) -Z:(-u,-v,-1)   (u=col, v=row, both in [-1,1])
  *
+ * Octahedral encode/decode uses the standard unit-vector parameterization from
+ * Cigolle, Donow, Evangelakos, Mara, McGuire & Meyer, "A Survey of Efficient
+ * Representations for Independent Unit Vectors", JCGT 2014.
+ *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
  * SPDX-License-Identifier: Apache-2.0
  */
