@@ -134,25 +134,34 @@ static uint32_t tc_block_quick_mask(const uint8_t pix[16][4], uint32_t user_mask
     return mask ? mask : user_mask;
 }
 
+/* Per-channel error weights (R,G,B,A), applied to the squared-error metric.
+ * Default {1,1,1,1} makes the weighted expression byte-identical to the plain
+ * sum of squares, so uniform weights change nothing. Set once by
+ * tc_bc7_compress_rgba8 before any worker threads run (read-only thereafter);
+ * not safe against concurrent compress calls using different weights. */
+static uint32_t tc_bc7_cw[4] = {1u, 1u, 1u, 1u};
+
 static uint32_t tc_err4(const uint8_t *a, uint8_t r, uint8_t g, uint8_t b,
                         uint8_t al, int has_alpha) {
     int dr = (int)a[0] - (int)r;
     int dg = (int)a[1] - (int)g;
     int db = (int)a[2] - (int)b;
     int da = has_alpha ? ((int)a[3] - (int)al) : 0;
-    return (uint32_t)(dr * dr + dg * dg + db * db + da * da);
+    return tc_bc7_cw[0] * (uint32_t)(dr * dr) + tc_bc7_cw[1] * (uint32_t)(dg * dg) +
+           tc_bc7_cw[2] * (uint32_t)(db * db) + tc_bc7_cw[3] * (uint32_t)(da * da);
 }
 
 static uint32_t tc_err3(const uint8_t *a, uint8_t r, uint8_t g, uint8_t b) {
     int dr = (int)a[0] - (int)r;
     int dg = (int)a[1] - (int)g;
     int db = (int)a[2] - (int)b;
-    return (uint32_t)(dr * dr + dg * dg + db * db);
+    return tc_bc7_cw[0] * (uint32_t)(dr * dr) + tc_bc7_cw[1] * (uint32_t)(dg * dg) +
+           tc_bc7_cw[2] * (uint32_t)(db * db);
 }
 
 static uint32_t tc_err1(uint8_t a, uint8_t b) {
     int d = (int)a - (int)b;
-    return (uint32_t)(d * d);
+    return tc_bc7_cw[3] * (uint32_t)(d * d);
 }
 
 typedef struct tc_bc7_candidate {
@@ -953,6 +962,16 @@ tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
     if (!opt) {
         tc_bc7_options_init(&defopt);
         opt = &defopt;
+    }
+
+    /* Resolve per-channel error weights: all-zero -> uniform (byte-identical to
+     * the unweighted path). */
+    {
+        int c, any = 0;
+        for (c = 0; c < 4; ++c)
+            if (opt->channel_weights[c]) any = 1;
+        for (c = 0; c < 4; ++c)
+            tc_bc7_cw[c] = any ? (uint32_t)opt->channel_weights[c] : 1u;
     }
 
     for (by = 0; by < height; by += 4) {

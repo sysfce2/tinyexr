@@ -44,6 +44,12 @@ typedef struct tc_bc7_options {
      * smaller/lossier). Output is still standard BC7, decodable by any BC7
      * device. */
     int rdo;
+    /* Per-channel error weights (R,G,B,A) for the encode error metric. All zero
+     * (the default) means uniform weighting -- byte-identical to no weighting.
+     * Otherwise the squared error of channel c is scaled by channel_weights[c]
+     * (e.g. {2,2,1,1} spends more bits on R,G; useful for normal maps or masks).
+     * Output is still standard BC7. */
+    uint8_t channel_weights[4];
 } tc_bc7_options;
 
 typedef struct tc_bc1_options {
@@ -84,6 +90,10 @@ typedef struct tc_astc_options {
      * solid mode, with least-squares endpoint refinement. Output is standard
      * ASTC LDR 4x4. */
     int uastc;
+    /* Per-channel error weights (R,G,B,A) for error-weighted ASTC. Honored only
+     * by the astcenc ("arm") backend (mapped to cfg.cw_*_weight); the pure-C
+     * encoder ignores them. All zero (default) = uniform. */
+    float channel_weights[4];
 } tc_astc_options;
 
 /* ASTC HDR (UASTC HDR 4x4). Float RGB(A) input, standard ASTC HDR 4x4 output.

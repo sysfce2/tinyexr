@@ -60,6 +60,14 @@ static tc_result tc_cli_astcenc_compress(const uint8_t *rgba, uint32_t w,
                             opt->block_x, opt->block_y, 1u, presets[q], 0,
                             &cfg) != ASTCENC_SUCCESS)
         return TC_ERROR_UNSUPPORTED;
+    /* Error-weighted ASTC: forward per-channel weights to astcenc. */
+    if (opt->channel_weights[0] || opt->channel_weights[1] ||
+        opt->channel_weights[2] || opt->channel_weights[3]) {
+        cfg.cw_r_weight = opt->channel_weights[0];
+        cfg.cw_g_weight = opt->channel_weights[1];
+        cfg.cw_b_weight = opt->channel_weights[2];
+        cfg.cw_a_weight = opt->channel_weights[3];
+    }
     {
         unsigned int nthreads = opt->threads > 0 ? (unsigned int)opt->threads : 1u;
 #ifndef TC_CLI_HAVE_THREADS
@@ -426,7 +434,10 @@ static void usage(void) {
             "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
             "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
             "[--quick on|off] [--mode-mask HEX] [--rdo N] "
+            "[--channel-weights R,G,B,A] "
             "[--linear|--perceptual]\n"
+            "  --channel-weights: per-channel error weights for BC7 (pure-C) and\n"
+            "        ASTC (astcenc/--encoder arm); e.g. 2,2,1,1 favours R,G.\n"
             "  xbc7: supercompressed BC7 (windowed RDO + zstd); --rdo N sets the\n"
             "        max per-channel RMS reuse budget. Transcode back with\n"
             "        `-i in.xbc7 -o out.dds` (standard BC7, any device reads it).\n");
@@ -529,6 +540,23 @@ int main(int argc, char **argv) {
             bc7_opt.mode_mask = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (strcmp(argv[i], "--rdo") == 0 && i + 1 < argc)
             bc7_opt.rdo = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--channel-weights") == 0 && i + 1 < argc) {
+            /* R,G,B,A error weights for BC7 (pure-C) and ASTC (astcenc). */
+            float wr = 1, wg = 1, wb = 1, wa = 1;
+            int k;
+            sscanf(argv[++i], "%f,%f,%f,%f", &wr, &wg, &wb, &wa);
+            astc_opt.channel_weights[0] = wr; astc_opt.channel_weights[1] = wg;
+            astc_opt.channel_weights[2] = wb; astc_opt.channel_weights[3] = wa;
+            {
+                float wv[4] = {wr, wg, wb, wa};
+                for (k = 0; k < 4; ++k) {
+                    int iw = (int)(wv[k] + 0.5f);
+                    if (iw < 0) iw = 0;
+                    if (iw > 255) iw = 255;
+                    bc7_opt.channel_weights[k] = (uint8_t)iw;
+                }
+            }
+        }
         else {
             usage();
             return 2;

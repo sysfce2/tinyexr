@@ -299,6 +299,7 @@ static void usage(void) {
         "    --channel-ops l,l,m,l  per-channel R,G,B,A: l=linear, m=majority(binary), r=roughness\n"
         "  --srgb-resize          decode sRGB->linear, filter, re-encode (correct albedo mips)\n"
         "  --ycocg                store colour as YCoCg (shader inverts; helps low-bit codecs)\n"
+        "  --bc7-weights R,G,B,A  per-channel BC7 error weights (e.g. 2,2,1,1)\n"
         "  displacement / atlas:\n"
         "    --minmax             build a (min,max) height pyramid (BC5) for POM/relief\n"
         "    --dilate N           flood valid texels into alpha<0.5 gutter N passes\n");
@@ -325,6 +326,8 @@ int main(int argc, char **argv) {
     int have_chan_ops = 0;
     int srgb_resize = 0;
     int dilate = 0, minmax = 0, ycocg = 0;
+    uint8_t bc7_w[4] = {0, 0, 0, 0};
+    int have_bc7_w = 0;
     const char *cube_files[6] = {0};
     int cube_n = 0;
     int cube_layout = -1; /* -1 = none */
@@ -382,6 +385,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--dilate")) { const char *v = NEXT(); if (!v) { usage(); return 2; } dilate = atoi(v); }
         else if (!strcmp(a, "--minmax")) minmax = 1;
         else if (!strcmp(a, "--ycocg")) ycocg = 1;
+        else if (!strcmp(a, "--bc7-weights")) {
+            const char *v = NEXT();
+            unsigned wr = 1, wg = 1, wb = 1, wa = 1;
+            if (!v || sscanf(v, "%u,%u,%u,%u", &wr, &wg, &wb, &wa) != 4) { usage(); return 2; }
+            bc7_w[0] = (uint8_t)(wr > 255 ? 255 : wr); bc7_w[1] = (uint8_t)(wg > 255 ? 255 : wg);
+            bc7_w[2] = (uint8_t)(wb > 255 ? 255 : wb); bc7_w[3] = (uint8_t)(wa > 255 ? 255 : wa);
+            have_bc7_w = 1;
+        }
         else if (!strcmp(a, "--normal-enc")) { const char *v = NEXT(); if (!v || !parse_normal_enc(v, &normal_enc)) { usage(); return 2; } }
         else if (!strcmp(a, "--bake-roughness")) bake_roughness = 1;
         else if (!strcmp(a, "--base-roughness")) { const char *v = NEXT(); if (!v) { usage(); return 2; } base_roughness = (float)atof(v); }
@@ -458,6 +469,7 @@ int main(int argc, char **argv) {
     }
     if (srgb_resize) opt.srgb_aware = 1;
     if (ycocg) opt.ycocg = 1;
+    if (have_bc7_w) { int k; for (k = 0; k < 4; ++k) opt.bc7.channel_weights[k] = bc7_w[k]; }
     if (content == TP_CONTENT_NORMAL) {
         opt.normal_encoding = normal_enc;
         opt.base_roughness = base_roughness;

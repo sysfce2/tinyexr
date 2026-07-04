@@ -67,6 +67,10 @@ Implemented:
 - **YCoCg decorrelation** (`--ycocg`, `tp_rgb_to_ycocg`): store colour as YCoCg
   before compression (shader inverts). Helps low-bit-depth codecs (BC1); roughly
   neutral for BC7, which already rotates colour internally.
+- **Error-weighted BC7** (`--bc7-weights R,G,B,A`, `tc_bc7_options.channel_weights`):
+  per-channel weights in the BC7 encode error metric — byte-identical to
+  unweighted when uniform, so no regression. (ASTC error-weighting is available
+  via the astcenc backend: `texcomp --encoder arm --channel-weights R,G,B,A`.)
 - **Multi-mip DDS** (DX10) for the BC family and **multi-mip KTX2** (Vulkan
   formats, native cube/mip/array) for BC/ETC2/EAC/ASTC.
 - Codecs: BC1/BC3/BC5/BC7/BC6H, ETC2 RGB/RGBA, EAC R11/RG11, ASTC LDR (any

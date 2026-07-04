@@ -234,11 +234,69 @@ static void test_normal_bc5_vs_bc7(void) {
     free(nm); free(rg); free(bc5); free(bc7); free(dec7);
 }
 
+/* Reconstruct a unit normal from decoded X,Y (Z from XY), like a BC5 workflow. */
+static void recon_xy(const uint8_t *p, float n[3]) {
+    float x = p[0]/255.f*2-1, y = p[1]/255.f*2-1, zz = 1 - x*x - y*y;
+    n[0] = x; n[1] = y; n[2] = sqrtf(zz > 0 ? zz : 0);
+}
+
+/* Error-weighted BC7: when Z is reconstructed from X,Y (the standard normal-map
+ * workflow), de-weighting Z (and alpha) frees bits for X,Y and lowers the
+ * post-reconstruction angular error. Also checks the safety guarantee: uniform
+ * weights are byte-identical to no weighting. */
+static void test_bc7_weighted_normal(void) {
+    int W = 64, H = 64, x, y, i, identical = 1;
+    uint8_t *nm = (uint8_t *)malloc((size_t)W * H * 4);
+    uint8_t *b0 = (uint8_t *)malloc(tc_bc7_compressed_size(W, H));
+    uint8_t *b1 = (uint8_t *)malloc(tc_bc7_compressed_size(W, H));
+    uint8_t *bw = (uint8_t *)malloc(tc_bc7_compressed_size(W, H));
+    uint8_t *du = (uint8_t *)malloc((size_t)W * H * 4);
+    uint8_t *dw = (uint8_t *)malloc((size_t)W * H * 4);
+    tc_bc7_options ou, o1, ow;
+    double eu = 0, ew = 0;
+    size_t bsz = tc_bc7_compressed_size(W, H);
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            float fx = (x/(float)(W-1))*2-1, fy = (y/(float)(H-1))*2-1;
+            float nx = 0.8f*sinf(fx*3.4f), ny = 0.8f*sinf(fy*3.4f), nz = 1, l = sqrtf(nx*nx+ny*ny+nz*nz);
+            uint8_t *p = nm + (y*W+x)*4;
+            nx/=l; ny/=l; nz/=l;
+            p[0]=(uint8_t)((nx*.5f+.5f)*255); p[1]=(uint8_t)((ny*.5f+.5f)*255);
+            p[2]=(uint8_t)((nz*.5f+.5f)*255); p[3]=255;
+        }
+    tc_bc7_options_init(&ou);
+    tc_bc7_options_init(&o1);
+    o1.channel_weights[0]=1; o1.channel_weights[1]=1; o1.channel_weights[2]=1; o1.channel_weights[3]=1;
+    tc_bc7_options_init(&ow);
+    ow.channel_weights[0]=6; ow.channel_weights[1]=6; /* X,Y */
+    ow.channel_weights[2]=1; ow.channel_weights[3]=1; /* Z reconstructed, alpha unused */
+    /* safety: uniform explicit weights == default */
+    tc_bc7_compress_rgba8(nm, W, H, W*4, &ou, b0, bsz);
+    tc_bc7_compress_rgba8(nm, W, H, W*4, &o1, b1, bsz);
+    if (memcmp(b0, b1, bsz) != 0) identical = 0;
+    CHECK(identical, "uniform channel_weights are byte-identical to unweighted");
+    /* weighted encode */
+    tc_bc7_compress_rgba8(nm, W, H, W*4, &ow, bw, bsz);
+    tc_bc7_decompress_rgba8(b0, W, H, W*4, du, (size_t)W*H*4);
+    tc_bc7_decompress_rgba8(bw, W, H, W*4, dw, (size_t)W*H*4);
+    for (i = 0; i < W*H; ++i) {
+        float ns[3], nu[3], nw[3];
+        recon_xy(nm + i*4, ns); recon_xy(du + i*4, nu); recon_xy(dw + i*4, nw);
+        eu += normal_angle_deg(ns, nu);
+        ew += normal_angle_deg(ns, nw);
+    }
+    eu /= (W*H); ew /= (W*H);
+    printf("  error-weighted BC7 normal (Z reconstructed): unweighted=%.3f deg, XY-weighted=%.3f deg\n", eu, ew);
+    CHECK(ew <= eu, "XY-weighted BC7 lowers reconstructed-normal angular error");
+    free(nm); free(b0); free(b1); free(bw); free(du); free(dw);
+}
+
 int main(void) {
     printf("envmap PBR validation harness\n");
     test_albedo_compression_shading();
     test_normal_bc7_angular_error();
     test_normal_bc5_vs_bc7();
+    test_bc7_weighted_normal();
     if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;
