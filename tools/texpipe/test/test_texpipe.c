@@ -938,6 +938,146 @@ static void test_vector_displacement_mean(void) {
     free(img);
 }
 
+static void test_cone_map(void) {
+    /* Flat field except a central spike: cone ratio grows with distance from the
+     * spike, and a fully flat field yields cone 1 everywhere. */
+    tir_image_view v;
+    tp_surface cone;
+    uint8_t *img = (uint8_t *)malloc((size_t)32 * 32 * 4);
+    int x, y;
+    for (y = 0; y < 32; ++y)
+        for (x = 0; x < 32; ++x) {
+            uint8_t *p = img + (y * 32 + x) * 4;
+            uint8_t h = (x == 16 && y == 16) ? 255 : 128; /* spike */
+            p[0] = h; p[1] = h; p[2] = h; p[3] = 255;
+        }
+    view_u8(&v, img, 32, 32);
+    memset(&cone, 0, sizeof(cone));
+    CHECK(TP_OK(tp_build_cone_map(NULL, &v, 0, &cone)), "build cone map");
+    {
+        float near_spike = cone.data[15 * 32 + 16]; /* adjacent to spike */
+        float far_corner = cone.data[0];            /* far away */
+        CHECK(near_spike < far_corner, "cone ratio grows with distance from occluder");
+        CHECK(near_spike >= 0.0f && far_corner <= 1.0f, "cone ratio in [0,1]");
+        printf("  cone-step map: ok (near=%.3f far=%.3f)\n", near_spike, far_corner);
+    }
+    tp_free(NULL, cone.data);
+    free(img);
+}
+
+static void test_ripmap(void) {
+    float *img = (float *)malloc((size_t)64 * 64 * 3 * sizeof(float));
+    tir_image_view v;
+    tp_mip_chain rip;
+    int nx = 0, ny = 0, x, y, ok = 1;
+    for (y = 0; y < 64; ++y)
+        for (x = 0; x < 64; ++x) {
+            float *p = img + (y * 64 + x) * 3;
+            p[0] = x / 63.0f; p[1] = y / 63.0f; p[2] = 0.5f;
+        }
+    v.data = img; v.width = 64; v.height = 64; v.channels = 3; v.type = TIR_F32; v.row_stride_bytes = 0;
+    memset(&rip, 0, sizeof(rip));
+    CHECK(TP_OK(tp_build_ripmap(NULL, &v, NULL, &rip, &nx, &ny)), "build ripmap");
+    CHECK(nx == 7 && ny == 7, "ripmap 7x7 grid for 64x64");
+    /* cell (ix,jy) must have dims (64>>ix, 64>>jy) */
+    {
+        int ix, jy;
+        for (jy = 0; jy < ny; ++jy)
+            for (ix = 0; ix < nx; ++ix) {
+                const tp_surface *s = &rip.level[jy * nx + ix];
+                int ew = 64 >> ix, eh = 64 >> jy;
+                if (ew < 1) ew = 1;
+                if (eh < 1) eh = 1;
+                if (s->width != ew || s->height != eh) ok = 0;
+            }
+    }
+    CHECK(ok, "ripmap cell dimensions are anisotropic (w>>ix, h>>jy)");
+    printf("  ripmap: ok (%dx%d cells)\n", nx, ny);
+    tp_mip_chain_free(NULL, &rip);
+    free(img);
+}
+
+static void test_ycocg(void) {
+    /* round-trip identity + BC7-on-YCoCg vs BC7-on-RGB on a chroma-rich image. */
+    float rgb[3] = {0.8f, 0.2f, 0.5f}, yc[3], back[3];
+    int W = 64, H = 64, x, y, i;
+    uint8_t *rgba, *yimg, *bc, *dec;
+    double mse_rgb = 0, mse_yc = 0;
+    tp_rgb_to_ycocg(rgb, yc);
+    tp_ycocg_to_rgb(yc, back);
+    CHECK(fabsf(back[0]-rgb[0]) < 1e-5f && fabsf(back[1]-rgb[1]) < 1e-5f && fabsf(back[2]-rgb[2]) < 1e-5f,
+          "YCoCg round-trip identity");
+    rgba = (uint8_t *)malloc((size_t)W*H*4);
+    yimg = (uint8_t *)malloc((size_t)W*H*4);
+    bc = (uint8_t *)malloc(tc_bc7_compressed_size(W, H));
+    dec = (uint8_t *)malloc((size_t)W*H*4);
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            uint8_t *p = rgba + (y*W+x)*4;
+            float r[3] = {0.5f+0.5f*sinf(x*0.4f), 0.5f+0.5f*sinf(y*0.4f+2), 0.5f+0.5f*sinf((x+y)*0.3f+4)};
+            float c[3];
+            uint8_t *q = yimg + (y*W+x)*4;
+            p[0]=to_u8(r[0]); p[1]=to_u8(r[1]); p[2]=to_u8(r[2]); p[3]=255;
+            tp_rgb_to_ycocg(r, c);
+            q[0]=to_u8(c[0]); q[1]=to_u8(c[1]); q[2]=to_u8(c[2]); q[3]=255;
+        }
+    /* RGB path */
+    tc_bc7_compress_rgba8(rgba, W, H, W*4, NULL, bc, tc_bc7_compressed_size(W,H));
+    tc_bc7_decompress_rgba8(bc, W, H, W*4, dec, (size_t)W*H*4);
+    for (i = 0; i < W*H; ++i) { int c; for (c=0;c<3;++c){ double d=(double)dec[i*4+c]-rgba[i*4+c]; mse_rgb+=d*d; } }
+    /* YCoCg path: decode, inverse-transform, compare to source RGB */
+    tc_bc7_compress_rgba8(yimg, W, H, W*4, NULL, bc, tc_bc7_compressed_size(W,H));
+    tc_bc7_decompress_rgba8(bc, W, H, W*4, dec, (size_t)W*H*4);
+    for (i = 0; i < W*H; ++i) {
+        float c[3] = {dec[i*4]/255.f, dec[i*4+1]/255.f, dec[i*4+2]/255.f}, r[3];
+        int k;
+        tp_ycocg_to_rgb(c, r);
+        for (k = 0; k < 3; ++k) { double d = to_u8(r[k]) - (double)rgba[i*4+k]; mse_yc += d*d; }
+    }
+    {
+        double p_rgb = 10*log10(255.0*255.0/(mse_rgb/(W*H*3)));
+        double p_yc = 10*log10(255.0*255.0/(mse_yc/(W*H*3)));
+        printf("  ycocg: BC7 RGB=%.1f dB, BC7 YCoCg=%.1f dB\n", p_rgb, p_yc);
+        CHECK(p_yc >= p_rgb - 1.0, "YCoCg BC7 quality not worse than RGB");
+    }
+    free(rgba); free(yimg); free(bc); free(dec);
+}
+
+static void test_kaiser(void) {
+    /* Kaiser resize must produce finite, energy-preserving output. */
+    tir_image_view v;
+    tp_options opt;
+    tp_mip_chain c;
+    uint8_t *img = make_gradient(128, 128);
+    int i, x, y, finite = 1;
+    double base_mean = 0, mip_mean = 0;
+    view_u8(&v, img, 128, 128);
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    opt.filter = TIR_FILTER_KAISER;
+    memset(&c, 0, sizeof(c));
+    CHECK(TP_OK(tp_build_mips(NULL, &v, 1, &opt, &c)), "build kaiser mips");
+    for (i = 0; i < 128*128; ++i) base_mean += img[i*4];
+    base_mean /= (128*128*255.0);
+    {
+        const tp_surface *s = &c.level[2];
+        double n = (double)s->width * s->height;
+        for (y = 0; y < s->height; ++y) {
+            const float *row = (const float *)((const uint8_t *)s->data + (size_t)y*s->stride);
+            for (x = 0; x < s->width; ++x) {
+                float r = row[x*s->channels];
+                if (!(r == r) || r < -0.5f || r > 1.5f) finite = 0;
+                mip_mean += r;
+            }
+        }
+        mip_mean /= n;
+    }
+    CHECK(finite, "kaiser output finite and bounded");
+    CHECK(fabs(mip_mean - base_mean) < 0.03, "kaiser mip preserves mean");
+    printf("  kaiser filter: ok (base %.3f -> mip %.3f)\n", base_mean, mip_mean);
+    tp_mip_chain_free(NULL, &c);
+    free(img);
+}
+
 int main(void) {
     printf("texpipe unit tests\n");
     test_octa_seam();
@@ -948,6 +1088,10 @@ int main(void) {
     test_minmax_pyramid();
     test_dilate();
     test_vector_displacement_mean();
+    test_cone_map();
+    test_ripmap();
+    test_ycocg();
+    test_kaiser();
     test_mip_geometry();
     test_bc7_roundtrip_psnr();
     test_alpha_scale_helper();

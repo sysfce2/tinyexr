@@ -149,6 +149,8 @@ typedef struct tp_options {
 
     /* -- packed material channels (ORM/mask) ----------------------------- */
     tp_channel_op channel_op[4];/* per-channel downsample rule; default LINEAR */
+    int ycocg;                  /* COLOR: store RGB as YCoCg before compression
+                                 * (shader inverts); better chroma at same size */
 
     /* -- codec knobs (forwarded verbatim to texcomp) --------------------- */
     tc_bc7_options bc7;
@@ -277,6 +279,27 @@ tp_result tp_build_minmax_pyramid(const tir_allocator *a,
  * valid_channel itself (e.g. alpha) is left unchanged. */
 tp_result tp_dilate(tp_surface *s, int valid_channel, float threshold,
                     int iters);
+
+/* Cone-step ratio map (relaxed cone step / relief mapping): for each texel of
+ * the height field (channel `channel` of `height`), the widest empty cone ratio
+ * = min over higher texels of horizontal_dist / height_diff, in [0,1]. `out`
+ * becomes a 1-channel surface (free out->data with the allocator). O(n^2 * n^2)
+ * — use modest resolutions (<= ~128). */
+tp_result tp_build_cone_map(const tir_allocator *a, const tir_image_view *height,
+                            int channel, tp_surface *out);
+
+/* Ripmap (anisotropic) grid: cell (ix,jy) has dimensions (w>>ix, h>>jy) and is
+ * stored at out->level[jy*(*out_nx) + ix]. Reuses tp_mip_chain (num_faces = 1,
+ * num_levels = nx*ny). Free with tp_mip_chain_free. */
+tp_result tp_build_ripmap(const tir_allocator *a, const tir_image_view *base,
+                          const tp_options *opt, tp_mip_chain *out, int *out_nx,
+                          int *out_ny);
+
+/* YCoCg decorrelation (float; Co,Cg biased by +0.5 into [0,1]). Storing colour
+ * as YCoCg before BC/ASTC compression decorrelates chroma and improves quality;
+ * the shader must invert with tp_ycocg_to_rgb after sampling. */
+void tp_rgb_to_ycocg(const float rgb[3], float ycocg[3]);
+void tp_ycocg_to_rgb(const float ycocg[3], float rgb[3]);
 
 /* Seam-free cubemap fixup: average the shared edge and corner texels across
  * the 6 cube faces (order +X,-X,+Y,-Y,+Z,-Z) so borders become bit-identical

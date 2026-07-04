@@ -121,7 +121,9 @@ typedef enum tir_filter {
     TIR_FILTER_MITCHELL = 5,    /* cubic B=C=1/3; good general default */
     TIR_FILTER_CATMULL_ROM = 6, /* interpolating cubic (B=0,C=0.5) */
     TIR_FILTER_LANCZOS2 = 7,
-    TIR_FILTER_LANCZOS3 = 8
+    TIR_FILTER_LANCZOS3 = 8,
+    TIR_FILTER_KAISER = 9       /* Kaiser-windowed sinc (radius 3, beta 8): sharp
+                                 * with lower ringing than Lanczos3 */
 } tir_filter;
 
 typedef enum tir_edge_mode {

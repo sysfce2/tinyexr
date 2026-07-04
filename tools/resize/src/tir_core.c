@@ -76,7 +76,8 @@ void tir_options_init(tir_options *opt) {
 
 static int filter_has_negative_lobes(tir_filter f) {
     return f == TIR_FILTER_MITCHELL || f == TIR_FILTER_CATMULL_ROM ||
-           f == TIR_FILTER_LANCZOS2 || f == TIR_FILTER_LANCZOS3;
+           f == TIR_FILTER_LANCZOS2 || f == TIR_FILTER_LANCZOS3 ||
+           f == TIR_FILTER_KAISER;
 }
 
 static tir_filter resolve_filter(tir_filter f, tir_mode mode, int is_down) {
@@ -119,8 +120,8 @@ static void normal_map_coeffs(tir_normal_enc enc, tir_pixel_type t, float *a,
 }
 
 static tir_result validate_options(const tir_options *o) {
-    if ((int)o->filter_x < 0 || o->filter_x > TIR_FILTER_LANCZOS3 ||
-        (int)o->filter_y < 0 || o->filter_y > TIR_FILTER_LANCZOS3)
+    if ((int)o->filter_x < 0 || o->filter_x > TIR_FILTER_KAISER ||
+        (int)o->filter_y < 0 || o->filter_y > TIR_FILTER_KAISER)
         return TIR_ERROR_INVALID_ARGUMENT;
     if ((int)o->edge_x < 0 || o->edge_x > TIR_EDGE_WRAP || (int)o->edge_y < 0 ||
         o->edge_y > TIR_EDGE_WRAP)

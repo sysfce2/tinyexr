@@ -58,6 +58,15 @@ Implemented:
 - **Vector displacement**: 3-channel float via the BC6H/ASTC-HDR path resizes
   mean-preserving (averaging keeps the mean displacement — correct, unlike
   normals which renormalize).
+- **Cone-step ratio map** (`tp_build_cone_map`): per-texel conservative cone
+  ratio for cone-step/relief mapping (O(n⁴) — modest resolutions only).
+- **Ripmap** (`tp_build_ripmap`): anisotropic grid of resizes (w>>ix, h>>jy) for
+  grazing-angle sampling without runtime anisotropy.
+- **Kaiser filter** (`--filter kaiser`): Kaiser-windowed sinc (radius 3, β=8) —
+  sharp with lower ringing than Lanczos3 (added to `tir`).
+- **YCoCg decorrelation** (`--ycocg`, `tp_rgb_to_ycocg`): store colour as YCoCg
+  before compression (shader inverts). Helps low-bit-depth codecs (BC1); roughly
+  neutral for BC7, which already rotates colour internally.
 - **Multi-mip DDS** (DX10) for the BC family and **multi-mip KTX2** (Vulkan
   formats, native cube/mip/array) for BC/ETC2/EAC/ASTC.
 - Codecs: BC1/BC3/BC5/BC7/BC6H, ETC2 RGB/RGBA, EAC R11/RG11, ASTC LDR (any

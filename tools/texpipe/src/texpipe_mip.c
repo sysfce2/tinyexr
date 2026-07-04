@@ -422,6 +422,24 @@ tp_result tp_build_mips(const tir_allocator *a, const tir_image_view *faces,
         for (level = 0; level < num_levels; ++level)
             tp_octa_seam_fixup(&out->level[level], opt);
     }
+
+    /* YCoCg decorrelation: store colour as YCoCg (shader inverts) for better
+     * chroma compression. Applied last, over every surface. */
+    if (opt->ycocg && channels >= 3 &&
+        (opt->content == TP_CONTENT_COLOR || opt->content == TP_CONTENT_ALPHA_TESTED)) {
+        int n = out->num_faces * out->num_levels, i, xx, yy;
+        for (i = 0; i < n; ++i) {
+            tp_surface *s = &out->level[i];
+            for (yy = 0; yy < s->height; ++yy) {
+                float *row = (float *)((uint8_t *)s->data + (size_t)yy * s->stride);
+                for (xx = 0; xx < s->width; ++xx) {
+                    float *px = row + xx * s->channels, yc[3];
+                    tp_rgb_to_ycocg(px, yc);
+                    px[0] = yc[0]; px[1] = yc[1]; px[2] = yc[2];
+                }
+            }
+        }
+    }
     return TP_SUCCESS;
 }
 

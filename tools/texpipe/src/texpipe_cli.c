@@ -198,6 +198,7 @@ static int parse_filter(const char *s, tir_filter *f) {
     else if (!strcmp(s, "catmull")) *f = TIR_FILTER_CATMULL_ROM;
     else if (!strcmp(s, "lanczos2")) *f = TIR_FILTER_LANCZOS2;
     else if (!strcmp(s, "lanczos3")) *f = TIR_FILTER_LANCZOS3;
+    else if (!strcmp(s, "kaiser")) *f = TIR_FILTER_KAISER; /* sharp, low-ring */
     else if (!strcmp(s, "bspline")) *f = TIR_FILTER_BSPLINE;
     else if (!strcmp(s, "gaussian")) *f = TIR_FILTER_GAUSSIAN;
     else return 0;
@@ -273,7 +274,7 @@ static void usage(void) {
         "  --format   bc1|bc3|bc5|bc7|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr\n"
         "  --content  color|alpha|normal|height        (default color)\n"
         "  --container dds|ktx2                         (default per codec)\n"
-        "  --filter   auto|box|triangle|mitchell|catmull|lanczos2|lanczos3|bspline|gaussian\n"
+        "  --filter   auto|box|triangle|mitchell|catmull|lanczos2|lanczos3|kaiser|bspline|gaussian\n"
         "  --edge     clamp|wrap|reflect               (per-axis both)\n"
         "  --levels N            cap mip levels (0=full chain)\n"
         "  --mip-source base|previous\n"
@@ -297,6 +298,7 @@ static void usage(void) {
         "  packed material maps (ORM/mask):\n"
         "    --channel-ops l,l,m,l  per-channel R,G,B,A: l=linear, m=majority(binary), r=roughness\n"
         "  --srgb-resize          decode sRGB->linear, filter, re-encode (correct albedo mips)\n"
+        "  --ycocg                store colour as YCoCg (shader inverts; helps low-bit codecs)\n"
         "  displacement / atlas:\n"
         "    --minmax             build a (min,max) height pyramid (BC5) for POM/relief\n"
         "    --dilate N           flood valid texels into alpha<0.5 gutter N passes\n");
@@ -322,7 +324,7 @@ int main(int argc, char **argv) {
     int chan_ops[4] = {0, 0, 0, 0};
     int have_chan_ops = 0;
     int srgb_resize = 0;
-    int dilate = 0, minmax = 0;
+    int dilate = 0, minmax = 0, ycocg = 0;
     const char *cube_files[6] = {0};
     int cube_n = 0;
     int cube_layout = -1; /* -1 = none */
@@ -379,6 +381,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--srgb-resize")) { srgb_resize = 1; srgb = 1; }
         else if (!strcmp(a, "--dilate")) { const char *v = NEXT(); if (!v) { usage(); return 2; } dilate = atoi(v); }
         else if (!strcmp(a, "--minmax")) minmax = 1;
+        else if (!strcmp(a, "--ycocg")) ycocg = 1;
         else if (!strcmp(a, "--normal-enc")) { const char *v = NEXT(); if (!v || !parse_normal_enc(v, &normal_enc)) { usage(); return 2; } }
         else if (!strcmp(a, "--bake-roughness")) bake_roughness = 1;
         else if (!strcmp(a, "--base-roughness")) { const char *v = NEXT(); if (!v) { usage(); return 2; } base_roughness = (float)atof(v); }
@@ -454,6 +457,7 @@ int main(int argc, char **argv) {
                                                        : TP_CH_LINEAR;
     }
     if (srgb_resize) opt.srgb_aware = 1;
+    if (ycocg) opt.ycocg = 1;
     if (content == TP_CONTENT_NORMAL) {
         opt.normal_encoding = normal_enc;
         opt.base_roughness = base_roughness;
