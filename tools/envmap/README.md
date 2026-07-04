@@ -18,6 +18,10 @@ only the CLI does HDR EXR I/O.
 - **Spherical gaussians** (`sg`) — fit K SG lobes (Fibonacci axes, shared
   sharpness ≈ 0.35·K, non-negative least-squares amplitudes) — a compact
   all-frequency-ish lighting representation.
+- **Image-based lighting** (`ibl` / `irradiance` / `brdflut`) — GGX-prefiltered
+  specular radiance as a roughness-indexed **BC6H cube KTX2**, cosine-convolved
+  diffuse **irradiance** cube, and the split-sum **BRDF DFG LUT** (R=scale,
+  G=bias). Together these are the split-sum inputs a PBR shader samples.
 
 `sh`/`sg` also write `<out>_recon.exr`, an equirect reconstruction from the
 coefficients for eyeballing quality.
@@ -42,6 +46,11 @@ envmap convert -i env.exr --to octa --size 512 -o octa.exr
 envmap sh -i env.exr --order 2 -o env.sh
 # 24-lobe spherical gaussians + reconstruction
 envmap sg -i env.exr --lobes 24 -o env.sg
+
+# split-sum IBL inputs
+envmap ibl -i env.exr --face 128 --samples 64 -o spec.ktx2    # BC6H roughness cube
+envmap irradiance -i env.exr --face 32 -o irr.ktx2            # BC6H diffuse cube
+envmap brdflut --size 256 -o brdf.exr                        # DFG LUT (R=scale G=bias)
 ```
 
 ## Pipeline into texpipe (HDR mip + compress)

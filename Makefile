@@ -472,7 +472,8 @@ texpipe-test: resize-lib texcomp tools/texpipe/test/test_texpipe.c $(TEXPIPE_HDR
 ENVMAP_INC = -Itools/envmap/include -Itools/resize/include \
   -Itools/texcomp/include -Itools/texpipe/include -Iinclude -Isrc -Iexamples/common
 ENVMAP_LIB_SRC = tools/envmap/src/envmap_proj.c tools/envmap/src/envmap_sample.c \
-  tools/envmap/src/envmap_sh.c tools/envmap/src/envmap_sg.c
+  tools/envmap/src/envmap_sh.c tools/envmap/src/envmap_sg.c \
+  tools/envmap/src/envmap_ibl.c
 ENVMAP_HDRS = tools/envmap/include/envmap.h
 ENVMAP_OBJ = $(patsubst tools/envmap/src/%.c,build/envmap/%.o,$(ENVMAP_LIB_SRC))
 

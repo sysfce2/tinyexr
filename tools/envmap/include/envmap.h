@@ -154,6 +154,32 @@ em_result em_sg_fit(const tir_allocator *a, const em_image *src, int num_lobes,
 void em_sg_eval(const em_sg_lobe *lobes, int num_lobes, const float dir[3],
                 float rgb[3]);
 
+/* ===========================================================================
+ * Image-based lighting (Phase 1) — GGX prefilter, irradiance, BRDF LUT
+ * ========================================================================= */
+
+/* GGX/Trowbridge-Reitz importance-sampled half-vector about +Z for `roughness`
+ * (perceptual; alpha = roughness^2) from xi in [0,1)^2. */
+void em_sample_ggx(const float xi[2], float roughness, float out_h[3]);
+
+/* Prefiltered specular radiance: fills `out_levels[0..num_levels-1]` with cube
+ * em_images (face_size >> level) where level l holds the env GGX-convolved at
+ * roughness l/(num_levels-1). Level 0 is the sharp (mirror) env. `num_samples`
+ * importance samples per texel (e.g. 64). Each out level is allocated; free with
+ * em_image_free. */
+em_result em_prefilter_specular(const tir_allocator *a, const em_image *src,
+                                int face_size, int num_levels, int num_samples,
+                                em_image *out_levels);
+
+/* Diffuse irradiance map: a single-level cube (face_size) holding the cosine-
+ * convolved env (stored as E/pi, i.e. multiply by albedo for diffuse). */
+em_result em_irradiance_cube(const tir_allocator *a, const em_image *src,
+                             int face_size, int num_samples, em_image *out);
+
+/* Split-sum BRDF integration LUT (Karis): out_rg is size*size*2 floats, R =
+ * scale, G = bias, indexed [roughness][NdotV] row-major. */
+void em_brdf_lut(int size, int num_samples, float *out_rg);
+
 #ifdef __cplusplus
 }
 #endif

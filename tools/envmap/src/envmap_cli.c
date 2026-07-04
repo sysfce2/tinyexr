@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "envmap.h"
+#include "texpipe.h"
 #include "exr.h"
 
 #include <stdio.h>
@@ -14,6 +15,13 @@
 #include <string.h>
 
 /* ------------------------------------------------------------ EXR I/O */
+
+static int write_file(const char *path, const void *data, size_t size) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    if (fwrite(data, 1, size, f) != size) { fclose(f); return 0; }
+    return fclose(f) == 0;
+}
 
 static int channel_index(const exr_part *part, const char *name) {
     int32_t i;
@@ -151,7 +159,13 @@ static void usage(void) {
         "    cube output writes 6 face EXRs out_{px,nx,py,ny,pz,nz}.exr\n"
         "  envmap sh -i env.exr [--from P] [--order 0..4] [--window W] [--recon-size N] -o env.sh\n"
         "  envmap sg -i env.exr [--from P] [--lobes K] [--asg] [--recon-size N] -o env.sg\n"
-        "    sh/sg also write <out>_recon.exr (equirect reconstruction)\n");
+        "    sh/sg also write <out>_recon.exr (equirect reconstruction)\n"
+        "  envmap ibl -i env.exr [--from P] [--face N] [--levels N] [--samples N] -o spec.ktx2\n"
+        "    prefiltered specular (GGX roughness mips) -> BC6H cube KTX2\n"
+        "  envmap irradiance -i env.exr [--face N] [--samples N] -o irr.ktx2\n"
+        "    diffuse irradiance -> BC6H cube KTX2\n"
+        "  envmap brdflut [--size N] [--samples N] -o brdf.exr\n"
+        "    split-sum DFG LUT (R=scale G=bias)\n");
 }
 
 static int cmd_convert(int argc, char **argv) {
@@ -329,11 +343,151 @@ static int cmd_sg(int argc, char **argv) {
     return 0;
 }
 
+/* Compress a set of cube em_image levels to a BC6H cube KTX2 via texpipe. */
+static int write_cube_bc6h(const char *out, const em_image *levels, int num_levels) {
+    tp_mip_chain chain;
+    tp_options opt;
+    tp_blocks blocks;
+    uint8_t *buf = NULL;
+    size_t need, wrote = 0;
+    int face, l, ok = 0;
+    memset(&chain, 0, sizeof(chain));
+    memset(&blocks, 0, sizeof(blocks));
+    chain.num_faces = 6;
+    chain.num_levels = num_levels;
+    chain.channels = 3;
+    chain.level = (tp_surface *)calloc((size_t)6 * num_levels, sizeof(tp_surface));
+    if (!chain.level) return 0;
+    for (face = 0; face < 6; ++face)
+        for (l = 0; l < num_levels; ++l) {
+            const em_image *im = &levels[l];
+            tp_surface *s = &chain.level[face * num_levels + l];
+            s->width = im->width; s->height = im->height; s->channels = 3;
+            s->data = em_image_texel(im, face, 0, 0);
+            s->stride = (size_t)im->width * 3 * sizeof(float);
+        }
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC6H);
+    opt.container = TP_CONTAINER_KTX2;
+    opt.is_cube = 1;
+    if (TP_OK(tp_compress_chain(NULL, &chain, &opt, &blocks))) {
+        need = tp_container_size(&blocks, &opt);
+        buf = (uint8_t *)malloc(need);
+        if (buf && TP_OK(tp_write_container(&blocks, &opt, buf, need, &wrote)))
+            ok = write_file(out, buf, wrote);
+    }
+    free(buf);
+    tp_blocks_free(NULL, &blocks);
+    free(chain.level); /* surfaces borrow em_image data; do not free that here */
+    return ok;
+}
+
+static int cmd_ibl(int argc, char **argv) {
+    const char *in = NULL, *out = NULL;
+    em_proj from = EM_PROJ_EQUIRECT;
+    int face = 128, levels = 0, samples = 64, i;
+    em_image src, out_levels[16];
+    for (i = 0; i < argc; ++i) {
+        const char *a = argv[i];
+#define NEXT() (++i < argc ? argv[i] : NULL)
+        if (!strcmp(a, "-i")) in = NEXT();
+        else if (!strcmp(a, "-o")) out = NEXT();
+        else if (!strcmp(a, "--from")) { const char *v = NEXT(); if (!v || !parse_proj(v, &from)) { usage(); return 2; } }
+        else if (!strcmp(a, "--face")) { const char *v = NEXT(); if (!v) { usage(); return 2; } face = atoi(v); }
+        else if (!strcmp(a, "--levels")) { const char *v = NEXT(); if (!v) { usage(); return 2; } levels = atoi(v); }
+        else if (!strcmp(a, "--samples")) { const char *v = NEXT(); if (!v) { usage(); return 2; } samples = atoi(v); }
+        else { fprintf(stderr, "unknown arg: %s\n", a); usage(); return 2; }
+#undef NEXT
+    }
+    if (!in || !out || face < 1) { usage(); return 2; }
+    if (levels <= 0) { levels = 1; while ((face >> levels) >= 1) ++levels; }
+    if (levels > 16) levels = 16;
+    memset(&src, 0, sizeof(src));
+    if (!load_exr(in, from, &src)) { fprintf(stderr, "failed to load %s\n", in); return 1; }
+    if (!EM_OK(em_prefilter_specular(NULL, &src, face, levels, samples, out_levels))) {
+        fprintf(stderr, "prefilter failed\n"); em_image_free(NULL, &src); return 1;
+    }
+    if (write_cube_bc6h(out, out_levels, levels))
+        printf("wrote %s (prefiltered specular, BC6H cube, %d levels, face %d)\n", out, levels, face);
+    else fprintf(stderr, "failed to write %s\n", out);
+    for (i = 0; i < levels; ++i) em_image_free(NULL, &out_levels[i]);
+    em_image_free(NULL, &src);
+    return 0;
+}
+
+static int cmd_irradiance(int argc, char **argv) {
+    const char *in = NULL, *out = NULL;
+    em_proj from = EM_PROJ_EQUIRECT;
+    int face = 32, samples = 256, i;
+    em_image src, irr;
+    for (i = 0; i < argc; ++i) {
+        const char *a = argv[i];
+#define NEXT() (++i < argc ? argv[i] : NULL)
+        if (!strcmp(a, "-i")) in = NEXT();
+        else if (!strcmp(a, "-o")) out = NEXT();
+        else if (!strcmp(a, "--from")) { const char *v = NEXT(); if (!v || !parse_proj(v, &from)) { usage(); return 2; } }
+        else if (!strcmp(a, "--face")) { const char *v = NEXT(); if (!v) { usage(); return 2; } face = atoi(v); }
+        else if (!strcmp(a, "--samples")) { const char *v = NEXT(); if (!v) { usage(); return 2; } samples = atoi(v); }
+        else { fprintf(stderr, "unknown arg: %s\n", a); usage(); return 2; }
+#undef NEXT
+    }
+    if (!in || !out || face < 1) { usage(); return 2; }
+    memset(&src, 0, sizeof(src));
+    memset(&irr, 0, sizeof(irr));
+    if (!load_exr(in, from, &src)) { fprintf(stderr, "failed to load %s\n", in); return 1; }
+    if (!EM_OK(em_irradiance_cube(NULL, &src, face, samples, &irr))) {
+        fprintf(stderr, "irradiance failed\n"); em_image_free(NULL, &src); return 1;
+    }
+    if (write_cube_bc6h(out, &irr, 1))
+        printf("wrote %s (diffuse irradiance, BC6H cube, face %d)\n", out, face);
+    else fprintf(stderr, "failed to write %s\n", out);
+    em_image_free(NULL, &irr);
+    em_image_free(NULL, &src);
+    return 0;
+}
+
+static int cmd_brdflut(int argc, char **argv) {
+    const char *out = NULL;
+    int size = 256, samples = 1024, i, x, y;
+    float *lut;
+    em_image img;
+    for (i = 0; i < argc; ++i) {
+        const char *a = argv[i];
+#define NEXT() (++i < argc ? argv[i] : NULL)
+        if (!strcmp(a, "-o")) out = NEXT();
+        else if (!strcmp(a, "--size")) { const char *v = NEXT(); if (!v) { usage(); return 2; } size = atoi(v); }
+        else if (!strcmp(a, "--samples")) { const char *v = NEXT(); if (!v) { usage(); return 2; } samples = atoi(v); }
+        else { fprintf(stderr, "unknown arg: %s\n", a); usage(); return 2; }
+#undef NEXT
+    }
+    if (!out || size < 1) { usage(); return 2; }
+    lut = (float *)malloc((size_t)size * size * 2 * sizeof(float));
+    if (!lut) return 1;
+    em_brdf_lut(size, samples, lut);
+    memset(&img, 0, sizeof(img));
+    if (!EM_OK(em_image_alloc(NULL, &img, EM_PROJ_EQUIRECT, size, size, 3))) { free(lut); return 1; }
+    for (y = 0; y < size; ++y)
+        for (x = 0; x < size; ++x) {
+            float *t = em_image_texel(&img, 0, x, y);
+            t[0] = lut[(y * size + x) * 2 + 0];
+            t[1] = lut[(y * size + x) * 2 + 1];
+            t[2] = 0.0f;
+        }
+    if (save_exr_face(out, &img, 0))
+        printf("wrote %s (BRDF DFG LUT %dx%d, R=scale G=bias)\n", out, size, size);
+    else fprintf(stderr, "failed to write %s\n", out);
+    em_image_free(NULL, &img);
+    free(lut);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
     if (!strcmp(argv[1], "convert")) return cmd_convert(argc - 2, argv + 2);
     if (!strcmp(argv[1], "sh")) return cmd_sh(argc - 2, argv + 2);
     if (!strcmp(argv[1], "sg")) return cmd_sg(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "ibl")) return cmd_ibl(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "irradiance")) return cmd_irradiance(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "brdflut")) return cmd_brdflut(argc - 2, argv + 2);
     if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) { usage(); return 0; }
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     usage();

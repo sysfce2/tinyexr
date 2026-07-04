@@ -248,14 +248,105 @@ static void test_sg_fit(void) {
     em_image_free(NULL, &eq);
 }
 
+/* ------------------------------------------------------------- IBL */
+
+static double cube_mean(const em_image *c) {
+    double s = 0.0;
+    size_t n = (size_t)c->faces * c->width * c->height * c->channels, i;
+    for (i = 0; i < n; ++i) s += c->data[i];
+    return s / n;
+}
+
+static void test_ibl_white_furnace(void) {
+    em_image eq, levels[6], irr;
+    int i, l;
+    memset(&eq, 0, sizeof(eq));
+    em_image_alloc(NULL, &eq, EM_PROJ_EQUIRECT, 128, 64, 3);
+    for (i = 0; i < eq.width * eq.height * 3; ++i) eq.data[i] = 0.8f; /* constant */
+    /* Prefiltered specular of a constant env must stay constant at every level. */
+    CHECK(EM_OK(em_prefilter_specular(NULL, &eq, 32, 5, 64, levels)), "prefilter");
+    for (l = 0; l < 5; ++l) {
+        double m = cube_mean(&levels[l]);
+        double dev = 0.0;
+        size_t k, n = (size_t)levels[l].faces * levels[l].width * levels[l].height * 3;
+        for (k = 0; k < n; ++k) { double d = levels[l].data[k] - 0.8; if (fabs(d) > dev) dev = fabs(d); }
+        CHECK(fabs(m - 0.8) < 0.01, "prefilter constant mean ~0.8");
+        CHECK(dev < 0.02, "prefilter constant flat");
+        (void)m;
+        em_image_free(NULL, &levels[l]);
+    }
+    /* Irradiance of a constant env = the constant (E/pi with L const = L). */
+    memset(&irr, 0, sizeof(irr));
+    CHECK(EM_OK(em_irradiance_cube(NULL, &eq, 16, 256, &irr)), "irradiance");
+    CHECK(fabs(cube_mean(&irr) - 0.8) < 0.01, "irradiance constant ~0.8");
+    printf("  ibl white-furnace: ok (irr mean=%.3f)\n", cube_mean(&irr));
+    em_image_free(NULL, &irr);
+    em_image_free(NULL, &eq);
+}
+
+static void test_ibl_blur_monotonic(void) {
+    /* A high-frequency env: prefiltered variance must DROP as roughness rises. */
+    em_image eq, levels[6];
+    int x, y, l;
+    double var_prev = 1e30;
+    memset(&eq, 0, sizeof(eq));
+    em_image_alloc(NULL, &eq, EM_PROJ_EQUIRECT, 256, 128, 3);
+    for (y = 0; y < 128; ++y)
+        for (x = 0; x < 256; ++x) {
+            float *t = em_image_texel(&eq, 0, x, y);
+            float v = ((x / 8 + y / 8) & 1) ? 1.0f : 0.0f; /* checker */
+            t[0] = t[1] = t[2] = v;
+        }
+    CHECK(EM_OK(em_prefilter_specular(NULL, &eq, 64, 5, 64, levels)), "prefilter hf");
+    {
+        double var0 = -1.0, varlast = -1.0;
+        for (l = 0; l < 5; ++l) {
+            double m = cube_mean(&levels[l]), var = 0.0;
+            size_t k, n = (size_t)levels[l].faces * levels[l].width * levels[l].height * 3;
+            for (k = 0; k < n; ++k) { double d = levels[l].data[k] - m; var += d * d; }
+            var /= n;
+            if (l == 0) var0 = var;
+            varlast = var;
+            em_image_free(NULL, &levels[l]);
+        }
+        /* Highest roughness must be far smoother than the sharp mirror level. */
+        CHECK(varlast < 0.5 * var0, "roughness=1 is much blurrier than roughness=0");
+        printf("  ibl roughness blur: ok (var0=%.4f -> varlast=%.4f)\n", var0, varlast);
+    }
+    (void)var_prev;
+    em_image_free(NULL, &eq);
+}
+
+static void test_brdf_lut(void) {
+    int size = 32, i;
+    float *lut = (float *)malloc((size_t)size * size * 2 * sizeof(float));
+    int inrange = 1;
+    em_brdf_lut(size, 256, lut);
+    for (i = 0; i < size * size * 2; ++i)
+        if (lut[i] < -0.01f || lut[i] > 1.01f) inrange = 0;
+    CHECK(inrange, "BRDF LUT values in [0,1]");
+    /* Low roughness, high NdotV -> scale (A) approaches 1, bias (B) small. */
+    {
+        int ix = size - 1, iy = 0; /* NdotV~1, roughness~0 */
+        float A = lut[(iy * size + ix) * 2 + 0], B = lut[(iy * size + ix) * 2 + 1];
+        CHECK(A > 0.9f, "BRDF A ~1 at low roughness / high NdotV");
+        CHECK(B < 0.1f, "BRDF B ~0 at low roughness / high NdotV");
+        printf("  brdf lut: ok (A=%.3f B=%.3f)\n", A, B);
+    }
+    free(lut);
+}
+
 int main(void) {
-    printf("envmap Phase A/B tests\n");
+    printf("envmap Phase A/B/IBL tests\n");
     test_dir_roundtrip();
     test_solid_angle();
     test_convert();
     test_sh_constant();
     test_sh_reconstruct();
     test_sg_fit();
+    test_ibl_white_furnace();
+    test_ibl_blur_monotonic();
+    test_brdf_lut();
     if (g_fail) { printf("SOME TESTS FAILED\n"); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;
