@@ -15,6 +15,7 @@
 #include "astcenc.h"
 #include "texcomp.h"
 #include "astc_hdr_ref_decode.h"
+#include "../src/texcomp_internal.h" /* tc_encode_astc_hdr_cem15_block, lns16 */
 
 #include <math.h>
 #include <stdio.h>
@@ -280,6 +281,48 @@ int main(void) {
         }
         if (p < 32.0) {
             fprintf(stderr, "FAIL: brightness-ramp psnr %.2f dB below floor\n", p);
+            return 1;
+        }
+    }
+
+    /* (f) HDR RGB + HDR alpha via the CEM 15 block encoder: an RGBA gradient
+     * (alpha correlated with the colour so a single weight line fits all four
+     * channels). astcenc must decode all four channels -- proves the CEM 15
+     * field, 8-value endpoint stream (incl. the 2 HDR-alpha values) and QUANT_6
+     * weights are all assembled correctly. */
+    {
+        static float srgba[W * H * 4];
+        double sse = 0.0, pa;
+        size_t j, c2;
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                float t = (float)x / (float)(W - 1);
+                float *px = srgba + ((size_t)y * W + x) * 4;
+                px[0] = 0.2f + t * 18.0f;
+                px[1] = 0.15f + t * 12.0f;
+                px[2] = 0.10f + t * 8.0f;
+                px[3] = 0.05f + t * 10.0f; /* HDR alpha, correlated */
+            }
+        /* Full public RGBA-HDR path (CEM 15 blocks + void-extent fallback). */
+        if (tc_astc_hdr_compress_rgbaf(srgba, W, H,
+                                       (size_t)W * 4u * sizeof(float), &opt,
+                                       blocks, need) != TC_SUCCESS) {
+            fprintf(stderr, "FAIL: hdr rgba encode (cem15)\n");
+            return 1;
+        }
+        if (astc_hdr_decode(blocks, need, W, H, dec) != 0) {
+            fprintf(stderr, "FAIL: astcenc hdr decode (cem15)\n");
+            return 1;
+        }
+        for (j = 0; j < (size_t)W * H; ++j)
+            for (c2 = 0; c2 < 4; ++c2) {
+                double dd = (double)srgba[j * 4 + c2] - (double)dec[j * 4 + c2];
+                sse += dd * dd;
+            }
+        pa = 10.0 * log10(18.0 * 18.0 / (sse / ((double)W * H * 4)));
+        printf("astc-hdr cem15 rgba 64x64: %.2f dB\n", pa);
+        if (pa < 42.0) {
+            fprintf(stderr, "FAIL: cem15 rgba psnr %.2f dB below floor\n", pa);
             return 1;
         }
     }

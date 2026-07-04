@@ -4046,6 +4046,34 @@ static void tc_astc_hdr_lsq(const int lns[16][3], const uint8_t wt[16],
     }
 }
 
+/* 4-channel (RGBA) LNS least-squares, for the CEM 15 HDR+alpha path. Same 2x2
+ * normal equations as tc_astc_hdr_lsq, over all four LNS channels. */
+static void tc_astc_hdr_lsq4(const int lns[16][4], const uint8_t wt[16],
+                             int e0[4], int e1[4]) {
+    int c, i;
+    for (c = 0; c < 4; ++c) {
+        int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+        for (i = 0; i < 16; ++i) {
+            int64_t a = 64 - wt[i], b = wt[i], p = lns[i][c];
+            saa += a * a;
+            sab += a * b;
+            sbb += b * b;
+            sap += a * p;
+            sbp += b * p;
+        }
+        det = saa * sbb - sab * sab;
+        if (det <= 0) continue;
+        l = tc_div_round_s64((sap * sbb - sbp * sab) * 64, det);
+        h = tc_div_round_s64((sbp * saa - sap * sab) * 64, det);
+        if (l < 0) l = 0;
+        if (l > 65535) l = 65535;
+        if (h < 0) h = 0;
+        if (h > 65535) h = 65535;
+        e0[c] = (int)l;
+        e1[c] = (int)h;
+    }
+}
+
 /* Partition-aware LNS least-squares: as tc_astc_hdr_lsq, but summing only the
  * texels assigned to `subset` (for the 2-subset HDR path). */
 static void tc_astc_hdr_lsq_part(const int lns[16][3], const uint8_t wt[16],
@@ -4242,6 +4270,92 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 6u, v, packed);
     (void)tc_astc_ise_encode_bits(20u, 6u, packed, out, 16u, 17u);
     return (uint64_t)sse_single;
+}
+
+/* Single-subset CEM 15 (HDR RGB direct + HDR alpha) block. CEM 15 stores 8
+ * endpoint values (RGB direct = 6, HDR alpha = 2), so at colour quant 256 they
+ * need 64 colour bits; that forces weight range 6 (QUANT_6, quant_method 4,
+ * ~42 weight bits -> 111-42=69 colour bits available). Range 8 (48 weight bits)
+ * would leave only 63, one short of 64, and the decoder would derive a lower
+ * colour quant and corrupt the 8-bit endpoint bytes. Endpoints come from the
+ * RGBA LNS bounding box with least-squares refinement; each texel's weight is
+ * its projection onto the 4D endpoint line. Input `lns` is per-texel 16-bit LNS
+ * RGBA (see tc_astc_float_to_lns16). Returns the LNS-domain SSE. */
+uint64_t tc_encode_astc_hdr_cem15_block(const int lns[16][4], uint8_t out[16]) {
+    static uint32_t bm = 0xffffffffu;
+    uint8_t weightbuf[16], packed[8], sw[16], v[8];
+    int e0[4], e1[4];
+    int i, c, round;
+    int64_t best_sse = -1;
+    uint8_t best_v[8] = {0}, best_sw[16] = {0};
+    uint32_t bitpos;
+
+    if (bm == 0xffffffffu) bm = tc_astc_hdr_find_grid_mode(4u); /* QUANT_6 */
+    tc_hdr_ctx_ensure();
+
+    for (c = 0; c < 4; ++c) {
+        e0[c] = lns[0][c];
+        e1[c] = lns[0][c];
+    }
+    for (i = 1; i < 16; ++i)
+        for (c = 0; c < 4; ++c) {
+            if (lns[i][c] < e0[c]) e0[c] = lns[i][c];
+            if (lns[i][c] > e1[c]) e1[c] = lns[i][c];
+        }
+
+    for (round = 0; round < 3; ++round) {
+        uint8_t wt[16];
+        int64_t sse = 0, dl = 0;
+        int q0[4], q1[4], d[4];
+        tc_astc_cem15_pack(e0, e1, e0[3], e1[3], 20, v);
+        tc_astc_cem15_unpack(v, q0, q1);
+        for (c = 0; c < 4; ++c) {
+            d[c] = q1[c] - q0[c];
+            dl += (int64_t)d[c] * d[c];
+        }
+        for (i = 0; i < 16; ++i) {
+            int w64 = 0, uq;
+            if (dl > 0) {
+                int64_t dot = 0;
+                for (c = 0; c < 4; ++c)
+                    dot += ((int64_t)lns[i][c] - q0[c]) * d[c];
+                if (dot < 0) dot = 0;
+                if (dot > dl) dot = dl;
+                w64 = (int)((dot * 64 + dl / 2) / dl);
+            }
+            sw[i] = tc_astc_hdr_quant_weight(w64, 4u, 6u);
+            uq = (int)tc_astc_weight_unquant(sw[i], 4u);
+            wt[i] = (uint8_t)uq;
+            for (c = 0; c < 4; ++c) {
+                int64_t rec = q0[c] + ((int64_t)d[c] * uq) / 64;
+                int64_t e = rec - lns[i][c];
+                sse += e * e;
+            }
+        }
+        if (best_sse < 0 || sse < best_sse) {
+            best_sse = sse;
+            memcpy(best_v, v, sizeof(best_v));
+            memcpy(best_sw, sw, sizeof(best_sw));
+        } else {
+            break;
+        }
+        if (round + 1 < 3) tc_astc_hdr_lsq4(lns, wt, e0, e1);
+    }
+    memcpy(v, best_v, sizeof(v));
+    memcpy(sw, best_sw, sizeof(sw));
+
+    memset(out, 0, 16u);
+    memset(weightbuf, 0, sizeof(weightbuf));
+    tc_astc_scramble_weights(sw, 16u, 4u);
+    (void)tc_astc_ise_encode_bits(4u, 16u, sw, weightbuf, sizeof(weightbuf), 0u);
+    for (i = 0; i < 16; ++i) out[i] = tc_bitrev8(weightbuf[15 - i]);
+    bitpos = 0;
+    tc_set_bits(out, &bitpos, bm, 11u);
+    tc_set_bits(out, &bitpos, 0u, 2u);
+    tc_set_bits(out, &bitpos, 15u, 4u); /* CEM 15 */
+    tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 8u, v, packed);
+    (void)tc_astc_ise_encode_bits(20u, 8u, packed, out, 16u, 17u);
+    return (uint64_t)best_sse;
 }
 
 /* Single-subset CEM 7 (HDR RGB base+scale) block. Fits base+scale to the LNS

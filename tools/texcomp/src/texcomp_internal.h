@@ -95,6 +95,8 @@ uint64_t tc_encode_astc_hdr_cem7_block(const int lns[16][3], uint8_t out[16]);
  * the ASTC block/ISE machinery). `lns` is 16 texels of 16-bit LNS RGB; returns
  * the reconstruction SSE in the LNS domain (for mode selection). */
 uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]);
+/* Single-subset CEM 15 (HDR RGB + HDR alpha) 4x4 block encoder; lns is RGBA. */
+uint64_t tc_encode_astc_hdr_cem15_block(const int lns[16][4], uint8_t out[16]);
 /* Two-subset CEM 11 block; UINT64_MAX if no usable partition. */
 uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
                                                 uint8_t out[16]);

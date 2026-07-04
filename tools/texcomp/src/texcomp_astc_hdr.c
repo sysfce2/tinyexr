@@ -847,3 +847,91 @@ tc_result tc_astc_hdr_compress_rgbf(const float *rgb, uint32_t width,
     }
     return TC_SUCCESS;
 }
+
+/* RGBA HDR: like tc_astc_hdr_compress_rgbf but with an HDR alpha channel, using
+ * the CEM 15 (HDR RGB + HDR alpha) single-subset block encoder. Constant blocks
+ * still use an exact FP16 void-extent (now carrying real alpha). `rgba` is
+ * per-texel float RGBA. */
+tc_result tc_astc_hdr_compress_rgbaf(const float *rgba, uint32_t width,
+                                     uint32_t height, size_t stride_bytes,
+                                     const tc_astc_hdr_options *opt,
+                                     uint8_t *out_astc, size_t out_size) {
+    uint32_t bx, by, x, y, xx, yy;
+    size_t need, off = 0;
+    (void)opt;
+
+    if (!rgba || !out_astc || !width || !height)
+        return TC_ERROR_INVALID_ARGUMENT;
+    if (stride_bytes < (size_t)width * 4u * sizeof(float))
+        return TC_ERROR_INVALID_ARGUMENT;
+    need = tc_astc_hdr_compressed_size(width, height);
+    if (!need || out_size < need) return TC_ERROR_INVALID_ARGUMENT;
+
+    for (by = 0; by < height; by += 4) {
+        for (bx = 0; bx < width; bx += 4) {
+            int lns[16][4];
+            float src0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            int allsame = 1;
+            for (yy = 0; yy < 4; ++yy) {
+                y = by + yy;
+                if (y >= height) y = height - 1u;
+                for (xx = 0; xx < 4; ++xx) {
+                    const float *src;
+                    int idx = (int)(yy * 4u + xx);
+                    x = bx + xx;
+                    if (x >= width) x = width - 1u;
+                    src = (const float *)((const uint8_t *)rgba +
+                                          (size_t)y * stride_bytes +
+                                          (size_t)x * 4u * sizeof(float));
+                    lns[idx][0] = tc_astc_float_to_lns16(src[0]);
+                    lns[idx][1] = tc_astc_float_to_lns16(src[1]);
+                    lns[idx][2] = tc_astc_float_to_lns16(src[2]);
+                    lns[idx][3] = tc_astc_float_to_lns16(src[3]);
+                    if (idx == 0) {
+                        src0[0] = src[0];
+                        src0[1] = src[1];
+                        src0[2] = src[2];
+                        src0[3] = src[3];
+                    } else if (lns[idx][0] != lns[0][0] ||
+                               lns[idx][1] != lns[0][1] ||
+                               lns[idx][2] != lns[0][2] ||
+                               lns[idx][3] != lns[0][3]) {
+                        allsame = 0;
+                    }
+                }
+            }
+            if (allsame) {
+                tc_astc_hdr_write_void_extent(tc_float_to_half_bits(src0[0]),
+                                              tc_float_to_half_bits(src0[1]),
+                                              tc_float_to_half_bits(src0[2]),
+                                              tc_float_to_half_bits(src0[3]),
+                                              out_astc + off);
+            } else {
+                uint8_t cem15[16];
+                uint64_t cem15_sse, ve_sse = 0;
+                int mean[4], i, cc;
+                int64_t sum[4] = {0, 0, 0, 0};
+                cem15_sse = tc_encode_astc_hdr_cem15_block(lns, cem15);
+                for (i = 0; i < 16; ++i)
+                    for (cc = 0; cc < 4; ++cc) sum[cc] += lns[i][cc];
+                for (cc = 0; cc < 4; ++cc) mean[cc] = (int)(sum[cc] / 16);
+                for (i = 0; i < 16; ++i)
+                    for (cc = 0; cc < 4; ++cc) {
+                        int64_t e = (int64_t)lns[i][cc] - mean[cc];
+                        ve_sse += (uint64_t)(e * e);
+                    }
+                if (ve_sse <= cem15_sse) {
+                    tc_astc_hdr_write_void_extent(
+                        tc_astc_lns16_to_sf16(mean[0]),
+                        tc_astc_lns16_to_sf16(mean[1]),
+                        tc_astc_lns16_to_sf16(mean[2]),
+                        tc_astc_lns16_to_sf16(mean[3]), out_astc + off);
+                } else {
+                    memcpy(out_astc + off, cem15, 16u);
+                }
+            }
+            off += 16u;
+        }
+    }
+    return TC_SUCCESS;
+}

@@ -224,6 +224,12 @@ tc_result tc_astc_hdr_compress_rgbf(const float *rgb, uint32_t width,
                                     uint32_t height, size_t stride_bytes,
                                     const tc_astc_hdr_options *opt,
                                     uint8_t *out_astc, size_t out_size);
+/* Encode float RGBA (with an HDR alpha channel) to ASTC HDR 4x4 blocks, using
+ * the CEM 15 (HDR RGB + HDR alpha) block encoder. Same size as the RGB path. */
+tc_result tc_astc_hdr_compress_rgbaf(const float *rgba, uint32_t width,
+                                     uint32_t height, size_t stride_bytes,
+                                     const tc_astc_hdr_options *opt,
+                                     uint8_t *out_astc, size_t out_size);
 
 size_t tc_dds_bc7_size(uint32_t width, uint32_t height);
 size_t tc_dds_bc1_size(uint32_t width, uint32_t height);
