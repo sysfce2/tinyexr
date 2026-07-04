@@ -417,6 +417,55 @@ texcomp-xbc7-gate: lib $(TEXCOMP_OBJ) texcomp tools/texcomp/test/xbc7_gate.c too
 	  && echo "xbc7 CLI round-trip: OK (transcode is bit-exact BC7)" \
 	  || { echo "FAIL: xbc7 round-trip differs"; exit 1; }
 
+# ---- tools/texpipe: resize-aware texture compression ----------------------
+# Ties tir (resize) + texcomp (block compression) into content-aware mip
+# chains serialized to multi-mip DDS / KTX2 containers. Pure C11 library
+# (no <stdio.h> in src/); only texpipe_cli.c does file I/O.
+TEXPIPE_INC = -Itools/texpipe/include -Itools/resize/include \
+  -Itools/texcomp/include -Iinclude -Isrc -Iexamples/common
+TEXPIPE_LIB_SRC = tools/texpipe/src/texpipe.c tools/texpipe/src/texpipe_mip.c \
+  tools/texpipe/src/texpipe_alpha.c tools/texpipe/src/texpipe_cube.c \
+  tools/texpipe/src/texpipe_normal.c tools/texpipe/src/texpipe_container.c
+TEXPIPE_HDRS = tools/texpipe/include/texpipe.h tools/texpipe/src/texpipe_internal.h
+TEXPIPE_OBJ = $(patsubst tools/texpipe/src/%.c,build/texpipe/%.o,$(TEXPIPE_LIB_SRC))
+
+.PHONY: texpipe texpipe-c11-gate texpipe-test
+
+build/texpipe:
+	@mkdir -p build/texpipe
+
+build/texpipe/%.o: tools/texpipe/src/%.c $(TEXPIPE_HDRS) | build/texpipe
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) -O2 -g -c $< -o $@
+
+# Full CLI: base image -> content-aware mip chain -> compressed container.
+texpipe: lib resize-lib texcomp $(TEXPIPE_OBJ) tools/texpipe/src/texpipe_cli.c | build/texpipe
+	$(AR) rcs build/libtexpipe.a $(TEXPIPE_OBJ)
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXPIPE_INC) $(V3_DEFS) $(V3_INC) -O2 -g \
+	  tools/texpipe/src/texpipe_cli.c build/libtexpipe.a build/libtir.a \
+	  build/libtexcomp.a build/libtinyexr3.a -pthread -lm \
+	  -o build/texpipe/texpipe
+	@echo "built build/texpipe/texpipe"
+
+# Strict pure-C11 gate: syntax-check each lib TU with -Werror and forbid
+# <stdio.h> outside the CLI.
+texpipe-c11-gate: | build/texpipe
+	@for f in $(TEXPIPE_LIB_SRC); do \
+	  echo "  c11-gate $$f"; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	@bad=`grep -rl --exclude=texpipe_cli.c '<stdio.h>' tools/texpipe/src/ || true`; \
+	  if [ -n "$$bad" ]; then echo "FAIL: <stdio.h> in texpipe src: $$bad"; exit 1; fi
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) $(V3_INC) -O1 -fsyntax-only \
+	  tools/texpipe/src/texpipe_cli.c
+	@echo "texpipe pure-C11 gate: OK"
+
+# Unit tests: per-mip round-trip PSNR (BC7 shipped decoder) + alpha coverage.
+texpipe-test: resize-lib texcomp tools/texpipe/test/test_texpipe.c $(TEXPIPE_HDRS) | build/texpipe
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXPIPE_INC) -Itools/texcomp/test -O1 -g $(SAN) -pthread \
+	  tools/texpipe/test/test_texpipe.c $(TEXPIPE_LIB_SRC) build/libtir.a \
+	  build/libtexcomp.a -lm -o build/test_texpipe
+	./build/test_texpipe
+
 # Build + run the unit tests with multithreading enabled (parity + race checks).
 test-c-threads:
 	$(MAKE) test-c THREADS=1
