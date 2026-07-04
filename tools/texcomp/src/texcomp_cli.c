@@ -127,6 +127,7 @@ static tc_result tc_cli_astcenc_compress(const uint8_t *rgba, uint32_t w,
 #include "tinyexr_zstd.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -480,17 +481,37 @@ static uint32_t uni_sse_sel(const uint8_t *a, const uint8_t *b) {
     return s;
 }
 
-/* Build a codebook of the 8-byte field at `off` of each 16-byte uni block, plus
- * per-block indices. If the number of distinct patterns exceeds `cap` (> 0), the
- * cap most frequent patterns are kept and every block is remapped to its nearest
- * codebook entry (byte SSE) -- lossy, the size lever behind BasisLZ. cap == 0 is
- * lossless. Returns the code count, or 0xffffffff on OOM. */
+#define UNI_LLOYD_ITERS 8
+
+/* Nearest codebook entry to `pp` under the field metric, plus an optional
+ * rate penalty lambda*rate[c] (bits) for rate-distortion assignment. */
+static uint32_t uni_assign(const uint8_t *pp, const uint8_t *cb, uint32_t cap,
+                           int is_sel, const float *rate, float lambda) {
+    uint32_t best = 0, c;
+    double bestc = 1e300;
+    for (c = 0; c < cap; ++c) {
+        double d = is_sel ? uni_sse_sel(pp, cb + (size_t)c * 8u)
+                          : uni_sse8(pp, cb + (size_t)c * 8u);
+        double cost = rate ? d + (double)lambda * rate[c] : d;
+        if (cost < bestc) { bestc = cost; best = c; if (d == 0.0 && !rate) break; }
+    }
+    return best;
+}
+
+/* Build an RD-optimized codebook of the 8-byte field at `off` of each uni block,
+ * plus per-block indices. cap == 0 or distinct <= cap is lossless. Otherwise:
+ * seed with the cap most-frequent patterns, refine with Lloyd (k-means) so the
+ * entries minimize distortion, then a final rate-distortion assignment
+ * (distortion + lambda*bits) that biases toward popular entries for a smaller
+ * post-Zstd index stream. Returns the code count, or 0xffffffff on OOM. */
 static uint32_t uni_build_codebook(const uint8_t *uni, size_t nblocks, size_t off,
-                                   uint32_t cap, uint8_t *cb, uint32_t *idx) {
+                                   uint32_t cap, float lambda, uint8_t *cb,
+                                   uint32_t *idx) {
     size_t hcap = 16, i;
     uint64_t *hk, *upat;
     int32_t *hv;
     uint32_t *ucnt, *bidx, nu = 0, ncodes;
+    int is_sel = (off == 8u);
     while (hcap < nblocks * 2u) hcap <<= 1;
     hk = (uint64_t *)malloc(hcap * 8u);
     hv = (int32_t *)malloc(hcap * 4u);
@@ -515,23 +536,49 @@ static uint32_t uni_build_codebook(const uint8_t *uni, size_t nblocks, size_t of
         ncodes = nu;
     } else {
         uint32_t *order = (uint32_t *)malloc(nu * 4u), c;
-        if (!order) { free(hk); free(hv); free(upat); free(ucnt); free(bidx); return 0xffffffffu; }
+        int vlen = is_sel ? 16 : 8, iter, k;
+        uint32_t *csum = (uint32_t *)malloc((size_t)cap * vlen * 4u);
+        uint32_t *ccnt = (uint32_t *)malloc((size_t)cap * 4u);
+        float *rate = (float *)malloc((size_t)cap * sizeof(float));
+        if (!order || !csum || !ccnt || !rate) { free(order); free(csum); free(ccnt); free(rate); free(hk); free(hv); free(upat); free(ucnt); free(bidx); return 0xffffffffu; }
         for (c = 0; c < nu; ++c) order[c] = c;
         g_uni_cnt = ucnt;
         qsort(order, nu, sizeof(uint32_t), uni_cnt_cmp);
         for (c = 0; c < cap; ++c) memcpy(cb + (size_t)c * 8u, &upat[order[c]], 8u);
-        for (i = 0; i < nblocks; ++i) {
-            const uint8_t *pp = uni + i * 16u + off;
-            uint32_t best = 0, bestd = 0xffffffffu;
-            for (c = 0; c < cap; ++c) {
-                uint32_t d = off == 8u ? uni_sse_sel(pp, cb + (size_t)c * 8u)
-                                       : uni_sse8(pp, cb + (size_t)c * 8u);
-                if (d < bestd) { bestd = d; best = c; if (d == 0u) break; }
-            }
-            idx[i] = best;
-        }
         ncodes = cap;
-        free(order);
+        /* Lloyd refinement: assign to nearest, recompute centroids as the mean
+         * of assigned blocks (per texel for selectors, per byte for endpoints). */
+        for (iter = 0; iter < UNI_LLOYD_ITERS; ++iter) {
+            memset(csum, 0, (size_t)cap * vlen * 4u);
+            memset(ccnt, 0, (size_t)cap * 4u);
+            for (i = 0; i < nblocks; ++i) {
+                const uint8_t *pp = uni + i * 16u + off;
+                uint32_t b = uni_assign(pp, cb, cap, is_sel, NULL, 0.0f);
+                idx[i] = b;
+                ccnt[b]++;
+                if (is_sel) { for (k = 0; k < 16; ++k) csum[b * 16 + k] += (pp[k >> 1] >> ((k & 1) * 4)) & 0xf; }
+                else { for (k = 0; k < 8; ++k) csum[b * 8 + k] += pp[k]; }
+            }
+            for (c = 0; c < cap; ++c) {
+                if (!ccnt[c]) continue;
+                if (is_sel) {
+                    uint8_t nw[8] = {0};
+                    for (k = 0; k < 16; ++k) { uint32_t w = (csum[c * 16 + k] + ccnt[c] / 2) / ccnt[c]; if (w > 15u) w = 15u; nw[k >> 1] |= (uint8_t)(w << ((k & 1) * 4)); }
+                    memcpy(cb + (size_t)c * 8u, nw, 8u);
+                } else {
+                    for (k = 0; k < 8; ++k) { uint32_t v = (csum[c * 8 + k] + ccnt[c] / 2) / ccnt[c]; cb[(size_t)c * 8u + k] = (uint8_t)(v > 255u ? 255u : v); }
+                }
+            }
+        }
+        /* rate-distortion final assignment: bits(c) ~= -log2(freq(c)). */
+        for (c = 0; c < cap; ++c) {
+            double p = ((double)ccnt[c] + 1.0) / ((double)nblocks + (double)cap);
+            rate[c] = (float)(-log(p) / log(2.0));
+        }
+        for (i = 0; i < nblocks; ++i)
+            idx[i] = uni_assign(uni + i * 16u + off, cb, cap, is_sel,
+                                lambda > 0.0f ? rate : NULL, lambda);
+        free(order); free(csum); free(ccnt); free(rate);
     }
     free(hk); free(hv); free(upat); free(ucnt); free(bidx);
     return ncodes;
@@ -543,7 +590,8 @@ static uint32_t uni_build_codebook(const uint8_t *uni, size_t nblocks, size_t of
  * by the outer Zstd. NOTE: this is NOT the wire-format BasisLZ scheme (that is
  * the Basis ETC1S codec); the KTX2 supercompressionScheme stays 2 (Zstd). */
 static tc_result encode_uni_basis(const uint8_t *uni, size_t uni_size,
-                                  uint32_t cap, uint8_t **out, size_t *out_size) {
+                                  uint32_t cap, float lambda, uint8_t **out,
+                                  size_t *out_size) {
     size_t nblocks = uni_size / 16u, i;
     uint8_t *epcb = (uint8_t *)malloc(nblocks * 8u), *selcb = (uint8_t *)malloc(nblocks * 8u), *o, *p;
     uint32_t *epidx = (uint32_t *)malloc(nblocks * 4u), *selidx = (uint32_t *)malloc(nblocks * 4u);
@@ -552,8 +600,8 @@ static tc_result encode_uni_basis(const uint8_t *uni, size_t uni_size,
     size_t sz;
     tc_result r = TC_ERROR_OUT_OF_MEMORY;
     if (!epcb || !selcb || !epidx || !selidx) goto done;
-    nep = uni_build_codebook(uni, nblocks, 0u, cap, epcb, epidx);
-    nsel = uni_build_codebook(uni, nblocks, 8u, cap, selcb, selidx);
+    nep = uni_build_codebook(uni, nblocks, 0u, cap, lambda, epcb, epidx);
+    nsel = uni_build_codebook(uni, nblocks, 8u, cap, lambda, selcb, selidx);
     if (nep == 0xffffffffu || nsel == 0xffffffffu) goto done;
     epb = nep <= 256u ? 1 : 2;
     selb = nsel <= 256u ? 1 : 2;
@@ -645,7 +693,8 @@ static int build_mips(const uint8_t *base, uint32_t w, uint32_t h,
  * (KTX2 convention). Our loader identifies the file by vkFormat==0 && scheme==2. */
 static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
                                 const size_t uni_sizes[], const uint32_t lw[],
-                                const uint32_t lh[], int nlevels, int basis) {
+                                const uint32_t lh[], int nlevels, int basis,
+                                float rdo) {
     static const uint8_t id[12] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32,
                                    0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
     uint8_t *comp[UNI_MAX_LEVELS] = {0}, *bbuf[UNI_MAX_LEVELS] = {0}, *ktx = NULL;
@@ -660,7 +709,7 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
         size_t src_size = uni_sizes[l], bound;
         if (basis) {
             /* `basis` carries the codebook cap (0 = plain zstd path, not here). */
-            if ((r = encode_uni_basis(uni[l], uni_sizes[l], (uint32_t)basis, &bbuf[l], &src_size)) != TC_SUCCESS) goto done;
+            if ((r = encode_uni_basis(uni[l], uni_sizes[l], (uint32_t)basis, rdo, &bbuf[l], &src_size)) != TC_SUCCESS) goto done;
             src = bbuf[l];
         }
         ulen[l] = src_size; /* KTX2 uncompressedByteLength = post-zstd-decode size */
@@ -811,6 +860,7 @@ int main(int argc, char **argv) {
     const char *format = "bc7";
     int part = 0;
     int uni_basis = 0;
+    float uni_rdo = 0.0f;
     uint8_t *rgba = NULL, *compressed = NULL, *container = NULL;
     float *rgbf = NULL;
     uint32_t w = 0, h = 0;
@@ -894,6 +944,7 @@ int main(int argc, char **argv) {
             bc7_opt.rdo = atoi(argv[++i]);
         else if (strcmp(argv[i], "--basis") == 0) uni_basis = 2048; /* codebook cap */
         else if (strcmp(argv[i], "--basis-cap") == 0 && i + 1 < argc) uni_basis = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--basis-rdo") == 0 && i + 1 < argc) uni_rdo = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--channel-weights") == 0 && i + 1 < argc) {
             /* R,G,B,A error weights for BC7 (pure-C) and ASTC (astcenc). */
             float wr = 1, wg = 1, wb = 1, wa = 1;
@@ -1036,7 +1087,7 @@ int main(int argc, char **argv) {
                 if (!ulev[l]) { tr = TC_ERROR_OUT_OF_MEMORY; break; }
                 tr = tc_uni_compress_rgba8(rlev[l], lw[l], lh[l], (size_t)lw[l] * 4u, ulev[l], usz[l]);
             }
-            if (tr == TC_SUCCESS) tr = write_uni_ktx2(out, ulev, usz, lw, lh, nl, uni_basis);
+            if (tr == TC_SUCCESS) tr = write_uni_ktx2(out, ulev, usz, lw, lh, nl, uni_basis, uni_rdo);
             for (l = 0; l < nl; ++l) { free(rlev[l]); free(ulev[l]); }
         } else {
             /* raw TUNI container: "TUNI" + w,h + level-0 blocks */
