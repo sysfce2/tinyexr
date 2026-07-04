@@ -451,90 +451,155 @@ static uint8_t *read_whole_file(const char *path, size_t *out_size) {
     return buf;
 }
 
-/* Write the uni block stream as a KTX2 with vkFormat=UNDEFINED and
- * supercompressionScheme=2 (Zstandard). Our loader identifies it by that pair
- * and transcodes; a standard KTX2 tool sees a Zstd-supercompressed transcode
- * source (DFD colourModel = UASTC). */
-static tc_result write_uni_ktx2(const char *path, const uint8_t *uni,
-                                size_t uni_size, uint32_t w, uint32_t h) {
+#define UNI_MAX_LEVELS 16
+
+/* Box-filter (2x2, from previous level) mip chain of an RGBA8 image. Fills
+ * levels[]/lw[]/lh[] (each level malloc'd) and returns the level count. */
+static int build_mips(const uint8_t *base, uint32_t w, uint32_t h,
+                      uint8_t *levels[], uint32_t lw[], uint32_t lh[], int cap) {
+    int n = 1, l;
+    uint32_t x, y, c, m = w > h ? w : h;
+    while (m > 1u) { m >>= 1; ++n; }
+    if (n > cap) n = cap;
+    lw[0] = w; lh[0] = h;
+    levels[0] = (uint8_t *)malloc((size_t)w * h * 4u);
+    if (!levels[0]) return 0;
+    memcpy(levels[0], base, (size_t)w * h * 4u);
+    for (l = 1; l < n; ++l) {
+        uint32_t pw = lw[l - 1], ph = lh[l - 1];
+        uint32_t cw = pw > 1u ? pw >> 1 : 1u, ch = ph > 1u ? ph >> 1 : 1u;
+        const uint8_t *p = levels[l - 1];
+        lw[l] = cw; lh[l] = ch;
+        levels[l] = (uint8_t *)malloc((size_t)cw * ch * 4u);
+        if (!levels[l]) { while (--l >= 0) { free(levels[l]); } return 0; }
+        for (y = 0; y < ch; ++y)
+            for (x = 0; x < cw; ++x) {
+                uint32_t x0 = 2u * x, x1 = x0 + 1u < pw ? x0 + 1u : pw - 1u;
+                uint32_t y0 = 2u * y, y1 = y0 + 1u < ph ? y0 + 1u : ph - 1u;
+                uint8_t *o = levels[l] + ((size_t)y * cw + x) * 4u;
+                for (c = 0; c < 4u; ++c)
+                    o[c] = (uint8_t)((p[((size_t)y0 * pw + x0) * 4u + c] +
+                                      p[((size_t)y0 * pw + x1) * 4u + c] +
+                                      p[((size_t)y1 * pw + x0) * 4u + c] +
+                                      p[((size_t)y1 * pw + x1) * 4u + c] + 2u) / 4u);
+            }
+    }
+    return n;
+}
+
+/* Write uni levels as a KTX2 (vkFormat=UNDEFINED, supercompressionScheme=2/Zstd).
+ * Each mip level is Zstd-compressed independently; data is packed smallest-first
+ * (KTX2 convention). Our loader identifies the file by vkFormat==0 && scheme==2. */
+static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
+                                const size_t uni_sizes[], const uint32_t lw[],
+                                const uint32_t lh[], int nlevels) {
     static const uint8_t id[12] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32,
                                    0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
-    size_t bound = tinyexr_zstd_compress_bound(uni_size), zc;
-    size_t dfd_off = 104u, dfd_len = 44u, data_off = 148u, total;
-    uint8_t *comp = (uint8_t *)malloc(bound), *ktx;
-    tc_result r;
-    if (!comp) return TC_ERROR_OUT_OF_MEMORY;
-    zc = tinyexr_zstd_compress(comp, bound, uni, uni_size, 19);
-    if (tinyexr_zstd_is_error(zc)) { free(comp); return TC_ERROR_UNSUPPORTED; }
-    total = data_off + zc;
+    uint8_t *comp[UNI_MAX_LEVELS] = {0}, *ktx = NULL;
+    size_t clen[UNI_MAX_LEVELS], dfd_off, dfd_len = 44u, data_base, cursor, total;
+    uint64_t loff[UNI_MAX_LEVELS];
+    int l;
+    tc_result r = TC_SUCCESS;
+    (void)lh;
+    for (l = 0; l < nlevels; ++l) {
+        size_t bound = tinyexr_zstd_compress_bound(uni_sizes[l]);
+        comp[l] = (uint8_t *)malloc(bound);
+        if (!comp[l]) { r = TC_ERROR_OUT_OF_MEMORY; goto done; }
+        clen[l] = tinyexr_zstd_compress(comp[l], bound, uni[l], uni_sizes[l], 19);
+        if (tinyexr_zstd_is_error(clen[l])) { r = TC_ERROR_UNSUPPORTED; goto done; }
+    }
+    dfd_off = 80u + (size_t)nlevels * 24u;
+    data_base = dfd_off + dfd_len;
+    cursor = data_base; /* supercompressed: tightly packed, smallest-first */
+    for (l = nlevels - 1; l >= 0; --l) { loff[l] = cursor; cursor += clen[l]; }
+    total = cursor;
     ktx = (uint8_t *)calloc(1, total);
-    if (!ktx) { free(comp); return TC_ERROR_OUT_OF_MEMORY; }
+    if (!ktx) { r = TC_ERROR_OUT_OF_MEMORY; goto done; }
     memcpy(ktx, id, 12);
-    xbc7_put32(ktx + 12, 0u);    /* vkFormat = UNDEFINED */
-    xbc7_put32(ktx + 16, 1u);    /* typeSize */
-    xbc7_put32(ktx + 20, w);
-    xbc7_put32(ktx + 24, h);
-    xbc7_put32(ktx + 36, 1u);    /* faceCount */
-    xbc7_put32(ktx + 40, 1u);    /* levelCount */
-    xbc7_put32(ktx + 44, 2u);    /* supercompressionScheme = Zstandard */
+    xbc7_put32(ktx + 12, 0u);              /* vkFormat = UNDEFINED */
+    xbc7_put32(ktx + 16, 1u);              /* typeSize */
+    xbc7_put32(ktx + 20, lw[0]);
+    xbc7_put32(ktx + 24, lh[0]);
+    xbc7_put32(ktx + 36, 1u);              /* faceCount */
+    xbc7_put32(ktx + 40, (uint32_t)nlevels);
+    xbc7_put32(ktx + 44, 2u);              /* Zstandard */
     xbc7_put32(ktx + 48, (uint32_t)dfd_off);
-    xbc7_put32(ktx + 52, (uint32_t)dfd_len);
-    /* level index (1 level): byteOffset, byteLength(compressed), uncompressed */
-    uni_put64(ktx + 80, data_off);
-    uni_put64(ktx + 88, zc);
-    uni_put64(ktx + 96, uni_size);
-    /* minimal DFD (44 bytes), colourModel 166 = UASTC (transcode source) */
+    xbc7_put32(ktx + 52, dfd_len);
+    for (l = 0; l < nlevels; ++l) {
+        uint8_t *e = ktx + 80u + (size_t)l * 24u;
+        uni_put64(e + 0, loff[l]);
+        uni_put64(e + 8, clen[l]);           /* byteLength (compressed) */
+        uni_put64(e + 16, uni_sizes[l]);     /* uncompressedByteLength */
+    }
     xbc7_put32(ktx + dfd_off, 44u);
     xbc7_put32(ktx + dfd_off + 8, 2u | (40u << 16));
     ktx[dfd_off + 12] = 166u; ktx[dfd_off + 13] = 1u; ktx[dfd_off + 14] = 1u;
     ktx[dfd_off + 16] = 3u; ktx[dfd_off + 17] = 3u; ktx[dfd_off + 20] = 16u;
     ktx[dfd_off + 30] = 127u; xbc7_put32(ktx + dfd_off + 40, 0xffffffffu);
-    memcpy(ktx + data_off, comp, zc);
+    for (l = 0; l < nlevels; ++l) memcpy(ktx + loff[l], comp[l], clen[l]);
     r = write_file(path, ktx, total);
     if (r == TC_SUCCESS)
-        printf("wrote %s (uni KTX2, Zstd-supercompressed: %zu -> %zu bytes)\n",
-               path, uni_size, zc);
-    free(comp); free(ktx);
+        printf("wrote %s (uni KTX2, %d mip levels, Zstd-supercompressed, %zu bytes)\n",
+               path, nlevels, total);
+done:
+    for (l = 0; l < nlevels; ++l) free(comp[l]);
+    free(ktx);
     return r;
 }
 
-/* Read a uni KTX2 back into the raw uni block stream (Zstd-decompressed). */
-static uint8_t *read_uni_ktx2(const char *path, size_t *out_size, uint32_t *w,
-                              uint32_t *h) {
+/* Read all uni levels back from a KTX2 (Zstd-decompressed). Returns level count
+ * or -1; fills uni[]/uni_sizes[]/lw[]/lh[] (each level malloc'd). */
+static int read_uni_ktx2(const char *path, uint8_t *uni[], size_t uni_sizes[],
+                         uint32_t lw[], uint32_t lh[], int cap) {
     size_t fsz;
-    uint8_t *buf = read_whole_file(path, &fsz), *uni;
-    uint64_t off, clen, ulen;
-    size_t dec;
-    if (!buf) return NULL;
-    if (fsz < 104u || xbc7_get32(buf + 12) != 0u || xbc7_get32(buf + 44) != 2u ||
-        xbc7_get32(buf + 40) < 1u) { free(buf); return NULL; }
-    *w = xbc7_get32(buf + 20); *h = xbc7_get32(buf + 24);
-    off = uni_get64(buf + 80); clen = uni_get64(buf + 88); ulen = uni_get64(buf + 96);
-    if (off + clen > fsz || ulen == 0) { free(buf); return NULL; }
-    uni = (uint8_t *)malloc((size_t)ulen);
-    if (!uni) { free(buf); return NULL; }
-    dec = tinyexr_zstd_decompress(uni, (size_t)ulen, buf + off, (size_t)clen);
+    uint8_t *buf = read_whole_file(path, &fsz);
+    uint32_t pw, ph;
+    int nlevels, l;
+    if (!buf) return -1;
+    if (fsz < 80u || xbc7_get32(buf + 12) != 0u || xbc7_get32(buf + 44) != 2u) {
+        free(buf); return -1;
+    }
+    nlevels = (int)xbc7_get32(buf + 40);
+    if (nlevels < 1 || nlevels > cap || fsz < 80u + (size_t)nlevels * 24u) { free(buf); return -1; }
+    pw = xbc7_get32(buf + 20); ph = xbc7_get32(buf + 24);
+    for (l = 0; l < nlevels; ++l) {
+        const uint8_t *e = buf + 80u + (size_t)l * 24u;
+        uint64_t off = uni_get64(e), clen = uni_get64(e + 8), ulen = uni_get64(e + 16);
+        size_t dec;
+        lw[l] = pw >> l ? pw >> l : 1u;
+        lh[l] = ph >> l ? ph >> l : 1u;
+        if (off + clen > fsz || ulen == 0 || !(uni[l] = (uint8_t *)malloc((size_t)ulen))) {
+            while (--l >= 0) free(uni[l]);
+            free(buf);
+            return -1;
+        }
+        dec = tinyexr_zstd_decompress(uni[l], (size_t)ulen, buf + off, (size_t)clen);
+        if (tinyexr_zstd_is_error(dec) || dec != ulen) {
+            free(uni[l]);
+            while (--l >= 0) free(uni[l]);
+            free(buf);
+            return -1;
+        }
+        uni_sizes[l] = (size_t)ulen;
+    }
     free(buf);
-    if (tinyexr_zstd_is_error(dec) || dec != ulen) { free(uni); return NULL; }
-    *out_size = (size_t)ulen;
-    return uni;
+    return nlevels;
 }
 
-/* Transcode a uni block stream to the --format target and write raw blocks. */
-static tc_result transcode_uni(const uint8_t *ubuf, uint32_t uw, uint32_t uh,
-                               const char *format, const char *out) {
+/* Transcode one uni level; returns malloc'd target blocks via *out (+ *osz). */
+static tc_result transcode_uni_level(const uint8_t *ubuf, uint32_t uw, uint32_t uh,
+                                     const char *format, uint8_t **out, size_t *osz) {
     uint8_t *ob = NULL;
-    size_t osz = 0;
+    size_t sz = 0;
     tc_result tr;
-    if (!strcmp(format, "bc7")) { osz = tc_bc7_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc7(ubuf, uw, uh, ob, osz); }
-    else if (!strcmp(format, "bc1") || !strcmp(format, "dxt1")) { osz = tc_bc1_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_bc1(ubuf, uw, uh, ob, osz); }
-    else if (!strcmp(format, "astc")) { tc_astc_options ao; tc_astc_options_init(&ao); ao.block_x = 4; ao.block_y = 4; ao.uastc = 1; osz = tc_astc_compressed_size(uw, uh, &ao); ob = malloc(osz); tr = tc_uni_transcode_astc(ubuf, uw, uh, ob, osz); }
-    else if (!strcmp(format, "etc2") || !strcmp(format, "etc2_rgba")) { osz = tc_etc2_rgba_compressed_size(uw, uh); ob = malloc(osz); tr = tc_uni_transcode_etc2(ubuf, uw, uh, 1, ob, osz); }
+    if (!strcmp(format, "bc7")) { sz = tc_bc7_compressed_size(uw, uh); ob = malloc(sz); tr = tc_uni_transcode_bc7(ubuf, uw, uh, ob, sz); }
+    else if (!strcmp(format, "bc1") || !strcmp(format, "dxt1")) { sz = tc_bc1_compressed_size(uw, uh); ob = malloc(sz); tr = tc_uni_transcode_bc1(ubuf, uw, uh, ob, sz); }
+    else if (!strcmp(format, "astc")) { tc_astc_options ao; tc_astc_options_init(&ao); ao.block_x = 4; ao.block_y = 4; ao.uastc = 1; sz = tc_astc_compressed_size(uw, uh, &ao); ob = malloc(sz); tr = tc_uni_transcode_astc(ubuf, uw, uh, ob, sz); }
+    else if (!strcmp(format, "etc2") || !strcmp(format, "etc2_rgba")) { sz = tc_etc2_rgba_compressed_size(uw, uh); ob = malloc(sz); tr = tc_uni_transcode_etc2(ubuf, uw, uh, 1, ob, sz); }
     else { fprintf(stderr, "texcomp: --format for uni transcode must be bc7|bc1|astc|etc2\n"); return TC_ERROR_INVALID_ARGUMENT; }
-    if (tr == TC_SUCCESS && ob) tr = write_file(out, ob, osz);
-    if (tr == TC_SUCCESS) printf("transcoded -> %s (%s, %ux%u, %zu bytes)\n", out, format, uw, uh, osz);
-    free(ob);
-    return tr;
+    if (tr != TC_SUCCESS) { free(ob); return tr; }
+    *out = ob; *osz = sz;
+    return TC_SUCCESS;
 }
 
 static void usage(void) {
@@ -548,8 +613,9 @@ static void usage(void) {
             "  --channel-weights: per-channel error weights for BC7 (pure-C) and\n"
             "        ASTC (astcenc/--encoder arm); e.g. 2,2,1,1 favours R,G.\n"
             "  uni: universal transcodable intermediate. `--format uni -o x.uni`\n"
-            "        (raw) or `-o x.ktx2` (KTX2, Zstd-supercompressed). Transcode\n"
-            "        with `-i x.{uni,ktx2} -o out.bin --format bc7|bc1|astc|etc2`.\n"
+            "        (raw, level 0) or `-o x.ktx2` (KTX2, full mip chain, Zstd-\n"
+            "        supercompressed). Transcode all levels with\n"
+            "        `-i x.{uni,ktx2} -o out.bin --format bc7|bc1|astc|etc2`.\n"
             "  xbc7: supercompressed BC7 (windowed RDO + zstd); --rdo N sets the\n"
             "        max per-channel RMS reuse budget. Transcode back with\n"
             "        `-i in.xbc7 -o out.dds` (standard BC7, any device reads it).\n");
@@ -688,30 +754,44 @@ int main(int argc, char **argv) {
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
-    /* Transcode mode: a uni intermediate (.uni raw, or .ktx2 Zstd-supercompressed)
-     * -> the --format target. BC7/BC1 are cheap repacks; astc/etc2 re-encode. */
+    /* Transcode mode: a uni intermediate (.uni raw single level, or .ktx2
+     * Zstd-supercompressed with a mip chain) -> the --format target. Every level
+     * is transcoded and the block streams are concatenated (largest mip first).
+     * BC7/BC1 are cheap repacks; astc/etc2 re-encode. */
     if (ends_with(in, ".uni") || ends_with(in, ".ktx2")) {
-        uint8_t *ubuf = NULL;
-        uint32_t uw = 0, uh = 0;
-        size_t usz = 0;
+        uint8_t *ulev[UNI_MAX_LEVELS] = {0}, *blocks[UNI_MAX_LEVELS] = {0}, *cat = NULL, *p;
+        size_t usz[UNI_MAX_LEVELS], bsz[UNI_MAX_LEVELS], total = 0;
+        uint32_t lw[UNI_MAX_LEVELS], lh[UNI_MAX_LEVELS];
+        int nl = 0, l;
         if (ends_with(in, ".ktx2")) {
-            ubuf = read_uni_ktx2(in, &usz, &uw, &uh);
-            if (!ubuf) { fprintf(stderr, "texcomp: %s is not a uni KTX2\n", in); return 1; }
+            nl = read_uni_ktx2(in, ulev, usz, lw, lh, UNI_MAX_LEVELS);
+            if (nl < 1) { fprintf(stderr, "texcomp: %s is not a uni KTX2\n", in); return 1; }
         } else {
             size_t fsz;
             uint8_t *raw = read_whole_file(in, &fsz);
             if (!raw || fsz < 12u || memcmp(raw, "TUNI", 4) != 0) { free(raw); fprintf(stderr, "texcomp: not a .uni file\n"); return 1; }
-            uw = xbc7_get32(raw + 4); uh = xbc7_get32(raw + 8);
-            usz = fsz - 12u;
-            ubuf = (uint8_t *)malloc(usz);
-            if (ubuf) memcpy(ubuf, raw + 12u, usz);
+            lw[0] = xbc7_get32(raw + 4); lh[0] = xbc7_get32(raw + 8); usz[0] = fsz - 12u;
+            ulev[0] = (uint8_t *)malloc(usz[0]);
+            if (ulev[0]) memcpy(ulev[0], raw + 12u, usz[0]);
             free(raw);
-            if (!ubuf) return 1;
+            if (!ulev[0]) return 1;
+            nl = 1;
         }
-        (void)usz;
-        tr = transcode_uni(ubuf, uw, uh, format, out);
-        if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: uni transcode failed\n");
-        free(ubuf);
+        tr = TC_SUCCESS;
+        for (l = 0; l < nl; ++l) {
+            tr = transcode_uni_level(ulev[l], lw[l], lh[l], format, &blocks[l], &bsz[l]);
+            if (tr != TC_SUCCESS) break;
+            total += bsz[l];
+        }
+        if (tr == TC_SUCCESS) {
+            cat = (uint8_t *)malloc(total ? total : 1u);
+            if (cat) { p = cat; for (l = 0; l < nl; ++l) { memcpy(p, blocks[l], bsz[l]); p += bsz[l]; } tr = write_file(out, cat, total); }
+            else tr = TC_ERROR_OUT_OF_MEMORY;
+        }
+        if (tr == TC_SUCCESS) printf("transcoded %s -> %s (%s, %d level%s, %zu bytes)\n", in, out, format, nl, nl == 1 ? "" : "s", total);
+        else fprintf(stderr, "texcomp: uni transcode failed\n");
+        for (l = 0; l < nl; ++l) { free(blocks[l]); free(ulev[l]); }
+        free(cat);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
@@ -767,26 +847,37 @@ int main(int argc, char **argv) {
     /* uni: universal transcodable intermediate. Write a tiny container
      * ("TUNI" + w,h + blocks); transcode at load with tc_uni_transcode_*. */
     if (strcmp(format, "uni") == 0) {
-        size_t usz = tc_uni_compressed_size(w, h);
-        uint8_t *u = (uint8_t *)malloc(usz);
-        if (!u) { fprintf(stderr, "oom\n"); free(rgba); free(rgbf); return 1; }
-        tr = tc_uni_compress_rgba8(rgba, w, h, (size_t)w * 4u, u, usz);
-        if (tr == TC_SUCCESS && ends_with(out, ".ktx2")) {
-            /* Zstd-supercompressed KTX2 (KTX2 supercompressionScheme = 2). */
-            tr = write_uni_ktx2(out, u, usz, w, h);
-        } else if (tr == TC_SUCCESS) {
-            /* raw TUNI container: "TUNI" + w,h + blocks */
-            uint8_t *f = (uint8_t *)malloc(12u + usz);
-            if (!f) { free(u); free(rgba); free(rgbf); return 1; }
-            memcpy(f, "TUNI", 4);
-            xbc7_put32(f + 4, w); xbc7_put32(f + 8, h);
-            memcpy(f + 12, u, usz);
-            tr = write_file(out, f, 12u + usz);
-            if (tr == TC_SUCCESS) printf("wrote %s (universal intermediate, %ux%u, %zu bytes)\n", out, w, h, usz);
-            free(f);
+        if (ends_with(out, ".ktx2")) {
+            /* Zstd-supercompressed KTX2 with a full mip chain. */
+            uint8_t *rlev[UNI_MAX_LEVELS] = {0}, *ulev[UNI_MAX_LEVELS] = {0};
+            uint32_t lw[UNI_MAX_LEVELS], lh[UNI_MAX_LEVELS];
+            size_t usz[UNI_MAX_LEVELS];
+            int nl = build_mips(rgba, w, h, rlev, lw, lh, UNI_MAX_LEVELS), l;
+            tr = nl >= 1 ? TC_SUCCESS : TC_ERROR_OUT_OF_MEMORY;
+            for (l = 0; l < nl && tr == TC_SUCCESS; ++l) {
+                usz[l] = tc_uni_compressed_size(lw[l], lh[l]);
+                ulev[l] = (uint8_t *)malloc(usz[l]);
+                if (!ulev[l]) { tr = TC_ERROR_OUT_OF_MEMORY; break; }
+                tr = tc_uni_compress_rgba8(rlev[l], lw[l], lh[l], (size_t)lw[l] * 4u, ulev[l], usz[l]);
+            }
+            if (tr == TC_SUCCESS) tr = write_uni_ktx2(out, ulev, usz, lw, lh, nl);
+            for (l = 0; l < nl; ++l) { free(rlev[l]); free(ulev[l]); }
+        } else {
+            /* raw TUNI container: "TUNI" + w,h + level-0 blocks */
+            size_t usz = tc_uni_compressed_size(w, h);
+            uint8_t *u = (uint8_t *)malloc(usz), *f;
+            tr = u ? tc_uni_compress_rgba8(rgba, w, h, (size_t)w * 4u, u, usz) : TC_ERROR_OUT_OF_MEMORY;
+            if (tr == TC_SUCCESS && (f = (uint8_t *)malloc(12u + usz)) != NULL) {
+                memcpy(f, "TUNI", 4); xbc7_put32(f + 4, w); xbc7_put32(f + 8, h);
+                memcpy(f + 12, u, usz);
+                tr = write_file(out, f, 12u + usz);
+                if (tr == TC_SUCCESS) printf("wrote %s (universal intermediate, %ux%u, %zu bytes)\n", out, w, h, usz);
+                free(f);
+            } else if (tr == TC_SUCCESS) tr = TC_ERROR_OUT_OF_MEMORY;
+            free(u);
         }
         if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: uni encode failed\n");
-        free(u); free(rgba); free(rgbf);
+        free(rgba); free(rgbf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
