@@ -502,178 +502,10 @@ static uint8_t *read_whole_file(const char *path, size_t *out_size) {
 
 #define UNI_MAX_LEVELS 16
 
-static void uni_put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static uint16_t uni_get16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
-static const uint32_t *g_uni_cnt; /* for the frequency sort below */
-static int uni_cnt_cmp(const void *a, const void *b) {
-    uint32_t ca = g_uni_cnt[*(const uint32_t *)a], cb = g_uni_cnt[*(const uint32_t *)b];
-    return ca < cb ? 1 : (ca > cb ? -1 : 0);
-}
-static uint32_t uni_sse8(const uint8_t *a, const uint8_t *b) {
-    uint32_t s = 0;
-    int k;
-    for (k = 0; k < 8; ++k) { int d = (int)a[k] - (int)b[k]; s += (uint32_t)(d * d); }
-    return s;
-}
-/* Selectors are 16 4-bit weights packed in 8 bytes; compare per-texel. */
-static uint32_t uni_sse_sel(const uint8_t *a, const uint8_t *b) {
-    uint32_t s = 0;
-    int k;
-    for (k = 0; k < 16; ++k) {
-        int wa = (a[k >> 1] >> ((k & 1) * 4)) & 0xf;
-        int wb = (b[k >> 1] >> ((k & 1) * 4)) & 0xf;
-        int d = wa - wb;
-        s += (uint32_t)(d * d);
-    }
-    return s;
-}
-
-#define UNI_LLOYD_ITERS 8
-
-/* Nearest codebook entry to `pp` under the field metric, plus an optional
- * rate penalty lambda*rate[c] (bits) for rate-distortion assignment. */
-static uint32_t uni_assign(const uint8_t *pp, const uint8_t *cb, uint32_t cap,
-                           int is_sel, const float *rate, float lambda) {
-    uint32_t best = 0, c;
-    double bestc = 1e300;
-    for (c = 0; c < cap; ++c) {
-        double d = is_sel ? uni_sse_sel(pp, cb + (size_t)c * 8u)
-                          : uni_sse8(pp, cb + (size_t)c * 8u);
-        double cost = rate ? d + (double)lambda * rate[c] : d;
-        if (cost < bestc) { bestc = cost; best = c; if (d == 0.0 && !rate) break; }
-    }
-    return best;
-}
-
-/* Build an RD-optimized codebook of the 8-byte field at `off` of each uni block,
- * plus per-block indices. cap == 0 or distinct <= cap is lossless. Otherwise:
- * seed with the cap most-frequent patterns, refine with Lloyd (k-means) so the
- * entries minimize distortion, then a final rate-distortion assignment
- * (distortion + lambda*bits) that biases toward popular entries for a smaller
- * post-Zstd index stream. Returns the code count, or 0xffffffff on OOM. */
-static uint32_t uni_build_codebook(const uint8_t *uni, size_t nblocks, size_t off,
-                                   uint32_t cap, float lambda, uint8_t *cb,
-                                   uint32_t *idx) {
-    size_t hcap = 16, i;
-    uint64_t *hk, *upat;
-    int32_t *hv;
-    uint32_t *ucnt, *bidx, nu = 0, ncodes;
-    int is_sel = (off == 8u);
-    while (hcap < nblocks * 2u) hcap <<= 1;
-    hk = (uint64_t *)malloc(hcap * 8u);
-    hv = (int32_t *)malloc(hcap * 4u);
-    upat = (uint64_t *)malloc(nblocks * 8u);
-    ucnt = (uint32_t *)malloc(nblocks * 4u);
-    bidx = (uint32_t *)malloc(nblocks * 4u);
-    if (!hk || !hv || !upat || !ucnt || !bidx) { free(hk); free(hv); free(upat); free(ucnt); free(bidx); return 0xffffffffu; }
-    for (i = 0; i < hcap; ++i) hv[i] = -1;
-    for (i = 0; i < nblocks; ++i) {
-        uint64_t k;
-        size_t h;
-        memcpy(&k, uni + i * 16u + off, 8u);
-        h = (size_t)((k * 0x9E3779B97F4A7C15ULL) & (uint64_t)(hcap - 1u));
-        while (hv[h] != -1 && hk[h] != k) h = (h + 1u) & (hcap - 1u);
-        if (hv[h] == -1) { hk[h] = k; hv[h] = (int32_t)nu; upat[nu] = k; ucnt[nu] = 1u; ++nu; }
-        else ucnt[hv[h]]++;
-        bidx[i] = (uint32_t)hv[h];
-    }
-    if (cap == 0u || nu <= cap) {
-        for (i = 0; i < nu; ++i) memcpy(cb + i * 8u, &upat[i], 8u);
-        for (i = 0; i < nblocks; ++i) idx[i] = bidx[i];
-        ncodes = nu;
-    } else {
-        uint32_t *order = (uint32_t *)malloc(nu * 4u), c;
-        int vlen = is_sel ? 16 : 8, iter, k;
-        uint32_t *csum = (uint32_t *)malloc((size_t)cap * vlen * 4u);
-        uint32_t *ccnt = (uint32_t *)malloc((size_t)cap * 4u);
-        float *rate = (float *)malloc((size_t)cap * sizeof(float));
-        if (!order || !csum || !ccnt || !rate) { free(order); free(csum); free(ccnt); free(rate); free(hk); free(hv); free(upat); free(ucnt); free(bidx); return 0xffffffffu; }
-        for (c = 0; c < nu; ++c) order[c] = c;
-        g_uni_cnt = ucnt;
-        qsort(order, nu, sizeof(uint32_t), uni_cnt_cmp);
-        for (c = 0; c < cap; ++c) memcpy(cb + (size_t)c * 8u, &upat[order[c]], 8u);
-        ncodes = cap;
-        /* Lloyd refinement: assign to nearest, recompute centroids as the mean
-         * of assigned blocks (per texel for selectors, per byte for endpoints). */
-        for (iter = 0; iter < UNI_LLOYD_ITERS; ++iter) {
-            memset(csum, 0, (size_t)cap * vlen * 4u);
-            memset(ccnt, 0, (size_t)cap * 4u);
-            for (i = 0; i < nblocks; ++i) {
-                const uint8_t *pp = uni + i * 16u + off;
-                uint32_t b = uni_assign(pp, cb, cap, is_sel, NULL, 0.0f);
-                idx[i] = b;
-                ccnt[b]++;
-                if (is_sel) { for (k = 0; k < 16; ++k) csum[b * 16 + k] += (pp[k >> 1] >> ((k & 1) * 4)) & 0xf; }
-                else { for (k = 0; k < 8; ++k) csum[b * 8 + k] += pp[k]; }
-            }
-            for (c = 0; c < cap; ++c) {
-                if (!ccnt[c]) continue;
-                if (is_sel) {
-                    uint8_t nw[8] = {0};
-                    for (k = 0; k < 16; ++k) { uint32_t w = (csum[c * 16 + k] + ccnt[c] / 2) / ccnt[c]; if (w > 15u) w = 15u; nw[k >> 1] |= (uint8_t)(w << ((k & 1) * 4)); }
-                    memcpy(cb + (size_t)c * 8u, nw, 8u);
-                } else {
-                    for (k = 0; k < 8; ++k) { uint32_t v = (csum[c * 8 + k] + ccnt[c] / 2) / ccnt[c]; cb[(size_t)c * 8u + k] = (uint8_t)(v > 255u ? 255u : v); }
-                }
-            }
-        }
-        /* rate-distortion final assignment: bits(c) ~= -log2(freq(c)). */
-        for (c = 0; c < cap; ++c) {
-            double p = ((double)ccnt[c] + 1.0) / ((double)nblocks + (double)cap);
-            rate[c] = (float)(-log(p) / log(2.0));
-        }
-        for (i = 0; i < nblocks; ++i)
-            idx[i] = uni_assign(uni + i * 16u + off, cb, cap, is_sel,
-                                lambda > 0.0f ? rate : NULL, lambda);
-        free(order); free(csum); free(ccnt); free(rate);
-    }
-    free(hk); free(hv); free(upat); free(ucnt); free(bidx);
-    return ncodes;
-}
-
-/* Basis-style codebook pre-transform of a uni level: split into deduplicated
- * endpoint + selector codebooks with per-block indices. This is the size lever
- * behind BasisLZ (shared endpoint/selector codebooks), entropy-coded afterwards
- * by the outer Zstd. NOTE: this is NOT the wire-format BasisLZ scheme (that is
- * the Basis ETC1S codec); the KTX2 supercompressionScheme stays 2 (Zstd). */
-static tc_result encode_uni_basis(const uint8_t *uni, size_t uni_size,
-                                  uint32_t cap, float lambda, uint8_t **out,
-                                  size_t *out_size) {
-    size_t nblocks = uni_size / 16u, i;
-    uint8_t *epcb = (uint8_t *)malloc(nblocks * 8u), *selcb = (uint8_t *)malloc(nblocks * 8u), *o, *p;
-    uint32_t *epidx = (uint32_t *)malloc(nblocks * 4u), *selidx = (uint32_t *)malloc(nblocks * 4u);
-    uint32_t nep, nsel;
-    int epb, selb;
-    size_t sz;
-    tc_result r = TC_ERROR_OUT_OF_MEMORY;
-    if (!epcb || !selcb || !epidx || !selidx) goto done;
-    nep = uni_build_codebook(uni, nblocks, 0u, cap, lambda, epcb, epidx);
-    nsel = uni_build_codebook(uni, nblocks, 8u, cap, lambda, selcb, selidx);
-    if (nep == 0xffffffffu || nsel == 0xffffffffu) goto done;
-    epb = nep <= 256u ? 1 : 2;
-    selb = nsel <= 256u ? 1 : 2;
-    sz = 18u + (size_t)nep * 8u + (size_t)nsel * 8u + nblocks * (size_t)epb + nblocks * (size_t)selb;
-    o = (uint8_t *)malloc(sz);
-    if (!o) goto done;
-    p = o;
-    memcpy(p, "UBAS", 4); p += 4;
-    xbc7_put32(p, (uint32_t)nblocks); p += 4;
-    xbc7_put32(p, nep); p += 4;
-    xbc7_put32(p, nsel); p += 4;
-    *p++ = (uint8_t)epb; *p++ = (uint8_t)selb;
-    memcpy(p, epcb, (size_t)nep * 8u); p += (size_t)nep * 8u;
-    memcpy(p, selcb, (size_t)nsel * 8u); p += (size_t)nsel * 8u;
-    for (i = 0; i < nblocks; ++i) { if (epb == 1) *p++ = (uint8_t)epidx[i]; else { uni_put16(p, (uint16_t)epidx[i]); p += 2; } }
-    for (i = 0; i < nblocks; ++i) { if (selb == 1) *p++ = (uint8_t)selidx[i]; else { uni_put16(p, (uint16_t)selidx[i]); p += 2; } }
-    *out = o; *out_size = sz;
-    r = TC_SUCCESS;
-done:
-    free(epcb); free(selcb); free(epidx); free(selidx);
-    return r;
-}
-
-/* Reverse encode_uni_basis: reconstruct the raw uni block stream. */
+/* Reverse encode_uni_basis: reconstruct the raw uni block stream (kept for
+ * old UBAS-wrapped files that may still exist on disk). */
 static tc_result decode_uni_basis(const uint8_t *buf, size_t size,
                                   uint8_t **out_uni, size_t *out_size) {
     size_t nblocks, i;
@@ -752,14 +584,10 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
     int l;
     tc_result r = TC_SUCCESS;
     (void)lh;
+    (void)basis; (void)rdo; /* Basis codebook layer removed (incompatible with UASTC block layout). */
     for (l = 0; l < nlevels; ++l) {
         const uint8_t *src = uni[l];
         size_t src_size = uni_sizes[l], bound;
-        if (basis) {
-            /* `basis` carries the codebook cap (0 = plain zstd path, not here). */
-            if ((r = encode_uni_basis(uni[l], uni_sizes[l], (uint32_t)basis, rdo, &bbuf[l], &src_size)) != TC_SUCCESS) goto done;
-            src = bbuf[l];
-        }
         ulen[l] = src_size; /* KTX2 uncompressedByteLength = post-zstd-decode size */
         bound = tinyexr_zstd_compress_bound(src_size);
         comp[l] = (uint8_t *)malloc(bound);
@@ -798,8 +626,7 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
     for (l = 0; l < nlevels; ++l) memcpy(ktx + loff[l], comp[l], clen[l]);
     r = write_file(path, ktx, total);
     if (r == TC_SUCCESS)
-        printf("wrote %s (uni KTX2, %d mip levels, %s, %zu bytes)\n", path, nlevels,
-               basis ? "Basis-style codebook + Zstd" : "Zstd-supercompressed", total);
+        printf("wrote %s (uni UASTC KTX2, %d mip levels, Zstd, %zu bytes)\n", path, nlevels, total);
 done:
     for (l = 0; l < nlevels; ++l) { free(comp[l]); free(bbuf[l]); }
     free(ktx);
@@ -884,12 +711,12 @@ static void usage(void) {
             "        color axis, keep-best (off by default; ~+0.09 dB, ~1.7x slower).\n"
             "  --hdr-alpha: for --format astc_hdr on an EXR, encode the alpha\n"
             "        channel too (ASTC HDR CEM 15); default is RGB-only.\n"
-            "  uni: universal transcodable intermediate. `--format uni -o x.uni`\n"
-            "        (raw, level 0) or `-o x.ktx2` (KTX2, full mip chain, Zstd-\n"
-            "        supercompressed; add --basis[/--basis-cap N] for a BasisLZ-\n"
-            "        style bounded endpoint/selector codebook before Zstd -- a lossy\n"
-            "        rate knob, smaller N = smaller+lossier). Transcode all levels\n"
+            "  uni: universal transcodable intermediate (UASTC block format).\n"
+            "        `--format uni -o x.uni` (raw, level 0) or `-o x.ktx2` (KTX2,\n"
+            "        full mip chain, Zstd-supercompressed). Transcode all levels\n"
             "        with `-i x.{uni,ktx2} -o out.bin --format bc7|bc1|astc|etc2`.\n"
+            "        ASTC 4x4 is a byte-copy (the stored blocks are valid ASTC);\n"
+            "        bc7/bc1/etc2 go through decode+re-encode.\n"
             "  xbc7: supercompressed BC7 (windowed RDO + zstd); --rdo N sets the\n"
             "        max per-channel RMS reuse budget. Transcode back with\n"
             "        `-i in.xbc7 -o out.dds` (standard BC7, any device reads it).\n");
@@ -1036,10 +863,11 @@ int main(int argc, char **argv) {
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
-    /* Transcode mode: a uni intermediate (.uni raw single level, or .ktx2
-     * Zstd-supercompressed with a mip chain) -> the --format target. Every level
-     * is transcoded and the block streams are concatenated (largest mip first).
-     * BC7/BC1 are cheap repacks; astc/etc2 re-encode. */
+    /* Transcode mode: a uni intermediate (UASTC blocks in .uni raw single
+     * level, or .ktx2 Zstd-supercompressed with a mip chain) -> the --format
+     * target. Every level is transcoded and the block streams are concatenated
+     * (largest mip first).  ASTC 4x4 is a byte copy; bc7/bc1/etc2 decode the
+     * UASTC block and re-encode to the target format. */
     if (ends_with(in, ".uni") || ends_with(in, ".ktx2")) {
         uint8_t *ulev[UNI_MAX_LEVELS] = {0}, *blocks[UNI_MAX_LEVELS] = {0}, *cat = NULL, *p;
         size_t usz[UNI_MAX_LEVELS], bsz[UNI_MAX_LEVELS], total = 0;
@@ -1051,7 +879,7 @@ int main(int argc, char **argv) {
         } else {
             size_t fsz;
             uint8_t *raw = read_whole_file(in, &fsz);
-            if (!raw || fsz < 12u || memcmp(raw, "TUNI", 4) != 0) { free(raw); fprintf(stderr, "texcomp: not a .uni file\n"); return 1; }
+            if (!raw || fsz < 12u || memcmp(raw, "TUN2", 4) != 0) { free(raw); fprintf(stderr, "texcomp: not a .uni file (expected TUN2 magic)\n"); return 1; }
             lw[0] = xbc7_get32(raw + 4); lh[0] = xbc7_get32(raw + 8); usz[0] = fsz - 12u;
             ulev[0] = (uint8_t *)malloc(usz[0]);
             if (ulev[0]) memcpy(ulev[0], raw + 12u, usz[0]);
@@ -1070,7 +898,7 @@ int main(int argc, char **argv) {
             if (cat) { p = cat; for (l = 0; l < nl; ++l) { memcpy(p, blocks[l], bsz[l]); p += bsz[l]; } tr = write_file(out, cat, total); }
             else tr = TC_ERROR_OUT_OF_MEMORY;
         }
-        if (tr == TC_SUCCESS) printf("transcoded %s -> %s (%s, %d level%s, %zu bytes)\n", in, out, format, nl, nl == 1 ? "" : "s", total);
+        if (tr == TC_SUCCESS) printf("transcoded UASTC %s -> %s (%s, %d level%s, %zu bytes)\n", in, out, format, nl, nl == 1 ? "" : "s", total);
         else fprintf(stderr, "texcomp: uni transcode failed\n");
         for (l = 0; l < nl; ++l) { free(blocks[l]); free(ulev[l]); }
         free(cat);
@@ -1128,8 +956,9 @@ int main(int argc, char **argv) {
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
-    /* uni: universal transcodable intermediate. Write a tiny container
-     * ("TUNI" + w,h + blocks); transcode at load with tc_uni_transcode_*. */
+    /* uni: universal transcodable intermediate (UASTC blocks). Write a tiny
+     * container ("TUN2" + w,h + blocks); transcode at load with
+     * tc_uni_transcode_*. */
     if (strcmp(format, "uni") == 0) {
         if (ends_with(out, ".ktx2")) {
             /* Zstd-supercompressed KTX2 with a full mip chain. */
@@ -1147,12 +976,12 @@ int main(int argc, char **argv) {
             if (tr == TC_SUCCESS) tr = write_uni_ktx2(out, ulev, usz, lw, lh, nl, uni_basis, uni_rdo);
             for (l = 0; l < nl; ++l) { free(rlev[l]); free(ulev[l]); }
         } else {
-            /* raw TUNI container: "TUNI" + w,h + level-0 blocks */
+            /* raw TUN2 container: "TUN2" + w,h + UASTC level-0 blocks */
             size_t usz = tc_uni_compressed_size(w, h);
             uint8_t *u = (uint8_t *)malloc(usz), *f;
             tr = u ? tc_uni_compress_rgba8(rgba, w, h, (size_t)w * 4u, u, usz) : TC_ERROR_OUT_OF_MEMORY;
             if (tr == TC_SUCCESS && (f = (uint8_t *)malloc(12u + usz)) != NULL) {
-                memcpy(f, "TUNI", 4); xbc7_put32(f + 4, w); xbc7_put32(f + 8, h);
+                memcpy(f, "TUN2", 4); xbc7_put32(f + 4, w); xbc7_put32(f + 8, h);
                 memcpy(f + 12, u, usz);
                 tr = write_file(out, f, 12u + usz);
                 if (tr == TC_SUCCESS) printf("wrote %s (universal intermediate, %ux%u, %zu bytes)\n", out, w, h, usz);

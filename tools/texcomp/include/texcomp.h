@@ -136,8 +136,9 @@ void tc_astc_options_init(tc_astc_options *opt);
 void tc_astc_hdr_options_init(tc_astc_hdr_options *opt);
 
 size_t tc_bc7_compressed_size(uint32_t width, uint32_t height);
-/* "uni": compact universal transcodable intermediate (16 bytes/block). Encode
- * once, then transcode cheaply (no re-encode) to a GPU block format. */
+/* "uni": universal intermediate using UASTC blocks (16 bytes/block). Encode
+ * once, then transcode: ASTC 4x4 is a byte-copy (the stored blocks ARE valid
+ * ASTC); bc7, bc1, etc2 go through decode+re-encode. */
 size_t tc_uni_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc1_compressed_size(uint32_t width, uint32_t height);
 size_t tc_bc3_compressed_size(uint32_t width, uint32_t height);
@@ -172,16 +173,16 @@ tc_result tc_uni_compress_rgba8(const uint8_t *rgba, uint32_t width,
 tc_result tc_uni_decompress_rgba8(const uint8_t *uni, uint32_t width,
                                   uint32_t height, size_t stride, uint8_t *out,
                                   size_t out_size);
-/* Cheap transcodes to final GPU formats (no decode+re-encode search). Output
- * sizes are the usual tc_bc7/bc1 sizes. */
+/* Transcodes to final GPU formats. ASTC 4x4 is a byte-copy (the stored blocks
+ * ARE valid ASTC blocks). BC7, BC1, and ETC2 decode the UASTC block and
+ * re-encode to the target format. Output sizes are the usual sizes. */
 tc_result tc_uni_transcode_bc7(const uint8_t *uni, uint32_t width,
                                uint32_t height, uint8_t *out, size_t out_size);
 tc_result tc_uni_transcode_bc1(const uint8_t *uni, uint32_t width,
                                uint32_t height, uint8_t *out, size_t out_size);
-/* Mobile targets. ASTC/ETC don't share uni's endpoint-line, so these are
- * re-encode transcoders (decode + encode) rather than cheap bit-repacks;
- * output is conformant. ASTC is 4x4 single-subset (UASTC LDR); out sizes are the
- * usual tc_astc/etc2 sizes. */
+/* Mobile targets. ASTC is a byte-copy (the stored blocks are valid ASTC 4x4).
+ * ETC2 decodes the UASTC block and re-encodes to the target format. Out sizes
+ * are the usual tc_astc/etc2 sizes. */
 tc_result tc_uni_transcode_astc(const uint8_t *uni, uint32_t width,
                                 uint32_t height, uint8_t *out, size_t out_size);
 tc_result tc_uni_transcode_etc2(const uint8_t *uni, uint32_t width,
