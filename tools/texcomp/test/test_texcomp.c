@@ -1557,7 +1557,8 @@ int main(void) {
     CHECK(tc_bc6h_compress_rgb32f(rgbf, 7, 5, 7 * 3 * sizeof(float), &bc6h_opt,
                                   bc6h, sizeof(bc6h)) == TC_SUCCESS,
           "bc6h signed compress");
-    CHECK(rd_bits(bc6h, 0, 5) == 3u, "bc6h signed mode11 bits");
+    CHECK(rd_bits(bc6h, 0, 5) == 3u || rd_bits(bc6h, 0, 5) == 30u ||
+              rd_bits(bc6h, 0, 5) == 0u, "bc6h signed mode bits (10/9/0)");
     CHECK(tc_dds_write_bc6h_memory(bc6h, 7, 5, &bc6h_opt, dds, sizeof(dds)) ==
               TC_SUCCESS,
           "bc6h signed dds write");

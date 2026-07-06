@@ -707,6 +707,33 @@ static uint32_t tc_bc6h_unquant_n_to_mag(uint32_t q, uint32_t bits) {
     return (unq * 31u) >> 6;
 }
 
+/* Signed N-bit quantizer: half → quantized signed N-bit value. */
+static int32_t tc_bc6h_quant_sf16_n(float f, uint32_t bits) {
+    uint16_t h;
+    uint32_t mag;
+    int32_t maxq = (int32_t)((1u << (bits - 1u)) - 1u);
+    int32_t q;
+    if (f == 0.0f) return 0;
+    h = tc_float_to_half_bits(f);
+    mag = h & 0x7fffu;
+    if (mag > 0x7bffu) mag = 0x7bffu;
+    q = (int32_t)((mag * (uint32_t)maxq + 15871u) / 31743u);
+    if (q > maxq) q = maxq;
+    return (h & 0x8000u) ? -q : q;
+}
+
+/* Signed N-bit unquantizer: quantized signed N-bit → signed magnitude. */
+static int32_t tc_bc6h_unquant_n_to_smag(int32_t q, uint32_t bits) {
+    int32_t maxq = (int32_t)((1u << (bits - 1u)) - 1u);
+    int32_t sign = 1, unq;
+    if (q < 0) { sign = -1; q = -q; }
+    if (q == 0) unq = 0;
+    else if (q >= maxq) unq = 0x7fff;
+    else unq = (int32_t)((((uint32_t)q << 15) + 0x4000u) >> (bits - 1u));
+    if (sign < 0) unq = -unq;
+    return (unq < 0) ? -(((-unq) * 31) >> 5) : (unq * 31) >> 5;
+}
+
 /* Per-texel 3-bit selectors + total error for one candidate partition/endpoints
  * (endpoints ep[region*2 + 0/1], 6-bit). */
 static uint64_t tc_bc6h_mode9_selectors(const uint32_t q[16][3],
@@ -762,6 +789,67 @@ static uint64_t tc_bc6h_mode0_selectors(const uint32_t target[16][3],
         uint32_t reg = part[i], best = 0, berr = UINT_MAX;
         for (s = 0; s < 8u; ++s) {
             uint32_t e = tc_bc6h_err3_mag(target[i], pal[reg][s][0], pal[reg][s][1], pal[reg][s][2]);
+            if (e < berr) { berr = e; best = s; }
+        }
+        sel[i] = (uint8_t)best;
+        err += berr;
+    }
+    return err;
+}
+
+/* Signed variant of mode0 selectors: uses int32_t targets/endpoints and
+ * tc_bc6h_err3_smag / tc_bc6h_unquant_sf16_to_smag for palette reconstruction. */
+static uint64_t tc_bc6h_mode0_selectors_sf16(const int32_t target[16][3],
+                                              const uint8_t part[16],
+                                              const int32_t ep[4][3],
+                                              uint8_t sel[16]) {
+    static const uint32_t w3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+    int32_t pal[2][8][3];
+    uint64_t err = 0;
+    uint32_t r, s, c, i;
+    for (r = 0; r < 2u; ++r)
+        for (s = 0; s < 8u; ++s)
+            for (c = 0; c < 3u; ++c) {
+                int32_t qv = ((int32_t)(64 - w3[s]) * ep[r * 2][c] +
+                              (int32_t)w3[s] * ep[r * 2 + 1][c] + 32) >> 6;
+                pal[r][s][c] = tc_bc6h_unquant_sf16_to_smag(qv);
+            }
+    for (i = 0; i < 16u; ++i) {
+        uint32_t reg = part[i], best = 0, berr = UINT_MAX;
+        for (s = 0; s < 8u; ++s) {
+            uint32_t e = tc_bc6h_err3_smag(target[i], pal[reg][s][0],
+                                           pal[reg][s][1], pal[reg][s][2]);
+            if (e < berr) { berr = e; best = s; }
+        }
+        sel[i] = (uint8_t)best;
+        err += berr;
+    }
+    return err;
+}
+
+/* Signed variant of mode9 selectors. */
+static uint64_t tc_bc6h_mode9_selectors_sf16(const int32_t q[16][3],
+                                              const int32_t target[16][3],
+                                              const uint8_t part[16],
+                                              const int32_t ep[4][3],
+                                              uint8_t sel[16]) {
+    static const uint32_t w3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+    int32_t pal[2][8][3];
+    uint64_t err = 0;
+    uint32_t r, s, c, i;
+    (void)q;
+    for (r = 0; r < 2u; ++r)
+        for (s = 0; s < 8u; ++s)
+            for (c = 0; c < 3u; ++c) {
+                int32_t qv = ((int32_t)(64 - w3[s]) * ep[r * 2][c] +
+                              (int32_t)w3[s] * ep[r * 2 + 1][c] + 32) >> 6;
+                pal[r][s][c] = tc_bc6h_unquant_n_to_smag(qv, 6);
+            }
+    for (i = 0; i < 16u; ++i) {
+        uint32_t reg = part[i], best = 0, berr = UINT_MAX;
+        for (s = 0; s < 8u; ++s) {
+            uint32_t e = tc_bc6h_err3_smag(target[i], pal[reg][s][0],
+                                           pal[reg][s][1], pal[reg][s][2]);
             if (e < berr) { berr = e; best = s; }
         }
         sel[i] = (uint8_t)best;
@@ -2102,6 +2190,376 @@ static uint64_t tc_bc6h_mode9_uf16(const float pix[16][3], uint8_t out[16]) {
     return best_err;
 }
 
+/* Signed variant of mode9 (two-region, 6-bit explicit endpoints). */
+static uint64_t tc_bc6h_mode9_sf16(const float pix[16][3], uint8_t out[16]) {
+    int32_t q[16][3], target[16][3], bep[4][3];
+    uint32_t i, c, p;
+    uint8_t bsel[16];
+    int best_p = -1;
+    uint64_t best_err = (uint64_t)-1;
+    uint32_t R[4], G[4], B[4], bitpos = 0, anchor, r;
+    for (i = 0; i < 16u; ++i)
+        for (c = 0; c < 3u; ++c) {
+            q[i][c] = tc_bc6h_quant_sf16_n(pix[i][c], 6);
+            target[i][c] = tc_bc6h_unquant_sf16_to_smag(tc_bc6h_quant_sf16(pix[i][c]));
+        }
+    {
+        enum { TOPK = 5u };
+        uint32_t cand[TOPK], k, ncand = 0;
+        uint64_t cscore[TOPK];
+        for (p = 0; p < 32u; ++p) {
+            int32_t rlo[2][3], rhi[2][3];
+            uint64_t score = 0;
+            int have[2] = {0, 0};
+            for (c = 0; c < 3u; ++c) {
+                rlo[0][c] = 63; rlo[1][c] = 63;
+                rhi[0][c] = -64; rhi[1][c] = -64;
+            }
+            for (i = 0; i < 16u; ++i) {
+                uint32_t reg = tc_bc6h_part2[p][i];
+                for (c = 0; c < 3u; ++c) {
+                    if (q[i][c] < rlo[reg][c]) rlo[reg][c] = q[i][c];
+                    if (q[i][c] > rhi[reg][c]) rhi[reg][c] = q[i][c];
+                }
+                have[reg] = 1;
+            }
+            if (!have[0] || !have[1]) continue;
+            for (c = 0; c < 3u; ++c) {
+                int64_t e0 = (int64_t)rhi[0][c] - (int64_t)rlo[0][c];
+                int64_t e1 = (int64_t)rhi[1][c] - (int64_t)rlo[1][c];
+                score += (uint64_t)(e0 * e0 + e1 * e1);
+            }
+            if (ncand < TOPK) {
+                cand[ncand] = p;
+                cscore[ncand] = score;
+                ++ncand;
+            } else {
+                uint32_t worst = 0;
+                for (k = 1; k < TOPK; ++k)
+                    if (cscore[k] > cscore[worst]) worst = k;
+                if (score < cscore[worst]) { cand[worst] = p; cscore[worst] = score; }
+            }
+        }
+        for (k = 0; k < ncand; ++k) {
+            int32_t ep[4][3], rlo[2][3], rhi[2][3];
+            uint8_t sel[16];
+            uint64_t err;
+            p = cand[k];
+            for (c = 0; c < 3u; ++c) {
+                rlo[0][c] = 63; rlo[1][c] = 63;
+                rhi[0][c] = -64; rhi[1][c] = -64;
+            }
+            for (i = 0; i < 16u; ++i) {
+                uint32_t reg = tc_bc6h_part2[p][i];
+                for (c = 0; c < 3u; ++c) {
+                    if (q[i][c] < rlo[reg][c]) rlo[reg][c] = q[i][c];
+                    if (q[i][c] > rhi[reg][c]) rhi[reg][c] = q[i][c];
+                }
+            }
+            for (c = 0; c < 3u; ++c) {
+                ep[0][c] = rlo[0][c];
+                ep[1][c] = rhi[0][c];
+                ep[2][c] = rlo[1][c];
+                ep[3][c] = rhi[1][c];
+            }
+            err = tc_bc6h_mode9_selectors_sf16(q, target, tc_bc6h_part2[p], ep, sel);
+            if (err < best_err) {
+                best_err = err;
+                best_p = (int)p;
+                memcpy(bep, ep, sizeof(ep));
+                memcpy(bsel, sel, 16u);
+            }
+        }
+    }
+    if (best_p < 0) return (uint64_t)-1;
+    {
+        static const uint32_t w3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+        int round, rr;
+        for (round = 0; round < 2; ++round) {
+            int32_t nep[4][3];
+            uint8_t nsel[16];
+            uint64_t e;
+            for (rr = 0; rr < 2; ++rr)
+                for (c = 0; c < 3u; ++c) {
+                    int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+                    for (i = 0; i < 16u; ++i) {
+                        int64_t bb, a, pp;
+                        if ((int)tc_bc6h_part2[best_p][i] != rr) continue;
+                        bb = w3[bsel[i]];
+                        a = 64 - bb;
+                        pp = q[i][c];
+                        saa += a * a;
+                        sab += a * bb;
+                        sbb += bb * bb;
+                        sap += a * pp;
+                        sbp += bb * pp;
+                    }
+                    det = saa * sbb - sab * sab;
+                    if (det <= 0) {
+                        nep[rr * 2][c] = bep[rr * 2][c];
+                        nep[rr * 2 + 1][c] = bep[rr * 2 + 1][c];
+                        continue;
+                    }
+                    l = tc_bc6h_rdiv((sap * sbb - sbp * sab) * 64, det);
+                    h = tc_bc6h_rdiv((sbp * saa - sap * sab) * 64, det);
+                    if (l < -32) l = -32;
+                    if (l > 31) l = 31;
+                    if (h < -32) h = -32;
+                    if (h > 31) h = 31;
+                    nep[rr * 2][c] = (int32_t)l;
+                    nep[rr * 2 + 1][c] = (int32_t)h;
+                }
+            e = tc_bc6h_mode9_selectors_sf16(q, target, tc_bc6h_part2[best_p], nep, nsel);
+            if (e < best_err) {
+                best_err = e;
+                memcpy(bep, nep, sizeof(nep));
+                memcpy(bsel, nsel, 16u);
+            } else {
+                break;
+            }
+        }
+    }
+    anchor = tc_bc6h_part2_anchor[best_p];
+    for (r = 0; r < 2; ++r) {
+        uint32_t at = (r == 0) ? 0u : anchor;
+        if (bsel[at] & 4u) {
+            for (c = 0; c < 3u; ++c) {
+                int32_t t = bep[r * 2][c];
+                bep[r * 2][c] = bep[r * 2 + 1][c];
+                bep[r * 2 + 1][c] = t;
+            }
+            for (i = 0; i < 16u; ++i)
+                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+        }
+    }
+    for (c = 0; c < 3u; ++c) {
+        uint32_t *E = (c == 0) ? R : (c == 1) ? G : B;
+        E[0] = (uint32_t)(bep[0][c] & 63u);
+        E[1] = (uint32_t)(bep[1][c] & 63u);
+        E[2] = (uint32_t)(bep[2][c] & 63u);
+        E[3] = (uint32_t)(bep[3][c] & 63u);
+    }
+    memset(out, 0, 16u);
+    tc_bc6h_w(out, &bitpos, 30u, 5);
+    tc_bc6h_w(out, &bitpos, R[0], 6);
+    tc_bc6h_w(out, &bitpos, (G[3] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, B[3] & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (B[3] >> 1) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (B[2] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, G[0], 6);
+    tc_bc6h_w(out, &bitpos, (G[2] >> 5) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (B[2] >> 5) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (B[3] >> 2) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (G[2] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, B[0], 6);
+    tc_bc6h_w(out, &bitpos, (G[3] >> 5) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (B[3] >> 3) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (B[3] >> 5) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (B[3] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, R[1], 6);
+    tc_bc6h_w(out, &bitpos, G[2] & 0xfu, 4);
+    tc_bc6h_w(out, &bitpos, G[1], 6);
+    tc_bc6h_w(out, &bitpos, G[3] & 0xfu, 4);
+    tc_bc6h_w(out, &bitpos, B[1], 6);
+    tc_bc6h_w(out, &bitpos, B[2] & 0xfu, 4);
+    tc_bc6h_w(out, &bitpos, R[2], 6);
+    tc_bc6h_w(out, &bitpos, R[3], 6);
+    tc_bc6h_w(out, &bitpos, (uint32_t)best_p, 5);
+    for (i = 0; i < 16u; ++i) {
+        uint32_t nb = (i == 0u || i == anchor) ? 2u : 3u;
+        tc_bc6h_w(out, &bitpos, bsel[i], nb);
+    }
+    return best_err;
+}
+
+/* Signed variant of mode0 (two-region, 10-bit primary + 5-bit signed deltas). */
+static uint64_t tc_bc6h_mode0_sf16(const float pix[16][3], uint8_t out[16]) {
+    int32_t q[16][3], target[16][3], bep[4][3];
+    uint32_t i, c, p, r;
+    uint8_t bsel[16];
+    int best_p = -1;
+    uint64_t best_err = (uint64_t)-1;
+    uint32_t bitpos = 0, anchor;
+    for (i = 0; i < 16u; ++i)
+        for (c = 0; c < 3u; ++c) {
+            q[i][c] = tc_bc6h_quant_sf16(pix[i][c]);
+            target[i][c] = tc_bc6h_unquant_sf16_to_smag(q[i][c]);
+        }
+    {
+        enum { TOPK = 5u };
+        uint32_t cand[TOPK], k, ncand = 0;
+        uint64_t cscore[TOPK];
+        for (p = 0; p < 32u; ++p) {
+            int32_t rlo[2][3], rhi[2][3];
+            uint64_t score = 0;
+            int have[2] = {0, 0};
+            for (c = 0; c < 3u; ++c) {
+                rlo[0][c] = 511; rlo[1][c] = 511;
+                rhi[0][c] = -512; rhi[1][c] = -512;
+            }
+            for (i = 0; i < 16u; ++i) {
+                uint32_t reg = tc_bc6h_part2[p][i];
+                for (c = 0; c < 3u; ++c) {
+                    if (q[i][c] < rlo[reg][c]) rlo[reg][c] = q[i][c];
+                    if (q[i][c] > rhi[reg][c]) rhi[reg][c] = q[i][c];
+                }
+                have[reg] = 1;
+            }
+            if (!have[0] || !have[1]) continue;
+            for (c = 0; c < 3u; ++c) {
+                int64_t e0 = (int64_t)rhi[0][c] - (int64_t)rlo[0][c];
+                int64_t e1 = (int64_t)rhi[1][c] - (int64_t)rlo[1][c];
+                score += (uint64_t)(e0 * e0 + e1 * e1);
+            }
+            if (ncand < TOPK) {
+                cand[ncand] = p;
+                cscore[ncand] = score;
+                ++ncand;
+            } else {
+                uint32_t worst = 0;
+                for (k = 1; k < TOPK; ++k)
+                    if (cscore[k] > cscore[worst]) worst = k;
+                if (score < cscore[worst]) { cand[worst] = p; cscore[worst] = score; }
+            }
+        }
+        for (k = 0; k < ncand; ++k) {
+            int32_t ep[4][3], rlo[2][3], rhi[2][3];
+            uint8_t sel[16];
+            uint64_t err;
+            int fit = 1;
+            p = cand[k];
+            for (c = 0; c < 3u; ++c) {
+                rlo[0][c] = 511; rlo[1][c] = 511;
+                rhi[0][c] = -512; rhi[1][c] = -512;
+            }
+            for (i = 0; i < 16u; ++i) {
+                uint32_t reg = tc_bc6h_part2[p][i];
+                for (c = 0; c < 3u; ++c) {
+                    if (q[i][c] < rlo[reg][c]) rlo[reg][c] = q[i][c];
+                    if (q[i][c] > rhi[reg][c]) rhi[reg][c] = q[i][c];
+                }
+            }
+            for (c = 0; c < 3u && fit; ++c) {
+                int32_t d1 = rhi[0][c] - rlo[0][c];
+                int32_t d2 = rlo[1][c] - rlo[0][c];
+                int32_t d3 = rhi[1][c] - rlo[0][c];
+                if (d1 < -16 || d1 > 15 || d2 < -16 || d2 > 15 || d3 < -16 || d3 > 15)
+                    fit = 0;
+            }
+            if (!fit) continue;
+            for (c = 0; c < 3u; ++c) {
+                ep[0][c] = rlo[0][c];
+                ep[1][c] = rhi[0][c];
+                ep[2][c] = rlo[1][c];
+                ep[3][c] = rhi[1][c];
+            }
+            err = tc_bc6h_mode0_selectors_sf16(target, tc_bc6h_part2[p], ep, sel);
+            if (err < best_err) {
+                best_err = err;
+                best_p = (int)p;
+                memcpy(bep, ep, sizeof(ep));
+                memcpy(bsel, sel, 16u);
+            }
+        }
+    }
+    if (best_p < 0) return (uint64_t)-1;
+    {
+        static const uint32_t w3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+        int round, rr;
+        for (round = 0; round < 2; ++round) {
+            int32_t nep[4][3];
+            uint8_t nsel[16];
+            uint64_t e;
+            int fit = 1;
+            for (rr = 0; rr < 2; ++rr)
+                for (c = 0; c < 3u; ++c) {
+                    int64_t saa = 0, sab = 0, sbb = 0, sap = 0, sbp = 0, det, l, h;
+                    for (i = 0; i < 16u; ++i) {
+                        int64_t bb, a, pp;
+                        if ((int)tc_bc6h_part2[best_p][i] != rr) continue;
+                        bb = w3[bsel[i]];
+                        a = 64 - bb;
+                        pp = q[i][c];
+                        saa += a * a;
+                        sab += a * bb;
+                        sbb += bb * bb;
+                        sap += a * pp;
+                        sbp += bb * pp;
+                    }
+                    det = saa * sbb - sab * sab;
+                    if (det <= 0) {
+                        nep[rr * 2][c] = bep[rr * 2][c];
+                        nep[rr * 2 + 1][c] = bep[rr * 2 + 1][c];
+                        continue;
+                    }
+                    l = tc_bc6h_rdiv((sap * sbb - sbp * sab) * 64, det);
+                    h = tc_bc6h_rdiv((sbp * saa - sap * sab) * 64, det);
+                    if (l < -512) l = -512;
+                    if (l > 511) l = 511;
+                    if (h < -512) h = -512;
+                    if (h > 511) h = 511;
+                    nep[rr * 2][c] = (int32_t)l;
+                    nep[rr * 2 + 1][c] = (int32_t)h;
+                }
+            for (c = 0; c < 3u && fit; ++c) {
+                int32_t d1 = nep[1][c] - nep[0][c];
+                int32_t d2 = nep[2][c] - nep[0][c];
+                int32_t d3 = nep[3][c] - nep[0][c];
+                if (d1 < -16 || d1 > 15 || d2 < -16 || d2 > 15 || d3 < -16 || d3 > 15)
+                    fit = 0;
+            }
+            if (!fit) break;
+            e = tc_bc6h_mode0_selectors_sf16(target, tc_bc6h_part2[best_p], nep, nsel);
+            if (e < best_err) {
+                best_err = e;
+                memcpy(bep, nep, sizeof(nep));
+                memcpy(bsel, nsel, 16u);
+            } else {
+                break;
+            }
+        }
+    }
+    anchor = tc_bc6h_part2_anchor[best_p];
+    for (r = 0; r < 2; ++r) {
+        uint32_t at = (r == 0) ? 0u : anchor;
+        if (bsel[at] & 4u) {
+            for (c = 0; c < 3u; ++c) {
+                int32_t t = bep[r * 2][c];
+                bep[r * 2][c] = bep[r * 2 + 1][c];
+                bep[r * 2 + 1][c] = t;
+            }
+            for (i = 0; i < 16u; ++i)
+                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+        }
+    }
+    memset(out, 0, 16u);
+    tc_bc6h_w(out, &bitpos, (bep[2][1] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (bep[2][2] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (bep[3][2] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_signed10(bep[0][0]), 10);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_signed10(bep[0][1]), 10);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_signed10(bep[0][2]), 10);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_delta5(bep[1][0] - bep[0][0]), 5);
+    tc_bc6h_w(out, &bitpos, (bep[3][1] >> 4) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, bep[2][1] & 0xfu, 4);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_delta5(bep[1][1] - bep[0][1]), 5);
+    tc_bc6h_w(out, &bitpos, bep[3][2] & 1u, 1);
+    tc_bc6h_w(out, &bitpos, bep[3][1] & 0xfu, 4);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_delta5(bep[1][2] - bep[0][2]), 5);
+    tc_bc6h_w(out, &bitpos, (bep[3][2] >> 1) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, bep[2][2] & 0xfu, 4);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_delta5(bep[2][0] - bep[0][0]), 5);
+    tc_bc6h_w(out, &bitpos, (bep[3][2] >> 2) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, tc_bc6h_pack_delta5(bep[3][0] - bep[0][0]), 5);
+    tc_bc6h_w(out, &bitpos, (bep[3][2] >> 3) & 1u, 1);
+    tc_bc6h_w(out, &bitpos, (uint32_t)best_p, 5);
+    for (i = 0; i < 16u; ++i) {
+        uint32_t nb = (i == 0u || i == anchor) ? 2u : 3u;
+        tc_bc6h_w(out, &bitpos, bsel[i], nb);
+    }
+    return best_err;
+}
+
 static void tc_encode_bc6h_block_uf16(const float pix[16][3], uint8_t out[16]) {
     uint32_t q[16][3], target[16][3], lo[3], hi[3], luma_lo[3], luma_hi[3];
     uint32_t i, c, bitpos = 0, min_l = UINT_MAX, max_l = 0, min_i = 0, max_i = 0;
@@ -2246,6 +2704,7 @@ static void tc_encode_bc6h_block_sf16(const float pix[16][3], uint8_t out[16]) {
     uint32_t i, c, bitpos = 0, min_i = 0, max_i = 0;
     int32_t min_l = INT_MAX, max_l = INT_MIN;
     uint8_t sel[16], box_sel[16], luma_sel[16];
+    uint64_t best_err;
     memset(out, 0, 16);
     for (c = 0; c < 3u; ++c) {
         lo[c] = INT_MAX;
@@ -2281,7 +2740,7 @@ static void tc_encode_bc6h_block_sf16(const float pix[16][3], uint8_t out[16]) {
     } else {
         memcpy(sel, box_sel, sizeof(sel));
     }
-    (void)tc_bc6h_refine_sf16(q, target, lo, hi, sel);
+    best_err = tc_bc6h_refine_sf16(q, target, lo, hi, sel);
     if (sel[0] & 8u) {
         int32_t t;
         for (c = 0; c < 3u; ++c) {
@@ -2291,7 +2750,7 @@ static void tc_encode_bc6h_block_sf16(const float pix[16][3], uint8_t out[16]) {
         }
         for (i = 0; i < 16u; ++i) sel[i] = (uint8_t)(15u - sel[i]);
     }
-
+    /* Pack mode10 as initial output, then try mode9 and mode0. */
     tc_set_bits(out, &bitpos, 0x03u, 5);
     tc_set_bits(out, &bitpos, tc_bc6h_pack_signed10(lo[0]), 10);
     tc_set_bits(out, &bitpos, tc_bc6h_pack_signed10(lo[1]), 10);
@@ -2301,6 +2760,18 @@ static void tc_encode_bc6h_block_sf16(const float pix[16][3], uint8_t out[16]) {
     tc_set_bits(out, &bitpos, tc_bc6h_pack_signed10(hi[2]), 10);
     tc_set_bits(out, &bitpos, sel[0], 3);
     for (i = 1; i < 16u; ++i) tc_set_bits(out, &bitpos, sel[i], 4);
+    if (best_err > 48ull * 256 * 256) {
+        uint8_t tmp[16];
+        uint64_t err9 = tc_bc6h_mode9_sf16(pix, tmp);
+        if (err9 < best_err) {
+            best_err = err9;
+            memcpy(out, tmp, 16u);
+        }
+        uint64_t err0 = tc_bc6h_mode0_sf16(pix, tmp);
+        if (err0 < best_err) {
+            memcpy(out, tmp, 16u);
+        }
+    }
 }
 
 tc_result tc_bc6h_compress_rgb32f(const float *rgb, uint32_t width,
