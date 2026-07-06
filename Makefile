@@ -832,13 +832,13 @@ tocio-lib: $(TOC_OBJ)
 tocio-c11-gate: | build
 	@for f in $(TOC_SRC); do \
 	  echo "  C11  $$f"; \
-	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O1 -fsyntax-only $$f || exit 1; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -ffp-contract=off -O1 -fsyntax-only $$f || exit 1; \
 	done
 	@echo "tocio pure-C11 gate: OK"
 
 build/toc-fs-%.o: sandbox/tocio/src/%.c $(TOC_HDRS) | build
 	$(CC) -DTOC_FREESTANDING -ffreestanding -fno-builtin -fno-stack-protector \
-	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O2 -g -c $< -o $@
+	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -ffp-contract=off -O2 -g -c $< -o $@
 
 tocio-freestanding-gate: $(TOC_FS_OBJ) sandbox/tocio/tests/toc_fs_smoke.c | build
 	@echo "  scan: only toc_stdio.c may include <stdio.h>"

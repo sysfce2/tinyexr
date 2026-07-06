@@ -16,10 +16,8 @@
  * compiler would otherwise fuse a*b+c into fmla, making the scalar result both
  * platform-dependent and divergent from the NEON batch kernels (which evaluate
  * the same polynomials lane-wise with FP_CONTRACT OFF). This pins one bit-exact
- * reference for every tier; accuracy vs libm (~1e-6) is unaffected. */
-#if defined(__GNUC__) || defined(__clang__)
-#pragma STDC FP_CONTRACT OFF
-#endif
+ * result across every baseline tier (scalar, NEON) on aarch64 and x86-64.
+ * The OFF state is enforced by -ffp-contract=no in the Makefile. */
 
 static float bits_to_f(uint32_t u) {
     float f;
