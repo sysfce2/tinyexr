@@ -361,6 +361,16 @@ texcomp-bc6h-gate: $(TEXCOMP_OBJ) tools/texcomp/test/bc6h_gate.c | build/texcomp
 	  tools/texcomp/test/bc6h_gate.c $(TEXCOMP_OBJ) -lm -o build/texcomp/bc6h_gate
 	./build/texcomp/bc6h_gate
 
+# BC6H/BC7 pipeline quality gate: loads real EXR images, encodes/decodes,
+# checks PSNR + SSIM. Argument: path to openexr-images directory.
+texcomp-pipeline-gate: $(TEXCOMP_OBJ) tools/texcomp/test/bc6h_pipeline_gate.c \
+                        tools/texcomp/test/tc_ssim.h \
+                        tools/texcomp/test/tc_ssim_gauss11.inc | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -O2 -g \
+	  tools/texcomp/test/bc6h_pipeline_gate.c $(TEXCOMP_OBJ) build/libtinyexr3.a \
+	  -lm -o build/texcomp/bc6h_pipeline_gate
+	./build/texcomp/bc6h_pipeline_gate $(OPENEXR_IMAGES_DIR)
+
 texcomp-bench: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_bench.c | build/texcomp
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O3 \
 	  tools/texcomp/bench/texcomp_bench.c $(TEXCOMP_OBJ) -lm -o build/texcomp_bench
