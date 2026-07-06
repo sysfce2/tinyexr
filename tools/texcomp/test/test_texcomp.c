@@ -681,6 +681,37 @@ int main(void) {
     CHECK(rd_bits(bc7, 2, 6) == 5u, "quickbc7 mode1 partition");
     opt.mode_mask = 0xffu;
 
+    /* Float-input wrapper must produce valid output. */
+    {
+        float f_rgba[7 * 5 * 4];
+        uint8_t bc7_f[64];
+        uint32_t i;
+        for (i = 0; i < 7u * 5u * 4u; ++i)
+            f_rgba[i] = (float)rgba[i] / 255.0f;
+        CHECK(tc_bc7_compress_rgbaf(f_rgba, 7, 5, 7 * 4 * sizeof(float),
+                                    &opt, bc7_f, sizeof(bc7_f)) == TC_SUCCESS,
+              "bc7 float compress");
+        CHECK(bc7_mode(bc7_f) < 8u, "bc7 float valid mode");
+    }
+    /* Float decompress round-trip: compress uint8, decompress to float, check
+     * the float output matches the expected uint8 reconstruction. */
+    {
+        uint8_t dec_u8[7 * 5 * 4];
+        float dec_f[7 * 5 * 4];
+        uint32_t i, mismatches = 0;
+        CHECK(tc_bc7_decompress_rgba8(bc7, 7, 5, 7 * 4, dec_u8,
+                                      sizeof(dec_u8)) == TC_SUCCESS,
+              "bc7 u8 decompress");
+        CHECK(tc_bc7_decompress_rgbaf(bc7, 7, 5, 7 * 4 * sizeof(float),
+                                      dec_f, sizeof(dec_f)) == TC_SUCCESS,
+              "bc7 float decompress");
+        for (i = 0; i < 7u * 5u * 4u; ++i) {
+            float expected = (float)dec_u8[i] / 255.0f;
+            if (fabsf(dec_f[i] - expected) > 1e-6f) ++mismatches;
+        }
+        CHECK(mismatches == 0u, "bc7 float decompress matches u8 decompress");
+    }
+
     CHECK(tc_bc5_compress_rgba8(rgba, 7, 5, 7 * 4, &bc5_opt, bc5,
                                 sizeof(bc5)) == TC_SUCCESS,
           "bc5 compress");

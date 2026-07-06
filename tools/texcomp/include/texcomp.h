@@ -26,7 +26,8 @@ typedef enum tc_result {
 
 typedef enum tc_bc7_quality {
     TC_BC7_QUALITY_FAST = 0,
-    TC_BC7_QUALITY_QUICKBC7 = 1
+    TC_BC7_QUALITY_QUICKBC7 = 1,
+    TC_BC7_QUALITY_MEDIUM = 2
 } tc_bc7_quality;
 
 typedef struct tc_bc7_options {
@@ -161,10 +162,22 @@ tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride,
                                 const tc_bc7_options *opt, uint8_t *out_bc7,
                                 size_t out_size);
+/* Encode float [0,1] RGBA to BC7. A convenience wrapper that clamps float
+ * to uint8 and delegates to tc_bc7_compress_rgba8. stride_bytes is the row
+ * pitch in bytes for the float source (typically width*4*sizeof(float)). */
+tc_result tc_bc7_compress_rgbaf(const float *rgba, uint32_t width,
+                                uint32_t height, size_t stride_bytes,
+                                const tc_bc7_options *opt, uint8_t *out_bc7,
+                                size_t out_size);
 /* Decode a BC7 block stream to RGBA8 (all 8 BPTC modes). */
 tc_result tc_bc7_decompress_rgba8(const uint8_t *bc7, uint32_t width,
                                   uint32_t height, size_t stride,
                                   uint8_t *out_rgba, size_t out_size);
+/* Decode BC7 to float [0,1] RGBA. stride_bytes is row pitch in bytes
+ * for the float output (typically width*4*sizeof(float)). */
+tc_result tc_bc7_decompress_rgbaf(const uint8_t *bc7, uint32_t width,
+                                  uint32_t height, size_t stride_bytes,
+                                  float *out_rgba, size_t out_size);
 /* Encode RGBA8 to the universal intermediate. */
 tc_result tc_uni_compress_rgba8(const uint8_t *rgba, uint32_t width,
                                 uint32_t height, size_t stride, uint8_t *out,

@@ -817,7 +817,13 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--linear") == 0) bc7_opt.perceptual = 0;
         else if (strcmp(argv[i], "--perceptual") == 0) bc7_opt.perceptual = 1;
-        else if (strcmp(argv[i], "--quick") == 0 && i + 1 < argc) bc7_opt.quick = strcmp(argv[++i], "off") != 0;
+        else if (strcmp(argv[i], "--quick") == 0 && i + 1 < argc) {
+            const char *qv = argv[++i];
+            if (strcmp(qv, "off") == 0) bc7_opt.quick = 0;
+            else if (strcmp(qv, "on") == 0) bc7_opt.quick = 1;
+            else if (strcmp(qv, "medium") == 0) bc7_opt.quick = 2;
+            else bc7_opt.quick = (int)strtol(qv, NULL, 10);
+        }
         else if (strcmp(argv[i], "--mode-mask") == 0 && i + 1 < argc)
             bc7_opt.mode_mask = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (strcmp(argv[i], "--rdo") == 0 && i + 1 < argc)
