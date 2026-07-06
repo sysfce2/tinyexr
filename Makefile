@@ -426,13 +426,15 @@ BASISU_DIR ?= deps/basisu
 BASISU_HDR = $(BASISU_DIR)/basisu_transcoder.h
 BASISU_SRC = $(BASISU_DIR)/basisu_transcoder.cpp
 
+BASISU_DEFS = -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=0
+
 texcomp-basis-gate: tools/texcomp/test/basis_validate.c | build/texcomp
 	@test -f "$(BASISU_SRC)" || { echo "basis-validate: vendored transcoder not found (cp from https://github.com/BinomialLLC/basis_universal)"; exit 77; }
-	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -I$(BASISU_DIR) -O2 -g -c \
+	$(CXX) -std=c++17 -Wall -Wextra -fno-strict-aliasing $(BASISU_DEFS) -I$(BASISU_DIR) -O2 -g -c \
 	  tools/texcomp/test/basis_validate.c -o build/texcomp/basis_validate.o
-	$(CXX) -std=c++11 -Wall -Wextra -I$(BASISU_DIR) -O2 -g -c \
-	  tools/texcomp/test/basis_validate.c -o build/texcomp/basis_validate_cxx.o
-	$(CXX) build/texcomp/basis_validate_cxx.o $(BASISU_SRC) -lm -o build/texcomp/basis_validate
+	$(CXX) -std=c++17 $(BASISU_DEFS) -I$(BASISU_DIR) -O2 -g -c \
+	  $(BASISU_SRC) -o build/texcomp/basisu_transcoder.o
+	$(CXX) build/texcomp/basis_validate.o build/texcomp/basisu_transcoder.o -lm -o build/texcomp/basis_validate
 	./build/texcomp/basis_validate
 	@echo "basis-validate: OK"
 
