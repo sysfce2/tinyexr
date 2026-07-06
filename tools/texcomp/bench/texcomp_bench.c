@@ -293,6 +293,51 @@ int main(int argc, char **argv) {
         }
         tc_backend_force_mask(TC_BACKEND_ALL);
     }
+    {
+        /* C7 batch pipeline benchmark: ASTC LDR at quality=1 (batch path) with
+         * and without AVX2. Uses a varied 512x512 image so the partition search /
+         * decimation / endpoint trial pipeline actually runs. */
+        uint32_t avail = tc_backend_available_mask();
+        static const uint32_t bmasks[3] = {TC_BACKEND_SSE2,
+                                           TC_BACKEND_SSE2 | TC_BACKEND_SSE41,
+                                           TC_BACKEND_SSE2 | TC_BACKEND_SSE41 | TC_BACKEND_AVX2};
+        static const char *const bnames[3] = {"sse2", "sse41", "avx2"};
+        int bi;
+        iters = 8;
+        for (i = 0; i < n; ++i) {
+            uint32_t xi = (uint32_t)(i % w), yi = (uint32_t)(i / w);
+            rgba[i * 4u + 0u] = (uint8_t)((xi ^ yi) * 7u);
+            rgba[i * 4u + 1u] = (uint8_t)((xi + yi * 3u) * 5u);
+            rgba[i * 4u + 2u] = (uint8_t)((xi * 13u + yi * 37u) & 255u);
+            rgba[i * 4u + 3u] = (uint8_t)((xi * 3u + yi * 7u) & 255u);
+        }
+        tc_astc_options_init(&astc_opt);
+        astc_opt.block_x = 4;
+        astc_opt.block_y = 4;
+        astc_opt.quality = 1;
+        bc_size = tc_astc_compressed_size(w, h, &astc_opt);
+        {
+            uint8_t *abc = (uint8_t *)malloc(bc_size);
+            if (abc) {
+                for (bi = 0; bi < 3; ++bi) {
+                    if (bi > 0 && !(avail & bmasks[bi])) continue;
+                    tc_backend_force_mask(bmasks[bi]);
+                    t0 = now_sec();
+                    for (i = 0; i < (size_t)iters; ++i)
+                        if (tc_astc_compress_rgba8(rgba, w, h,
+                                                   (size_t)w * 4u, &astc_opt,
+                                                   abc, bc_size) != TC_SUCCESS)
+                            break;
+                    t1 = now_sec();
+                    mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
+                    printf("texcomp astc batch 4x4 q1 %s: %.2f MPix/s (%ux%u x %d)\n",
+                           bnames[bi], mpix, w, h, iters);
+                }
+                tc_backend_force_mask(TC_BACKEND_ALL);
+                free(abc);
+            }
+        }
+    }
     free(rgba);
     free(rgba_solid);
     free(rgbf);
