@@ -5,15 +5,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define _GNU_SOURCE
 #include "texcomp.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <glob.h>
 
 #ifdef TEXCOMP_HAVE_ASTCENC
 /* Vendored Arm astcenc backend (deps/astcenc, Apache-2.0); its public API
  * has C linkage, so the pure-C CLI can drive it directly. */
 #include "astcenc.h"
-
-#include <stdio.h>
-#include <stdlib.h>
 
 #if !defined(__STDC_NO_THREADS__) && !defined(TC_NO_THREADS)
 #include <threads.h>
@@ -123,6 +126,12 @@ static tc_result tc_cli_astcenc_compress(const uint8_t *rgba, uint32_t w,
     }
 }
 #endif
+
+/* Collected CLI options, visible to both ASTCENC and non-ASTCENC builds. */
+struct cli_opts;
+static int encode_one(const char *in, const char *out,
+                       const struct cli_opts *opts);
+
 #include "exr.h"
 #include "tinyexr_zstd.h"
 
@@ -281,6 +290,54 @@ static tc_result load_exr_rgbf(const char *path, int part_index, float **rgb,
         (*rgb)[i * 3u + 0u] = read_exr_sample(part, r, i);
         (*rgb)[i * 3u + 1u] = read_exr_sample(part, g, i);
         (*rgb)[i * 3u + 2u] = read_exr_sample(part, b, i);
+    }
+    *w = (uint32_t)part->width;
+    *h = (uint32_t)part->height;
+    exr_image_free(&img);
+    return TC_SUCCESS;
+}
+
+/* Load an EXR as float RGBA (for HDR-alpha / CEM 15). A defaults to 1.0 when the
+ * part has no alpha channel. */
+static tc_result load_exr_rgbaf(const char *path, int part_index, float **rgba,
+                                uint32_t *w, uint32_t *h) {
+    exr_image img;
+    exr_part *part;
+    int r, g, b, a;
+    size_t i, n;
+    exr_result er;
+    memset(&img, 0, sizeof(img));
+    er = exr_load_from_file(path, NULL, &img);
+    if (!EXR_OK(er)) return TC_ERROR_CORRUPT;
+    if (part_index < 0) part_index = 0;
+    if (part_index >= img.num_parts) {
+        exr_image_free(&img);
+        return TC_ERROR_INVALID_ARGUMENT;
+    }
+    part = &img.parts[part_index];
+    if (part->is_deep || !part->images || part->width <= 0 || part->height <= 0) {
+        exr_image_free(&img);
+        return TC_ERROR_UNSUPPORTED;
+    }
+    r = channel_index(part, "R");
+    g = channel_index(part, "G");
+    b = channel_index(part, "B");
+    a = channel_index(part, "A");
+    if (r < 0 || g < 0 || b < 0) {
+        exr_image_free(&img);
+        return TC_ERROR_UNSUPPORTED;
+    }
+    n = (size_t)part->width * (size_t)part->height;
+    *rgba = (float *)malloc(n * 4u * sizeof(float));
+    if (!*rgba) {
+        exr_image_free(&img);
+        return TC_ERROR_OUT_OF_MEMORY;
+    }
+    for (i = 0; i < n; ++i) {
+        (*rgba)[i * 4u + 0u] = read_exr_sample(part, r, i);
+        (*rgba)[i * 4u + 1u] = read_exr_sample(part, g, i);
+        (*rgba)[i * 4u + 2u] = read_exr_sample(part, b, i);
+        (*rgba)[i * 4u + 3u] = (a >= 0) ? read_exr_sample(part, a, i) : 1.0f;
     }
     *w = (uint32_t)part->width;
     *h = (uint32_t)part->height;
@@ -454,178 +511,10 @@ static uint8_t *read_whole_file(const char *path, size_t *out_size) {
 
 #define UNI_MAX_LEVELS 16
 
-static void uni_put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static uint16_t uni_get16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
-static const uint32_t *g_uni_cnt; /* for the frequency sort below */
-static int uni_cnt_cmp(const void *a, const void *b) {
-    uint32_t ca = g_uni_cnt[*(const uint32_t *)a], cb = g_uni_cnt[*(const uint32_t *)b];
-    return ca < cb ? 1 : (ca > cb ? -1 : 0);
-}
-static uint32_t uni_sse8(const uint8_t *a, const uint8_t *b) {
-    uint32_t s = 0;
-    int k;
-    for (k = 0; k < 8; ++k) { int d = (int)a[k] - (int)b[k]; s += (uint32_t)(d * d); }
-    return s;
-}
-/* Selectors are 16 4-bit weights packed in 8 bytes; compare per-texel. */
-static uint32_t uni_sse_sel(const uint8_t *a, const uint8_t *b) {
-    uint32_t s = 0;
-    int k;
-    for (k = 0; k < 16; ++k) {
-        int wa = (a[k >> 1] >> ((k & 1) * 4)) & 0xf;
-        int wb = (b[k >> 1] >> ((k & 1) * 4)) & 0xf;
-        int d = wa - wb;
-        s += (uint32_t)(d * d);
-    }
-    return s;
-}
-
-#define UNI_LLOYD_ITERS 8
-
-/* Nearest codebook entry to `pp` under the field metric, plus an optional
- * rate penalty lambda*rate[c] (bits) for rate-distortion assignment. */
-static uint32_t uni_assign(const uint8_t *pp, const uint8_t *cb, uint32_t cap,
-                           int is_sel, const float *rate, float lambda) {
-    uint32_t best = 0, c;
-    double bestc = 1e300;
-    for (c = 0; c < cap; ++c) {
-        double d = is_sel ? uni_sse_sel(pp, cb + (size_t)c * 8u)
-                          : uni_sse8(pp, cb + (size_t)c * 8u);
-        double cost = rate ? d + (double)lambda * rate[c] : d;
-        if (cost < bestc) { bestc = cost; best = c; if (d == 0.0 && !rate) break; }
-    }
-    return best;
-}
-
-/* Build an RD-optimized codebook of the 8-byte field at `off` of each uni block,
- * plus per-block indices. cap == 0 or distinct <= cap is lossless. Otherwise:
- * seed with the cap most-frequent patterns, refine with Lloyd (k-means) so the
- * entries minimize distortion, then a final rate-distortion assignment
- * (distortion + lambda*bits) that biases toward popular entries for a smaller
- * post-Zstd index stream. Returns the code count, or 0xffffffff on OOM. */
-static uint32_t uni_build_codebook(const uint8_t *uni, size_t nblocks, size_t off,
-                                   uint32_t cap, float lambda, uint8_t *cb,
-                                   uint32_t *idx) {
-    size_t hcap = 16, i;
-    uint64_t *hk, *upat;
-    int32_t *hv;
-    uint32_t *ucnt, *bidx, nu = 0, ncodes;
-    int is_sel = (off == 8u);
-    while (hcap < nblocks * 2u) hcap <<= 1;
-    hk = (uint64_t *)malloc(hcap * 8u);
-    hv = (int32_t *)malloc(hcap * 4u);
-    upat = (uint64_t *)malloc(nblocks * 8u);
-    ucnt = (uint32_t *)malloc(nblocks * 4u);
-    bidx = (uint32_t *)malloc(nblocks * 4u);
-    if (!hk || !hv || !upat || !ucnt || !bidx) { free(hk); free(hv); free(upat); free(ucnt); free(bidx); return 0xffffffffu; }
-    for (i = 0; i < hcap; ++i) hv[i] = -1;
-    for (i = 0; i < nblocks; ++i) {
-        uint64_t k;
-        size_t h;
-        memcpy(&k, uni + i * 16u + off, 8u);
-        h = (size_t)((k * 0x9E3779B97F4A7C15ULL) & (uint64_t)(hcap - 1u));
-        while (hv[h] != -1 && hk[h] != k) h = (h + 1u) & (hcap - 1u);
-        if (hv[h] == -1) { hk[h] = k; hv[h] = (int32_t)nu; upat[nu] = k; ucnt[nu] = 1u; ++nu; }
-        else ucnt[hv[h]]++;
-        bidx[i] = (uint32_t)hv[h];
-    }
-    if (cap == 0u || nu <= cap) {
-        for (i = 0; i < nu; ++i) memcpy(cb + i * 8u, &upat[i], 8u);
-        for (i = 0; i < nblocks; ++i) idx[i] = bidx[i];
-        ncodes = nu;
-    } else {
-        uint32_t *order = (uint32_t *)malloc(nu * 4u), c;
-        int vlen = is_sel ? 16 : 8, iter, k;
-        uint32_t *csum = (uint32_t *)malloc((size_t)cap * vlen * 4u);
-        uint32_t *ccnt = (uint32_t *)malloc((size_t)cap * 4u);
-        float *rate = (float *)malloc((size_t)cap * sizeof(float));
-        if (!order || !csum || !ccnt || !rate) { free(order); free(csum); free(ccnt); free(rate); free(hk); free(hv); free(upat); free(ucnt); free(bidx); return 0xffffffffu; }
-        for (c = 0; c < nu; ++c) order[c] = c;
-        g_uni_cnt = ucnt;
-        qsort(order, nu, sizeof(uint32_t), uni_cnt_cmp);
-        for (c = 0; c < cap; ++c) memcpy(cb + (size_t)c * 8u, &upat[order[c]], 8u);
-        ncodes = cap;
-        /* Lloyd refinement: assign to nearest, recompute centroids as the mean
-         * of assigned blocks (per texel for selectors, per byte for endpoints). */
-        for (iter = 0; iter < UNI_LLOYD_ITERS; ++iter) {
-            memset(csum, 0, (size_t)cap * vlen * 4u);
-            memset(ccnt, 0, (size_t)cap * 4u);
-            for (i = 0; i < nblocks; ++i) {
-                const uint8_t *pp = uni + i * 16u + off;
-                uint32_t b = uni_assign(pp, cb, cap, is_sel, NULL, 0.0f);
-                idx[i] = b;
-                ccnt[b]++;
-                if (is_sel) { for (k = 0; k < 16; ++k) csum[b * 16 + k] += (pp[k >> 1] >> ((k & 1) * 4)) & 0xf; }
-                else { for (k = 0; k < 8; ++k) csum[b * 8 + k] += pp[k]; }
-            }
-            for (c = 0; c < cap; ++c) {
-                if (!ccnt[c]) continue;
-                if (is_sel) {
-                    uint8_t nw[8] = {0};
-                    for (k = 0; k < 16; ++k) { uint32_t w = (csum[c * 16 + k] + ccnt[c] / 2) / ccnt[c]; if (w > 15u) w = 15u; nw[k >> 1] |= (uint8_t)(w << ((k & 1) * 4)); }
-                    memcpy(cb + (size_t)c * 8u, nw, 8u);
-                } else {
-                    for (k = 0; k < 8; ++k) { uint32_t v = (csum[c * 8 + k] + ccnt[c] / 2) / ccnt[c]; cb[(size_t)c * 8u + k] = (uint8_t)(v > 255u ? 255u : v); }
-                }
-            }
-        }
-        /* rate-distortion final assignment: bits(c) ~= -log2(freq(c)). */
-        for (c = 0; c < cap; ++c) {
-            double p = ((double)ccnt[c] + 1.0) / ((double)nblocks + (double)cap);
-            rate[c] = (float)(-log(p) / log(2.0));
-        }
-        for (i = 0; i < nblocks; ++i)
-            idx[i] = uni_assign(uni + i * 16u + off, cb, cap, is_sel,
-                                lambda > 0.0f ? rate : NULL, lambda);
-        free(order); free(csum); free(ccnt); free(rate);
-    }
-    free(hk); free(hv); free(upat); free(ucnt); free(bidx);
-    return ncodes;
-}
-
-/* Basis-style codebook pre-transform of a uni level: split into deduplicated
- * endpoint + selector codebooks with per-block indices. This is the size lever
- * behind BasisLZ (shared endpoint/selector codebooks), entropy-coded afterwards
- * by the outer Zstd. NOTE: this is NOT the wire-format BasisLZ scheme (that is
- * the Basis ETC1S codec); the KTX2 supercompressionScheme stays 2 (Zstd). */
-static tc_result encode_uni_basis(const uint8_t *uni, size_t uni_size,
-                                  uint32_t cap, float lambda, uint8_t **out,
-                                  size_t *out_size) {
-    size_t nblocks = uni_size / 16u, i;
-    uint8_t *epcb = (uint8_t *)malloc(nblocks * 8u), *selcb = (uint8_t *)malloc(nblocks * 8u), *o, *p;
-    uint32_t *epidx = (uint32_t *)malloc(nblocks * 4u), *selidx = (uint32_t *)malloc(nblocks * 4u);
-    uint32_t nep, nsel;
-    int epb, selb;
-    size_t sz;
-    tc_result r = TC_ERROR_OUT_OF_MEMORY;
-    if (!epcb || !selcb || !epidx || !selidx) goto done;
-    nep = uni_build_codebook(uni, nblocks, 0u, cap, lambda, epcb, epidx);
-    nsel = uni_build_codebook(uni, nblocks, 8u, cap, lambda, selcb, selidx);
-    if (nep == 0xffffffffu || nsel == 0xffffffffu) goto done;
-    epb = nep <= 256u ? 1 : 2;
-    selb = nsel <= 256u ? 1 : 2;
-    sz = 18u + (size_t)nep * 8u + (size_t)nsel * 8u + nblocks * (size_t)epb + nblocks * (size_t)selb;
-    o = (uint8_t *)malloc(sz);
-    if (!o) goto done;
-    p = o;
-    memcpy(p, "UBAS", 4); p += 4;
-    xbc7_put32(p, (uint32_t)nblocks); p += 4;
-    xbc7_put32(p, nep); p += 4;
-    xbc7_put32(p, nsel); p += 4;
-    *p++ = (uint8_t)epb; *p++ = (uint8_t)selb;
-    memcpy(p, epcb, (size_t)nep * 8u); p += (size_t)nep * 8u;
-    memcpy(p, selcb, (size_t)nsel * 8u); p += (size_t)nsel * 8u;
-    for (i = 0; i < nblocks; ++i) { if (epb == 1) *p++ = (uint8_t)epidx[i]; else { uni_put16(p, (uint16_t)epidx[i]); p += 2; } }
-    for (i = 0; i < nblocks; ++i) { if (selb == 1) *p++ = (uint8_t)selidx[i]; else { uni_put16(p, (uint16_t)selidx[i]); p += 2; } }
-    *out = o; *out_size = sz;
-    r = TC_SUCCESS;
-done:
-    free(epcb); free(selcb); free(epidx); free(selidx);
-    return r;
-}
-
-/* Reverse encode_uni_basis: reconstruct the raw uni block stream. */
+/* Reverse encode_uni_basis: reconstruct the raw uni block stream (kept for
+ * old UBAS-wrapped files that may still exist on disk). */
 static tc_result decode_uni_basis(const uint8_t *buf, size_t size,
                                   uint8_t **out_uni, size_t *out_size) {
     size_t nblocks, i;
@@ -704,14 +593,10 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
     int l;
     tc_result r = TC_SUCCESS;
     (void)lh;
+    (void)basis; (void)rdo; /* Basis codebook layer removed (incompatible with UASTC block layout). */
     for (l = 0; l < nlevels; ++l) {
         const uint8_t *src = uni[l];
         size_t src_size = uni_sizes[l], bound;
-        if (basis) {
-            /* `basis` carries the codebook cap (0 = plain zstd path, not here). */
-            if ((r = encode_uni_basis(uni[l], uni_sizes[l], (uint32_t)basis, rdo, &bbuf[l], &src_size)) != TC_SUCCESS) goto done;
-            src = bbuf[l];
-        }
         ulen[l] = src_size; /* KTX2 uncompressedByteLength = post-zstd-decode size */
         bound = tinyexr_zstd_compress_bound(src_size);
         comp[l] = (uint8_t *)malloc(bound);
@@ -750,8 +635,7 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
     for (l = 0; l < nlevels; ++l) memcpy(ktx + loff[l], comp[l], clen[l]);
     r = write_file(path, ktx, total);
     if (r == TC_SUCCESS)
-        printf("wrote %s (uni KTX2, %d mip levels, %s, %zu bytes)\n", path, nlevels,
-               basis ? "Basis-style codebook + Zstd" : "Zstd-supercompressed", total);
+        printf("wrote %s (uni UASTC KTX2, %d mip levels, Zstd, %zu bytes)\n", path, nlevels, total);
 done:
     for (l = 0; l < nlevels; ++l) { free(comp[l]); free(bbuf[l]); }
     free(ktx);
@@ -822,172 +706,35 @@ static tc_result transcode_uni_level(const uint8_t *ubuf, uint32_t uw, uint32_t 
     return TC_SUCCESS;
 }
 
-static void usage(void) {
-    fprintf(stderr,
-            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr|xbc7|uni] "
-            "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
-            "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
-            "[--quick on|off] [--mode-mask HEX] [--rdo N] "
-            "[--channel-weights R,G,B,A] "
-            "[--linear|--perceptual]\n"
-            "  --channel-weights: per-channel error weights for BC7 (pure-C) and\n"
-            "        ASTC (astcenc/--encoder arm); e.g. 2,2,1,1 favours R,G.\n"
-            "  --bc7-pca: also seed BC7 endpoints from the weighted principal\n"
-            "        color axis, keep-best (off by default; ~+0.09 dB, ~1.7x slower).\n"
-            "  uni: universal transcodable intermediate. `--format uni -o x.uni`\n"
-            "        (raw, level 0) or `-o x.ktx2` (KTX2, full mip chain, Zstd-\n"
-            "        supercompressed; add --basis[/--basis-cap N] for a BasisLZ-\n"
-            "        style bounded endpoint/selector codebook before Zstd -- a lossy\n"
-            "        rate knob, smaller N = smaller+lossier). Transcode all levels\n"
-            "        with `-i x.{uni,ktx2} -o out.bin --format bc7|bc1|astc|etc2`.\n"
-            "  xbc7: supercompressed BC7 (windowed RDO + zstd); --rdo N sets the\n"
-            "        max per-channel RMS reuse budget. Transcode back with\n"
-            "        `-i in.xbc7 -o out.dds` (standard BC7, any device reads it).\n");
-}
+typedef struct cli_opts {
+    const char *format;
+    int part; int hdr_alpha; int uni_basis; float uni_rdo;
+    const char *raw;
+    tc_bc7_options bc7; tc_bc1_options bc1; tc_bc3_options bc3;
+    tc_bc5_options bc5; tc_bc6h_options bc6h;
+    tc_etc2_options etc2; tc_astc_options astc;
+    int use_arm_encoder; int progress;
+} cli_opts;
 
-static int parse_astc_block(const char *s, uint32_t *bx, uint32_t *by) {
-    char *endp = NULL;
-    unsigned long x = strtoul(s, &endp, 10);
-    unsigned long y;
-    if (!endp || (*endp != 'x' && *endp != 'X')) return 0;
-    y = strtoul(endp + 1, &endp, 10);
-    if (!endp || *endp != '\0' || x > UINT32_MAX || y > UINT32_MAX) return 0;
-    *bx = (uint32_t)x;
-    *by = (uint32_t)y;
-    return 1;
-}
-
-int main(int argc, char **argv) {
-    const char *in = NULL, *out = NULL, *raw = NULL;
-    const char *format = "bc7";
-    int part = 0;
-    int uni_basis = 0;
-    float uni_rdo = 0.0f;
+static int encode_one(const char *in, const char *out,
+                       const struct cli_opts *opts) {
     uint8_t *rgba = NULL, *compressed = NULL, *container = NULL;
-    float *rgbf = NULL;
+    float *rgbf = NULL, *rgbaf = NULL;
     uint32_t w = 0, h = 0;
     size_t compressed_size, container_size;
-    tc_bc7_options bc7_opt;
-    tc_bc1_options bc1_opt;
-    tc_bc3_options bc3_opt;
-    tc_bc5_options bc5_opt;
-    tc_bc6h_options bc6h_opt;
-    tc_etc2_options etc2_opt;
-    tc_astc_options astc_opt;
-    int use_arm_encoder = 0;
     tc_result tr;
-    int i;
+    int part = opts->part;
+    const char *format = opts->format;
+    int hdr_alpha = opts->hdr_alpha;
 
-    tc_bc7_options_init(&bc7_opt);
-    tc_bc1_options_init(&bc1_opt);
-    tc_bc3_options_init(&bc3_opt);
-    tc_bc5_options_init(&bc5_opt);
-    tc_bc6h_options_init(&bc6h_opt);
-    tc_etc2_options_init(&etc2_opt);
-    tc_astc_options_init(&astc_opt);
-    (void)use_arm_encoder;
-    for (i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) in = argv[++i];
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out = argv[++i];
-        else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) format = argv[++i];
-        else if (strcmp(argv[i], "--raw") == 0 && i + 1 < argc) raw = argv[++i];
-        else if (strcmp(argv[i], "--raw-bc7") == 0 && i + 1 < argc) raw = argv[++i];
-        else if (strcmp(argv[i], "--part") == 0 && i + 1 < argc) part = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--srgb") == 0) {
-            bc7_opt.srgb = 1;
-            bc1_opt.srgb = 1;
-            bc3_opt.srgb = 1;
-            etc2_opt.srgb = 1;
-            astc_opt.srgb = 1;
-        }
-        else if (strcmp(argv[i], "--signed") == 0) bc6h_opt.signed_float = 1;
-        else if (strcmp(argv[i], "--encoder") == 0 && i + 1 < argc) {
-            const char *e = argv[++i];
-            if (strcmp(e, "arm") == 0) {
-#ifdef TEXCOMP_HAVE_ASTCENC
-                use_arm_encoder = 1;
-#else
-                fprintf(stderr,
-                        "texcomp: built without the Arm astcenc backend "
-                        "(use `make texcomp-arm`)\n");
-                return 1;
-#endif
-            } else if (strcmp(e, "tc") != 0) {
-                fprintf(stderr, "texcomp: unknown encoder '%s'\n", e);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-            astc_opt.threads = atoi(argv[++i]);
-            if (astc_opt.threads < 1) astc_opt.threads = 1;
-        }
-        else if (strcmp(argv[i], "--astc-block") == 0 && i + 1 < argc) {
-            if (!parse_astc_block(argv[++i], &astc_opt.block_x, &astc_opt.block_y)) {
-                usage();
-                return 2;
-            }
-        }
-        else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
-            const char *q = argv[++i];
-            if (strcmp(q, "fast") == 0) astc_opt.quality = 0;
-            else if (strcmp(q, "medium") == 0) astc_opt.quality = 1;
-            else if (strcmp(q, "normal") == 0) astc_opt.quality = 2;
-            else {
-                usage();
-                return 2;
-            }
-        }
-        else if (strcmp(argv[i], "--linear") == 0) bc7_opt.perceptual = 0;
-        else if (strcmp(argv[i], "--perceptual") == 0) bc7_opt.perceptual = 1;
-        else if (strcmp(argv[i], "--quick") == 0 && i + 1 < argc) bc7_opt.quick = strcmp(argv[++i], "off") != 0;
-        else if (strcmp(argv[i], "--mode-mask") == 0 && i + 1 < argc)
-            bc7_opt.mode_mask = (uint32_t)strtoul(argv[++i], NULL, 0);
-        else if (strcmp(argv[i], "--rdo") == 0 && i + 1 < argc)
-            bc7_opt.rdo = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--bc7-pca") == 0) bc7_opt.pca_endpoints = 1;
-        else if (strcmp(argv[i], "--basis") == 0) uni_basis = 2048; /* codebook cap */
-        else if (strcmp(argv[i], "--basis-cap") == 0 && i + 1 < argc) uni_basis = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--basis-rdo") == 0 && i + 1 < argc) uni_rdo = (float)atof(argv[++i]);
-        else if (strcmp(argv[i], "--channel-weights") == 0 && i + 1 < argc) {
-            /* R,G,B,A error weights for BC7 (pure-C) and ASTC (astcenc). */
-            float wr = 1, wg = 1, wb = 1, wa = 1;
-            int k;
-            sscanf(argv[++i], "%f,%f,%f,%f", &wr, &wg, &wb, &wa);
-            astc_opt.channel_weights[0] = wr; astc_opt.channel_weights[1] = wg;
-            astc_opt.channel_weights[2] = wb; astc_opt.channel_weights[3] = wa;
-            {
-                float wv[4] = {wr, wg, wb, wa};
-                for (k = 0; k < 4; ++k) {
-                    int iw = (int)(wv[k] + 0.5f);
-                    if (iw < 0) iw = 0;
-                    if (iw > 255) iw = 255;
-                    bc7_opt.channel_weights[k] = (uint8_t)iw;
-                }
-            }
-        }
-        else {
-            usage();
-            return 2;
-        }
-    }
-    if (!in || !out) {
-        usage();
-        return 2;
-    }
-
-    /* Transcode mode: a .xbc7 input is decoded back to a standard BC7 DDS. */
     if (ends_with(in, ".xbc7")) {
-        tr = xbc7_transcode(in, out, raw);
+        tr = xbc7_transcode(in, out, opts->raw);
         if (tr != TC_SUCCESS)
             fprintf(stderr, "texcomp: xbc7 transcode failed: %s\n",
                     tc_result_string(tr));
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
-    /* Transcode mode: a uni intermediate (.uni raw single level, or .ktx2
-     * Zstd-supercompressed with a mip chain) -> the --format target. Every level
-     * is transcoded and the block streams are concatenated (largest mip first).
-     * BC7/BC1 are cheap repacks; astc/etc2 re-encode. */
     if (ends_with(in, ".uni") || ends_with(in, ".ktx2")) {
         uint8_t *ulev[UNI_MAX_LEVELS] = {0}, *blocks[UNI_MAX_LEVELS] = {0}, *cat = NULL, *p;
         size_t usz[UNI_MAX_LEVELS], bsz[UNI_MAX_LEVELS], total = 0;
@@ -999,7 +746,7 @@ int main(int argc, char **argv) {
         } else {
             size_t fsz;
             uint8_t *raw = read_whole_file(in, &fsz);
-            if (!raw || fsz < 12u || memcmp(raw, "TUNI", 4) != 0) { free(raw); fprintf(stderr, "texcomp: not a .uni file\n"); return 1; }
+            if (!raw || fsz < 12u || memcmp(raw, "TUN2", 4) != 0) { free(raw); fprintf(stderr, "texcomp: not a .uni file (expected TUN2 magic)\n"); return 1; }
             lw[0] = xbc7_get32(raw + 4); lh[0] = xbc7_get32(raw + 8); usz[0] = fsz - 12u;
             ulev[0] = (uint8_t *)malloc(usz[0]);
             if (ulev[0]) memcpy(ulev[0], raw + 12u, usz[0]);
@@ -1018,38 +765,18 @@ int main(int argc, char **argv) {
             if (cat) { p = cat; for (l = 0; l < nl; ++l) { memcpy(p, blocks[l], bsz[l]); p += bsz[l]; } tr = write_file(out, cat, total); }
             else tr = TC_ERROR_OUT_OF_MEMORY;
         }
-        if (tr == TC_SUCCESS) printf("transcoded %s -> %s (%s, %d level%s, %zu bytes)\n", in, out, format, nl, nl == 1 ? "" : "s", total);
+        if (tr == TC_SUCCESS) printf("transcoded UASTC %s -> %s (%s, %d level%s, %zu bytes)\n", in, out, format, nl, nl == 1 ? "" : "s", total);
         else fprintf(stderr, "texcomp: uni transcode failed\n");
         for (l = 0; l < nl; ++l) { free(blocks[l]); free(ulev[l]); }
         free(cat);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
-    if (strcmp(format, "bc6") == 0) format = "bc6h";
-    if (strcmp(format, "dxt1") == 0) format = "bc1";
-    if (strcmp(format, "dxt5") == 0) format = "bc3";
-    if (strcmp(format, "uastc_hdr") == 0) format = "astc_hdr";
-    /* UASTC LDR is a subset of standard ASTC LDR 4x4; our ASTC encoder emits
-     * the (superset) standard format, decodable by any ASTC device. This is
-     * not the constrained 19-mode transcodable subset (see docs). */
-    if (strcmp(format, "uastc_ldr") == 0 || strcmp(format, "uastc") == 0) {
-        format = "astc";
-        astc_opt.block_x = 4;
-        astc_opt.block_y = 4;
-        astc_opt.uastc = 1;
-    }
-    if (strcmp(format, "etc2") == 0 || strcmp(format, "etc2_rgba") == 0) {
-        etc2_opt.alpha = 1;
-        format = "etc2_rgba";
-    } else if (strcmp(format, "etc2_rgb") == 0) {
-        etc2_opt.alpha = 0;
-    } else if (strcmp(format, "etc2_r11") == 0) {
-        format = "eac_r11";
-    } else if (strcmp(format, "etc2_rg11") == 0) {
-        format = "eac_rg11";
-    }
-    if ((strcmp(format, "bc6h") == 0 || strcmp(format, "astc_hdr") == 0) &&
-        ends_with(in, ".exr")) {
+    if (strcmp(format, "bc6h") == 0 && ends_with(in, ".exr")) {
+        tr = load_exr_rgbf(in, part, &rgbf, &w, &h);
+    } else if ((strcmp(format, "astc_hdr") == 0 && hdr_alpha && ends_with(in, ".exr"))) {
+        tr = load_exr_rgbaf(in, part, &rgbaf, &w, &h);
+    } else if (strcmp(format, "astc_hdr") == 0 && ends_with(in, ".exr")) {
         tr = load_exr_rgbf(in, part, &rgbf, &w, &h);
     } else {
         if (ends_with(in, ".png")) tr = load_png_rgba(in, &rgba, &w, &h);
@@ -1061,24 +788,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* xbc7: supercompressed BC7 (windowed RDO + zstd). Default to a moderate
-     * RDO budget when the user didn't request one. */
+    /* xbc7: supercompressed BC7 with RDO + zstd. */
     if (strcmp(format, "xbc7") == 0) {
-        if (bc7_opt.rdo <= 0) bc7_opt.rdo = 16;
-        tr = xbc7_encode(rgba, w, h, &bc7_opt, out, raw);
+        tc_bc7_options b7 = opts->bc7;
+        if (b7.rdo <= 0) b7.rdo = 16;
+        tr = xbc7_encode(rgba, w, h, &b7, out, opts->raw);
         if (tr != TC_SUCCESS)
             fprintf(stderr, "texcomp: xbc7 encode failed: %s\n",
                     tc_result_string(tr));
-        free(rgba);
-        free(rgbf);
+        free(rgba); free(rgbf); free(rgbaf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
-    /* uni: universal transcodable intermediate. Write a tiny container
-     * ("TUNI" + w,h + blocks); transcode at load with tc_uni_transcode_*. */
+    /* uni: universal intermediate. */
     if (strcmp(format, "uni") == 0) {
         if (ends_with(out, ".ktx2")) {
-            /* Zstd-supercompressed KTX2 with a full mip chain. */
             uint8_t *rlev[UNI_MAX_LEVELS] = {0}, *ulev[UNI_MAX_LEVELS] = {0};
             uint32_t lw[UNI_MAX_LEVELS], lh[UNI_MAX_LEVELS];
             size_t usz[UNI_MAX_LEVELS];
@@ -1090,15 +814,14 @@ int main(int argc, char **argv) {
                 if (!ulev[l]) { tr = TC_ERROR_OUT_OF_MEMORY; break; }
                 tr = tc_uni_compress_rgba8(rlev[l], lw[l], lh[l], (size_t)lw[l] * 4u, ulev[l], usz[l]);
             }
-            if (tr == TC_SUCCESS) tr = write_uni_ktx2(out, ulev, usz, lw, lh, nl, uni_basis, uni_rdo);
+            if (tr == TC_SUCCESS) tr = write_uni_ktx2(out, ulev, usz, lw, lh, nl, opts->uni_basis, opts->uni_rdo);
             for (l = 0; l < nl; ++l) { free(rlev[l]); free(ulev[l]); }
         } else {
-            /* raw TUNI container: "TUNI" + w,h + level-0 blocks */
             size_t usz = tc_uni_compressed_size(w, h);
             uint8_t *u = (uint8_t *)malloc(usz), *f;
             tr = u ? tc_uni_compress_rgba8(rgba, w, h, (size_t)w * 4u, u, usz) : TC_ERROR_OUT_OF_MEMORY;
             if (tr == TC_SUCCESS && (f = (uint8_t *)malloc(12u + usz)) != NULL) {
-                memcpy(f, "TUNI", 4); xbc7_put32(f + 4, w); xbc7_put32(f + 8, h);
+                memcpy(f, "TUN2", 4); xbc7_put32(f + 4, w); xbc7_put32(f + 8, h);
                 memcpy(f + 12, u, usz);
                 tr = write_file(out, f, 12u + usz);
                 if (tr == TC_SUCCESS) printf("wrote %s (universal intermediate, %ux%u, %zu bytes)\n", out, w, h, usz);
@@ -1107,7 +830,7 @@ int main(int argc, char **argv) {
             free(u);
         }
         if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: uni encode failed\n");
-        free(rgba); free(rgbf);
+        free(rgba); free(rgbf); free(rgbaf);
         return tr == TC_SUCCESS ? 0 : 1;
     }
 
@@ -1129,14 +852,13 @@ int main(int argc, char **argv) {
     } else if (strcmp(format, "astc_hdr") == 0) {
         tc_astc_options hdr4;
         tc_astc_options_init(&hdr4);
-        hdr4.block_x = 4;
-        hdr4.block_y = 4;
+        hdr4.block_x = 4; hdr4.block_y = 4;
         compressed_size = tc_astc_hdr_compressed_size(w, h);
         container_size = tc_astc_file_size(w, h, &hdr4);
     } else if (strcmp(format, "etc2_rgba") == 0 || strcmp(format, "etc2_rgb") == 0) {
-        compressed_size = etc2_opt.alpha ? tc_etc2_rgba_compressed_size(w, h)
-                                         : tc_etc2_rgb_compressed_size(w, h);
-        container_size = tc_ktx_etc2_size(w, h, &etc2_opt);
+        compressed_size = opts->etc2.alpha ? tc_etc2_rgba_compressed_size(w, h)
+                                          : tc_etc2_rgb_compressed_size(w, h);
+        container_size = tc_ktx_etc2_size(w, h, &opts->etc2);
     } else if (strcmp(format, "eac_r11") == 0) {
         compressed_size = tc_eac_r11_compressed_size(w, h);
         container_size = 68u + compressed_size;
@@ -1144,83 +866,84 @@ int main(int argc, char **argv) {
         compressed_size = tc_eac_rg11_compressed_size(w, h);
         container_size = 68u + compressed_size;
     } else if (strcmp(format, "astc") == 0) {
-        compressed_size = tc_astc_compressed_size(w, h, &astc_opt);
-        container_size = tc_astc_file_size(w, h, &astc_opt);
+        compressed_size = tc_astc_compressed_size(w, h, &opts->astc);
+        container_size = tc_astc_file_size(w, h, &opts->astc);
     } else {
         fprintf(stderr, "texcomp: unsupported format: %s\n", format);
-        free(rgba);
-        free(rgbf);
+        free(rgba); free(rgbf); free(rgbaf);
         return 1;
     }
     if (!compressed_size || !container_size) {
         fprintf(stderr, "texcomp: invalid output size for format: %s\n", format);
-        free(rgba);
-        free(rgbf);
+        free(rgba); free(rgbf); free(rgbaf);
         return 1;
     }
     compressed = (uint8_t *)malloc(compressed_size);
     container = (uint8_t *)malloc(container_size);
     if (!compressed || !container) {
         fprintf(stderr, "texcomp: out of memory\n");
-        free(rgba);
-        free(rgbf);
-        free(compressed);
-        free(container);
+        free(rgba); free(rgbf); free(rgbaf);
+        free(compressed); free(container);
         return 1;
     }
 
     if (strcmp(format, "bc7") == 0) {
-        tr = tc_bc7_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc7_opt,
+        tr = tc_bc7_compress_rgba8(rgba, w, h, (size_t)w * 4u, &opts->bc7,
                                    compressed, compressed_size);
         if (tr == TC_SUCCESS)
-            tr = tc_dds_write_bc7_memory(compressed, w, h, &bc7_opt, container,
+            tr = tc_dds_write_bc7_memory(compressed, w, h, &opts->bc7, container,
                                          container_size);
     } else if (strcmp(format, "bc1") == 0) {
-        tr = tc_bc1_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc1_opt,
+        tr = tc_bc1_compress_rgba8(rgba, w, h, (size_t)w * 4u, &opts->bc1,
                                    compressed, compressed_size);
         if (tr == TC_SUCCESS)
-            tr = tc_dds_write_bc1_memory(compressed, w, h, &bc1_opt, container,
+            tr = tc_dds_write_bc1_memory(compressed, w, h, &opts->bc1, container,
                                          container_size);
     } else if (strcmp(format, "bc3") == 0) {
-        tr = tc_bc3_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc3_opt,
+        tr = tc_bc3_compress_rgba8(rgba, w, h, (size_t)w * 4u, &opts->bc3,
                                    compressed, compressed_size);
         if (tr == TC_SUCCESS)
-            tr = tc_dds_write_bc3_memory(compressed, w, h, &bc3_opt, container,
+            tr = tc_dds_write_bc3_memory(compressed, w, h, &opts->bc3, container,
                                          container_size);
     } else if (strcmp(format, "bc5") == 0) {
-        tr = tc_bc5_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc5_opt,
+        tr = tc_bc5_compress_rgba8(rgba, w, h, (size_t)w * 4u, &opts->bc5,
                                    compressed, compressed_size);
         if (tr == TC_SUCCESS)
-            tr = tc_dds_write_bc5_memory(compressed, w, h, &bc5_opt, container,
+            tr = tc_dds_write_bc5_memory(compressed, w, h, &opts->bc5, container,
                                          container_size);
     } else if (strcmp(format, "bc6h") == 0) {
         if (!rgbf) tr = rgba_to_rgbf(rgba, w, h, &rgbf);
         if (tr == TC_SUCCESS)
             tr = tc_bc6h_compress_rgb32f(rgbf, w, h, (size_t)w * 3u * sizeof(float),
-                                         &bc6h_opt, compressed, compressed_size);
+                                         &opts->bc6h, compressed, compressed_size);
         if (tr == TC_SUCCESS)
-            tr = tc_dds_write_bc6h_memory(compressed, w, h, &bc6h_opt, container,
+            tr = tc_dds_write_bc6h_memory(compressed, w, h, &opts->bc6h, container,
                                           container_size);
     } else if (strcmp(format, "astc_hdr") == 0) {
         tc_astc_options hdr4;
         tc_astc_hdr_options hdr_opt;
         tc_astc_hdr_options_init(&hdr_opt);
         tc_astc_options_init(&hdr4);
-        hdr4.block_x = 4;
-        hdr4.block_y = 4;
-        if (!rgbf) tr = rgba_to_rgbf(rgba, w, h, &rgbf);
-        if (tr == TC_SUCCESS)
-            tr = tc_astc_hdr_compress_rgbf(rgbf, w, h,
-                                           (size_t)w * 3u * sizeof(float),
-                                           &hdr_opt, compressed, compressed_size);
+        hdr4.block_x = 4; hdr4.block_y = 4;
+        if (rgbaf) {
+            tr = tc_astc_hdr_compress_rgbaf(rgbaf, w, h,
+                                            (size_t)w * 4u * sizeof(float),
+                                            &hdr_opt, compressed, compressed_size);
+        } else {
+            if (!rgbf) tr = rgba_to_rgbf(rgba, w, h, &rgbf);
+            if (tr == TC_SUCCESS)
+                tr = tc_astc_hdr_compress_rgbf(rgbf, w, h,
+                                               (size_t)w * 3u * sizeof(float),
+                                               &hdr_opt, compressed, compressed_size);
+        }
         if (tr == TC_SUCCESS)
             tr = tc_astc_write_file_memory(compressed, w, h, &hdr4, container,
                                            container_size);
     } else if (strcmp(format, "etc2_rgba") == 0 || strcmp(format, "etc2_rgb") == 0) {
-        tr = tc_etc2_compress_rgba8(rgba, w, h, (size_t)w * 4u, &etc2_opt,
-                                    compressed, compressed_size);
+        tr = tc_etc2_compress_rgba8(rgba, w, h, (size_t)w * 4u, &opts->etc2,
+                                   compressed, compressed_size);
         if (tr == TC_SUCCESS)
-            tr = tc_ktx_write_etc2_memory(compressed, w, h, &etc2_opt, container,
+            tr = tc_ktx_write_etc2_memory(compressed, w, h, &opts->etc2, container,
                                           container_size);
     } else if (strcmp(format, "eac_r11") == 0 || strcmp(format, "eac_rg11") == 0) {
         int rg11 = strcmp(format, "eac_rg11") == 0;
@@ -1231,23 +954,263 @@ int main(int argc, char **argv) {
                                          container_size);
     } else {
 #ifdef TEXCOMP_HAVE_ASTCENC
-        if (use_arm_encoder)
-            tr = tc_cli_astcenc_compress(rgba, w, h, &astc_opt, compressed,
+        if (opts->use_arm_encoder)
+            tr = tc_cli_astcenc_compress(rgba, w, h, &opts->astc, compressed,
                                          compressed_size);
         else
 #endif
-        tr = tc_astc_compress_rgba8(rgba, w, h, (size_t)w * 4u, &astc_opt,
+        tr = tc_astc_compress_rgba8(rgba, w, h, (size_t)w * 4u, &opts->astc,
                                     compressed, compressed_size);
         if (tr == TC_SUCCESS)
-            tr = tc_astc_write_file_memory(compressed, w, h, &astc_opt, container,
+            tr = tc_astc_write_file_memory(compressed, w, h, &opts->astc, container,
                                            container_size);
     }
     if (tr == TC_SUCCESS) tr = write_file(out, container, container_size);
-    if (tr == TC_SUCCESS && raw) tr = write_file(raw, compressed, compressed_size);
+    if (tr == TC_SUCCESS && opts->raw) tr = write_file(opts->raw, compressed, compressed_size);
     if (tr != TC_SUCCESS) fprintf(stderr, "texcomp: write failed: %s\n", tc_result_string(tr));
-    free(rgba);
-    free(rgbf);
-    free(compressed);
-    free(container);
+    free(rgba); free(rgbf); free(rgbaf);
+    free(compressed); free(container);
     return tr == TC_SUCCESS ? 0 : 1;
+}
+
+static void usage(void) {
+    fprintf(stderr,
+            "usage: texcomp -i in.{png,exr} -o out [--format bc1|bc3|bc7|bc5|bc6h|etc2|etc2_rgb|eac_r11|eac_rg11|astc|astc_hdr|uastc_ldr|xbc7|uni] "
+            "[--raw out.bin] [--raw-bc7 out.bc7] [--part N] [--srgb] "
+            "[--signed] [--astc-block WxH] [--quality fast|medium|normal] [--encoder tc|arm] [--threads N] "
+            "[--quick on|off] [--mode-mask HEX] [--rdo N] "
+            "[--channel-weights R,G,B,A] "
+            "[--linear|--perceptual]\n"
+            "  --channel-weights: per-channel error weights for BC7 (pure-C) and\n"
+            "        ASTC (astcenc/--encoder arm); e.g. 2,2,1,1 favours R,G.\n"
+            "  --bc7-pca: also seed BC7 endpoints from the weighted principal\n"
+            "        color axis, keep-best (off by default; ~+0.09 dB, ~1.7x slower).\n"
+            "  --hdr-alpha: for --format astc_hdr on an EXR, encode the alpha\n"
+            "        channel too (ASTC HDR CEM 15); default is RGB-only.\n"
+            "  uni: universal transcodable intermediate (UASTC block format).\n"
+            "        `--format uni -o x.uni` (raw, level 0) or `-o x.ktx2` (KTX2,\n"
+            "        full mip chain, Zstd-supercompressed). Transcode all levels\n"
+            "        with `-i x.{uni,ktx2} -o out.bin --format bc7|bc1|astc|etc2`.\n"
+            "        ASTC 4x4 is a byte-copy (the stored blocks are valid ASTC);\n"
+            "        bc7/bc1/etc2 go through decode+re-encode.\n"
+            "  xbc7: supercompressed BC7 (windowed RDO + zstd); --rdo N sets the\n"
+            "        max per-channel RMS reuse budget. Transcode back with\n"
+            "        `-i in.xbc7 -o out.dds` (standard BC7, any device reads it).\n");
+}
+
+static int parse_astc_block(const char *s, uint32_t *bx, uint32_t *by) {
+    char *endp = NULL;
+    unsigned long x = strtoul(s, &endp, 10);
+    unsigned long y;
+    if (!endp || (*endp != 'x' && *endp != 'X')) return 0;
+    y = strtoul(endp + 1, &endp, 10);
+    if (!endp || *endp != '\0' || x > UINT32_MAX || y > UINT32_MAX) return 0;
+    *bx = (uint32_t)x;
+    *by = (uint32_t)y;
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    struct cli_opts opts;
+    const char *in = NULL, *out = NULL;
+    int i, nfiles = 0, nfail = 0;
+    char **files = NULL;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.format = "bc7";
+    tc_bc7_options_init(&opts.bc7);
+    tc_bc1_options_init(&opts.bc1);
+    tc_bc3_options_init(&opts.bc3);
+    tc_bc5_options_init(&opts.bc5);
+    tc_bc6h_options_init(&opts.bc6h);
+    tc_etc2_options_init(&opts.etc2);
+    tc_astc_options_init(&opts.astc);
+
+    for (i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) in = argv[++i];
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out = argv[++i];
+        else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) opts.format = argv[++i];
+        else if (strcmp(argv[i], "--raw") == 0 && i + 1 < argc) opts.raw = argv[++i];
+        else if (strcmp(argv[i], "--raw-bc7") == 0 && i + 1 < argc) opts.raw = argv[++i];
+        else if (strcmp(argv[i], "--part") == 0 && i + 1 < argc) opts.part = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--srgb") == 0) {
+            opts.bc7.srgb = 1; opts.bc1.srgb = 1; opts.bc3.srgb = 1;
+            opts.etc2.srgb = 1; opts.astc.srgb = 1;
+        }
+        else if (strcmp(argv[i], "--signed") == 0) opts.bc6h.signed_float = 1;
+        else if (strcmp(argv[i], "--encoder") == 0 && i + 1 < argc) {
+            const char *e = argv[++i];
+            if (strcmp(e, "arm") == 0) {
+#ifdef TEXCOMP_HAVE_ASTCENC
+                opts.use_arm_encoder = 1;
+#else
+                fprintf(stderr, "texcomp: built without the Arm astcenc backend\n");
+                return 1;
+#endif
+            } else if (strcmp(e, "tc") != 0) { usage(); return 2; }
+        }
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            opts.astc.threads = atoi(argv[++i]);
+            if (opts.astc.threads < 1) opts.astc.threads = 1;
+        }
+        else if (strcmp(argv[i], "--astc-block") == 0 && i + 1 < argc) {
+            if (!parse_astc_block(argv[++i], &opts.astc.block_x, &opts.astc.block_y)) { usage(); return 2; }
+        }
+        else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
+            const char *q = argv[++i];
+            if (strcmp(q, "fast") == 0) opts.astc.quality = 0;
+            else if (strcmp(q, "medium") == 0) opts.astc.quality = 1;
+            else if (strcmp(q, "normal") == 0) opts.astc.quality = 2;
+            else { usage(); return 2; }
+        }
+        else if (strcmp(argv[i], "--linear") == 0) opts.bc7.perceptual = 0;
+        else if (strcmp(argv[i], "--perceptual") == 0) opts.bc7.perceptual = 1;
+        else if (strcmp(argv[i], "--quick") == 0 && i + 1 < argc) {
+            const char *qv = argv[++i];
+            if (strcmp(qv, "off") == 0) opts.bc7.quick = 0;
+            else if (strcmp(qv, "on") == 0) opts.bc7.quick = 1;
+            else if (strcmp(qv, "medium") == 0) opts.bc7.quick = 2;
+            else opts.bc7.quick = (int)strtol(qv, NULL, 10);
+        }
+        else if (strcmp(argv[i], "--mode-mask") == 0 && i + 1 < argc)
+            opts.bc7.mode_mask = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (strcmp(argv[i], "--rdo") == 0 && i + 1 < argc) opts.bc7.rdo = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bc7-pca") == 0) opts.bc7.pca_endpoints = 1;
+        else if (strcmp(argv[i], "--hdr-alpha") == 0) opts.hdr_alpha = 1;
+        else if (strcmp(argv[i], "--basis") == 0) opts.uni_basis = 2048;
+        else if (strcmp(argv[i], "--basis-cap") == 0 && i + 1 < argc) opts.uni_basis = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--basis-rdo") == 0 && i + 1 < argc) opts.uni_rdo = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--progress") == 0) opts.progress = 1;
+        else if (strcmp(argv[i], "--channel-weights") == 0 && i + 1 < argc) {
+            float wr = 1, wg = 1, wb = 1, wa = 1;
+            sscanf(argv[++i], "%f,%f,%f,%f", &wr, &wg, &wb, &wa);
+            opts.astc.channel_weights[0] = wr; opts.astc.channel_weights[1] = wg;
+            opts.astc.channel_weights[2] = wb; opts.astc.channel_weights[3] = wa;
+            {
+                float wv[4] = {wr, wg, wb, wa};
+                int k;
+                for (k = 0; k < 4; ++k) {
+                    int iw = (int)(wv[k] + 0.5f);
+                    if (iw < 0) iw = 0;
+                    if (iw > 255) iw = 255;
+                    opts.bc7.channel_weights[k] = (uint8_t)iw;
+                }
+            }
+        }
+        else { usage(); return 2; }
+    }
+
+    if (!in) { usage(); return 2; }
+
+    /* Normalize format aliases. */
+    if (strcmp(opts.format, "bc6") == 0) opts.format = "bc6h";
+    if (strcmp(opts.format, "dxt1") == 0) opts.format = "bc1";
+    if (strcmp(opts.format, "dxt5") == 0) opts.format = "bc3";
+    if (strcmp(opts.format, "uastc_hdr") == 0) opts.format = "astc_hdr";
+    if (strcmp(opts.format, "uastc_ldr") == 0 || strcmp(opts.format, "uastc") == 0) {
+        opts.format = "astc";
+        opts.astc.block_x = 4; opts.astc.block_y = 4; opts.astc.uastc = 1;
+    }
+    if (strcmp(opts.format, "etc2") == 0 || strcmp(opts.format, "etc2_rgba") == 0) {
+        opts.etc2.alpha = 1; opts.format = "etc2_rgba";
+    } else if (strcmp(opts.format, "etc2_rgb") == 0) {
+        opts.etc2.alpha = 0;
+    } else if (strcmp(opts.format, "etc2_r11") == 0) {
+        opts.format = "eac_r11";
+    } else if (strcmp(opts.format, "etc2_rg11") == 0) {
+        opts.format = "eac_rg11";
+    }
+
+    /* Expand input glob. */
+    {
+        glob_t gl;
+        int has_glob = strpbrk(in, "*?[") != NULL;
+        if (has_glob) {
+            int r = glob(in, GLOB_NOCHECK | GLOB_TILDE, NULL, &gl);
+            if (r != 0) { fprintf(stderr, "texcomp: glob failed: %s\n", in); return 1; }
+            nfiles = (int)gl.gl_pathc;
+            files = (char **)malloc((size_t)nfiles * sizeof(char *));
+            if (files) for (i = 0; i < nfiles; ++i) files[i] = strdup(gl.gl_pathv[i]);
+            globfree(&gl);
+        } else {
+            nfiles = 1;
+            files = (char **)malloc(sizeof(char *));
+            if (files) files[0] = strdup(in);
+        }
+        if (!files || (nfiles > 0 && !files[0])) {
+            fprintf(stderr, "texcomp: out of memory\n");
+            free(files);
+            return 1;
+        }
+    }
+
+    /* Determine if -o is a directory (batch mode) or single file. */
+    {
+        int is_dir = 0;
+        if (out) {
+            size_t olen = strlen(out);
+            if (olen > 0 && (out[olen - 1] == '/' || out[olen - 1] == '\\'))
+                is_dir = 1;
+        }
+        if (nfiles > 1 && !out) {
+            fprintf(stderr, "texcomp: batch mode requires -o output/\n");
+            for (i = 0; i < nfiles; ++i) free(files[i]);
+            free(files);
+            return 2;
+        }
+
+        for (i = 0; i < nfiles; ++i) {
+            const char *src = files[i];
+            char *dst = NULL;
+            int ec;
+
+            if (is_dir) {
+                const char *base, *dot;
+                const char *ext;
+                size_t blen;
+                /* simple inline output naming: dir/basename_format.ext */
+                base = strrchr(src, '/');
+                base = base ? base + 1 : src;
+                dot = strrchr(base, '.');
+                blen = dot ? (size_t)(dot - base) : strlen(base);
+                if (strcmp(opts.format, "bc6h") == 0) ext = "_bc6h.dds";
+                else if (strcmp(opts.format, "bc7") == 0) ext = "_bc7.dds";
+                else if (strcmp(opts.format, "xbc7") == 0) ext = ".xbc7";
+                else if (strcmp(opts.format, "astc_hdr") == 0 ||
+                         strcmp(opts.format, "astc") == 0) ext = ".astc";
+                else ext = ".dds";
+                dst = (char *)malloc(strlen(out) + blen + strlen(ext) + 2);
+                if (dst) {
+                    size_t dlen = strlen(out);
+                    memcpy(dst, out, dlen);
+                    if (dlen > 0 && out[dlen - 1] != '/') dst[dlen++] = '/';
+                    memcpy(dst + dlen, base, blen);
+                    memcpy(dst + dlen + blen, ext, strlen(ext) + 1);
+                } else {
+                    fprintf(stderr, "texcomp: out of memory\n"); ec = 1;
+                }
+            } else {
+                dst = out ? strdup(out) : strdup(src);
+            }
+
+            if (dst) {
+                ec = encode_one(src, dst, &opts);
+            } else {
+                fprintf(stderr, "texcomp: cannot derive output path for %s\n", src);
+                ec = 1;
+            }
+            if (ec != 0) ++nfail;
+            if (opts.progress)
+                fprintf(stderr, "[%d/%d] %s -> %s  %s\n",
+                        i + 1, nfiles, src, dst ? dst : "?", ec == 0 ? "OK" : "FAIL");
+
+            free(dst);
+        }
+    }
+
+    for (i = 0; i < nfiles; ++i) free(files[i]);
+    free(files);
+    if (nfail > 0)
+        fprintf(stderr, "texcomp: %d/%d file(s) failed\n", nfail, nfiles);
+    return nfail > 0 ? 1 : 0;
 }

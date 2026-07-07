@@ -14,10 +14,9 @@
  * tiers (SSE2/NEON) must reproduce. Disable FP contraction so the compiler
  * cannot fuse a*b+c into an FMA: on aarch64 it otherwise emits fmla here (and
  * in the NEON kernels), and the two contraction patterns diverge, breaking the
- * bit-exact parity test. x86-64 has no baseline packed FMA so it was unaffected. */
-#if defined(__GNUC__) || defined(__clang__)
-#pragma STDC FP_CONTRACT OFF
-#endif
+ * bit-exact parity test. x86-64 has no baseline packed FMA so it was unaffected.
+ * The OFF state is enforced by -ffp-contract=no in the Makefile, so the pragma
+ * is intentionally omitted here — GCC's C11 pedantic mode does not recognize it. */
 
 static float clampf(float x, float lo, float hi) {
     if (x < lo) return lo;

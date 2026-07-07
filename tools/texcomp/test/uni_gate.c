@@ -1,10 +1,11 @@
 /*
  * TinyEXR texcomp - universal ("uni") transcode gate.
  *
- * Verifies: encode/decode fidelity, and that the cheap transcoders emit valid
- * blocks -- uni -> BC7 decoded by the SHIPPED BC7 decoder must match the uni
- * reconstruction (proves the hand-written mode-6 packing is decoder-correct),
- * and uni -> BC1 round-trips at BC1-class quality.
+ * Verifies: encode/decode fidelity of the UASTC-block intermediate, and that
+ * the transcoders work correctly: uni->ASTC is a byte copy (the stored blocks
+ * ARE valid ASTC), verified by the test-only reference decoder against the
+ * uni reconstruction; uni->BC7 decoded by the SHIPPED BC7 decoder must match
+ * the uni reconstruction; uni->BC1 round-trips at BC1-class quality.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
  * SPDX-License-Identifier: Apache-2.0
@@ -107,7 +108,7 @@ int main(void) {
         CHECK(tc_uni_transcode_astc(uni, W, H, astc, asz) == TC_SUCCESS, "transcode astc");
         CHECK(aref_decode_image(astc, W, H, 4, 4, astcd) == 1, "astc decodes (valid block)");
         p_astc = psnr(unid, astcd, (size_t)W*H, 4, 4);
-        printf("uni->ASTC vs uni recon PSNR = %.1f dB (re-encode transcode)\n", p_astc);
+        printf("uni->ASTC vs uni recon PSNR = %.1f dB (byte-copy transcode)\n", p_astc);
         CHECK(p_astc >= 38.0, "uni->ASTC preserves uni fidelity");
         free(astc); free(astcd);
     }

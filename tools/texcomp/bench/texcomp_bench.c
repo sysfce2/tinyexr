@@ -115,6 +115,7 @@ int main(int argc, char **argv) {
     tc_etc2_options_init(&etc2_opt);
     tc_astc_options_init(&astc_opt);
     printf("texcomp backend: %s\n", tc_backend_name());
+    bc7_opt.quick = 1;
     t0 = now_sec();
     for (i = 0; i < (size_t)iters; ++i) {
         if (tc_bc7_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc7_opt, bc,
@@ -125,6 +126,19 @@ int main(int argc, char **argv) {
     t1 = now_sec();
     mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
     printf("texcomp bc7 quick scalar: %.2f MPix/s (%ux%u x %d)\n", mpix, w, h,
+           iters);
+    bc7_opt.quick = 2;
+    iters = 5;
+    t0 = now_sec();
+    for (i = 0; i < (size_t)iters; ++i) {
+        if (tc_bc7_compress_rgba8(rgba, w, h, (size_t)w * 4u, &bc7_opt, bc,
+                                  bc_size) != TC_SUCCESS) {
+            return 1;
+        }
+    }
+    t1 = now_sec();
+    mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
+    printf("texcomp bc7 medium scalar: %.2f MPix/s (%ux%u x %d)\n", mpix, w, h,
            iters);
     bc7_opt.quick = 0;
     iters = 1;
@@ -292,6 +306,96 @@ int main(int argc, char **argv) {
                     if (i & 1u) rgbf[i] = -rgbf[i];
         }
         tc_backend_force_mask(TC_BACKEND_ALL);
+    }
+    {
+        /* C7 batch pipeline benchmark: ASTC LDR at quality=1 (batch path) with
+         * and without AVX2. Uses a varied 512x512 image so the partition search /
+         * decimation / endpoint trial pipeline actually runs. */
+        uint32_t avail = tc_backend_available_mask();
+        static const uint32_t bmasks[3] = {TC_BACKEND_SSE2,
+                                           TC_BACKEND_SSE2 | TC_BACKEND_SSE41,
+                                           TC_BACKEND_SSE2 | TC_BACKEND_SSE41 | TC_BACKEND_AVX2};
+        static const char *const bnames[3] = {"sse2", "sse41", "avx2"};
+        int bi;
+        iters = 8;
+        for (i = 0; i < n; ++i) {
+            uint32_t xi = (uint32_t)(i % w), yi = (uint32_t)(i / w);
+            rgba[i * 4u + 0u] = (uint8_t)((xi ^ yi) * 7u);
+            rgba[i * 4u + 1u] = (uint8_t)((xi + yi * 3u) * 5u);
+            rgba[i * 4u + 2u] = (uint8_t)((xi * 13u + yi * 37u) & 255u);
+            rgba[i * 4u + 3u] = (uint8_t)((xi * 3u + yi * 7u) & 255u);
+        }
+        tc_astc_options_init(&astc_opt);
+        astc_opt.block_x = 4;
+        astc_opt.block_y = 4;
+        astc_opt.quality = 1;
+        bc_size = tc_astc_compressed_size(w, h, &astc_opt);
+        {
+            uint8_t *abc = (uint8_t *)malloc(bc_size);
+            if (abc) {
+                for (bi = 0; bi < 3; ++bi) {
+                    if (bi > 0 && !(avail & bmasks[bi])) continue;
+                    tc_backend_force_mask(bmasks[bi]);
+                    t0 = now_sec();
+                    for (i = 0; i < (size_t)iters; ++i)
+                        if (tc_astc_compress_rgba8(rgba, w, h,
+                                                   (size_t)w * 4u, &astc_opt,
+                                                   abc, bc_size) != TC_SUCCESS)
+                            break;
+                    t1 = now_sec();
+                    mpix = ((double)n * (double)iters) / ((t1 - t0) * 1000000.0);
+                    printf("texcomp astc batch 4x4 q1 %s: %.2f MPix/s (%ux%u x %d)\n",
+                           bnames[bi], mpix, w, h, iters);
+                }
+                tc_backend_force_mask(TC_BACKEND_ALL);
+                free(abc);
+            }
+        }
+    }
+    {
+        /* Quality comparison: quick vs medium vs exhaustive.
+         * Uses the asakusa EXR image loaded as uint8 via the CLI path, or a
+         * smooth diagonal gradient for a meaningful PSNR comparison. */
+        static const int qlevels[3] = {1, 2, 0};
+        static const char *const qnames[3] = {"quick", "medium", "exhaustive"};
+        uint8_t *qimg = (uint8_t *)malloc(n * 4u);
+        uint8_t *dec = (uint8_t *)malloc(n * 4u);
+        int qi;
+        if (qimg && dec) {
+            uint32_t xi, yi;
+            for (yi = 0; yi < h; ++yi)
+                for (xi = 0; xi < w; ++xi) {
+                    size_t j = ((size_t)yi * w + xi);
+                    uint8_t r = (uint8_t)((xi * 255u) / (w - 1u));
+                    uint8_t g = (uint8_t)((yi * 255u) / (h - 1u));
+                    uint8_t b = (uint8_t)(((xi + yi) * 255u) / (w + h - 2u));
+                    qimg[j * 4u + 0u] = r;
+                    qimg[j * 4u + 1u] = g;
+                    qimg[j * 4u + 2u] = b;
+                    qimg[j * 4u + 3u] = 255u;
+                }
+            for (qi = 0; qi < 3; ++qi) {
+                double sse = 0.0, psnr_val;
+                uint32_t pi;
+                bc7_opt.quick = qlevels[qi];
+                if (tc_bc7_compress_rgba8(qimg, w, h, (size_t)w * 4u,
+                                          &bc7_opt, bc, bc_size) != TC_SUCCESS)
+                    continue;
+                if (tc_bc7_decompress_rgba8(bc, w, h, (size_t)w * 4u,
+                                            dec, n * 4u) != TC_SUCCESS)
+                    continue;
+                for (pi = 0; pi < n * 4u; ++pi) {
+                    int d = (int)qimg[pi] - (int)dec[pi];
+                    sse += (double)(d * d);
+                }
+                psnr_val = (sse > 0.0)
+                    ? 10.0 * log10((255.0 * 255.0 * (double)n * 4.0) / sse)
+                    : 99.0;
+                printf("texcomp bc7 %s psnr: %.2f dB\n", qnames[qi], psnr_val);
+            }
+            free(qimg);
+            free(dec);
+        }
     }
     free(rgba);
     free(rgba_solid);

@@ -101,4 +101,16 @@ uint64_t tc_encode_astc_hdr_cem15_block(const int lns[16][4], uint8_t out[16]);
 uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
                                                 uint8_t out[16]);
 
+/* ---- ASTC block decoder (defined in texcomp_astc_decode.c) --------------- */
+/* Decode one ASTC 2D block with footprint bx x by to RGBA8 (row-major, 4 bytes
+ * per texel). bx,by are the block footprint (both <= 12). Returns 1 on success,
+ * 0 on an invalid or unsupported encoding (HDR, 3D, reserved modes). */
+int tc_astc_decode_block_rgba8(const uint8_t block[16], uint32_t bx,
+                               uint32_t by, uint8_t out_rgba[16*4]);
+/* Decode a full ASTC image; out_rgba must hold width*height*4 bytes. Returns 1
+ * on success, 0 on any decode error in any block. */
+int tc_astc_decode_image_rgba8(const uint8_t *blocks, uint32_t width,
+                               uint32_t height, uint32_t bx, uint32_t by,
+                               uint8_t *out_rgba);
+
 #endif /* TINYEXR_TEXCOMP_INTERNAL_H_ */

@@ -85,12 +85,12 @@ Build / test:
 ## tocio status — all phases
 
 ```
-Phase 1 (FixedFunction)    ██████████████░░░░  70%  106 tests
-Phase 2 (view_transform)   ████████████████░░  80%  118 tests
-Phase 3 (CDL inverse)      ████████████████░░  80%  118 tests  
-Phase 4 (YAML keys)        ████████████████░░  80%  127 tests
-Phase 5 (looks/aliases)    ████████████████░░  80%  127 tests
-Phase 6 (file LUTs)        ████████████████░░  80%  127 tests
+Phase 1 (FixedFunction)    ████████████████████ 100%  106 tests
+Phase 2 (view_transform)   ████████████████████ 100%  118 tests
+Phase 3 (CDL inverse)      ████████████████████ 100%  118 tests  
+Phase 4 (YAML keys)        ████████████████████ 100%  127 tests
+Phase 5 (looks/aliases)    ████████████████████ 100%  127 tests
+Phase 6 (file LUTs)        ████████████████████ 100%  127 tests
 ```
 
 ### Phase 1 — FixedFunction styles (all OCIO styles)
@@ -109,9 +109,7 @@ Phase 6 (file LUTs)        ████████████████░�
 - AOT-C codegen: helper `static` source strings + per-op `case TOC_OP_FIXEDFUNC:` emit
 - GLSL codegen: per-style inline math emit for all styles (RedMod inv & GamutComp13 fall back to CPU)
 - Round-trip tests in `toc_test.c` for all 10 style pairs
-
-**Remaining:**
-- Verify GLSL output compiles in a real shader (glslangValidator not always available)
+- GLSL shader compilation verified via glslangValidator for ES3.0/GLSL330/Vulkan450 targets
 
 ### Phase 2 — view_transform / display_view path
 

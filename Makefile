@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -42,6 +42,7 @@ test: $(TARGET)
 # gate compiles its C++ so it needs a C++ toolchain).
 .PHONY: tools-test tools-test-all
 tools-test: texcomp-c11-gate texcomp-test texcomp-uni-gate texcomp-xbc7-gate \
+            texcomp-bc6h-gate \
             resize-c11-gate resize-test \
             texpipe-c11-gate texpipe-test \
             envmap-c11-gate envmap-test envmap-pbr-test
@@ -247,7 +248,8 @@ TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
   tools/texcomp/src/texcomp_bc5.c tools/texcomp/src/texcomp_bc6h.c \
   tools/texcomp/src/texcomp_bc7.c tools/texcomp/src/texcomp_etc2.c \
   tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c \
-  tools/texcomp/src/texcomp_astc_hdr.c tools/texcomp/src/texcomp_uni.c
+  tools/texcomp/src/texcomp_astc_hdr.c tools/texcomp/src/texcomp_uni.c \
+  tools/texcomp/src/texcomp_astc_decode.c
 TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
 TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
 TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))
@@ -352,6 +354,23 @@ texcomp-uni-gate: $(TEXCOMP_OBJ) tools/texcomp/test/uni_gate.c | build/texcomp
 	  tools/texcomp/test/uni_gate.c $(TEXCOMP_OBJ) -lm -o build/texcomp/uni_gate
 	./build/texcomp/uni_gate
 
+# BC6H conformance + quality gate: encode HDR, decode every block with an
+# independent reference decoder (bcdec port) and check PSNR vs source.
+texcomp-bc6h-gate: $(TEXCOMP_OBJ) tools/texcomp/test/bc6h_gate.c | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -O2 -g \
+	  tools/texcomp/test/bc6h_gate.c $(TEXCOMP_OBJ) -lm -o build/texcomp/bc6h_gate
+	./build/texcomp/bc6h_gate
+
+# BC6H/BC7 pipeline quality gate: loads real EXR images, encodes/decodes,
+# checks PSNR + SSIM. Argument: path to openexr-images directory.
+texcomp-pipeline-gate: $(TEXCOMP_OBJ) tools/texcomp/test/bc6h_pipeline_gate.c \
+                        tools/texcomp/test/tc_ssim.h \
+                        tools/texcomp/test/tc_ssim_gauss11.inc | build/texcomp
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test -O2 -g \
+	  tools/texcomp/test/bc6h_pipeline_gate.c $(TEXCOMP_OBJ) build/libtinyexr3.a \
+	  -lm -o build/texcomp/bc6h_pipeline_gate
+	./build/texcomp/bc6h_pipeline_gate $(OPENEXR_IMAGES_DIR)
+
 texcomp-bench: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_bench.c | build/texcomp
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -O3 \
 	  tools/texcomp/bench/texcomp_bench.c $(TEXCOMP_OBJ) -lm -o build/texcomp_bench
@@ -410,6 +429,25 @@ texcomp-astc-arm-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc
 # Self-contained CI gate for the ASTC HDR encoder: encodes deterministic HDR
 # images with the pure-C tc encoder and verifies them with astcenc's conformant
 # HDR decoder (const-colour round-trip + gradient PSNR floor).
+# Basis Universal transcoder validation gate. Vendored from
+# https://github.com/BinomialLLC/basis_universal (transcoder/basisu_transcoder.cpp)
+# into deps/basisu/. C++ build like astcenc; skip if files not present.
+BASISU_DIR ?= deps/basisu
+BASISU_HDR = $(BASISU_DIR)/basisu_transcoder.h
+BASISU_SRC = $(BASISU_DIR)/basisu_transcoder.cpp
+
+BASISU_DEFS = -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=0
+
+texcomp-basis-gate: tools/texcomp/test/basis_validate.c | build/texcomp
+	@test -f "$(BASISU_SRC)" || { echo "basis-validate: vendored transcoder not found (cp from https://github.com/BinomialLLC/basis_universal)"; exit 77; }
+	$(CXX) -std=c++17 -Wall -Wextra -fno-strict-aliasing $(BASISU_DEFS) -I$(BASISU_DIR) -O2 -g -c \
+	  tools/texcomp/test/basis_validate.c -o build/texcomp/basis_validate.o
+	$(CXX) -std=c++17 $(BASISU_DEFS) -I$(BASISU_DIR) -O2 -g -c \
+	  $(BASISU_SRC) -o build/texcomp/basisu_transcoder.o
+	$(CXX) build/texcomp/basis_validate.o build/texcomp/basisu_transcoder.o -lm -o build/texcomp/basis_validate
+	./build/texcomp/basis_validate
+	@echo "basis-validate: OK"
+
 texcomp-astc-hdr-gate: $(TEXCOMP_OBJ) $(ASTCENC_LIB_OBJ) tools/texcomp/test/astc_hdr_xcheck.c | build/texcomp
 	$(AR) rcs build/libtexcomp_astcenc.a $(ASTCENC_LIB_OBJ)
 	$(CC) $(V3_CSTD) -Wall -Wextra $(TEXCOMP_INC) -Itools/texcomp/test \
@@ -794,13 +832,13 @@ tocio-lib: $(TOC_OBJ)
 tocio-c11-gate: | build
 	@for f in $(TOC_SRC); do \
 	  echo "  C11  $$f"; \
-	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O1 -fsyntax-only $$f || exit 1; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -ffp-contract=off -O1 -fsyntax-only $$f || exit 1; \
 	done
 	@echo "tocio pure-C11 gate: OK"
 
 build/toc-fs-%.o: sandbox/tocio/src/%.c $(TOC_HDRS) | build
 	$(CC) -DTOC_FREESTANDING -ffreestanding -fno-builtin -fno-stack-protector \
-	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O2 -g -c $< -o $@
+	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -ffp-contract=off -O2 -g -c $< -o $@
 
 tocio-freestanding-gate: $(TOC_FS_OBJ) sandbox/tocio/tests/toc_fs_smoke.c | build
 	@echo "  scan: only toc_stdio.c may include <stdio.h>"
@@ -1090,6 +1128,7 @@ help:
 	@echo "make texcomp-arm - texcomp CLI with the vendored Arm astcenc backend (--encoder arm)"
 	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
 	@echo "make texcomp-astc-arm-gate - self-contained astcenc build + PSNR cross-check (CI gate)"
+	@echo "make texcomp-basis-gate  - Basis Universal transcoder validation (cp basisu_transcoder to deps/basisu/)"
 	@echo "make texcomp-wasm - Emscripten texcomp C API + Node CLI (scalar wasm)"
 	@echo "make texcomp-wasm-simd - Emscripten texcomp C API + Node CLI (-msimd128)"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
