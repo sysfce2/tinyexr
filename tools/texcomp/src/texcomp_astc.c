@@ -1922,6 +1922,7 @@ static void tc_astc_accum_weights_avx2(uint32_t weight_accum[64],
     }
 }
 #endif /* __AVX2__ */
+#endif /* TC_X86 */
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 static void tc_astc_project_ideal_neon(const uint8_t block[144][4],
@@ -2030,7 +2031,6 @@ static uint64_t tc_astc_recon_sse_pt_neon(const uint8_t block[144][4],
     return err;
 }
 #endif /* NEON */
-#endif /* TC_X86 */
 
 static void tc_astc_project_ideal(const uint8_t block[144][4], uint32_t count,
                                   const uint32_t lo[4], const uint32_t hi[4],
@@ -5064,7 +5064,7 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     uint8_t v[8];
     int e0[3], e1[3], qe0[3], qe1[3], dir[3];
     int i, c, ccs;
-    int64_t dlen2 = 0, sse_single = 0, best_dual_sse = -1;
+    int64_t sse_single = 0, best_dual_sse = -1;
     int best_ccs = -1;
     uint8_t dp1[16], dp2[16];
     uint32_t bitpos;
@@ -5137,7 +5137,6 @@ uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]) {
     tc_astc_cem11_unpack(v, qe0, qe1);
     for (c = 0; c < 3; ++c) {
         dir[c] = qe1[c] - qe0[c];
-        dlen2 += (int64_t)dir[c] * dir[c];
     }
 
     /* dual plane: one channel gets its own weight plane. Try each candidate
@@ -6552,7 +6551,8 @@ static tc_result tc_astc_compress_band(tc_astc_encode_context *astc_ctx,
     return TC_SUCCESS;
 }
 
-#if !defined(__STDC_NO_THREADS__) && !defined(TC_NO_THREADS)
+#if !defined(__STDC_NO_THREADS__) && !defined(TC_NO_THREADS) && \
+    !defined(_WIN32)
 #include <threads.h>
 #define TC_ASTC_HAVE_THREADS 1
 

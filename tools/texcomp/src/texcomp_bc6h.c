@@ -1039,7 +1039,7 @@ static uint64_t tc_bc6h_mode0_uf16(const float pix[16][3], uint8_t out[16]) {
                 bep[r * 2 + 1][c] = t;
             }
             for (i = 0; i < 16u; ++i)
-                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+                if (tc_bc6h_part2[best_p][i] == (uint32_t)r) bsel[i] = (uint8_t)(7u - bsel[i]);
         }
     }
 
@@ -1240,7 +1240,7 @@ static uint64_t tc_bc6h_mode1_uf16(const float pix[16][3], uint8_t out[16]) {
                 bep[r * 2 + 1][c] = t;
             }
             for (i = 0; i < 16u; ++i)
-                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+                if (tc_bc6h_part2[best_p][i] == (uint32_t)r) bsel[i] = (uint8_t)(7u - bsel[i]);
         }
     }
 
@@ -1447,7 +1447,7 @@ static uint64_t tc_bc6h_mode234_uf16(const float pix[16][3], const uint8_t dbits
                 bep[r * 2 + 1][c] = t;
             }
             for (i = 0; i < 16u; ++i)
-                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+                if (tc_bc6h_part2[best_p][i] == (uint32_t)r) bsel[i] = (uint8_t)(7u - bsel[i]);
         }
     }
 
@@ -2164,7 +2164,7 @@ static uint64_t tc_bc6h_mode9_uf16(const float pix[16][3], uint8_t out[16]) {
                 bep[r * 2 + 1][c] = t;
             }
             for (i = 0; i < 16u; ++i)
-                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+                if (tc_bc6h_part2[best_p][i] == (uint32_t)r) bsel[i] = (uint8_t)(7u - bsel[i]);
         }
     }
 
@@ -2350,7 +2350,7 @@ static uint64_t tc_bc6h_mode9_sf16(const float pix[16][3], uint8_t out[16]) {
                 bep[r * 2 + 1][c] = t;
             }
             for (i = 0; i < 16u; ++i)
-                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+                if (tc_bc6h_part2[best_p][i] == (uint32_t)r) bsel[i] = (uint8_t)(7u - bsel[i]);
         }
     }
     for (c = 0; c < 3u; ++c) {
@@ -2550,7 +2550,7 @@ static uint64_t tc_bc6h_mode0_sf16(const float pix[16][3], uint8_t out[16]) {
                 bep[r * 2 + 1][c] = t;
             }
             for (i = 0; i < 16u; ++i)
-                if ((int)tc_bc6h_part2[best_p][i] == r) bsel[i] = (uint8_t)(7u - bsel[i]);
+                if (tc_bc6h_part2[best_p][i] == (uint32_t)r) bsel[i] = (uint8_t)(7u - bsel[i]);
         }
     }
     memset(out, 0, 16u);

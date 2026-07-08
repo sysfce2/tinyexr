@@ -5766,11 +5766,6 @@ static inline exr_result jph_ms_encode64(JphMsEnc *m, uint64_t cwd, int cwd_len)
     return EXR_SUCCESS;
 }
 
-static inline exr_result jph_ms_encode(JphMsEnc *m, uint32_t cwd, int cwd_len) {
-    if (cwd_len <= 0) return EXR_SUCCESS;
-    return jph_ms_encode64(m, cwd, cwd_len);
-}
-
 static inline exr_result jph_ms_terminate(JphMsEnc *m) {
     if (m->nbits) {
         int t = m->max_bits - m->nbits;

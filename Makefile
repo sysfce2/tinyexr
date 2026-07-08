@@ -387,7 +387,8 @@ texcomp-astc-psnr: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_psnr.c tools/texco
 # aarch64; the default `make texcomp` stays pure C11 with no C++ parts.
 ASTCENC_LIB_SRC = $(wildcard deps/astcenc/*.cpp)
 ASTCENC_LIB_OBJ = $(patsubst deps/astcenc/%.cpp,build/astcenc/%.o,$(ASTCENC_LIB_SRC))
-ifeq ($(shell uname -m),aarch64)
+ASTCENC_HOST_ARCH ?= $(shell uname -m)
+ifneq ($(filter aarch64 arm64,$(ASTCENC_HOST_ARCH)),)
   ASTCENC_DEFS = -DASTCENC_SSE=0 -DASTCENC_AVX=0 -DASTCENC_NEON=1 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
 else
   ASTCENC_DEFS = -DASTCENC_SSE=20 -DASTCENC_AVX=0 -DASTCENC_NEON=0 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
@@ -471,7 +472,7 @@ texcomp-xbc7-gate: lib $(TEXCOMP_OBJ) texcomp tools/texcomp/test/xbc7_gate.c too
 	  --format xbc7 --rdo 16 --raw build/texcomp/rt_enc.bc7
 	./build/texcomp/texcomp -i build/texcomp/rt.xbc7 -o build/texcomp/rt.dds \
 	  --raw build/texcomp/rt_dec.bc7
-	@cmp -s build/texcomp/rt_enc.bc7 build/texcomp/rt_dec.bc7 \
+	@git diff --no-index --quiet build/texcomp/rt_enc.bc7 build/texcomp/rt_dec.bc7 \
 	  && echo "xbc7 CLI round-trip: OK (transcode is bit-exact BC7)" \
 	  || { echo "FAIL: xbc7 round-trip differs"; exit 1; }
 

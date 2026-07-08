@@ -11,14 +11,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
 #include <glob.h>
+#endif
 
 #ifdef TEXCOMP_HAVE_ASTCENC
 /* Vendored Arm astcenc backend (deps/astcenc, Apache-2.0); its public API
  * has C linkage, so the pure-C CLI can drive it directly. */
 #include "astcenc.h"
 
-#if !defined(__STDC_NO_THREADS__) && !defined(TC_NO_THREADS)
+#if !defined(__STDC_NO_THREADS__) && !defined(TC_NO_THREADS) && \
+    !defined(_WIN32)
 #include <threads.h>
 #define TC_CLI_HAVE_THREADS 1
 #endif
@@ -1123,6 +1126,7 @@ int main(int argc, char **argv) {
 
     /* Expand input glob. */
     {
+#if !defined(_WIN32)
         glob_t gl;
         int has_glob = strpbrk(in, "*?[") != NULL;
         if (has_glob) {
@@ -1137,6 +1141,11 @@ int main(int argc, char **argv) {
             files = (char **)malloc(sizeof(char *));
             if (files) files[0] = strdup(in);
         }
+#else
+        nfiles = 1;
+        files = (char **)malloc(sizeof(char *));
+        if (files) files[0] = strdup(in);
+#endif
         if (!files || (nfiles > 0 && !files[0])) {
             fprintf(stderr, "texcomp: out of memory\n");
             free(files);
