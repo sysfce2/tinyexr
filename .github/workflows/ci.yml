@@ -8,6 +8,97 @@ on:
     branches: ["release", "master"]
 
 jobs:
+  tinyexr-v3-c:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gcc-v3-c
+            runs_on: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - name: linux-x64-clang-v3-c
+            runs_on: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - name: linux-arm64-gcc-v3-c
+            runs_on: ubuntu-24.04-arm
+            cc: gcc
+            cxx: g++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Strict pure-C11 syntax gate
+        run: make c11-gate
+
+      - name: Build TinyEXR v3 C library
+        run: make lib
+
+      - name: Run TinyEXR v3 C unit tests
+        run: make test-c
+
+  tools-c:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gcc-tools-c
+            runs_on: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - name: linux-x64-clang-tools-c
+            runs_on: ubuntu-latest
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run TIR, texcomp, texpipe, and envmap gates
+        run: make tools-test
+
+      - name: Build tool CLIs
+        run: make resize-cli texcomp texpipe envmap
+
+  texcomp-cxx-gates:
+    name: linux-x64-texcomp-cxx-gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build texcomp with vendored astcenc backend
+        run: make texcomp-arm
+
+      - name: Run texcomp ASTC HDR gate
+        run: make texcomp-astc-hdr-gate
+
+      - name: Run texcomp astcenc cross-check gate
+        run: make texcomp-astc-arm-gate
+
+      - name: Run texcomp Basis Universal validation gate
+        run: make texcomp-basis-gate
+
   unit-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on }}

@@ -91,6 +91,13 @@ static void run_safe(const char *path) {
     g_pass++;
 }
 
+static int file_readable(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    fclose(fp);
+    return 1;
+}
+
 static int images_equal(const exr_image *a, const exr_image *b) {
     int p, c;
     if (a->num_parts != b->num_parts) return 0;
@@ -171,6 +178,11 @@ static void jph_decode_matches(const char *ref_path, const char *ht_path,
                                const char *name) {
     exr_image ref, ht;
     exr_result rc_ref, rc_ht;
+    if (!file_readable(ref_path) || !file_readable(ht_path)) {
+        printf("  skip: %s or %s missing (HTJ2K decode compare %s)\n",
+               ref_path, ht_path, name);
+        return;
+    }
     memset(&ref, 0, sizeof(ref));
     memset(&ht, 0, sizeof(ht));
     rc_ref = exr_load_from_file(ref_path, NULL, &ref);
@@ -593,6 +605,15 @@ static void roundtrip(const char *path, exr_compression comp, const char *name) 
     free(buf);
     exr_image_free(&src);
     exr_image_free(&back);
+}
+
+static void roundtrip_if_present(const char *path, exr_compression comp,
+                                 const char *name) {
+    if (!file_readable(path)) {
+        printf("  skip: %s missing (roundtrip %s)\n", path, name);
+        return;
+    }
+    roundtrip(path, comp, name);
 }
 
 /* Build a tiled image from a scanline source in-memory, save tiled, reload. */
@@ -3958,18 +3979,20 @@ int main(void) {
               EXR_COMPRESSION_HTJ2K32, "HTJ2K32");
     roundtrip("test/unit/regression/2by2.exr",
               EXR_COMPRESSION_HTJ2K256, "HTJ2K256");
-    roundtrip("openexr-images/TestImages/AllHalfValues.exr",
-              EXR_COMPRESSION_HTJ2K32, "HTJ2K32 AllHalfValues");
-    roundtrip("openexr-images/TestImages/AllHalfValues.exr",
-              EXR_COMPRESSION_HTJ2K256, "HTJ2K256 AllHalfValues");
-    roundtrip("openexr-images/TestImages/BrightRingsNanInf.exr",
-              EXR_COMPRESSION_HTJ2K256, "HTJ2K256 BrightRingsNanInf");
-    roundtrip("openexr-images/TestImages/RgbRampsDiagonal.exr",
-              EXR_COMPRESSION_HTJ2K32, "HTJ2K32 RgbRampsDiagonal");
-    roundtrip("openexr-images/TestImages/WideFloatRange.exr",
-              EXR_COMPRESSION_HTJ2K32, "HTJ2K32 WideFloatRange");
-    roundtrip("openexr-images/TestImages/WideFloatRange.exr",
-              EXR_COMPRESSION_HTJ2K256, "HTJ2K256 WideFloatRange");
+    roundtrip_if_present("openexr-images/TestImages/AllHalfValues.exr",
+                         EXR_COMPRESSION_HTJ2K32, "HTJ2K32 AllHalfValues");
+    roundtrip_if_present("openexr-images/TestImages/AllHalfValues.exr",
+                         EXR_COMPRESSION_HTJ2K256, "HTJ2K256 AllHalfValues");
+    roundtrip_if_present("openexr-images/TestImages/BrightRingsNanInf.exr",
+                         EXR_COMPRESSION_HTJ2K256,
+                         "HTJ2K256 BrightRingsNanInf");
+    roundtrip_if_present("openexr-images/TestImages/RgbRampsDiagonal.exr",
+                         EXR_COMPRESSION_HTJ2K32,
+                         "HTJ2K32 RgbRampsDiagonal");
+    roundtrip_if_present("openexr-images/TestImages/WideFloatRange.exr",
+                         EXR_COMPRESSION_HTJ2K32, "HTJ2K32 WideFloatRange");
+    roundtrip_if_present("openexr-images/TestImages/WideFloatRange.exr",
+                         EXR_COMPRESSION_HTJ2K256, "HTJ2K256 WideFloatRange");
     jph_encode_subsampling_roundtrip();
     jph_encode_uint_roundtrip();
     jph_encode_rct_roundtrip();
