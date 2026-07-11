@@ -466,13 +466,21 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
 
 tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
                                      uint8_t *out_rgba, size_t out_size) {
+    return tp_ktx2_decode_slice_rgba8(img, level, 0, 0, out_rgba, out_size);
+}
+
+tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
+                                     int layer, int face, uint8_t *out_rgba,
+                                     size_t out_size) {
     uint32_t w, h;
-    size_t need;
+    size_t need, img_bytes, slice;
     const uint8_t *blocks;
+    int nlayers;
     if (!img || !out_rgba) return TP_ERROR_INVALID_ARGUMENT;
     if (level < 0 || level >= img->num_levels) return TP_ERROR_INVALID_ARGUMENT;
-    if (img->num_faces != 1 || img->num_layers > 1)
-        return TP_ERROR_UNSUPPORTED; /* single-face / non-array only for now */
+    nlayers = img->num_layers ? img->num_layers : 1; /* 0 = non-array */
+    if (layer < 0 || layer >= nlayers) return TP_ERROR_INVALID_ARGUMENT;
+    if (face < 0 || face >= img->num_faces) return TP_ERROR_INVALID_ARGUMENT;
     w = img->levels[level].width;
     h = img->levels[level].height;
     if (!w || !h) return TP_ERROR_INVALID_ARGUMENT;
@@ -482,7 +490,21 @@ tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
         return TP_ERROR_UNSUPPORTED;
     need = (size_t)w * (size_t)h * 4u;
     if (out_size < need) return TP_ERROR_INVALID_ARGUMENT;
-    blocks = img->levels[level].data;
+
+    /* A level holds its slices in KTX2 order (layer, face), each one a tightly
+     * packed block image of the level's dimensions. */
+    img_bytes = (size_t)(((uint64_t)w + (uint64_t)img->block_w - 1u) /
+                         (uint64_t)img->block_w) *
+                (size_t)(((uint64_t)h + (uint64_t)img->block_h - 1u) /
+                         (uint64_t)img->block_h) *
+                (size_t)img->block_bytes;
+    slice = ((size_t)layer * (size_t)img->num_faces + (size_t)face) * img_bytes;
+    /* The reader's level-size check covers all slices, but a hand-built
+     * tp_ktx2_image (or a level whose declared size we merely lower-bounded)
+     * could still come up short -- decoders read img_bytes without a length. */
+    if (img->levels[level].size < slice + img_bytes)
+        return TP_ERROR_INVALID_ARGUMENT;
+    blocks = img->levels[level].data + slice;
 
     if (img->is_uni)
         return tp_from_tc(tc_uni_decompress_rgba8(blocks, w, h, (size_t)w * 4u,

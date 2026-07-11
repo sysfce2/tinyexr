@@ -326,9 +326,20 @@ void tp_ktx2_image_free(const tir_allocator *a, tp_ktx2_image *img);
  * packed, top-to-bottom). Handles the LDR set: uni, BC7, BC1, BC3, BC5, and
  * ASTC LDR. BC6H (HDR, so RGBA8 is the wrong target) and ETC2/EAC return
  * TP_ERROR_UNSUPPORTED — upload their blocks directly instead, or transcode a
- * uni source via texcomp's tc_uni_transcode_*. Single-face/non-array only. */
+ * uni source via texcomp's tc_uni_transcode_*.
+ * For a cube or array KTX2 this decodes the first slice (layer 0, face 0); use
+ * tp_ktx2_decode_slice_rgba8 to reach the others. */
 tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
                                      uint8_t *out_rgba, size_t out_size);
+
+/* Decode one slice of one level: `face` in [0, num_faces) and `layer` in
+ * [0, max(1, num_layers)). A level stores its slices in KTX2 order (layer,
+ * face), each a tightly packed block image of the level's dimensions, so this
+ * is what reads back a cubemap (faceCount 6) or an array (layerCount N) written
+ * by tp_write_ktx2 / tp_write_ktx2_array. Same codec support as above. */
+tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
+                                     int layer, int face, uint8_t *out_rgba,
+                                     size_t out_size);
 
 /* Serialize pre-encoded uni (UASTC) mip levels as a KTX2 (vkFormat = UNDEFINED,
  * supercompressionScheme = 0, KHR_DF UASTC descriptor). This is the Basis-free

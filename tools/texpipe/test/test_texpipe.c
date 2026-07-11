@@ -454,6 +454,28 @@ static void test_cube_container(void) {
         CHECK(rd_u64(ktx + 88) == 6u * tc_bc7_compressed_size(n, n),
               "ktx2 cube level0 length = 6 faces");
     }
+    /* Read the cube back and decode each face. Face f was painted with a
+     * constant blue of f*40, so the decoded blue identifies the face -- that
+     * pins the per-face slice offsets and their order, not just that a decode
+     * succeeded. (Seam fixup only touches face borders, so sample the centre.) */
+    if (ktx) {
+        tp_ktx2_image ki;
+        uint8_t *d = (uint8_t *)malloc((size_t)n * n * 4u);
+        CHECK(TP_OK(tp_ktx2_read(ktx, ktx_n, &ki)), "cube: read back");
+        CHECK(ki.num_faces == 6 && ki.num_layers == 0, "cube: faces/layers");
+        for (f = 0; f < 6; ++f) {
+            int blue;
+            CHECK(TP_OK(tp_ktx2_decode_slice_rgba8(&ki, 0, 0, f, d,
+                                                   (size_t)n * n * 4u)),
+                  "cube: decode face");
+            blue = d[((n / 2) * n + n / 2) * 4 + 2];
+            CHECK(abs(blue - f * 40) <= 8, "cube: face decodes to its own blue");
+        }
+        CHECK(tp_ktx2_decode_slice_rgba8(&ki, 0, 0, 6, d, (size_t)n * n * 4u) ==
+                  TP_ERROR_INVALID_ARGUMENT, "cube: reject out-of-range face");
+        free(d);
+    }
+
     /* DDS cube caps. */
     {
         uint8_t *dds = NULL; size_t dds_n = 0;
@@ -732,6 +754,32 @@ static void test_array_ktx2(void) {
         CHECK(rd_u64(buf + 88) == 3u * tc_bc7_compressed_size(64, 64),
               "ktx2 array level0 length = 3 layers");
         CHECK(rd_u64(buf + 80) + rd_u64(buf + 88) <= wrote, "array level0 in bounds");
+    }
+    /* Read the array back: every layer must parse and decode. The three layers
+     * are the same blocks, so all three slices must decode identically. */
+    if (buf) {
+        tp_ktx2_image ki;
+        uint8_t *d0 = (uint8_t *)malloc(64u * 64u * 4u);
+        uint8_t *dn = (uint8_t *)malloc(64u * 64u * 4u);
+        int layer;
+        CHECK(TP_OK(tp_ktx2_read(buf, wrote, &ki)), "array: read back");
+        CHECK(ki.num_layers == 3 && ki.num_faces == 1, "array: layers/faces");
+        CHECK(TP_OK(tp_ktx2_decode_slice_rgba8(&ki, 0, 0, 0, d0, 64u * 64u * 4u)),
+              "array: decode layer 0");
+        for (layer = 1; layer < 3; ++layer) {
+            CHECK(TP_OK(tp_ktx2_decode_slice_rgba8(&ki, 0, layer, 0, dn,
+                                                   64u * 64u * 4u)),
+                  "array: decode layer n");
+            CHECK(memcmp(d0, dn, 64u * 64u * 4u) == 0,
+                  "array: identical layers decode identically");
+        }
+        CHECK(psnr_rgba(img, d0, 64u * 64u) >= 30.0, "array: layer 0 PSNR >= 30 dB");
+        CHECK(tp_ktx2_decode_slice_rgba8(&ki, 0, 3, 0, dn, 64u * 64u * 4u) ==
+                  TP_ERROR_INVALID_ARGUMENT, "array: reject out-of-range layer");
+        CHECK(tp_ktx2_decode_slice_rgba8(&ki, 0, 0, 1, dn, 64u * 64u * 4u) ==
+                  TP_ERROR_INVALID_ARGUMENT, "array: reject out-of-range face");
+        free(d0);
+        free(dn);
     }
     printf("  array ktx2 (layerCount=3): ok\n");
     free(buf);
