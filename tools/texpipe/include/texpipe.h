@@ -386,7 +386,7 @@ tp_result tp_ktx2_decode_slice_rgbaf(const tp_ktx2_image *img, int level,
  * tc_uni_decompress_rgba8. `uni_levels[l]`/`uni_sizes[l]` are the level-l uni
  * bytes (from tc_uni_compress_rgba8), level 0 = largest.
  *
- * Only the base dimensions are passed: every other level's size is derived as
+ * Only the base dimensions are used: every other level's size is derived as
  * max(1, base >> l), which is how the reader re-derives them, so uni_sizes[l]
  * must be exactly the 4x4x16B block payload for that level. num_levels may not
  * exceed the pyramid base_w x base_h actually has, and neither dimension may
@@ -396,9 +396,23 @@ tp_result tp_ktx2_decode_slice_rgbaf(const tp_ktx2_image *img, int level,
  * tp_ktx2_uni_size returns the required output size, or 0 if num_levels is out
  * of range or the level sizes would overflow the layout. */
 size_t tp_ktx2_uni_size(const size_t *uni_sizes, int num_levels);
+tp_result tp_ktx2_write_uni_ex(const uint8_t *const *uni_levels,
+                               const size_t *uni_sizes, uint32_t base_w,
+                               uint32_t base_h, int num_levels, uint32_t flags,
+                               uint8_t *out, size_t out_size, size_t *written);
+
+/* The pre-flags form, kept so existing callers keep compiling. Equivalent to
+ * tp_ktx2_write_uni_ex(..., level_w[0], level_h[0], num_levels, 0, ...): only
+ * element [0] of level_w/level_h was ever read, and flags = 0 means the DFD says
+ * linear, no alpha -- what this function always emitted.
+ *
+ * Prefer tp_ktx2_write_uni_ex: a uni file has no vkFormat, so unless you pass
+ * TP_UNI_SRGB / TP_UNI_ALPHA the DFD cannot tell a consumer that your texture is
+ * sRGB or that its alpha means anything, and it will be uploaded as linear and
+ * transcoded to an alpha-less format. */
 tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
-                            const size_t *uni_sizes, uint32_t base_w,
-                            uint32_t base_h, int num_levels, uint32_t flags,
+                            const size_t *uni_sizes, const uint32_t *level_w,
+                            const uint32_t *level_h, int num_levels,
                             uint8_t *out, size_t out_size, size_t *written);
 
 /* Zstd compressor callbacks -- the write-side counterpart of

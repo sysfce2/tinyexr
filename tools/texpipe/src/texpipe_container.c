@@ -841,10 +841,10 @@ static void tp_ktx2_uni_emit(uint8_t *buf, uint32_t base_w, uint32_t base_h,
     tp_write_uni_dfd(buf + dfd_off, flags);
 }
 
-tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
-                            const size_t *uni_sizes, uint32_t base_w,
-                            uint32_t base_h, int num_levels, uint32_t flags,
-                            uint8_t *out, size_t out_size, size_t *written) {
+tp_result tp_ktx2_write_uni_ex(const uint8_t *const *uni_levels,
+                               const size_t *uni_sizes, uint32_t base_w,
+                               uint32_t base_h, int num_levels, uint32_t flags,
+                               uint8_t *out, size_t out_size, size_t *written) {
     /* Zeroed because tp_ktx2_uni_layout fills only [0, num_levels) and the
      * compiler cannot see that across the call into tp_ktx2_uni_emit. */
     uint64_t loff[TP_KTX2_MAX_LEVELS] = {0};
@@ -877,13 +877,24 @@ tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
     return TP_SUCCESS;
 }
 
+/* Pre-flags compatibility form. Only level_w[0]/level_h[0] were ever read, and
+ * flags = 0 reproduces the DFD this used to emit (linear, no alpha). */
+tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
+                            const size_t *uni_sizes, const uint32_t *level_w,
+                            const uint32_t *level_h, int num_levels,
+                            uint8_t *out, size_t out_size, size_t *written) {
+    if (!level_w || !level_h) return TP_ERROR_INVALID_ARGUMENT;
+    return tp_ktx2_write_uni_ex(uni_levels, uni_sizes, level_w[0], level_h[0],
+                                num_levels, 0u, out, out_size, written);
+}
+
 tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound,
                                  tp_zstd_compress_fn zenc, void *user,
                                  const uint8_t *const *uni_levels,
                                  const size_t *uni_sizes, uint32_t base_w,
                                  uint32_t base_h, int num_levels, uint32_t flags,
                                  uint8_t **out, size_t *out_size) {
-    /* Zeroed for the same reason as in tp_ktx2_write_uni: the compiler cannot
+    /* Zeroed for the same reason as in tp_ktx2_write_uni_ex: the compiler cannot
      * see that the loop below fills exactly [0, num_levels) before both arrays
      * are handed to tp_ktx2_uni_emit. */
     size_t clen[TP_KTX2_MAX_LEVELS] = {0};

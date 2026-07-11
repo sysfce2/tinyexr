@@ -1557,7 +1557,7 @@ static void test_ktx2_read_roundtrip(void) {
         levels[0] = uni; sizes[0] = usz;
         ktx_size = tp_ktx2_uni_size(sizes, 1);
         ubuf = (uint8_t *)malloc(ktx_size);
-        CHECK(TP_OK(tp_ktx2_write_uni(levels, sizes, 64, 64, 1, TP_UNI_SRGB,
+        CHECK(TP_OK(tp_ktx2_write_uni_ex(levels, sizes, 64, 64, 1, TP_UNI_SRGB,
                                       ubuf, ktx_size, NULL)),
               "write uni ktx2");
         /* The DFD must carry the flags the caller asked for: sRGB transfer (2),
@@ -1660,7 +1660,7 @@ static void test_ktx2_read_roundtrip(void) {
         ulev[0] = block; ulev[1] = block;
         usz[0] = (size_t)-1 - 64u; usz[1] = 1024u; /* cursor + sizes[0] wraps */
         CHECK(tp_ktx2_uni_size(usz, 2) == 0, "uni layout overflow -> size 0");
-        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
+        CHECK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "reject uni write with overflowing level sizes");
 
@@ -1668,7 +1668,7 @@ static void test_ktx2_read_roundtrip(void) {
          * the write succeeds. Every rejection below therefore comes from the
          * rule it names, not from the output buffer being too small. */
         usz[0] = 16u; usz[1] = 16u; /* 4x4 and 2x2 are one block each */
-        CHECK(TP_OK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
+        CHECK(TP_OK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
                                       &wrote)),
               "control: a valid 4x4 2-level uni write succeeds into this buffer");
         CHECK(wrote == 208u, "control: the file is 208 bytes");
@@ -1676,19 +1676,46 @@ static void test_ktx2_read_roundtrip(void) {
         /* The scheme-0 writer now enforces the same rules as the Zstd one: each
          * of these emits a file tp_ktx2_read would refuse, so the write must
          * fail rather than hand back an unloadable asset. */
-        CHECK(tp_ktx2_write_uni(ulev, usz, 131072, 4, 2, 0u, obuf, sizeof(obuf),
+        CHECK(tp_ktx2_write_uni_ex(ulev, usz, 131072, 4, 2, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects a dimension over TP_KTX2_MAX_DIM");
-        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0x4u, obuf, sizeof(obuf),
+        CHECK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 2, 0x4u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects an unknown flag bit");
-        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 8, 0u, obuf, sizeof(obuf),
+        CHECK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 8, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects levelCount past the 4x4 pyramid");
         usz[1] = 32u; /* level 1 of a 4x4 base is 2x2 = one block = 16 B */
-        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
+        CHECK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects a level size that mismatches the dimensions");
+
+        /* The pre-flags form still compiles and still behaves: same call through
+         * the old signature must produce the byte-identical file that
+         * tp_ktx2_write_uni_ex(..., flags = 0) does. This is the compatibility
+         * guarantee for callers already on the release branch. */
+        {
+            uint32_t lw2[2], lh2[2];
+            uint8_t legacy[256];
+            size_t wrote_legacy = 0;
+            usz[0] = 16u; usz[1] = 16u;
+            lw2[0] = 4; lw2[1] = 2;
+            lh2[0] = 4; lh2[1] = 2;
+            CHECK(TP_OK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 2, 0u, obuf,
+                                             sizeof(obuf), &wrote)),
+                  "compat: _ex writes the reference file");
+            CHECK(TP_OK(tp_ktx2_write_uni(ulev, usz, lw2, lh2, 2, legacy,
+                                          sizeof(legacy), &wrote_legacy)),
+                  "compat: the pre-flags tp_ktx2_write_uni still works");
+            CHECK(wrote_legacy == wrote && memcmp(legacy, obuf, wrote) == 0,
+                  "compat: the old signature produces the identical file");
+            /* And it validates: the shim goes through the same tp_uni_check. */
+            usz[1] = 32u;
+            CHECK(tp_ktx2_write_uni(ulev, usz, lw2, lh2, 2, legacy,
+                                    sizeof(legacy),
+                                    &wrote_legacy) == TP_ERROR_INVALID_ARGUMENT,
+                  "compat: the old signature still rejects a bad level size");
+        }
     }
 
     free(dec);
@@ -1961,11 +1988,11 @@ static void test_ktx2_uni_zstd_write(void) {
             uint8_t *raw = (uint8_t *)malloc(raw_n);
             uint64_t prev_end = 0;
             CHECK(raw_n > 0, "uni size for a 3-level chain");
-            CHECK(TP_OK(tp_ktx2_write_uni(mlev, msz, W, H, NL, TP_UNI_SRGB, raw,
+            CHECK(TP_OK(tp_ktx2_write_uni_ex(mlev, msz, W, H, NL, TP_UNI_SRGB, raw,
                                           raw_n, NULL)),
                   "write 3-level uni ktx2 (scheme 0)");
             memset(raw, 0xAB, raw_n); /* poison: only what the writer writes may survive */
-            CHECK(TP_OK(tp_ktx2_write_uni(mlev, msz, W, H, NL, TP_UNI_SRGB, raw,
+            CHECK(TP_OK(tp_ktx2_write_uni_ex(mlev, msz, W, H, NL, TP_UNI_SRGB, raw,
                                           raw_n, NULL)),
                   "rewrite 3-level uni ktx2 over poison");
             prev_end = 80u + (uint64_t)NL * 24u + 44u; /* end of the DFD */
