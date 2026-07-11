@@ -9,6 +9,10 @@
  */
 #include "texpipe.h"
 
+/* tp_ktx2_size / tp_ktx2_write are internal (the public single-image entry point
+ * is tp_process); the argument-rejection tests below exercise them directly. */
+#include "../src/texpipe_internal.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
