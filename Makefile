@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate texcomp-web fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
 
 all: $(TARGET)
 
@@ -334,6 +334,13 @@ texcomp-wasm: build/texcomp/wasm/libtexcomp.a build/texcomp/wasm/texcomp.mjs bui
 
 texcomp-wasm-simd: build/texcomp/wasm-simd/libtexcomp.a build/texcomp/wasm-simd/texcomp.mjs build/texcomp/wasm-simd/texcomp_cli.js
 	@echo "built build/texcomp/wasm-simd/libtexcomp.a, texcomp.mjs/.wasm, texcomp_cli.js/.wasm"
+
+# Browser demo: web/texcomp (tir + texcomp + texpipe + envmap + EXR decode).
+# Needs emcc on PATH. Artifacts land next to index.html so the page can be
+# served straight from a checkout.
+.PHONY: texcomp-web
+texcomp-web:
+	cd web/texcomp && EMCC=$(EMCC) ./build.sh
 
 wasm-texcomp: texcomp-wasm
 
