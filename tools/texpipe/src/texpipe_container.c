@@ -412,11 +412,25 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
 
     /* scheme == 2 (Zstd): decompress every level into one owned buffer. */
     {
+        uint64_t ulen[TP_KTX2_MAX_LEVELS];
         uint64_t total = 0;
         uint8_t *owned;
         size_t cursor = 0;
-        for (l = 0; l < nlev; ++l)
-            total += tp_rd_u64(data + 80u + (size_t)l * 24u + 16u);
+        /* uncompressedByteLength must be *exactly* the inflated level size (per
+         * KTX2: the levels are tightly packed block data). Pinning it rather
+         * than merely lower-bounding it is what keeps `total` bounded by the
+         * dimension caps: a hostile pair of huge lengths would otherwise wrap
+         * the sum, yielding a small `owned` that zdec then writes far past --
+         * it is handed `ulen` as its destination capacity. */
+        for (l = 0; l < nlev; ++l) {
+            uint32_t w = out->width >> l, h = out->height >> l;
+            if (!w) w = 1u;
+            if (!h) h = 1u;
+            ulen[l] = tp_rd_u64(data + 80u + (size_t)l * 24u + 16u);
+            if (ulen[l] != tp_ktx2_level_expected(out, w, h))
+                return TP_ERROR_INVALID_ARGUMENT;
+            total += ulen[l]; /* <= TP_KTX2_MAX_LEVELS * 2^46: cannot wrap */
+        }
         if (total == 0u || total > (uint64_t)(size_t)-1)
             return TP_ERROR_INVALID_ARGUMENT;
         owned = (uint8_t *)tp_alloc(a, (size_t)total);
@@ -425,27 +439,25 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
             const uint8_t *e = data + 80u + (size_t)l * 24u;
             uint64_t off = tp_rd_u64(e + 0);
             uint64_t clen = tp_rd_u64(e + 8);
-            uint64_t ulen = tp_rd_u64(e + 16);
             uint32_t w = out->width >> l, h = out->height >> l;
             size_t got;
             if (!w) w = 1u;
             if (!h) h = 1u;
-            if (off > size || clen > (uint64_t)size - off ||
-                ulen < tp_ktx2_level_expected(out, w, h)) {
+            if (off > size || clen > (uint64_t)size - off) {
                 tp_dealloc(a, owned);
                 return TP_ERROR_INVALID_ARGUMENT;
             }
-            got = zdec(user, owned + cursor, (size_t)ulen, data + (size_t)off,
+            got = zdec(user, owned + cursor, (size_t)ulen[l], data + (size_t)off,
                        (size_t)clen);
-            if (got != (size_t)ulen) {
+            if (got != (size_t)ulen[l]) {
                 tp_dealloc(a, owned);
                 return TP_ERROR_INVALID_ARGUMENT;
             }
             out->levels[l].data = owned + cursor;
-            out->levels[l].size = (size_t)ulen;
+            out->levels[l].size = (size_t)ulen[l];
             out->levels[l].width = w;
             out->levels[l].height = h;
-            cursor += (size_t)ulen;
+            cursor += (size_t)ulen[l];
         }
         out->_owned = owned;
         return TP_SUCCESS;

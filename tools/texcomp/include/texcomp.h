@@ -246,7 +246,9 @@ tc_result tc_astc_hdr_compress_rgbaf(const float *rgba, uint32_t width,
                                      uint8_t *out_astc, size_t out_size);
 
 /* Decode an ASTC LDR block stream (footprint block_x x block_y) to RGBA8.
- * out_rgba must hold width*height*4 bytes. Rows top-to-bottom, tightly packed.
+ * `astc` must hold ceil(width/block_x) * ceil(height/block_y) * 16 bytes (its
+ * length is not passed, so the caller owns that bound); out_rgba must hold
+ * width*height*4 bytes. Rows top-to-bottom, tightly packed.
  * Companion to the BC7 (tc_bc7_decompress_rgba8) and uni (tc_uni_decompress_rgba8)
  * decoders; together they cover the tinyexr-native transcodable carrier set
  * (uni / ASTC 4x4 / BC7). */

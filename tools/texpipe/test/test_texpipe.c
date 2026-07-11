@@ -1299,6 +1299,41 @@ static void test_ktx2_zstd_scheme(void) {
         (void)off; (void)len;
     }
 
+    /* uncompressedByteLength is what zdec gets as its destination capacity, and
+     * the sum of them sizes the one buffer all levels are inflated into. Two
+     * levels declaring ~2^63 wrap that sum to 16, so the buffer used to be
+     * allocated 16 bytes wide and then handed to zdec with dst_cap = 2^63. */
+    {
+        uint8_t save0[8], save1[8];
+        int k;
+        memcpy(save0, sc2 + 96, 8);   /* level 0 uncompressedByteLength */
+        memcpy(save1, sc2 + 120, 8);  /* level 1 uncompressedByteLength */
+        for (k = 0; k < 8; ++k) { sc2[96 + k] = 0; sc2[120 + k] = 0; }
+        sc2[96] = 0x10; sc2[103] = 0x80;  /* 2^63 + 16 */
+        sc2[127] = 0x80;                  /* 2^63      -> sum wraps to 16 */
+        CHECK(tp_ktx2_read_zstd(sc2, ktx_n, NULL, passthrough_zdec, NULL, &img) ==
+                  TP_ERROR_INVALID_ARGUMENT,
+              "reject scheme-2 wrapping uncompressedByteLength sum");
+        memcpy(sc2 + 96, save0, 8);
+        memcpy(sc2 + 120, save1, 8);
+    }
+
+    /* A level claiming to inflate to more than its block-data size is a
+     * decompression bomb (huge allocation from a tiny file); require exactness. */
+    {
+        uint8_t save0[8];
+        memcpy(save0, sc2 + 96, 8);
+        sc2[100] = 0x10; /* level 0 uncompressedByteLength += 2^32 */
+        CHECK(tp_ktx2_read_zstd(sc2, ktx_n, NULL, passthrough_zdec, NULL, &img) ==
+                  TP_ERROR_INVALID_ARGUMENT,
+              "reject scheme-2 oversized uncompressedByteLength");
+        memcpy(sc2 + 96, save0, 8);
+        /* ...and the untouched stream still reads back cleanly. */
+        CHECK(TP_OK(tp_ktx2_read_zstd(sc2, ktx_n, NULL, passthrough_zdec, NULL, &img)),
+              "scheme-2 still valid after restore");
+        tp_ktx2_image_free(NULL, &img);
+    }
+
     tp_free(NULL, ktx);
     free(sc2);
     free(dec);
