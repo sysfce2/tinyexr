@@ -369,20 +369,35 @@ tp_result tp_ktx2_decode_slice_rgbaf(const tp_ktx2_image *img, int level,
                                      int layer, int face, float *out_rgba,
                                      size_t out_size);
 
+/* What the uni DFD should say about the payload. Neither can be inferred from
+ * the block bytes, and both are wrong by default if left unset: a consumer that
+ * honours the DFD (libktx, glTF KHR_texture_basisu loaders) would take sRGB
+ * albedo for linear-light data, and would transcode an RGBA texture into an
+ * alpha-less format. Pass TP_UNI_SRGB for non-linear (albedo/colour) textures
+ * and TP_UNI_ALPHA when the source alpha channel carries information. */
+#define TP_UNI_SRGB 0x1u  /* transfer = sRGB rather than linear   */
+#define TP_UNI_ALPHA 0x2u /* channelType = UASTC_RGBA rather than RGB */
+
 /* Serialize pre-encoded uni (UASTC) mip levels as a KTX2 (vkFormat = UNDEFINED,
  * supercompressionScheme = 0, KHR_DF UASTC descriptor). This is the Basis-free
  * transcodable carrier: the reader reports is_uni = 1 and a consumer transcodes
  * per device with tc_uni_transcode_{bc7,bc1,astc,etc2} or decodes with
  * tc_uni_decompress_rgba8. `uni_levels[l]`/`uni_sizes[l]` are the level-l uni
- * bytes (from tc_uni_compress_rgba8), level 0 = largest. Only level_w[0] /
- * level_h[0] reach the header: levels 1..num_levels-1 must be the standard
- * halving pyramid (max(1, w >> l)), which is how the reader re-derives them.
+ * bytes (from tc_uni_compress_rgba8), level 0 = largest.
+ *
+ * Only the base dimensions are passed: every other level's size is derived as
+ * max(1, base >> l), which is how the reader re-derives them, so uni_sizes[l]
+ * must be exactly the 4x4x16B block payload for that level. num_levels may not
+ * exceed the pyramid base_w x base_h actually has, and neither dimension may
+ * exceed TP_KTX2_MAX_DIM -- the reader refuses all of these, so writing one
+ * would only produce a file that cannot be read back.
+ *
  * tp_ktx2_uni_size returns the required output size, or 0 if num_levels is out
  * of range or the level sizes would overflow the layout. */
 size_t tp_ktx2_uni_size(const size_t *uni_sizes, int num_levels);
 tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
-                            const size_t *uni_sizes, const uint32_t *level_w,
-                            const uint32_t *level_h, int num_levels,
+                            const size_t *uni_sizes, uint32_t base_w,
+                            uint32_t base_h, int num_levels, uint32_t flags,
                             uint8_t *out, size_t out_size, size_t *written);
 
 /* Zstd compressor callbacks -- the write-side counterpart of
@@ -404,16 +419,12 @@ typedef size_t (*tp_zstd_compress_fn)(void *user, uint8_t *dst, size_t dst_cap,
  * returned via *out / *out_size; release it with tp_free(a, *out). On failure
  * *out / *out_size are cleared to NULL / 0.
  *
- * Level rules match tp_ktx2_write_uni: only level_w[0] / level_h[0] reach the
- * header, levels 1.. must be the standard halving pyramid, and uni_sizes[l] must
- * be the exact block payload for level l (the reader pins uncompressedByteLength
- * to it). */
+ * Level, dimension and flag rules are exactly tp_ktx2_write_uni's. */
 tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound,
                                  tp_zstd_compress_fn zenc, void *user,
                                  const uint8_t *const *uni_levels,
-                                 const size_t *uni_sizes,
-                                 const uint32_t *level_w,
-                                 const uint32_t *level_h, int num_levels,
+                                 const size_t *uni_sizes, uint32_t base_w,
+                                 uint32_t base_h, int num_levels, uint32_t flags,
                                  uint8_t **out, size_t *out_size);
 
 /* ===========================================================================

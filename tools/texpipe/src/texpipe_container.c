@@ -639,20 +639,37 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
 
 /* ---- uni (UASTC) KTX2 writer: vkFormat=UNDEFINED, supercompression=0 ---- */
 
-/* KHR_DF UASTC descriptor (44 bytes), matching the uni-in-KTX2 convention. */
-static void tp_write_uni_dfd(uint8_t *p) {
+#define TP_KDF_MODEL_UASTC 166u
+#define TP_KDF_PRIMARIES_UNSPECIFIED 0u
+#define TP_KDF_CHANNEL_UASTC_RGB 0u
+#define TP_KDF_CHANNEL_UASTC_RGBA 3u
+#define TP_UNI_FLAGS_ALL (TP_UNI_SRGB | TP_UNI_ALPHA)
+
+/* KHR_DF UASTC descriptor (44 bytes), matching the uni-in-KTX2 convention.
+ * `flags` is the caller's TP_UNI_SRGB / TP_UNI_ALPHA: neither is recoverable
+ * from the block bytes, and both are what a DFD-honouring consumer keys off to
+ * decide sRGB decode and whether to transcode into a format that has alpha. */
+static void tp_write_uni_dfd(uint8_t *p, uint32_t flags) {
     memset(p, 0, 44);
     tp_wr_u32(p + 0, 44u);                 /* dfdTotalSize */
     tp_wr_u32(p + 8, 2u | (40u << 16));    /* version | descriptorBlockSize */
-    p[12] = 166u;                          /* KHR_DF_MODEL_UASTC */
-    p[13] = 1u;                            /* primaries BT709 */
-    p[14] = 1u;                            /* transfer LINEAR */
+    p[12] = (uint8_t)TP_KDF_MODEL_UASTC;
+    /* The glTF KHR_texture_basisu profile that `ktx validate` enforces admits
+     * exactly two colour pairings: BT709 primaries with sRGB transfer, or
+     * UNSPECIFIED primaries with linear. Non-colour uni data (normal, roughness)
+     * has no meaningful primaries, so pair linear with UNSPECIFIED. */
+    p[13] = (uint8_t)((flags & TP_UNI_SRGB) ? TP_KDF_PRIMARIES_BT709
+                                            : TP_KDF_PRIMARIES_UNSPECIFIED);
+    p[14] = (uint8_t)((flags & TP_UNI_SRGB) ? TP_KDF_TRANSFER_SRGB
+                                            : TP_KDF_TRANSFER_LINEAR);
     p[16] = 3u; p[17] = 3u;                /* texelBlockDimension = 4x4 */
     /* The pre-deflation block size, kept as-is even under supercompression:
      * KTX2 2.0.4 dropped the old "bytesPlane must be 0 if supercompressed" rule
      * and now requires the real value (0 merely warns as deprecated). */
     p[20] = 16u;                           /* bytesPlane0 */
     p[30] = 127u;                          /* sample bitLength (128 bits) */
+    p[31] = (uint8_t)((flags & TP_UNI_ALPHA) ? TP_KDF_CHANNEL_UASTC_RGBA
+                                             : TP_KDF_CHANNEL_UASTC_RGB);
     tp_wr_u32(p + 40, 0xffffffffu);        /* sampleUpper */
 }
 
@@ -694,46 +711,90 @@ size_t tp_ktx2_uni_size(const size_t *sizes, int num_levels) {
     return tp_ktx2_uni_layout(sizes, num_levels, NULL);
 }
 
-tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
-                            const size_t *uni_sizes, const uint32_t *level_w,
-                            const uint32_t *level_h, int num_levels,
-                            uint8_t *out, size_t out_size, size_t *written) {
-    uint64_t loff[TP_KTX2_MAX_LEVELS];
-    size_t need, dfd_off;
+/* Everything both uni writers must reject. Each rule exists because the reader
+ * (or the KTX2 spec) refuses the result, so writing one would only produce a
+ * file that cannot be loaded back -- a silent failure at asset-build time that
+ * surfaces much later. Shared so the two writers cannot drift apart. */
+static tp_result tp_uni_check(const uint8_t *const *uni_levels,
+                              const size_t *uni_sizes, uint32_t base_w,
+                              uint32_t base_h, int num_levels, uint32_t flags) {
     int l;
-    if (!uni_levels || !uni_sizes || !level_w || !level_h || !out)
-        return TP_ERROR_INVALID_ARGUMENT;
+    if (!uni_levels || !uni_sizes) return TP_ERROR_INVALID_ARGUMENT;
     if (num_levels < 1 || num_levels > TP_KTX2_MAX_LEVELS)
         return TP_ERROR_INVALID_ARGUMENT;
+    if (flags & ~TP_UNI_FLAGS_ALL) return TP_ERROR_INVALID_ARGUMENT;
+    /* The reader refuses dimensions past TP_KTX2_MAX_DIM. */
+    if (base_w == 0u || base_h == 0u || base_w > (uint32_t)TP_KTX2_MAX_DIM ||
+        base_h > (uint32_t)TP_KTX2_MAX_DIM)
+        return TP_ERROR_INVALID_ARGUMENT;
+    /* levelCount past the pyramid the base dimensions imply is invalid KTX2:
+     * the surplus levels all clamp to 1x1, and a loader that trusts levelCount
+     * would bind mips that do not exist. */
+    if (num_levels > tp_level_count((int)base_w, (int)base_h, 0))
+        return TP_ERROR_INVALID_ARGUMENT;
+    /* Level sizes must be exactly the block payload the reader derives from the
+     * base dimensions -- the scheme-2 reader pins uncompressedByteLength to it,
+     * and the scheme-0 reader rejects anything shorter as truncated. */
+    for (l = 0; l < num_levels; ++l)
+        if (!uni_levels[l] ||
+            (uint64_t)uni_sizes[l] != tp_uni_level_expected(base_w, base_h, l))
+            return TP_ERROR_INVALID_ARGUMENT;
+    return TP_SUCCESS;
+}
+
+/* Header + level index + DFD, i.e. everything before the level payloads. The
+ * two writers differ only in `scheme` and in the byteLength column: raw levels
+ * store their own size there, supercompressed ones the compressed size. */
+static void tp_ktx2_uni_emit(uint8_t *buf, uint32_t base_w, uint32_t base_h,
+                             int num_levels, uint32_t scheme, uint32_t flags,
+                             const uint64_t *loff, const size_t *byte_len,
+                             const size_t *uncompressed_len) {
+    size_t dfd_off = 80u + (size_t)num_levels * 24u;
+    int l;
+    memcpy(buf, tp_ktx2_id, 12);
+    tp_wr_u32(buf + 12, 0u);        /* vkFormat = UNDEFINED (uni) */
+    tp_wr_u32(buf + 16, 1u);        /* typeSize                   */
+    tp_wr_u32(buf + 20, base_w);
+    tp_wr_u32(buf + 24, base_h);
+    tp_wr_u32(buf + 28, 0u);        /* pixelDepth                 */
+    tp_wr_u32(buf + 32, 0u);        /* layerCount                 */
+    tp_wr_u32(buf + 36, 1u);        /* faceCount                  */
+    tp_wr_u32(buf + 40, (uint32_t)num_levels);
+    tp_wr_u32(buf + 44, scheme);
+    tp_wr_u32(buf + 48, (uint32_t)dfd_off);
+    tp_wr_u32(buf + 52, 44u);
+    tp_wr_u32(buf + 56, 0u);        /* kvdByteOffset              */
+    tp_wr_u32(buf + 60, 0u);        /* kvdByteLength              */
+    tp_wr_u64(buf + 64, 0u);        /* sgdByteOffset              */
+    tp_wr_u64(buf + 72, 0u);        /* sgdByteLength              */
+    for (l = 0; l < num_levels; ++l) {
+        uint8_t *e = buf + 80u + (size_t)l * 24u;
+        tp_wr_u64(e + 0, loff[l]);
+        tp_wr_u64(e + 8, (uint64_t)byte_len[l]);
+        tp_wr_u64(e + 16, (uint64_t)uncompressed_len[l]);
+    }
+    tp_write_uni_dfd(buf + dfd_off, flags);
+}
+
+tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
+                            const size_t *uni_sizes, uint32_t base_w,
+                            uint32_t base_h, int num_levels, uint32_t flags,
+                            uint8_t *out, size_t out_size, size_t *written) {
+    uint64_t loff[TP_KTX2_MAX_LEVELS];
+    size_t need;
+    tp_result r;
+    int l;
+    if (!out) return TP_ERROR_INVALID_ARGUMENT;
+    r = tp_uni_check(uni_levels, uni_sizes, base_w, base_h, num_levels, flags);
+    if (!TP_OK(r)) return r;
     need = tp_ktx2_uni_layout(uni_sizes, num_levels, loff);
     if (need == 0u) return TP_ERROR_INVALID_ARGUMENT; /* layout overflowed */
     if (out_size < need) return TP_ERROR_INVALID_ARGUMENT;
+    /* Unlike the supercompressed layout, this one aligns each level to 16, so
+     * the padding between them has to be zeroed. */
     memset(out, 0, need);
-
-    memcpy(out, tp_ktx2_id, 12);
-    tp_wr_u32(out + 12, 0u);                      /* vkFormat = UNDEFINED */
-    tp_wr_u32(out + 16, 1u);                      /* typeSize */
-    tp_wr_u32(out + 20, level_w[0]);
-    tp_wr_u32(out + 24, level_h[0]);
-    tp_wr_u32(out + 28, 0u);                      /* pixelDepth */
-    tp_wr_u32(out + 32, 0u);                      /* layerCount */
-    tp_wr_u32(out + 36, 1u);                      /* faceCount */
-    tp_wr_u32(out + 40, (uint32_t)num_levels);
-    tp_wr_u32(out + 44, 0u);                      /* supercompressionScheme */
-    dfd_off = 80u + (size_t)num_levels * 24u;
-    tp_wr_u32(out + 48, (uint32_t)dfd_off);       /* dfdByteOffset */
-    tp_wr_u32(out + 52, 44u);                     /* dfdByteLength */
-    tp_wr_u32(out + 56, 0u);                      /* kvdByteOffset */
-    tp_wr_u32(out + 60, 0u);                      /* kvdByteLength */
-    tp_wr_u64(out + 64, 0u);                      /* sgdByteOffset */
-    tp_wr_u64(out + 72, 0u);                      /* sgdByteLength */
-    for (l = 0; l < num_levels; ++l) {
-        uint8_t *e = out + 80u + (size_t)l * 24u;
-        tp_wr_u64(e + 0, loff[l]);
-        tp_wr_u64(e + 8, (uint64_t)uni_sizes[l]);
-        tp_wr_u64(e + 16, (uint64_t)uni_sizes[l]); /* uncompressedByteLength */
-    }
-    tp_write_uni_dfd(out + dfd_off);
+    tp_ktx2_uni_emit(out, base_w, base_h, num_levels, 0u, flags, loff, uni_sizes,
+                     uni_sizes);
     for (l = 0; l < num_levels; ++l)
         memcpy(out + (size_t)loff[l], uni_levels[l], uni_sizes[l]);
     if (written) *written = need;
@@ -743,54 +804,30 @@ tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
 tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound,
                                  tp_zstd_compress_fn zenc, void *user,
                                  const uint8_t *const *uni_levels,
-                                 const size_t *uni_sizes,
-                                 const uint32_t *level_w,
-                                 const uint32_t *level_h, int num_levels,
+                                 const size_t *uni_sizes, uint32_t base_w,
+                                 uint32_t base_h, int num_levels, uint32_t flags,
                                  uint8_t **out, size_t *out_size) {
     uint8_t *comp[TP_KTX2_MAX_LEVELS];
     size_t clen[TP_KTX2_MAX_LEVELS];
     uint64_t loff[TP_KTX2_MAX_LEVELS];
     const size_t smax = (size_t)-1;
-    size_t dfd_off, cursor, total;
+    size_t cursor, total;
     uint8_t *buf = NULL;
-    tp_result r = TP_SUCCESS;
+    tp_result r;
     int l;
 
-    if (!zbound || !zenc || !uni_levels || !uni_sizes || !level_w || !level_h ||
-        !out || !out_size)
-        return TP_ERROR_INVALID_ARGUMENT;
+    if (!zbound || !zenc || !out || !out_size) return TP_ERROR_INVALID_ARGUMENT;
     /* Cleared before any other rejection: the contract is that a failed call
      * leaves nothing for the caller to free. */
     *out = NULL;
     *out_size = 0;
-    if (num_levels < 1 || num_levels > TP_KTX2_MAX_LEVELS)
-        return TP_ERROR_INVALID_ARGUMENT;
-    /* The reader refuses dimensions past TP_KTX2_MAX_DIM, so writing them would
-     * only produce a file we cannot read back. */
-    if (level_w[0] == 0u || level_h[0] == 0u ||
-        level_w[0] > (uint32_t)TP_KTX2_MAX_DIM ||
-        level_h[0] > (uint32_t)TP_KTX2_MAX_DIM)
-        return TP_ERROR_INVALID_ARGUMENT;
-    /* levelCount past the pyramid the base dimensions imply is invalid KTX2:
-     * the extra levels would all clamp to 1x1 and a loader that trusts
-     * levelCount would bind mips that do not exist. */
-    if (num_levels > tp_level_count((int)level_w[0], (int)level_h[0], 0))
-        return TP_ERROR_INVALID_ARGUMENT;
+    r = tp_uni_check(uni_levels, uni_sizes, base_w, base_h, num_levels, flags);
+    if (!TP_OK(r)) return r;
     for (l = 0; l < num_levels; ++l) comp[l] = NULL;
-
-    /* A scheme-2 reader pins uncompressedByteLength to the exact block payload
-     * implied by the base dimensions, so a level whose size disagrees would
-     * produce a file our own reader rejects. Refuse it here instead. */
-    for (l = 0; l < num_levels; ++l)
-        if (!uni_levels[l] ||
-            (uint64_t)uni_sizes[l] !=
-                tp_uni_level_expected(level_w[0], level_h[0], l))
-            return TP_ERROR_INVALID_ARGUMENT;
 
     /* Compress each level independently, so a reader can inflate one at a time. */
     for (l = 0; l < num_levels; ++l) {
-        size_t bound;
-        bound = zbound(user, uni_sizes[l]);
+        size_t bound = zbound(user, uni_sizes[l]);
         if (bound == 0) { r = TP_ERROR_UNSUPPORTED; goto done; }
         comp[l] = (uint8_t *)tp_alloc(a, bound);
         if (!comp[l]) { r = TP_ERROR_OUT_OF_MEMORY; goto done; }
@@ -799,9 +836,9 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
     }
 
     /* Layout: header + level index + DFD, then the compressed levels packed
-     * smallest-first. Supercompressed levels carry no mip padding. */
-    dfd_off = 80u + (size_t)num_levels * 24u;
-    cursor = dfd_off + 44u;
+     * smallest-first. Supercompressed levels carry no mip padding -- KTX2 sets
+     * required_alignment = 1 when supercompressionScheme != 0. */
+    cursor = 80u + (size_t)num_levels * 24u + 44u;
     for (l = num_levels - 1; l >= 0; --l) {
         if (clen[l] > smax - cursor) { r = TP_ERROR_INVALID_ARGUMENT; goto done; }
         loff[l] = cursor;
@@ -811,30 +848,10 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
 
     buf = (uint8_t *)tp_alloc(a, total);
     if (!buf) { r = TP_ERROR_OUT_OF_MEMORY; goto done; }
-    memset(buf, 0, total);
-    memcpy(buf, tp_ktx2_id, 12);
-    tp_wr_u32(buf + 12, 0u);        /* vkFormat = UNDEFINED (uni)          */
-    tp_wr_u32(buf + 16, 1u);        /* typeSize                            */
-    tp_wr_u32(buf + 20, level_w[0]);
-    tp_wr_u32(buf + 24, level_h[0]);
-    tp_wr_u32(buf + 28, 0u);        /* pixelDepth                          */
-    tp_wr_u32(buf + 32, 0u);        /* layerCount                          */
-    tp_wr_u32(buf + 36, 1u);        /* faceCount                           */
-    tp_wr_u32(buf + 40, (uint32_t)num_levels);
-    tp_wr_u32(buf + 44, 2u);        /* supercompressionScheme = Zstd       */
-    tp_wr_u32(buf + 48, (uint32_t)dfd_off);
-    tp_wr_u32(buf + 52, 44u);
-    tp_wr_u32(buf + 56, 0u);        /* kvdByteOffset                       */
-    tp_wr_u32(buf + 60, 0u);        /* kvdByteLength                       */
-    tp_wr_u64(buf + 64, 0u);        /* sgdByteOffset                       */
-    tp_wr_u64(buf + 72, 0u);        /* sgdByteLength                       */
-    for (l = 0; l < num_levels; ++l) {
-        uint8_t *e = buf + 80u + (size_t)l * 24u;
-        tp_wr_u64(e + 0, loff[l]);
-        tp_wr_u64(e + 8, (uint64_t)clen[l]);       /* byteLength (compressed) */
-        tp_wr_u64(e + 16, (uint64_t)uni_sizes[l]); /* uncompressedByteLength  */
-    }
-    tp_write_uni_dfd(buf + dfd_off);
+    /* No memset: with no padding anywhere in this layout, the emit below plus
+     * the level copies write every byte of `total`. */
+    tp_ktx2_uni_emit(buf, base_w, base_h, num_levels, 2u, flags, loff, clen,
+                     uni_sizes);
     for (l = 0; l < num_levels; ++l)
         memcpy(buf + (size_t)loff[l], comp[l], clen[l]);
 
@@ -844,7 +861,7 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
 
 done:
     for (l = 0; l < num_levels; ++l) tp_dealloc(a, comp[l]);
-    if (buf) tp_dealloc(a, buf);
+    tp_dealloc(a, buf);
     return r;
 }
 

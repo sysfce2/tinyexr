@@ -1474,15 +1474,23 @@ static void test_ktx2_read_roundtrip(void) {
     {
         size_t usz = tc_uni_compressed_size(64, 64);
         uint8_t *uni = (uint8_t *)malloc(usz);
-        const uint8_t *levels[1]; size_t sizes[1]; uint32_t lw[1], lh[1];
+        const uint8_t *levels[1]; size_t sizes[1];
         uint8_t *ubuf = NULL; size_t ktx_size;
         CHECK(tc_uni_compress_rgba8(ref, 64, 64, (size_t)64 * 4u, uni, usz) == TC_SUCCESS,
               "uni compress");
-        levels[0] = uni; sizes[0] = usz; lw[0] = 64; lh[0] = 64;
+        levels[0] = uni; sizes[0] = usz;
         ktx_size = tp_ktx2_uni_size(sizes, 1);
         ubuf = (uint8_t *)malloc(ktx_size);
-        CHECK(TP_OK(tp_ktx2_write_uni(levels, sizes, lw, lh, 1, ubuf, ktx_size, NULL)),
+        CHECK(TP_OK(tp_ktx2_write_uni(levels, sizes, 64, 64, 1, TP_UNI_SRGB,
+                                      ubuf, ktx_size, NULL)),
               "write uni ktx2");
+        /* The DFD must carry the flags the caller asked for: sRGB transfer (2),
+         * and channelType RGB (0) since TP_UNI_ALPHA was not passed. */
+        {
+            size_t dfd = rd_u32(ubuf + 48);
+            CHECK(ubuf[dfd + 14] == 2u, "uni DFD transfer = sRGB");
+            CHECK(ubuf[dfd + 31] == 0u, "uni DFD channelType = RGB");
+        }
         CHECK(TP_OK(tp_ktx2_read(ubuf, ktx_size, &img)), "read uni ktx2");
         CHECK(img.is_uni && img.vk_format == 0u, "uni marker");
         CHECK(img.width == 64 && img.num_levels == 1, "uni header");
@@ -1566,16 +1574,29 @@ static void test_ktx2_read_roundtrip(void) {
     {
         const uint8_t *ulev[2];
         size_t usz[2];
-        uint32_t uw[2], uh[2];
         uint8_t dummy[16];
         size_t wrote = 0;
         ulev[0] = dummy; ulev[1] = dummy;
         usz[0] = (size_t)-1 - 64u; usz[1] = 1024u; /* cursor + sizes[0] wraps */
-        uw[0] = 4; uh[0] = 4; uw[1] = 2; uh[1] = 2;
         CHECK(tp_ktx2_uni_size(usz, 2) == 0, "uni layout overflow -> size 0");
-        CHECK(tp_ktx2_write_uni(ulev, usz, uw, uh, 2, dummy, sizeof(dummy),
+        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, dummy, sizeof(dummy),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "reject uni write with overflowing level sizes");
+
+        /* The scheme-0 writer now enforces the same rules as the Zstd one: each
+         * of these emits a file tp_ktx2_read would refuse, so the write must
+         * fail rather than hand back an unloadable asset. */
+        usz[0] = 16u; usz[1] = 16u; /* 4x4 and 2x2 are one block each */
+        CHECK(tp_ktx2_write_uni(ulev, usz, 131072, 4, 2, 0u, dummy, sizeof(dummy),
+                                &wrote) == TP_ERROR_INVALID_ARGUMENT,
+              "write_uni rejects a dimension over TP_KTX2_MAX_DIM");
+        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0x4u, dummy, sizeof(dummy),
+                                &wrote) == TP_ERROR_INVALID_ARGUMENT,
+              "write_uni rejects an unknown flag bit");
+        usz[1] = 32u; /* level 1 of a 4x4 base is 2x2 = one block = 16 B */
+        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, dummy, sizeof(dummy),
+                                &wrote) == TP_ERROR_INVALID_ARGUMENT,
+              "write_uni rejects a level size that mismatches the dimensions");
     }
 
     free(dec);
@@ -1619,7 +1640,6 @@ static void test_ktx2_uni_zstd_write(void) {
      * than quietly staying in bounds. */
     const uint8_t *levels[TP_KTX2_MAX_LEVELS];
     size_t sizes[TP_KTX2_MAX_LEVELS], usz, ktx_n = 0;
-    uint32_t lw[TP_KTX2_MAX_LEVELS], lh[TP_KTX2_MAX_LEVELS];
     tp_ktx2_image img;
     const size_t npix = (size_t)W * H;
     int i;
@@ -1629,11 +1649,12 @@ static void test_ktx2_uni_zstd_write(void) {
     CHECK(tc_uni_compress_rgba8(ref, W, H, (size_t)W * 4u, uni, usz) == TC_SUCCESS,
           "uni compress");
     for (i = 0; i < TP_KTX2_MAX_LEVELS; ++i) {
-        levels[i] = uni; sizes[i] = usz; lw[i] = W; lh[i] = H;
+        levels[i] = uni; sizes[i] = usz;
     }
 
     CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound, passthrough_zenc,
-                                       NULL, levels, sizes, lw, lh, 1, &ktx,
+                                       NULL, levels, sizes, W, H, 1,
+                                       TP_UNI_SRGB | TP_UNI_ALPHA, &ktx,
                                        &ktx_n)),
           "write uni zstd ktx2");
     CHECK(ktx != NULL && ktx_n > 0, "zstd ktx2 produced");
@@ -1686,30 +1707,58 @@ static void test_ktx2_uni_zstd_write(void) {
         for (i = 0; i < sizeof(bad_in) / sizeof(bad_in[0]); ++i) {
             uint8_t *bad = (uint8_t *)0x1; /* must be overwritten with NULL */
             size_t bad_n = 123u;
-            sizes[0] = bad_in[i].sz; lw[0] = bad_in[i].w; lh[0] = bad_in[i].h;
+            sizes[0] = bad_in[i].sz;
             CHECK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
                                          passthrough_zenc, NULL, levels, sizes,
-                                         lw, lh, bad_in[i].n, &bad,
+                                         bad_in[i].w, bad_in[i].h, bad_in[i].n,
+                                         0u, &bad,
                                          &bad_n) == TP_ERROR_INVALID_ARGUMENT,
                   bad_in[i].what);
             CHECK(bad == NULL && bad_n == 0u, "outputs cleared on failure");
         }
-        sizes[0] = usz; lw[0] = W; lh[0] = H;
+        sizes[0] = usz;
     }
 
-    /* KTX2 >= 2.0.4: a supercompressed file keeps the real pre-deflation
-     * bytesPlane0 (the old "must be 0" rule is retired), so the DFD the writer
-     * emits must still say 16 even under scheme 2. */
+    /* The DFD must describe what the caller actually encoded. Neither fact is
+     * recoverable from the block bytes, and a consumer that honours the DFD
+     * (libktx, glTF KHR_texture_basisu) decodes sRGB and picks an alpha-capable
+     * transcode target from exactly these two fields. */
     {
         uint8_t *k2 = NULL;
-        size_t k2n = 0, dfd_off;
+        size_t k2n = 0, dfd;
+        /* sRGB + alpha: BT709 primaries are the pairing the glTF profile wants. */
         CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
                                            passthrough_zenc, NULL, levels, sizes,
-                                           lw, lh, 1, &k2, &k2n)),
-              "rewrite for DFD check");
-        dfd_off = rd_u32(k2 + 48);
-        CHECK(k2[dfd_off + 20] == 16u, "DFD bytesPlane0 = 16 under scheme 2");
+                                           W, H, 1, TP_UNI_SRGB | TP_UNI_ALPHA,
+                                           &k2, &k2n)),
+              "write uni zstd (srgb + alpha)");
+        dfd = rd_u32(k2 + 48);
+        /* KTX2 >= 2.0.4 keeps the real pre-deflation bytesPlane0 even when
+         * supercompressed; the old "must be 0" rule is retired. */
+        CHECK(k2[dfd + 20] == 16u, "DFD bytesPlane0 = 16 under scheme 2");
+        CHECK(k2[dfd + 12] == 166u, "DFD colorModel = UASTC");
+        CHECK(k2[dfd + 13] == 1u, "DFD primaries = BT709 (sRGB)");
+        CHECK(k2[dfd + 14] == 2u, "DFD transfer = sRGB");
+        CHECK(k2[dfd + 31] == 3u, "DFD channelType = UASTC_RGBA");
         tp_free(NULL, k2);
+
+        /* Linear + no alpha: the glTF profile pairs linear with UNSPECIFIED
+         * primaries, and an alpha-less payload must not claim RGBA. */
+        CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
+                                           passthrough_zenc, NULL, levels, sizes,
+                                           W, H, 1, 0u, &k2, &k2n)),
+              "write uni zstd (linear, no alpha)");
+        dfd = rd_u32(k2 + 48);
+        CHECK(k2[dfd + 13] == 0u, "DFD primaries = UNSPECIFIED (linear)");
+        CHECK(k2[dfd + 14] == 1u, "DFD transfer = linear");
+        CHECK(k2[dfd + 31] == 0u, "DFD channelType = UASTC_RGB");
+        tp_free(NULL, k2);
+
+        /* An unknown flag bit is a caller bug, not something to silently drop. */
+        CHECK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound, passthrough_zenc,
+                                     NULL, levels, sizes, W, H, 1, 0x8u, &k2,
+                                     &k2n) == TP_ERROR_INVALID_ARGUMENT,
+              "reject an unknown uni flag bit");
     }
 
     free(dec);
