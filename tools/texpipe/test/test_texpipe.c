@@ -1614,17 +1614,23 @@ static void test_ktx2_uni_zstd_write(void) {
     const uint32_t W = 64, H = 64;
     uint8_t *ref = make_gradient((int)W, (int)H);
     uint8_t *uni = NULL, *ktx = NULL, *dec = NULL;
-    const uint8_t *levels[1];
-    size_t sizes[1], usz, ktx_n = 0;
-    uint32_t lw[1], lh[1];
+    /* Sized for the largest num_levels the negative cases below pass in, so a
+     * writer that validated in the wrong order would read past the array rather
+     * than quietly staying in bounds. */
+    const uint8_t *levels[TP_KTX2_MAX_LEVELS];
+    size_t sizes[TP_KTX2_MAX_LEVELS], usz, ktx_n = 0;
+    uint32_t lw[TP_KTX2_MAX_LEVELS], lh[TP_KTX2_MAX_LEVELS];
     tp_ktx2_image img;
     const size_t npix = (size_t)W * H;
+    int i;
 
     usz = tc_uni_compressed_size(W, H);
     uni = (uint8_t *)malloc(usz);
     CHECK(tc_uni_compress_rgba8(ref, W, H, (size_t)W * 4u, uni, usz) == TC_SUCCESS,
           "uni compress");
-    levels[0] = uni; sizes[0] = usz; lw[0] = W; lh[0] = H;
+    for (i = 0; i < TP_KTX2_MAX_LEVELS; ++i) {
+        levels[i] = uni; sizes[i] = usz; lw[i] = W; lh[i] = H;
+    }
 
     CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound, passthrough_zenc,
                                        NULL, levels, sizes, lw, lh, 1, &ktx,
@@ -1666,11 +1672,17 @@ static void test_ktx2_uni_zstd_write(void) {
             {"dimension over TP_KTX2_MAX_DIM", 0, 131072, 64, 1},
             /* more levels than the 64x64 pyramid has (7) */
             {"levelCount past the mip pyramid", 0, 64, 64, 9},
+            /* The MAX_DIM corner: the level payload is exactly 2^32 B, which the
+             * expected-size math must not wrap to 0 (it would then match this
+             * zero-length level and emit a file the reader rejects). Rejected on
+             * every target -- 2^32 does not fit a 32-bit size_t at all. */
+            {"zero-length level at the 65536x65536 corner", 0, 65536, 65536, 1},
         };
         size_t i;
         bad_in[0].sz = usz - 16u;
         bad_in[1].sz = usz;
         bad_in[2].sz = usz;
+        bad_in[3].sz = 0;
         for (i = 0; i < sizeof(bad_in) / sizeof(bad_in[0]); ++i) {
             uint8_t *bad = (uint8_t *)0x1; /* must be overwritten with NULL */
             size_t bad_n = 123u;
