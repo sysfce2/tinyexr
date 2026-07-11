@@ -1853,15 +1853,26 @@ static void test_ktx2_uni_zstd_write(void) {
             CHECK(TP_OK(tp_ktx2_write_uni(mlev, msz, W, H, NL, TP_UNI_SRGB, raw,
                                           raw_n, NULL)),
                   "write 3-level uni ktx2 (scheme 0)");
+            memset(raw, 0xAB, raw_n); /* poison: only what the writer writes may survive */
+            CHECK(TP_OK(tp_ktx2_write_uni(mlev, msz, W, H, NL, TP_UNI_SRGB, raw,
+                                          raw_n, NULL)),
+                  "rewrite 3-level uni ktx2 over poison");
+            prev_end = 80u + (uint64_t)NL * 24u + 44u; /* end of the DFD */
             for (l = NL - 1; l >= 0; --l) { /* smallest first = ascending offset */
                 uint64_t off = rd_u64(raw + 80 + (size_t)l * 24 + 0);
                 uint64_t blen = rd_u64(raw + 80 + (size_t)l * 24 + 8);
+                uint64_t p;
                 CHECK(off % 16u == 0u, "scheme-0 level is 16-byte aligned");
                 CHECK(off >= prev_end, "scheme-0 level does not overlap the previous");
                 CHECK(blen == (uint64_t)msz[l], "scheme-0 byteLength = uni size");
                 CHECK(off + blen <= (uint64_t)raw_n, "scheme-0 level is in-bounds");
+                /* KTX2 requires mipPadding to be zero; the writer only zeroes the
+                 * gaps now, so a missed gap would leave the poison behind. */
+                for (p = prev_end; p < off; ++p)
+                    CHECK(raw[p] == 0u, "scheme-0 mipPadding is zeroed");
                 prev_end = off + blen;
             }
+            CHECK(prev_end == (uint64_t)raw_n, "scheme-0 levels reach the end of the file");
             CHECK(TP_OK(tp_ktx2_read(raw, raw_n, &img)), "read 3-level uni ktx2");
             CHECK(img.num_levels == NL, "scheme-0 3-level header");
             for (l = 0; l < NL; ++l) {

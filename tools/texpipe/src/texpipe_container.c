@@ -688,10 +688,11 @@ static void tp_write_uni_dfd(uint8_t *p, uint32_t flags) {
  * level. Such a level cannot fit in a 32-bit size_t anyway, so on those targets
  * no uni_sizes[l] can match and the write is rejected, which is the point. */
 static uint64_t tp_uni_level_expected(uint32_t w0, uint32_t h0, int l) {
-    uint32_t w = w0 >> l, h = h0 >> l;
+    uint32_t w, h;
     if (!w0 || !h0) return 0;
-    if (!w) w = 1u;
-    if (!h) h = 1u;
+    /* Same clamp-to-1 mip rule the rest of the pipeline uses. */
+    w = (uint32_t)tp_level_dim((int)w0, l);
+    h = (uint32_t)tp_level_dim((int)h0, l);
     return (uint64_t)((w + 3u) / 4u) * (uint64_t)((h + 3u) / 4u) * 16u;
 }
 
@@ -798,13 +799,22 @@ tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
     need = tp_ktx2_uni_layout(uni_sizes, num_levels, loff);
     if (need == 0u) return TP_ERROR_INVALID_ARGUMENT; /* layout overflowed */
     if (out_size < need) return TP_ERROR_INVALID_ARGUMENT;
-    /* Unlike the supercompressed layout, this one aligns each level to 16, so
-     * the padding between them has to be zeroed. */
-    memset(out, 0, need);
     tp_ktx2_uni_emit(out, base_w, base_h, num_levels, 0u, flags, loff, uni_sizes,
                      uni_sizes);
-    for (l = 0; l < num_levels; ++l)
-        memcpy(out + (size_t)loff[l], uni_levels[l], uni_sizes[l]);
+    /* Emit covered everything up to the level data, and the copies below cover
+     * the levels themselves. What is left is this layout's one gap: unlike the
+     * supercompressed one, it aligns each level to 16, and mipPadding must be
+     * zero. Zero just those gaps rather than the whole output, which for a large
+     * chain is an extra full pass over tens of MB. Levels run smallest-first, so
+     * walking l descending walks the file in address order. */
+    {
+        size_t cursor = 80u + (size_t)num_levels * 24u + 44u;
+        for (l = num_levels - 1; l >= 0; --l) {
+            memset(out + cursor, 0, (size_t)loff[l] - cursor);
+            memcpy(out + (size_t)loff[l], uni_levels[l], uni_sizes[l]);
+            cursor = (size_t)loff[l] + uni_sizes[l];
+        }
+    }
     if (written) *written = need;
     return TP_SUCCESS;
 }
