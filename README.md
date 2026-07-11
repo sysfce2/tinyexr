@@ -2,6 +2,12 @@
 
 ![Example](https://github.com/syoyo/tinyexr/blob/release/asakusa.png?raw=true)
 
+### 🚀 Live demos — all run entirely in your browser
+
+| 🌐 [**EXR viewer (v3)**](https://syoyo.github.io/tinyexr/) | 🎨 [**tocio — OCIO + ACES 2.0**](https://syoyo.github.io/tinyexr/tocio/) | 🧊 [**texcomp — GPU texture compression**](https://syoyo.github.io/tinyexr/texcomp/) |
+|---|---|---|
+| Decode and view `.exr` by drag-and-drop — all v3 codecs (ZIP / PIZ / PXR24 / B44 / ZSTD / HTJ2K). Spectral EXRs get a wavelength scrubber with **CIE→sRGB** preview, deep images a 3D point cloud. Mobile/touch-friendly, with a fullscreen mode. | Apply an **OpenColorIO** transform — including the **ACES 2.0** output transforms — on **WebGL2**, from a live, editable OCIO config that **JIT-compiles to a GLSL shader**. [More ↓](#tocio--tiny-pure-c11-opencolorio-engine) | Compress to **BC1/3/5/6H/7, ETC2, EAC, ASTC (LDR + HDR)** and decompress back, beside an amplified error view. HDR vs 8-bit under exposure, normal maps ranked by **angular error** (BC5 beats BC7), cubemap/octahedral, downloadable **KTX2 / DDS**. [More ↓](#texcomp--gpu-texture-compression) |
+
 [![CI](https://github.com/syoyo/tinyexr/actions/workflows/ci.yml/badge.svg?branch=release)](https://github.com/syoyo/tinyexr/actions/workflows/ci.yml)
 
 `tinyexr` is a small library to load and save OpenEXR (.exr) images, good to
@@ -11,21 +17,6 @@ embed into your application. It comes in two flavours:
   current main development line and the recommended version going forward.
 - **[v1 — single-header C++ (old, deprecated)](#v1--single-header-c-stable).** The
   original `tinyexr.h`; still a solid, but sunsetting.
-
-> 🌐 **Live demo (v3):** [**TinyEXR v3 WASM viewer**](https://syoyo.github.io/tinyexr/) — decode and view `.exr`
-> entirely in the browser (drag-and-drop; all v3 codecs: ZIP / PIZ / PXR24 / B44 / ZSTD / HTJ2K).
-> Spectral EXRs get a wavelength scrubber + **CIE→sRGB color** preview, deep images a 3D
-> point cloud, and the whole UI is **mobile/touch-friendly** with a fullscreen mode.
-
-> 🎨 **Live demo (tocio):** [**tocio OCIO + ACES 2.0 viewer**](https://syoyo.github.io/tinyexr/tocio/) — decode an
-> EXR and apply an **OpenColorIO** transform (incl. the **ACES 2.0** output transforms) on **WebGL2**, with a
-> live, editable OCIO config that **JIT-compiles to a GLSL shader**. See [tocio](#tocio--tiny-pure-c11-opencolorio-engine) below.
-
-> 🧊 **Live demo (texcomp):** [**GPU texture compression**](https://syoyo.github.io/tinyexr/texcomp/) — compress
-> an EXR to **BC1/3/5/6H/7, ETC2, EAC, ASTC (LDR + HDR)** and decompress it back in the browser, side by side with
-> an amplified error view. HDR codecs vs an 8-bit one under exposure, normal maps ranked by **angular error**
-> (where BC5 beats BC7), cubemap/octahedral projection, and a downloadable **KTX2 / DDS**.
-> See [texcomp](#texcomp--gpu-texture-compression) below.
 
 **Performance (v3) at a glance** — single-thread decode/encode vs the reference
 OpenEXR library, with the vendored **libdeflate** backend on/off (and HTJ2K,
