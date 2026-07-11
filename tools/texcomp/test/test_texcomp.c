@@ -1000,6 +1000,78 @@ static int test_bc5_snorm(void) {
     return 0;
 }
 
+
+/* ETC2 encode quality, measured through the (Mesa-validated) decoder.
+ *
+ * The decoder goldens and the orientation test both passed while the encoder's
+ * differential mode was writing its 5-bit base and 3-bit delta at overlapping
+ * bit positions -- every differential block decoded to a wrong base colour, and
+ * ETC2 scored ~13 dB where BC1 scored ~35 dB on the same image. Nothing noticed,
+ * because no test asserted that ETC2 was any *good*, only that it round-tripped
+ * the modes it happened to emit.
+ *
+ * So: hold ETC2 to BC1's standard on identical content. They are both 4 bpp and
+ * ETC2 (with its planar mode) should be at least as good, so a generous floor of
+ * "within 2 dB of BC1" still catches a broken mode immediately.
+ */
+static int test_etc2_quality(void) {
+    enum { W = 64, H = 64 };
+    static uint8_t src[W * H * 4], dec[W * H * 4];
+    static uint8_t etc[W * H / 2], bc1[W * H / 2];
+    tc_etc2_options eo;
+    tc_bc1_options bo;
+    double sse_etc = 0.0, sse_bc1 = 0.0, p_etc, p_bc1;
+    uint32_t rs = 7u, x, y;
+    size_t i;
+    int c;
+    tc_etc2_options_init(&eo);
+    eo.alpha = 0;
+    tc_bc1_options_init(&bo);
+
+    /* Smooth luma with a little detail and a natural (correlated) tint -- the
+     * content both codecs are built for. */
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            uint8_t *p = src + ((size_t)y * W + x) * 4u;
+            int v;
+            rs = rs * 1664525u + 1013904223u;
+            v = (int)(128.0 + 100.0 * sin(x * 0.3) * cos(y * 0.25)) +
+                (int)((rs >> 26) % 8u) - 4;
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            p[0] = (uint8_t)v;
+            p[1] = (uint8_t)(v * 230 / 255);
+            p[2] = (uint8_t)(v * 200 / 255);
+            p[3] = 255u;
+        }
+
+    CHECK(tc_etc2_compress_rgba8(src, W, H, W * 4u, &eo, etc, sizeof(etc)) ==
+              TC_SUCCESS, "etc2 quality: compress");
+    CHECK(tc_etc2_decompress_rgba8(etc, W, H, 0, W * 4u, dec, sizeof(dec)) ==
+              TC_SUCCESS, "etc2 quality: decompress");
+    for (i = 0; i < (size_t)W * H; ++i)
+        for (c = 0; c < 3; ++c) {
+            double d = (double)src[i * 4u + (size_t)c] - (double)dec[i * 4u + (size_t)c];
+            sse_etc += d * d;
+        }
+    CHECK(tc_bc1_compress_rgba8(src, W, H, W * 4u, &bo, bc1, sizeof(bc1)) ==
+              TC_SUCCESS, "etc2 quality: bc1 compress");
+    CHECK(tc_bc1_decompress_rgba8(bc1, W, H, W * 4u, dec, sizeof(dec)) ==
+              TC_SUCCESS, "etc2 quality: bc1 decompress");
+    for (i = 0; i < (size_t)W * H; ++i)
+        for (c = 0; c < 3; ++c) {
+            double d = (double)src[i * 4u + (size_t)c] - (double)dec[i * 4u + (size_t)c];
+            sse_bc1 += d * d;
+        }
+    p_etc = 10.0 * log10(255.0 * 255.0 / (sse_etc / (double)(W * H * 3)));
+    p_bc1 = 10.0 * log10(255.0 * 255.0 / (sse_bc1 / (double)(W * H * 3)));
+    printf("  etc2 quality: ETC2=%.2f dB  BC1=%.2f dB (same content, both 4bpp)\n",
+           p_etc, p_bc1);
+    CHECK(p_etc >= 30.0, "etc2 encode quality clears an absolute floor");
+    CHECK(p_etc >= p_bc1 - 2.0, "etc2 encode quality is competitive with bc1");
+    return 0;
+}
+
 int main(void) {
     uint8_t rgba[7 * 5 * 4];
     uint8_t part_rgba[4 * 4 * 4];
@@ -2097,6 +2169,7 @@ int main(void) {
     if (test_bc_decoders()) return 1;
     if (test_bc7_decoder_conformance()) return 1;
     if (test_bc5_snorm()) return 1;
+    if (test_etc2_quality()) return 1;
     if (test_etc2_decoders()) return 1;
     if (test_etc2_orientation()) return 1;
     if (test_eac_orientation()) return 1;

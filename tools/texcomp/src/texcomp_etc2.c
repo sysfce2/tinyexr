@@ -313,12 +313,18 @@ static uint64_t tc_encode_etc1_differential(const uint8_t block[16][4],
             err_total += best_tab_err;
         }
 
-        d |= (uint64_t)q[1][0] << 0;
-        d |= (uint64_t)(diff[0] & 7) << 3;
-        d |= (uint64_t)q[1][1] << 8;
-        d |= (uint64_t)(diff[1] & 7) << 11;
-        d |= (uint64_t)q[1][2] << 16;
-        d |= (uint64_t)(diff[2] & 7) << 19;
+        /* Per channel the byte is [base:5][delta:3] -- the 5-bit base occupies
+         * the HIGH bits and the 3-bit signed delta the low three. Packing the
+         * base at bit 0 and the delta at bit 3 (as this used to) overlaps them
+         * and shifts both, so every differential block decoded to a wrong base
+         * colour. The flat and individual paths pack correctly, which is why
+         * solid and some flat-ish blocks still looked fine. */
+        d |= (uint64_t)(diff[0] & 7) << 0;
+        d |= (uint64_t)q[1][0] << 3;
+        d |= (uint64_t)(diff[1] & 7) << 8;
+        d |= (uint64_t)q[1][1] << 11;
+        d |= (uint64_t)(diff[2] & 7) << 16;
+        d |= (uint64_t)q[1][2] << 19;
         d |= (uint64_t)table[0] << 26;
         d |= (uint64_t)table[1] << 29;
         for (i = 0; i < 16u; ++i) {
