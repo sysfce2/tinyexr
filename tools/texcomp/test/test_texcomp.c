@@ -15,6 +15,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h> /* abs(): glibc leaks it in via other headers, clang does not */
 #include <string.h>
 
 /* Decode FP16 bits to float (for HDR round-trip checks). */
