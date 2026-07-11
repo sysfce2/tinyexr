@@ -1654,6 +1654,22 @@ static void test_ktx2_uni_zstd_write(void) {
     }
     tp_ktx2_image_free(NULL, &img);
     tp_free(NULL, ktx);
+
+    /* A level size that disagrees with the dimensions would make a file the
+     * scheme-2 reader rejects (it pins uncompressedByteLength to the exact block
+     * payload), so the writer must refuse it -- and leave *out cleared. */
+    {
+        uint8_t *bad = (uint8_t *)0x1; /* must be overwritten with NULL */
+        size_t bad_n = 123u;
+        sizes[0] = usz - 16u;
+        CHECK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound, passthrough_zenc,
+                                     NULL, levels, sizes, lw, lh, 1, &bad,
+                                     &bad_n) == TP_ERROR_INVALID_ARGUMENT,
+              "writer refuses a level size that mismatches the dimensions");
+        CHECK(bad == NULL && bad_n == 0u, "outputs cleared on failure");
+        sizes[0] = usz;
+    }
+
     free(dec);
     free(uni);
     free(ref);

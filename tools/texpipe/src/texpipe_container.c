@@ -653,6 +653,17 @@ static void tp_write_uni_dfd(uint8_t *p) {
     tp_wr_u32(p + 40, 0xffffffffu);        /* sampleUpper */
 }
 
+/* Tightly-packed 4x4x16B payload of uni level `l`, sized off the base dimensions
+ * the same way the reader derives them (width >> l, clamped to 1) rather than
+ * off level_w[]/level_h[]. Returns 0 if the level is degenerate. */
+static size_t tp_uni_level_expected(uint32_t w0, uint32_t h0, int l) {
+    uint32_t w = w0 >> l, h = h0 >> l;
+    if (!w0 || !h0) return 0;
+    if (!w) w = 1u;
+    if (!h) h = 1u;
+    return (size_t)((w + 3u) / 4u) * (size_t)((h + 3u) / 4u) * 16u;
+}
+
 /* Total KTX2 byte size for `n` uni levels, filling loff[] with each level's
  * offset. Returns 0 if the layout overflows size_t (uni_sizes[] is caller data
  * on the public tp_ktx2_write_uni path, so it is not trusted to be sane). */
@@ -742,12 +753,21 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
         return TP_ERROR_INVALID_ARGUMENT;
     if (num_levels < 1 || num_levels > TP_KTX2_MAX_LEVELS)
         return TP_ERROR_INVALID_ARGUMENT;
+    if (level_w[0] == 0u || level_h[0] == 0u) return TP_ERROR_INVALID_ARGUMENT;
+    *out = NULL;
+    *out_size = 0;
     for (l = 0; l < num_levels; ++l) comp[l] = NULL;
+
+    /* A scheme-2 reader pins uncompressedByteLength to the exact block payload
+     * implied by the base dimensions, so a level whose size disagrees would
+     * produce a file our own reader rejects. Refuse it here instead. */
+    for (l = 0; l < num_levels; ++l)
+        if (uni_sizes[l] != tp_uni_level_expected(level_w[0], level_h[0], l))
+            return TP_ERROR_INVALID_ARGUMENT;
 
     /* Compress each level independently, so a reader can inflate one at a time. */
     for (l = 0; l < num_levels; ++l) {
         size_t bound;
-        if (uni_sizes[l] == 0) { r = TP_ERROR_INVALID_ARGUMENT; goto done; }
         bound = zbound(user, uni_sizes[l]);
         if (bound == 0) { r = TP_ERROR_UNSUPPORTED; goto done; }
         comp[l] = (uint8_t *)tp_alloc(a, bound);
