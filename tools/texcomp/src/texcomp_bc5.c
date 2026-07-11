@@ -123,3 +123,57 @@ tc_result tc_bc5_compress_rgba8(const uint8_t *rgba, uint32_t width,
 
     return TC_SUCCESS;
 }
+
+/* --- decode ------------------------------------------------------------- */
+
+/* Expand an 8-byte BC4 block to 16 8-bit values. r0 > r1 selects the 8-value
+ * palette; r0 <= r1 the 6-value palette whose last two entries are 0 and 255. */
+void tc_decode_bc4_block(const uint8_t in[8], uint8_t v[16]) {
+    uint8_t r0 = in[0], r1 = in[1], pal[8];
+    uint64_t bits = 0;
+    uint32_t i;
+    pal[0] = r0;
+    pal[1] = r1;
+    if (r0 > r1) {
+        for (i = 1; i <= 6u; ++i)
+            pal[i + 1u] = (uint8_t)(((7u - i) * r0 + i * r1 + 3u) / 7u);
+    } else {
+        for (i = 1; i <= 4u; ++i)
+            pal[i + 1u] = (uint8_t)(((5u - i) * r0 + i * r1 + 2u) / 5u);
+        pal[6] = 0u;
+        pal[7] = 255u;
+    }
+    for (i = 0; i < 6u; ++i) bits |= (uint64_t)in[2u + i] << (8u * i);
+    for (i = 0; i < 16u; ++i) v[i] = pal[(bits >> (3u * i)) & 7u];
+}
+
+tc_result tc_bc5_decompress_rgba8(const uint8_t *bc5, uint32_t width,
+                                  uint32_t height, size_t stride,
+                                  uint8_t *out_rgba, size_t out_size) {
+    uint32_t bxc, bx, by, xx, yy;
+    if (!bc5 || !out_rgba || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    if (stride < (size_t)width * 4u) return TC_ERROR_INVALID_ARGUMENT;
+    if (out_size < (size_t)(height - 1u) * stride + (size_t)width * 4u)
+        return TC_ERROR_INVALID_ARGUMENT;
+    bxc = (width + 3u) / 4u;
+    for (by = 0; by < height; by += 4u)
+        for (bx = 0; bx < width; bx += 4u) {
+            uint8_t r[16], g[16];
+            size_t bi = ((size_t)(by / 4u) * bxc + bx / 4u) * 16u;
+            tc_decode_bc4_block(bc5 + bi, r);
+            tc_decode_bc4_block(bc5 + bi + 8u, g);
+            for (yy = 0; yy < 4u && by + yy < height; ++yy)
+                for (xx = 0; xx < 4u && bx + xx < width; ++xx) {
+                    uint8_t *d = out_rgba + (size_t)(by + yy) * stride +
+                                 (size_t)(bx + xx) * 4u;
+                    uint32_t t = yy * 4u + xx;
+                    /* BC5 carries only two channels; B/A are not stored. A
+                     * normal-map consumer reconstructs z from r,g itself. */
+                    d[0] = r[t];
+                    d[1] = g[t];
+                    d[2] = 0u;
+                    d[3] = 255u;
+                }
+        }
+    return TC_SUCCESS;
+}

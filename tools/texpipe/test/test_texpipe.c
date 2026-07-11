@@ -69,6 +69,31 @@ static double psnr_rgba(const uint8_t *a, const uint8_t *b, size_t npix) {
     return 10.0 * log10(255.0 * 255.0 / mse);
 }
 
+/* PSNR over the first `nc` of the 4 interleaved channels: BC1 discards alpha
+ * and BC5 keeps only R/G, so those decoders can only be judged on what the
+ * codec actually carries. */
+static double psnr_nc(const uint8_t *a, const uint8_t *b, size_t npix, int nc) {
+    double mse = 0.0;
+    size_t i;
+    int c;
+    for (i = 0; i < npix; ++i)
+        for (c = 0; c < nc; ++c) {
+            double d = (double)a[i * 4u + (size_t)c] - (double)b[i * 4u + (size_t)c];
+            mse += d * d;
+        }
+    mse /= (double)(npix * (size_t)nc);
+    if (mse <= 0.0) return 1e9;
+    return 10.0 * log10(255.0 * 255.0 / mse);
+}
+
+static double psnr_rgb(const uint8_t *a, const uint8_t *b, size_t npix) {
+    return psnr_nc(a, b, npix, 3);
+}
+
+static double psnr_rg(const uint8_t *a, const uint8_t *b, size_t npix) {
+    return psnr_nc(a, b, npix, 2);
+}
+
 /* ------------------------------------------------------------ fixtures */
 
 /* Smooth RGBA gradient (opaque). */
@@ -1107,6 +1132,32 @@ static void test_ktx2_read_roundtrip(void) {
     CHECK(p >= 30.0, "bc7 ktx2 decode PSNR >= 30 dB");
     tp_free(NULL, ktx); ktx = NULL;
 
+    /* --- BC1 / BC3 / BC5: the rest of the writer's LDR set is now decodable,
+     * so every codec we can emit as KTX2 reads back through the same path.
+     * BC5 keeps only two channels, so it is compared on R/G alone. --- */
+    {
+        static const struct { tp_codec codec; const char *name; double floor; }
+        bc[3] = {{TP_CODEC_BC1, "bc1", 24.0},
+                 {TP_CODEC_BC3, "bc3", 24.0},
+                 {TP_CODEC_BC5, "bc5", 24.0}};
+        int ci;
+        for (ci = 0; ci < 3; ++ci) {
+            tp_options_init(&opt, TP_CONTENT_COLOR, bc[ci].codec);
+            opt.container = TP_CONTAINER_KTX2;
+            CHECK(TP_OK(tp_process(NULL, &v, 1, &opt, &ktx, &ktx_n)),
+                  "process bc1/3/5 ktx2");
+            CHECK(TP_OK(tp_ktx2_read(ktx, ktx_n, &img)), "read bc1/3/5 ktx2");
+            CHECK(!img.is_uni && img.codec == bc[ci].codec, "bc1/3/5 codec mapped");
+            CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, 0, dec, npix * 4u)),
+                  "decode bc1/3/5 l0");
+            p = (bc[ci].codec == TP_CODEC_BC5) ? psnr_rg(ref, dec, npix)
+                                               : psnr_rgb(ref, dec, npix);
+            printf("    %s ktx2 read+decode level0 PSNR=%.2f dB\n", bc[ci].name, p);
+            CHECK(p >= bc[ci].floor, "bc1/3/5 ktx2 decode PSNR above floor");
+            tp_free(NULL, ktx); ktx = NULL;
+        }
+    }
+
     /* --- ASTC 4x4 KTX2: exercises the newly-exposed ASTC decoder --- */
     tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_ASTC);
     opt.container = TP_CONTAINER_KTX2;
@@ -1231,7 +1282,7 @@ static void test_ktx2_read_roundtrip(void) {
 
     free(dec);
     free(ref);
-    printf("  ktx2 read + decode (bc7 / astc / uni) + transcode: ok\n");
+    printf("  ktx2 read + decode (bc7 / bc1 / bc3 / bc5 / astc / uni) + transcode: ok\n");
 }
 
 /* Identity "decompressor": the scheme-2 payloads in this test are stored

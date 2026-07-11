@@ -492,13 +492,22 @@ tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
     case TP_CODEC_BC7:
         return tp_from_tc(tc_bc7_decompress_rgba8(blocks, w, h, (size_t)w * 4u,
                                                   out_rgba, out_size));
+    case TP_CODEC_BC1:
+        return tp_from_tc(tc_bc1_decompress_rgba8(blocks, w, h, (size_t)w * 4u,
+                                                  out_rgba, out_size));
+    case TP_CODEC_BC3:
+        return tp_from_tc(tc_bc3_decompress_rgba8(blocks, w, h, (size_t)w * 4u,
+                                                  out_rgba, out_size));
+    case TP_CODEC_BC5:
+        return tp_from_tc(tc_bc5_decompress_rgba8(blocks, w, h, (size_t)w * 4u,
+                                                  out_rgba, out_size));
     case TP_CODEC_ASTC:
         return tp_from_tc(tc_astc_decompress_rgba8(
             blocks, w, h, (uint32_t)img->block_w, (uint32_t)img->block_h,
             out_rgba, out_size));
     default:
-        /* BC1/3/5/6H, ETC2/EAC: no library decoder — upload blocks directly or
-         * transcode a uni source instead. */
+        /* BC6H (HDR: RGBA8 is the wrong target) and ETC2/EAC (no decoder yet):
+         * upload their blocks directly, or transcode a uni source instead. */
         return TP_ERROR_UNSUPPORTED;
     }
 }

@@ -563,6 +563,99 @@ static int astc_ref_roundtrip_test(void) {
     return 0;
 }
 
+/* The public BC1/BC3/BC5 surface decoders must agree, texel for texel, with the
+ * independent reference block decoders above (bc1_decode / bc4_decode), which
+ * were written from the S3TC spec rather than from the library. That pins the
+ * palette maths, the block/texel ordering and the partial-block edge handling.
+ * Exercised on a non-multiple-of-4 surface so the edge blocks are partial. */
+static int test_bc_decoders(void) {
+    enum { W = 13, H = 7 };
+    uint8_t src[W * H * 4], dec[W * H * 4];
+    uint8_t bc1[64 * 8], bc3[64 * 16], bc5[64 * 16];
+    tc_bc1_options o1;
+    tc_bc3_options o3;
+    tc_bc5_options o5;
+    uint32_t bxc = (W + 3u) / 4u, x, y, bx, by;
+    tc_bc1_options_init(&o1);
+    tc_bc3_options_init(&o3);
+    tc_bc5_options_init(&o5);
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            uint8_t *p = src + ((size_t)y * W + x) * 4u;
+            p[0] = (uint8_t)(x * 19u);
+            p[1] = (uint8_t)(y * 31u);
+            p[2] = (uint8_t)((x + y) * 11u);
+            p[3] = (uint8_t)(255u - x * 7u);
+        }
+
+    CHECK(tc_bc1_compress_rgba8(src, W, H, W * 4u, &o1, bc1, sizeof(bc1)) ==
+              TC_SUCCESS, "bc1 compress (decoder xcheck)");
+    CHECK(tc_bc1_decompress_rgba8(bc1, W, H, W * 4u, dec, sizeof(dec)) ==
+              TC_SUCCESS, "bc1 decompress");
+    for (by = 0; by < H; by += 4u)
+        for (bx = 0; bx < W; bx += 4u) {
+            uint8_t ref[16][3];
+            bc1_decode(bc1 + ((size_t)(by / 4u) * bxc + bx / 4u) * 8u, ref);
+            for (y = 0; y < 4u && by + y < H; ++y)
+                for (x = 0; x < 4u && bx + x < W; ++x) {
+                    const uint8_t *d = dec + ((size_t)(by + y) * W + bx + x) * 4u;
+                    const uint8_t *r = ref[y * 4u + x];
+                    CHECK(d[0] == r[0] && d[1] == r[1] && d[2] == r[2],
+                          "bc1 decode matches reference");
+                    CHECK(d[3] == 255u, "bc1 decode alpha opaque");
+                }
+        }
+
+    CHECK(tc_bc3_compress_rgba8(src, W, H, W * 4u, &o3, bc3, sizeof(bc3)) ==
+              TC_SUCCESS, "bc3 compress (decoder xcheck)");
+    CHECK(tc_bc3_decompress_rgba8(bc3, W, H, W * 4u, dec, sizeof(dec)) ==
+              TC_SUCCESS, "bc3 decompress");
+    for (by = 0; by < H; by += 4u)
+        for (bx = 0; bx < W; bx += 4u) {
+            uint8_t ref[16][3], refa[16];
+            size_t bi = ((size_t)(by / 4u) * bxc + bx / 4u) * 16u;
+            bc4_decode(bc3 + bi, refa);
+            bc1_decode(bc3 + bi + 8u, ref);
+            for (y = 0; y < 4u && by + y < H; ++y)
+                for (x = 0; x < 4u && bx + x < W; ++x) {
+                    const uint8_t *d = dec + ((size_t)(by + y) * W + bx + x) * 4u;
+                    const uint8_t *r = ref[y * 4u + x];
+                    CHECK(d[0] == r[0] && d[1] == r[1] && d[2] == r[2],
+                          "bc3 decode colour matches reference");
+                    CHECK(d[3] == refa[y * 4u + x],
+                          "bc3 decode alpha matches reference");
+                }
+        }
+
+    CHECK(tc_bc5_compress_rgba8(src, W, H, W * 4u, &o5, bc5, sizeof(bc5)) ==
+              TC_SUCCESS, "bc5 compress (decoder xcheck)");
+    CHECK(tc_bc5_decompress_rgba8(bc5, W, H, W * 4u, dec, sizeof(dec)) ==
+              TC_SUCCESS, "bc5 decompress");
+    for (by = 0; by < H; by += 4u)
+        for (bx = 0; bx < W; bx += 4u) {
+            uint8_t refr[16], refg[16];
+            size_t bi = ((size_t)(by / 4u) * bxc + bx / 4u) * 16u;
+            bc4_decode(bc5 + bi, refr);
+            bc4_decode(bc5 + bi + 8u, refg);
+            for (y = 0; y < 4u && by + y < H; ++y)
+                for (x = 0; x < 4u && bx + x < W; ++x) {
+                    const uint8_t *d = dec + ((size_t)(by + y) * W + bx + x) * 4u;
+                    CHECK(d[0] == refr[y * 4u + x] && d[1] == refg[y * 4u + x],
+                          "bc5 decode matches reference");
+                    CHECK(d[2] == 0u && d[3] == 255u, "bc5 decode b=0 a=255");
+                }
+        }
+
+    /* Undersized output and a too-narrow stride must be refused, not written. */
+    CHECK(tc_bc1_decompress_rgba8(bc1, W, H, W * 4u, dec, sizeof(dec) - 1u) ==
+              TC_ERROR_INVALID_ARGUMENT, "bc1 decompress rejects short output");
+    CHECK(tc_bc3_decompress_rgba8(bc3, W, H, W * 4u - 1u, dec, sizeof(dec)) ==
+              TC_ERROR_INVALID_ARGUMENT, "bc3 decompress rejects short stride");
+    CHECK(tc_bc5_decompress_rgba8(NULL, W, H, W * 4u, dec, sizeof(dec)) ==
+              TC_ERROR_INVALID_ARGUMENT, "bc5 decompress rejects null input");
+    return 0;
+}
+
 int main(void) {
     uint8_t rgba[7 * 5 * 4];
     uint8_t part_rgba[4 * 4 * 4];
@@ -1657,6 +1750,7 @@ int main(void) {
     if (astc_ref_roundtrip_test()) return 1;
     if (astc_backend_parity_test()) return 1;
     if (astc_thread_parity_test()) return 1;
+    if (test_bc_decoders()) return 1;
 
     printf("texcomp tests: OK\n");
     return 0;

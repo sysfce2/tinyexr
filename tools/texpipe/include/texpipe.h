@@ -323,10 +323,10 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
 void tp_ktx2_image_free(const tir_allocator *a, tp_ktx2_image *img);
 
 /* Decode one level of a parsed KTX2 to RGBA8 (width*height*4 bytes, tightly
- * packed, top-to-bottom). Handles the tinyexr-native decodable set: uni,
- * BC7, and ASTC LDR. Other codecs (BC1/3/5/6H, ETC2/EAC) return
- * TP_ERROR_UNSUPPORTED (upload their blocks directly instead, or transcode a uni
- * source via texcomp's tc_uni_transcode_*). Single-face/non-array only. */
+ * packed, top-to-bottom). Handles the LDR set: uni, BC7, BC1, BC3, BC5, and
+ * ASTC LDR. BC6H (HDR, so RGBA8 is the wrong target) and ETC2/EAC return
+ * TP_ERROR_UNSUPPORTED — upload their blocks directly instead, or transcode a
+ * uni source via texcomp's tc_uni_transcode_*. Single-face/non-array only. */
 tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
                                      uint8_t *out_rgba, size_t out_size);
 

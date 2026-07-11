@@ -173,6 +173,19 @@ tc_result tc_bc7_compress_rgbaf(const float *rgba, uint32_t width,
 tc_result tc_bc7_decompress_rgba8(const uint8_t *bc7, uint32_t width,
                                   uint32_t height, size_t stride,
                                   uint8_t *out_rgba, size_t out_size);
+/* Decode BC1/BC3/BC5 block streams to RGBA8. `stride` is the output row pitch
+ * in bytes (>= width*4). BC1 honours the 3-colour punch-through mode (index 3
+ * decodes to transparent black). BC5 stores only two channels, so it decodes to
+ * R=x, G=y, B=0, A=255 -- a normal-map consumer reconstructs z from x,y. */
+tc_result tc_bc1_decompress_rgba8(const uint8_t *bc1, uint32_t width,
+                                  uint32_t height, size_t stride,
+                                  uint8_t *out_rgba, size_t out_size);
+tc_result tc_bc3_decompress_rgba8(const uint8_t *bc3, uint32_t width,
+                                  uint32_t height, size_t stride,
+                                  uint8_t *out_rgba, size_t out_size);
+tc_result tc_bc5_decompress_rgba8(const uint8_t *bc5, uint32_t width,
+                                  uint32_t height, size_t stride,
+                                  uint8_t *out_rgba, size_t out_size);
 /* Decode BC7 to float [0,1] RGBA. stride_bytes is row pitch in bytes
  * for the float output (typically width*4*sizeof(float)). */
 tc_result tc_bc7_decompress_rgbaf(const uint8_t *bc7, uint32_t width,

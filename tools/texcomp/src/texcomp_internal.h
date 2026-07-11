@@ -60,6 +60,13 @@ extern const uint32_t tc_bc7_weights4[16];
 void tc_encode_bc4_block(const uint8_t v[16], uint8_t out[8]);
 void tc_encode_bc1_color_block(const uint8_t px[16][4], int dxt1, uint8_t out[8]);
 
+/* Block decoders, same sharing: the BC1 colour block is BC3's second half and
+ * the BC4 block is BC3's alpha half / both halves of BC5. `dxt1` selects
+ * standalone-BC1 semantics (c0 <= c1 is the 3-colour + punch-through mode); in
+ * BC3 the colour block is always 4-colour regardless of endpoint order. */
+void tc_decode_bc1_color_block(const uint8_t in[8], int dxt1, uint8_t px[16][4]);
+void tc_decode_bc4_block(const uint8_t in[8], uint8_t v[16]);
+
 /* EAC alpha block (defined in texcomp_eac.c), reused by texcomp_etc2.c. */
 uint64_t tc_encode_eac_alpha(const uint8_t alpha[16]);
 
