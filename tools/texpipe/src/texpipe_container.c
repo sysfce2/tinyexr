@@ -457,14 +457,20 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
             size_t got;
             if (!w) w = 1u;
             if (!h) h = 1u;
+            /* Both failures below happen with levels 0..l-1 already pointing
+             * into `owned`. Clear the image after freeing it: a caller that
+             * inspects it on error must not find dangling pointers, and _owned
+             * is still NULL here so tp_ktx2_image_free could not save them. */
             if (off > size || clen > (uint64_t)size - off) {
                 tp_dealloc(a, owned);
+                memset(out, 0, sizeof(*out));
                 return TP_ERROR_INVALID_ARGUMENT;
             }
             got = zdec(user, owned + cursor, (size_t)ulen[l], data + (size_t)off,
                        (size_t)clen);
             if (got != (size_t)ulen[l]) {
                 tp_dealloc(a, owned);
+                memset(out, 0, sizeof(*out));
                 return TP_ERROR_INVALID_ARGUMENT;
             }
             out->levels[l].data = owned + cursor;
@@ -807,11 +813,10 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
                                  const size_t *uni_sizes, uint32_t base_w,
                                  uint32_t base_h, int num_levels, uint32_t flags,
                                  uint8_t **out, size_t *out_size) {
-    uint8_t *comp[TP_KTX2_MAX_LEVELS];
     size_t clen[TP_KTX2_MAX_LEVELS];
     uint64_t loff[TP_KTX2_MAX_LEVELS];
     const size_t smax = (size_t)-1;
-    size_t cursor, total;
+    size_t head, cap, cursor;
     uint8_t *buf = NULL;
     tp_result r;
     int l;
@@ -823,44 +828,54 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
     *out_size = 0;
     r = tp_uni_check(uni_levels, uni_sizes, base_w, base_h, num_levels, flags);
     if (!TP_OK(r)) return r;
-    for (l = 0; l < num_levels; ++l) comp[l] = NULL;
-
-    /* Compress each level independently, so a reader can inflate one at a time. */
-    for (l = 0; l < num_levels; ++l) {
-        size_t bound = zbound(user, uni_sizes[l]);
-        if (bound == 0) { r = TP_ERROR_UNSUPPORTED; goto done; }
-        comp[l] = (uint8_t *)tp_alloc(a, bound);
-        if (!comp[l]) { r = TP_ERROR_OUT_OF_MEMORY; goto done; }
-        clen[l] = zenc(user, comp[l], bound, uni_levels[l], uni_sizes[l]);
-        if (clen[l] == 0 || clen[l] > bound) { r = TP_ERROR_UNSUPPORTED; goto done; }
-    }
 
     /* Layout: header + level index + DFD, then the compressed levels packed
      * smallest-first. Supercompressed levels carry no mip padding -- KTX2 sets
-     * required_alignment = 1 when supercompressionScheme != 0. */
-    cursor = 80u + (size_t)num_levels * 24u + 44u;
+     * required_alignment = 1 when supercompressionScheme != 0.
+     *
+     * Size the buffer for the worst case (every level incompressible) and
+     * compress straight into it at a running cursor, rather than into per-level
+     * scratch that is then copied in. The compressed sizes are not known up
+     * front, so the buffer ends up larger than the file: *out_size is the real
+     * length. This keeps peak memory at one buffer instead of the scratch and
+     * the output at once, which is what the 32-bit wasm heap has room for. */
+    head = 80u + (size_t)num_levels * 24u + 44u;
+    cap = head;
+    for (l = 0; l < num_levels; ++l) {
+        size_t bound = zbound(user, uni_sizes[l]);
+        if (bound == 0) return TP_ERROR_UNSUPPORTED;
+        if (bound > smax - cap) return TP_ERROR_INVALID_ARGUMENT;
+        cap += bound;
+    }
+    buf = (uint8_t *)tp_alloc(a, cap);
+    if (!buf) return TP_ERROR_OUT_OF_MEMORY;
+
+    /* Compress each level independently, so a reader can inflate one at a time.
+     * Smallest-first, so the cursor walks the levels in the order they are
+     * stored. Each level still gets at least its own zbound of room: what is
+     * left of `cap` here is the sum of the bounds of this level and every level
+     * not yet written. */
+    cursor = head;
     for (l = num_levels - 1; l >= 0; --l) {
-        if (clen[l] > smax - cursor) { r = TP_ERROR_INVALID_ARGUMENT; goto done; }
         loff[l] = cursor;
+        clen[l] = zenc(user, buf + cursor, cap - cursor, uni_levels[l],
+                       uni_sizes[l]);
+        if (clen[l] == 0 || clen[l] > cap - cursor) {
+            r = TP_ERROR_UNSUPPORTED;
+            goto done;
+        }
         cursor += clen[l];
     }
-    total = cursor;
 
-    buf = (uint8_t *)tp_alloc(a, total);
-    if (!buf) { r = TP_ERROR_OUT_OF_MEMORY; goto done; }
-    /* No memset: with no padding anywhere in this layout, the emit below plus
-     * the level copies write every byte of `total`. */
+    /* Nothing below `head` has been touched yet, and the levels wrote every byte
+     * from `head` to `cursor` -- so no memset is needed anywhere. */
     tp_ktx2_uni_emit(buf, base_w, base_h, num_levels, 2u, flags, loff, clen,
                      uni_sizes);
-    for (l = 0; l < num_levels; ++l)
-        memcpy(buf + (size_t)loff[l], comp[l], clen[l]);
-
     *out = buf;
-    *out_size = total;
-    buf = NULL;
+    *out_size = cursor;
+    return TP_SUCCESS;
 
 done:
-    for (l = 0; l < num_levels; ++l) tp_dealloc(a, comp[l]);
     tp_dealloc(a, buf);
     return r;
 }

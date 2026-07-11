@@ -1761,6 +1761,76 @@ static void test_ktx2_uni_zstd_write(void) {
               "reject an unknown uni flag bit");
     }
 
+    /* A real mip chain. The single-level case above exercises none of the actual
+     * new logic: the levels are packed smallest-first at a running cursor, and
+     * every level's offset/byteLength/uncompressedByteLength lands in the index.
+     * With one level, a reversed or off-by-one packing loop still round-trips. */
+    {
+        const int NL = 3; /* 64x64, 32x32, 16x16 */
+        uint8_t *mref[3], *muni[3];
+        const uint8_t *mlev[3];
+        size_t msz[3];
+        uint8_t *k2 = NULL;
+        size_t k2n = 0;
+        int l;
+        for (l = 0; l < NL; ++l) {
+            uint32_t w = W >> l, h = H >> l;
+            mref[l] = make_gradient((int)w, (int)h);
+            msz[l] = tc_uni_compressed_size(w, h);
+            muni[l] = (uint8_t *)malloc(msz[l]);
+            CHECK(tc_uni_compress_rgba8(mref[l], w, h, (size_t)w * 4u, muni[l],
+                                        msz[l]) == TC_SUCCESS,
+                  "uni compress mip level");
+            mlev[l] = muni[l];
+        }
+        CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
+                                           passthrough_zenc, NULL, mlev, msz, W,
+                                           H, NL, TP_UNI_SRGB, &k2, &k2n)),
+              "write 3-level uni zstd ktx2");
+
+        /* The index must describe three levels that are in-bounds, non-empty and
+         * non-overlapping -- a reversed packing loop would alias them. */
+        {
+            uint64_t prev_end = 0;
+            for (l = NL - 1; l >= 0; --l) { /* smallest first, i.e. ascending offset */
+                uint64_t off = rd_u64(k2 + 80 + (size_t)l * 24 + 0);
+                uint64_t blen = rd_u64(k2 + 80 + (size_t)l * 24 + 8);
+                uint64_t ulen = rd_u64(k2 + 80 + (size_t)l * 24 + 16);
+                CHECK(off >= prev_end, "level does not overlap the previous one");
+                CHECK(blen > 0 && off + blen <= (uint64_t)k2n,
+                      "level payload lies inside the file");
+                CHECK(ulen == (uint64_t)msz[l], "uncompressedByteLength = uni size");
+                prev_end = off + blen;
+            }
+            CHECK(prev_end == (uint64_t)k2n, "levels exactly fill the file");
+        }
+
+        CHECK(TP_OK(tp_ktx2_read_zstd(k2, k2n, NULL, passthrough_zdec, NULL,
+                                      &img)),
+              "read back 3-level zstd ktx2");
+        CHECK(img.num_levels == NL && img.width == W && img.height == H,
+              "3-level round-trip header");
+        /* Decode every level, not just level 0: a mixed-up index would surface
+         * as the wrong mip decoding cleanly at the wrong size. */
+        for (l = 0; l < NL; ++l) {
+            uint32_t w = W >> l, h = H >> l;
+            size_t n = (size_t)w * h;
+            uint8_t *d = (uint8_t *)malloc(n * 4u);
+            double p;
+            CHECK(img.levels[l].width == w && img.levels[l].height == h,
+                  "level dimensions");
+            CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, l, d, n * 4u)),
+                  "decode mip level");
+            p = psnr_rgba(mref[l], d, n);
+            printf("    uni->zstd-KTX2 mip %d (%ux%u) PSNR=%.2f dB\n", l, w, h, p);
+            CHECK(p >= 30.0, "mip level round-trips to the right image");
+            free(d);
+        }
+        tp_ktx2_image_free(NULL, &img);
+        tp_free(NULL, k2);
+        for (l = 0; l < NL; ++l) { free(mref[l]); free(muni[l]); }
+    }
+
     free(dec);
     free(uni);
     free(ref);
