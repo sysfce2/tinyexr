@@ -1220,9 +1220,47 @@ static void test_ktx2_bc6h_float(void) {
                   TP_ERROR_INVALID_ARGUMENT, "bc6h float rejects short output");
         tp_free(NULL, ktx);
     }
+    /* ASTC HDR reads back through the same float path. */
+    {
+        uint8_t *ktx = NULL;
+        size_t ktx_n = 0;
+        tp_ktx2_image img;
+        double mse = 0.0, psnr, peak = 6.1;
+        size_t i;
+        v.data = ref; v.width = W; v.height = H; v.channels = 3;
+        v.type = TIR_F32; v.row_stride_bytes = 0;
+        tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_ASTC_HDR);
+        opt.container = TP_CONTAINER_KTX2;
+        CHECK(TP_OK(tp_process(NULL, &v, 1, &opt, &ktx, &ktx_n)),
+              "astc_hdr ktx2 write");
+        CHECK(TP_OK(tp_ktx2_read(ktx, ktx_n, &img)), "astc_hdr ktx2 read");
+        CHECK(img.codec == TP_CODEC_ASTC_HDR && img.is_hdr,
+              "astc_hdr codec mapped, hdr");
+        CHECK(img.block_w == 4 && img.block_h == 4, "astc_hdr block 4x4");
+        CHECK(tp_ktx2_decode_level_rgba8(&img, 0, (uint8_t *)dec,
+                                         (size_t)W * H * 4u) ==
+                  TP_ERROR_UNSUPPORTED, "astc_hdr rejected on the rgba8 path");
+        CHECK(TP_OK(tp_ktx2_decode_level_rgbaf(&img, 0, dec,
+                                               (size_t)W * H * 4u * sizeof(float))),
+              "astc_hdr float decode");
+        for (i = 0; i < (size_t)W * H; ++i) {
+            int ch;
+            for (ch = 0; ch < 3; ++ch) {
+                double d = (double)dec[i * 4u + (size_t)ch] -
+                           (double)ref[i * 3u + (size_t)ch];
+                mse += d * d;
+            }
+        }
+        mse /= (double)((size_t)W * H * 3u);
+        psnr = 10.0 * log10(peak * peak / (mse > 0.0 ? mse : 1e-12));
+        printf("    astc_hdr ktx2 read+float-decode PSNR=%.2f dB\n", psnr);
+        CHECK(psnr >= 30.0, "astc_hdr float decode PSNR >= 30 dB");
+        tp_free(NULL, ktx);
+    }
+
     free(ref);
     free(dec);
-    printf("  ktx2 bc6h float decode (uf16 + sf16): ok\n");
+    printf("  ktx2 hdr float decode (bc6h uf16/sf16 + astc_hdr): ok\n");
 }
 
 /* ------------------------------------------------------------ KTX2 key/value */

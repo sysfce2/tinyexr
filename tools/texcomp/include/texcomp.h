@@ -212,6 +212,18 @@ tc_result tc_bc6h_decompress_rgbaf(const uint8_t *bc6h, uint32_t width,
                                    uint32_t height, int is_signed,
                                    size_t stride_bytes, float *out_rgba,
                                    size_t out_size);
+/* Decode an ASTC HDR block stream to float RGBA. `stride_bytes` is the output
+ * row pitch in bytes. Covers the set the texcomp HDR encoder emits: HDR
+ * void-extent and CEM 7 (RGB base+scale), CEM 11 (RGB direct) and CEM 15
+ * (RGB + HDR alpha), with all subsets sharing one CEM; CEM 7/11 yield alpha 1.
+ * Returns TC_ERROR_UNSUPPORTED -- rather than guessing -- for anything else a
+ * foreign file may hold: CEM 14 (HDR RGB + LDR alpha), mixed-CEM partitions, or
+ * an LDR block / LDR void-extent inside an HDR texture. Cross-checked block for
+ * block against astcenc's conformant HDR decoder by texcomp-astc-hdr-gate. */
+tc_result tc_astc_hdr_decompress_rgbaf(const uint8_t *astc, uint32_t width,
+                                       uint32_t height, uint32_t block_x,
+                                       uint32_t block_y, size_t stride_bytes,
+                                       float *out_rgba, size_t out_size);
 /* Decode BC7 to float [0,1] RGBA. stride_bytes is row pitch in bytes
  * for the float output (typically width*4*sizeof(float)). */
 tc_result tc_bc7_decompress_rgbaf(const uint8_t *bc7, uint32_t width,

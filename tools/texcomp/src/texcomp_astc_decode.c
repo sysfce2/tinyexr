@@ -552,3 +552,202 @@ tc_result tc_astc_decompress_rgba8(const uint8_t *astc, uint32_t width,
         return TC_ERROR_CORRUPT;
     return TC_SUCCESS;
 }
+
+/* ===================================================== ASTC HDR block decode */
+/* Promoted from test/astc_hdr_ref_decode.h, which was the pure-C oracle for
+ * texcomp-astc-hdr-gate. It now lives here as the library's HDR decoder,
+ * reusing this file's block-mode / ISE / partition / infill machinery instead
+ * of the parallel copy in the test tree. The astc-hdr gate still cross-checks
+ * it, block for block, against astcenc's conformant HDR decoder.
+ *
+ * Coverage is the set the texcomp HDR encoder emits: HDR void-extent and CEM 7
+ * (RGB base+scale), CEM 11 (RGB direct) and CEM 15 (RGB + HDR alpha), with all
+ * subsets sharing one CEM. Anything else in a foreign file -- CEM 14 (HDR RGB +
+ * LDR alpha), mixed-CEM partitions, an LDR block or LDR void-extent inside an
+ * HDR texture -- is reported unsupported rather than guessed at.
+ */
+
+/* IEEE half (sf16 bit pattern) -> float. */
+static float tacd_half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t man = h & 0x3ffu;
+    uint32_t bits;
+    float f;
+    if (exp == 0u) {
+        if (man == 0u) {
+            bits = sign;
+        } else {
+            uint32_t e = 127u - 15u + 1u;
+            while (!(man & 0x400u)) { man <<= 1; --e; }
+            man &= 0x3ffu;
+            bits = sign | (e << 23) | (man << 13);
+        }
+    } else if (exp == 31u) {
+        bits = sign | 0x7f800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 127u - 15u) << 23) | (man << 13);
+    }
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+int tc_astc_decode_block_hdr_rgbaf(const uint8_t block[16], uint32_t bx,
+                                  uint32_t by, float *out_rgba) {
+    uint32_t mode = tacd_rd_bits(block, 0, 11);
+    uint32_t wx, wy, wquant, dual;
+    uint32_t part_count, weight_count, weight_bits;
+    uint32_t pindex = 0, color_start, ccs = 3u, ccs_bits = 0;
+    uint32_t cems[4] = {0, 0, 0, 0};
+    int lns0[4][4], lns1[4][4]; /* per-subset LNS endpoints (RGBA for CEM 15) */
+    int has_alpha;
+    uint8_t rev[16], wsyms[64], wgrid[2][64], csyms[18], vals[18];
+    uint32_t vcount = 0, used, avail, i, x, y;
+    int cq = -1, small_block;
+
+    if ((mode & 0x1ffu) == 0x1fcu) { /* void-extent (constant colour) */
+        float px[4];
+        uint32_t c;
+        if (!(mode & (1u << 9))) return 0; /* LDR void-extent: not ours */
+        for (c = 0; c < 4u; ++c)
+            px[c] = tacd_half_to_float((uint16_t)(block[8u + c * 2u] |
+                                                   (block[9u + c * 2u] << 8)));
+        for (i = 0; i < bx * by; ++i) memcpy(out_rgba + i * 4u, px, 4u * 4u);
+        return 1;
+    }
+
+    if (!tacd_decode_block_mode_2d(mode, &wx, &wy, &wquant, &dual)) return 0;
+    if (wx > bx || wy > by) return 0;
+    part_count = tacd_rd_bits(block, 11, 2) + 1u;
+    if (dual && part_count == 4u) return 0;
+    weight_count = wx * wy * (dual ? 2u : 1u);
+    if (weight_count > 64u) return 0;
+    weight_bits = tacd_ise_bitcount(weight_count, wquant);
+    if (weight_bits < 24u || weight_bits > 96u) return 0;
+
+    for (i = 0; i < 16u; ++i) rev[i] = tacd_bitrev8(block[15u - i]);
+    if (!tacd_ise_decode(wquant, weight_count, rev, 0, wsyms)) return 0;
+    for (i = 0; i < wx * wy; ++i) {
+        if (dual) {
+            wgrid[0][i] = tacd_weight_unquant[wquant][wsyms[i * 2u]];
+            wgrid[1][i] = tacd_weight_unquant[wquant][wsyms[i * 2u + 1u]];
+        } else {
+            wgrid[0][i] = tacd_weight_unquant[wquant][wsyms[i]];
+        }
+    }
+
+    if (part_count == 1u) {
+        cems[0] = tacd_rd_bits(block, 13, 4);
+        color_start = 17u;
+    } else {
+        uint32_t cf = tacd_rd_bits(block, 23, 6);
+        pindex = tacd_rd_bits(block, 13, 10);
+        color_start = 29u;
+        if ((cf & 3u) != 0u) return 0; /* HDR encoder only emits all-same CEM */
+        for (i = 0; i < part_count; ++i) cems[i] = cf >> 2;
+    }
+    for (i = 0; i < part_count; ++i)
+        if (cems[i] != 11u && cems[i] != 7u && cems[i] != 15u)
+            return 0; /* CEM 7 / 11 / 15 only */
+    has_alpha = (cems[0] == 15u);
+
+    if (dual) {
+        ccs_bits = 2u;
+        if (weight_bits + 2u > 128u - color_start) return 0;
+        ccs = tacd_rd_bits(block, 128u - weight_bits - 2u, 2);
+    }
+
+    /* values per subset: CEM 7 = 4, CEM 11 = 6, CEM 15 = 8 */
+    vcount = part_count * (cems[0] == 7u ? 4u : cems[0] == 15u ? 8u : 6u);
+    used = color_start + weight_bits + ccs_bits;
+    if (used > 128u) return 0;
+    avail = 128u - used;
+    for (i = 20u; i >= 4u; --i) {
+        if (tacd_ise_bitcount(vcount, i) <= avail) {
+            cq = (int)i;
+            break;
+        }
+        if (i == 4u) break;
+    }
+    if (cq < 0) return 0;
+    if (!tacd_ise_decode((uint32_t)cq, vcount, block, color_start, csyms))
+        return 0;
+    for (i = 0; i < vcount; ++i)
+        vals[i] = (cq == 20) ? csyms[i] : tacd_color_unquant[cq - 4][csyms[i]];
+
+    {
+        uint32_t off = 0;
+        for (i = 0; i < part_count; ++i) {
+            if (cems[i] == 7u) {
+                tc_astc_cem7_unpack(vals + off, lns0[i], lns1[i]);
+                off += 4u;
+            } else if (cems[i] == 15u) {
+                tc_astc_cem15_unpack(vals + off, lns0[i], lns1[i]);
+                off += 8u;
+            } else {
+                tc_astc_cem11_unpack(vals + off, lns0[i], lns1[i]);
+                off += 6u;
+            }
+        }
+    }
+
+    small_block = bx * by < 32u;
+    for (y = 0; y < by; ++y)
+        for (x = 0; x < bx; ++x) {
+            uint32_t part =
+                part_count == 1u ? 0u
+                                 : tacd_select_partition(pindex, x, y,
+                                                         part_count, small_block);
+            uint32_t w0 = tacd_infill_weight(wgrid[0], wx, wy, bx, by, x, y);
+            uint32_t w1 =
+                dual ? tacd_infill_weight(wgrid[1], wx, wy, bx, by, x, y) : w0;
+            uint32_t c;
+            float *o = out_rgba + (y * bx + x) * 4u;
+            if (part >= part_count) part = part_count - 1u;
+            for (c = 0; c < 3u; ++c) {
+                uint32_t w = (dual && c == ccs) ? w1 : w0;
+                int rec = (lns0[part][c] * (int)(64u - w) + lns1[part][c] * (int)w +
+                           32) >> 6;
+                o[c] = tacd_half_to_float(tc_astc_lns16_to_sf16(rec));
+            }
+            if (has_alpha) { /* CEM 15: alpha shares the single weight plane */
+                int rec = (lns0[part][3] * (int)(64u - w0) +
+                           lns1[part][3] * (int)w0 + 32) >> 6;
+                o[3] = tacd_half_to_float(tc_astc_lns16_to_sf16(rec));
+            } else {
+                o[3] = 1.0f; /* CEM 7/11 have no alpha; astcenc yields 1.0 */
+            }
+        }
+    return 1;
+}
+
+tc_result tc_astc_hdr_decompress_rgbaf(const uint8_t *astc, uint32_t width,
+                                       uint32_t height, uint32_t block_x,
+                                       uint32_t block_y, size_t stride_bytes,
+                                       float *out_rgba, size_t out_size) {
+    uint32_t bxc, bx, by, xx, yy;
+    size_t row = (size_t)width * 4u * sizeof(float);
+    if (!astc || !out_rgba || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    if (block_x == 0u || block_y == 0u) return TC_ERROR_INVALID_ARGUMENT;
+    if (block_x > 12u || block_y > 12u) return TC_ERROR_UNSUPPORTED;
+    if (stride_bytes < row) return TC_ERROR_INVALID_ARGUMENT;
+    if (out_size < (size_t)(height - 1u) * stride_bytes + row)
+        return TC_ERROR_INVALID_ARGUMENT;
+    bxc = (width + block_x - 1u) / block_x;
+    for (by = 0; by < height; by += block_y)
+        for (bx = 0; bx < width; bx += block_x) {
+            float px[12 * 12 * 4];
+            size_t bi = ((size_t)(by / block_y) * bxc + bx / block_x) * 16u;
+            if (!tc_astc_decode_block_hdr_rgbaf(astc + bi, block_x, block_y, px))
+                return TC_ERROR_UNSUPPORTED;
+            for (yy = 0; yy < block_y && by + yy < height; ++yy)
+                for (xx = 0; xx < block_x && bx + xx < width; ++xx) {
+                    float *d = (float *)((uint8_t *)out_rgba +
+                                         (size_t)(by + yy) * stride_bytes) +
+                               (size_t)(bx + xx) * 4u;
+                    const float *s = px + (size_t)(yy * block_x + xx) * 4u;
+                    d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+                }
+        }
+    return TC_SUCCESS;
+}

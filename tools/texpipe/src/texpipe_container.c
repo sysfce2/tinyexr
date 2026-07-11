@@ -567,11 +567,20 @@ tp_result tp_ktx2_decode_slice_rgbaf(const tp_ktx2_image *img, int level,
     r = tp_ktx2_slice(img, level, layer, face, 4u * sizeof(float), out_size,
                       &blocks, &w, &h);
     if (!TP_OK(r)) return r;
-    if (img->is_uni || img->codec != TP_CODEC_BC6H)
-        return TP_ERROR_UNSUPPORTED; /* LDR: use the rgba8 path. ASTC HDR: none */
-    return tp_from_tc(tc_bc6h_decompress_rgbaf(blocks, w, h, img->is_signed,
-                                               (size_t)w * 4u * sizeof(float),
-                                               out_rgba, out_size));
+    if (img->is_uni) return TP_ERROR_UNSUPPORTED;
+    switch (img->codec) {
+    case TP_CODEC_BC6H:
+        return tp_from_tc(tc_bc6h_decompress_rgbaf(blocks, w, h, img->is_signed,
+                                                   (size_t)w * 4u * sizeof(float),
+                                                   out_rgba, out_size));
+    case TP_CODEC_ASTC_HDR:
+        return tp_from_tc(tc_astc_hdr_decompress_rgbaf(
+            blocks, w, h, (uint32_t)img->block_w, (uint32_t)img->block_h,
+            (size_t)w * 4u * sizeof(float), out_rgba, out_size));
+    default:
+        /* The LDR codecs stay on the RGBA8 path rather than being widened. */
+        return TP_ERROR_UNSUPPORTED;
+    }
 }
 
 tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,

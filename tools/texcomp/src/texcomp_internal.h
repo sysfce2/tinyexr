@@ -124,5 +124,10 @@ int tc_astc_decode_block_rgba8(const uint8_t block[16], uint32_t bx,
 int tc_astc_decode_image_rgba8(const uint8_t *blocks, uint32_t width,
                                uint32_t height, uint32_t bx, uint32_t by,
                                uint8_t *out_rgba);
+/* Decode one ASTC HDR block to float RGBA (bx*by texels, row-major). Returns 1
+ * on success, 0 for an encoding outside the supported HDR set (see
+ * tc_astc_hdr_decompress_rgbaf in texcomp.h). */
+int tc_astc_decode_block_hdr_rgbaf(const uint8_t block[16], uint32_t bx,
+                                   uint32_t by, float *out_rgba);
 
 #endif /* TINYEXR_TEXCOMP_INTERNAL_H_ */
