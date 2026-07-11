@@ -19,6 +19,7 @@
  * domain, https://github.com/iOrange/bcdec).
  */
 #include "texcomp_internal.h"
+#include "texcomp.h"
 #include <string.h>
 
 /* ---- ISE tables (ASTC spec data) --------------------------------------- */
@@ -527,4 +528,23 @@ int tc_astc_decode_image_rgba8(const uint8_t *blocks, uint32_t width,
         }
     }
     return 1;
+}
+
+/* Public API wrapper: validate arguments and decode a whole ASTC LDR surface
+ * to RGBA8. See texcomp.h. */
+tc_result tc_astc_decompress_rgba8(const uint8_t *astc, uint32_t width,
+                                   uint32_t height, uint32_t block_x,
+                                   uint32_t block_y, uint8_t *out_rgba,
+                                   size_t out_size) {
+    size_t need;
+    if (!astc || !out_rgba || width == 0u || height == 0u) return TC_ERROR_INVALID_ARGUMENT;
+    if (block_x == 0u || block_y == 0u) return TC_ERROR_INVALID_ARGUMENT;
+    /* This decoder handles all 2D block modes; the block dimension is bounded
+     * by the ASTC 2D footprint set (max 12x12). tmp[] holds bx*by*4 bytes. */
+    if (block_x > 12u || block_y > 12u) return TC_ERROR_UNSUPPORTED;
+    need = (size_t)width * (size_t)height * 4u;
+    if (out_size < need) return TC_ERROR_INVALID_ARGUMENT;
+    if (!tc_astc_decode_image_rgba8(astc, width, height, block_x, block_y, out_rgba))
+        return TC_ERROR_CORRUPT;
+    return TC_SUCCESS;
 }
