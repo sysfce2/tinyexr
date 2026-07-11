@@ -74,10 +74,15 @@ implementation from *outside* this tree:
 | ASTC LDR | [astcenc](https://github.com/ARM-software/astc-encoder) | 4480 astcenc-encoded blocks, bit-exact |
 | ASTC HDR | astcenc | 2240 encoded + 1856 mutated-CEM + 64 void-extent, bit-exact |
 
-Doing this found **six real bugs** that every round-trip test had happily passed,
-including transposed ETC2/EAC blocks (every ETC2 texture the tool had ever
-written would have displayed wrong on a GPU) and an ASTC LDR interpolation model
+Doing this found **eight real bugs** that every round-trip test had happily
+passed — including transposed ETC2/EAC blocks (every ETC2 texture the tool had
+ever written would have displayed wrong on a GPU), an ETC2 differential mode that
+packed its base and delta at overlapping bit positions, an ASTC HDR path whose
+endpoints overlapped its own weight data, and an ASTC LDR interpolation model
 that was off by 1 LSB from what hardware actually does.
+
+The same trick works on encoders: hold a codec to a *rival's* quality on
+identical content. ETC2 sat 22 dB behind BC1 for as long as nothing decoded it.
 
 ---
 
@@ -186,9 +191,6 @@ drifts from astcenc, Mesa or bcdec fails the build.
 
 ## Status and known gaps
 
-- The **ASTC HDR RGBA (CEM 15) encoder** emits broken blocks on some ordinary
-  content — confirmed against astcenc, which decodes them to the same garbage.
-  The RGB path (CEM 7/11) is fine, and is what the demo and the CLI drive.
 - ASTC LDR quality trails astcenc-medium by 1.7–4.2 dB on real photography; see
   `tools/texcomp/ASTC_PORT_NOTES.md`.
 - BasisLZ (KTX2 `supercompressionScheme = 1`) is not implemented, and will not be

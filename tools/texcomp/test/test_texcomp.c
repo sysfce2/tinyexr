@@ -1072,6 +1072,70 @@ static int test_etc2_quality(void) {
     return 0;
 }
 
+
+/* ASTC HDR, RGBA (CEM 15) path, on the block that actually broke it.
+ *
+ * The gate's CEM 15 case is a smooth correlated RGBA gradient. It never chose
+ * the dual-plane sub-path, so it never touched the bug -- and neither did my
+ * first attempt at a synthetic replacement, which passed identically against the
+ * broken encoder. The content below is the exact 4x4 block, lifted from a real
+ * photo, that decoded to 30208.
+ *
+ * The bug: the dual-plane path wrote its 8 endpoint values at colour quant 256
+ * (64 bits from bit 17) underneath 32 dual-plane weight symbols that already
+ * occupied the top 52 bits. They overlapped -- and the decoder, which derives
+ * the colour quant level from whatever space the weights leave behind, read them
+ * back at a different level entirely. astcenc decodes those blocks to the same
+ * garbage we do, which is how we know the encoder was at fault and not us.
+ *
+ * The range check is the load-bearing one: a blown-up endpoint shows up there
+ * immediately, and long before a PSNR number explains why.
+ */
+static int test_astc_hdr_rgba_quality(void) {
+    /* Ordinary, smooth, mid-grey-ish -- nothing exotic about it. */
+    static const float BR[16] = {
+        0.678f, 0.772f, 0.800f, 0.804f, 0.745f, 0.867f, 0.886f, 0.882f,
+        0.749f, 0.859f, 0.878f, 0.875f, 0.749f, 0.878f, 0.894f, 0.890f};
+    static const float BG[16] = {
+        0.643f, 0.757f, 0.792f, 0.780f, 0.788f, 0.910f, 0.957f, 0.945f,
+        0.788f, 0.914f, 0.937f, 0.933f, 0.800f, 0.933f, 0.953f, 0.949f};
+    static const float BB[16] = {
+        0.655f, 0.745f, 0.804f, 0.796f, 0.812f, 0.917f, 0.965f, 0.945f,
+        0.828f, 0.917f, 0.949f, 0.945f, 0.832f, 0.937f, 0.965f, 0.961f};
+    float src[16 * 4], dec[16 * 4];
+    uint8_t enc[16];
+    tc_astc_hdr_options o;
+    double sse = 0.0, psnr;
+    float dmax = 0.0f;
+    int i, c;
+    tc_astc_hdr_options_init(&o);
+    for (i = 0; i < 16; ++i) {
+        src[i * 4 + 0] = BR[i];
+        src[i * 4 + 1] = BG[i];
+        src[i * 4 + 2] = BB[i];
+        src[i * 4 + 3] = 1.0f;
+    }
+    CHECK(tc_astc_hdr_compress_rgbaf(src, 4, 4, 4u * 4u * sizeof(float), &o, enc,
+                                     sizeof(enc)) == TC_SUCCESS,
+          "astc hdr rgba: compress");
+    CHECK(tc_astc_hdr_decompress_rgbaf(enc, 4, 4, 4, 4, 4u * 4u * sizeof(float),
+                                       dec, sizeof(dec)) == TC_SUCCESS,
+          "astc hdr rgba: decompress");
+    for (i = 0; i < 16; ++i)
+        for (c = 0; c < 3; ++c) {
+            double d = (double)src[i * 4 + c] - (double)dec[i * 4 + c];
+            sse += d * d;
+            if (dec[i * 4 + c] > dmax) dmax = dec[i * 4 + c];
+        }
+    psnr = 10.0 * log10(1.0 / (sse / 48.0));
+    printf("  astc hdr rgba (cem15): %.2f dB, decoded max %.2f (source max ~0.97)\n",
+           psnr, (double)dmax);
+    CHECK((double)dmax <= 4.0,
+          "astc hdr rgba decode stays in range (no endpoint blow-up)");
+    CHECK(psnr >= 25.0, "astc hdr rgba encode quality clears its floor");
+    return 0;
+}
+
 int main(void) {
     uint8_t rgba[7 * 5 * 4];
     uint8_t part_rgba[4 * 4 * 4];
@@ -2170,6 +2234,7 @@ int main(void) {
     if (test_bc7_decoder_conformance()) return 1;
     if (test_bc5_snorm()) return 1;
     if (test_etc2_quality()) return 1;
+    if (test_astc_hdr_rgba_quality()) return 1;
     if (test_etc2_decoders()) return 1;
     if (test_etc2_orientation()) return 1;
     if (test_eac_orientation()) return 1;
