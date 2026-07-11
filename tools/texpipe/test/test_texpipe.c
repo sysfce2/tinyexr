@@ -1176,6 +1176,59 @@ static void test_ktx2_read_roundtrip(void) {
           "reject out-of-bounds level offset");
     tp_free(NULL, ktx);
 
+    /* Crafted header fields: each of these used to defeat one of the reader's
+     * own arithmetic guards (level-size product wrapping uint64_t, or a 32-bit
+     * count narrowing to a negative int and sailing past its limit). */
+    tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+    opt.container = TP_CONTAINER_KTX2;
+    CHECK(TP_OK(tp_process(NULL, &v, 1, &opt, &ktx, &ktx_n)), "process bc7 ktx2 (3)");
+    {
+        /* 0xFFFFFFFF x 0xFFFFFFFF with 4x4/16B blocks makes bw*bh*block_bytes
+         * exactly 2^64, i.e. 0 -- the truncated-level check then accepts a
+         * level of any length. */
+        static const struct { size_t off; uint32_t val; const char *what; } bad_hdr[] = {
+            {20, 0xFFFFFFFFu, "reject absurd pixelWidth"},
+            {24, 0xFFFFFFFFu, "reject absurd pixelHeight"},
+            {32, 0xFFFFFFFFu, "reject absurd layerCount"},
+            {36, 0xFFFFFFFFu, "reject absurd faceCount"},
+            {40, 0xFFFFFFFFu, "reject absurd levelCount"},
+        };
+        size_t k;
+        for (k = 0; k < sizeof(bad_hdr) / sizeof(bad_hdr[0]); ++k) {
+            uint8_t save[4];
+            size_t o = bad_hdr[k].off;
+            uint32_t val = bad_hdr[k].val;
+            memcpy(save, ktx + o, 4);
+            ktx[o] = (uint8_t)val; ktx[o+1] = (uint8_t)(val >> 8);
+            ktx[o+2] = (uint8_t)(val >> 16); ktx[o+3] = (uint8_t)(val >> 24);
+            CHECK(tp_ktx2_read(ktx, ktx_n, &img) == TP_ERROR_UNSUPPORTED,
+                  bad_hdr[k].what);
+            memcpy(ktx + o, save, 4);
+        }
+        /* dfdByteOffset past the end of the blob. */
+        ktx[48] = 0xFF; ktx[49] = 0xFF; ktx[50] = 0xFF; ktx[51] = 0x7F;
+        CHECK(tp_ktx2_read(ktx, ktx_n, &img) == TP_ERROR_INVALID_ARGUMENT,
+              "reject out-of-bounds DFD range");
+    }
+    tp_free(NULL, ktx);
+
+    /* tp_ktx2_write_uni is public API: a level-size array whose layout wraps
+     * size_t must be rejected, not produce a short buffer we then memcpy into. */
+    {
+        const uint8_t *ulev[2];
+        size_t usz[2];
+        uint32_t uw[2], uh[2];
+        uint8_t dummy[16];
+        size_t wrote = 0;
+        ulev[0] = dummy; ulev[1] = dummy;
+        usz[0] = (size_t)-1 - 64u; usz[1] = 1024u; /* cursor + sizes[0] wraps */
+        uw[0] = 4; uh[0] = 4; uw[1] = 2; uh[1] = 2;
+        CHECK(tp_ktx2_uni_size(usz, 2) == 0, "uni layout overflow -> size 0");
+        CHECK(tp_ktx2_write_uni(ulev, usz, uw, uh, 2, dummy, sizeof(dummy),
+                                &wrote) == TP_ERROR_INVALID_ARGUMENT,
+              "reject uni write with overflowing level sizes");
+    }
+
     free(dec);
     free(ref);
     printf("  ktx2 read + decode (bc7 / astc / uni) + transcode: ok\n");

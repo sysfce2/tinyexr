@@ -253,6 +253,11 @@ tp_result tp_write_ktx2_array(const tp_blocks *layers, int num_layers,
  * ========================================================================= */
 
 #define TP_KTX2_MAX_LEVELS 32
+/* Sanity bounds on the header fields of a parsed (untrusted) KTX2: dimensions
+ * and layer count beyond these are rejected, which also keeps the level-size
+ * arithmetic in the reader well clear of a 64-bit overflow. */
+#define TP_KTX2_MAX_DIM 65536
+#define TP_KTX2_MAX_LAYERS 2048
 
 /* One mip level of a parsed KTX2. `data` points into the caller's source buffer
  * (no copy); `size` is the level byte length (all faces/layers of that level).
@@ -326,7 +331,9 @@ tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
  * transcodable carrier: the reader reports is_uni = 1 and a consumer transcodes
  * per device with tc_uni_transcode_{bc7,bc1,astc,etc2} or decodes with
  * tc_uni_decompress_rgba8. `uni_levels[l]`/`uni_sizes[l]` are the level-l uni
- * bytes (from tc_uni_compress_rgba8), level 0 = largest. */
+ * bytes (from tc_uni_compress_rgba8), level 0 = largest. Only level_w[0] /
+ * level_h[0] reach the header: levels 1..num_levels-1 must be the standard
+ * halving pyramid (max(1, w >> l)), which is how the reader re-derives them. */
 size_t tp_ktx2_uni_size(const size_t *uni_sizes, int num_levels);
 tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
                             const size_t *uni_sizes, const uint32_t *level_w,
