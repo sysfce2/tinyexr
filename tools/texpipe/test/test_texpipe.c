@@ -821,6 +821,42 @@ static void test_array_ktx2(void) {
         tp_mip_chain_free(NULL, &chain2);
         free(img2);
     }
+
+    /* A zeroed tp_blocks is what a tp_compress_chain that failed leaves behind.
+     * num_levels == 0 with a NULL blk must be an error, not a NULL dereference
+     * of blk[0] inside the writers' own dimension check. */
+    {
+        tp_blocks empty;
+        uint8_t sink[256];
+        size_t w2 = 0;
+        memset(&empty, 0, sizeof(empty));
+        CHECK(tp_ktx2_size(&empty, &opt) == 0, "ktx2_size rejects a zeroed blocks");
+        CHECK(tp_ktx2_write(&empty, &opt, sink, sizeof(sink), &w2) != TP_SUCCESS,
+              "ktx2_write rejects a zeroed blocks");
+        CHECK(tp_ktx2_array_size(&empty, 1, &opt) == 0,
+              "array_size rejects a zeroed blocks");
+        CHECK(tp_write_ktx2_array(&empty, 1, &opt, sink, sizeof(sink), &w2) !=
+                  TP_SUCCESS,
+              "array write rejects a zeroed blocks");
+    }
+
+    /* The payload bytes come from `b` but the vkFormat and DFD come from opt: if
+     * they disagree the file describes BC1 over BC7 blocks and every reader
+     * decodes garbage. */
+    {
+        tp_options wrong;
+        uint8_t sink[256];
+        size_t w2 = 0;
+        tp_options_init(&wrong, TP_CONTENT_COLOR, TP_CODEC_BC1);
+        CHECK(b.codec == TP_CODEC_BC7, "blocks were encoded as BC7");
+        CHECK(tp_ktx2_size(&b, &wrong) == 0,
+              "ktx2_size rejects a codec that disagrees with the blocks");
+        CHECK(tp_ktx2_write(&b, &wrong, sink, sizeof(sink), &w2) != TP_SUCCESS,
+              "ktx2_write rejects a codec that disagrees with the blocks");
+        CHECK(tp_write_ktx2_array(layers, 3, &wrong, sink, sizeof(sink), &w2) !=
+                  TP_SUCCESS,
+              "array write rejects a codec that disagrees with the blocks");
+    }
     printf("  array ktx2 (layerCount=3): ok\n");
     free(buf);
     tp_blocks_free(NULL, &b);
@@ -1614,27 +1650,43 @@ static void test_ktx2_read_roundtrip(void) {
     {
         const uint8_t *ulev[2];
         size_t usz[2];
-        uint8_t dummy[16];
+        uint8_t block[16];
+        /* Big enough for the real file (80 + 2*24 + 44, 16-aligned, + two 16 B
+         * levels = 208). Passing a short buffer here would make every rejection
+         * below fire on `out_size < need` instead of the rule under test, so the
+         * asserts would pass even with the validation deleted. */
+        uint8_t obuf[256];
         size_t wrote = 0;
-        ulev[0] = dummy; ulev[1] = dummy;
+        ulev[0] = block; ulev[1] = block;
         usz[0] = (size_t)-1 - 64u; usz[1] = 1024u; /* cursor + sizes[0] wraps */
         CHECK(tp_ktx2_uni_size(usz, 2) == 0, "uni layout overflow -> size 0");
-        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, dummy, sizeof(dummy),
+        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "reject uni write with overflowing level sizes");
+
+        /* The control: with a correct 4x4 two-level chain and this same buffer
+         * the write succeeds. Every rejection below therefore comes from the
+         * rule it names, not from the output buffer being too small. */
+        usz[0] = 16u; usz[1] = 16u; /* 4x4 and 2x2 are one block each */
+        CHECK(TP_OK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
+                                      &wrote)),
+              "control: a valid 4x4 2-level uni write succeeds into this buffer");
+        CHECK(wrote == 208u, "control: the file is 208 bytes");
 
         /* The scheme-0 writer now enforces the same rules as the Zstd one: each
          * of these emits a file tp_ktx2_read would refuse, so the write must
          * fail rather than hand back an unloadable asset. */
-        usz[0] = 16u; usz[1] = 16u; /* 4x4 and 2x2 are one block each */
-        CHECK(tp_ktx2_write_uni(ulev, usz, 131072, 4, 2, 0u, dummy, sizeof(dummy),
+        CHECK(tp_ktx2_write_uni(ulev, usz, 131072, 4, 2, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects a dimension over TP_KTX2_MAX_DIM");
-        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0x4u, dummy, sizeof(dummy),
+        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0x4u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects an unknown flag bit");
+        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 8, 0u, obuf, sizeof(obuf),
+                                &wrote) == TP_ERROR_INVALID_ARGUMENT,
+              "write_uni rejects levelCount past the 4x4 pyramid");
         usz[1] = 32u; /* level 1 of a 4x4 base is 2x2 = one block = 16 B */
-        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, dummy, sizeof(dummy),
+        CHECK(tp_ktx2_write_uni(ulev, usz, 4, 4, 2, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects a level size that mismatches the dimensions");
     }
@@ -1658,9 +1710,14 @@ static size_t passthrough_zdec(void *user, uint8_t *dst, size_t dst_cap,
 /* Identity compressor pair, the write-side mirror of passthrough_zdec: exercises
  * the tp_ktx2_write_uni_zstd layout / index / callback path without a real zstd
  * (a stream it writes is then read back with passthrough_zdec). */
+/* Deliberately over-reports, the way ZSTD_compressBound does. An identity zenc
+ * then produces clen < bound, so the writer's buffer ends up bigger than the
+ * file and its shrink-copy path runs -- the path every real zstd caller takes.
+ * With bound == src_size the compressed data would exactly fill the worst-case
+ * buffer and that branch would never execute in CI. */
 static size_t passthrough_zbound(void *user, size_t src_size) {
     (void)user;
-    return src_size;
+    return src_size + 64u;
 }
 static size_t passthrough_zenc(void *user, uint8_t *dst, size_t dst_cap,
                                const uint8_t *src, size_t src_size) {

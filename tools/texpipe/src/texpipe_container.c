@@ -182,18 +182,40 @@ static int tp_ktx2_dims_ok(uint32_t w, uint32_t h) {
            h <= (uint32_t)TP_KTX2_MAX_DIM;
 }
 
-/* Byte length of one mip level = sum of all faces at that level. */
+/* The block shape both KTX2 block writers require of a tp_blocks. Checked before
+ * anything reads blk[0]: a zeroed tp_blocks (what a tp_compress_chain that
+ * failed leaves behind) has num_levels == 0 and a NULL blk, and must produce an
+ * error rather than a NULL dereference. */
+static int tp_blocks_shape_ok(const tp_blocks *b, const tp_options *opt) {
+    if (!b->blk || b->num_levels < 1 || b->num_levels > 32) return 0;
+    if (b->num_faces != 1 && b->num_faces != 6) return 0;
+    /* The vkFormat and DFD come from opt->codec but the payload bytes come from
+     * b: if they disagree, the file says BC1 over BC7 blocks and every reader
+     * decodes garbage from it. */
+    if (b->codec != opt->codec) return 0;
+    return tp_ktx2_dims_ok(b->blk[0].width, b->blk[0].height);
+}
+
+/* Byte length of one mip level = sum of all faces at that level. SIZE_MAX marks
+ * an overflow: the sizes are caller data, and on a 32-bit size_t (wasm) six
+ * faces of a large level can wrap, which would under-size the buffer the payload
+ * loop then memcpys into. */
+#define TP_SIZE_OVF ((size_t)-1)
 static size_t tp_ktx2_level_len(const tp_blocks *b, int level) {
     size_t total = 0;
     int face;
-    for (face = 0; face < b->num_faces; ++face)
-        total += b->blk[face * b->num_levels + level].size;
+    for (face = 0; face < b->num_faces; ++face) {
+        size_t s = b->blk[face * b->num_levels + level].size;
+        if (s > TP_SIZE_OVF - total) return TP_SIZE_OVF;
+        total += s;
+    }
     return total;
 }
 
 /* Compute the file layout: data region base + per-level absolute offsets
  * (levels stored smallest-first, aligned to the texel block size). Returns the
- * total file size; fills level_off/level_len if non-NULL. */
+ * total file size, or 0 if the layout overflows size_t; fills
+ * level_off/level_len if non-NULL. */
 static size_t tp_ktx2_layout(const tp_blocks *b, const tp_codec_desc *d,
                              uint64_t *level_off, uint64_t *level_len) {
     size_t idx_bytes = (size_t)b->num_levels * 24u;
@@ -203,7 +225,10 @@ static size_t tp_ktx2_layout(const tp_blocks *b, const tp_codec_desc *d,
     if (align < 4u) align = 4u;
     for (ll = b->num_levels - 1; ll >= 0; --ll) {
         size_t len = tp_ktx2_level_len(b, ll);
+        if (len == TP_SIZE_OVF) return 0;
+        if (cursor > TP_SIZE_OVF - (align - 1u)) return 0;
         cursor = tp_align_up(cursor, align);
+        if (len > TP_SIZE_OVF - cursor) return 0;
         if (level_off) level_off[ll] = cursor;
         if (level_len) level_len[ll] = len;
         cursor += len;
@@ -213,7 +238,7 @@ static size_t tp_ktx2_layout(const tp_blocks *b, const tp_codec_desc *d,
 
 size_t tp_ktx2_size(const tp_blocks *b, const tp_options *opt) {
     tp_codec_desc d;
-    if (!b || !opt) return 0;
+    if (!b || !opt || !tp_blocks_shape_ok(b, opt)) return 0;
     if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u) return 0;
     return tp_ktx2_layout(b, &d, NULL, NULL);
 }
@@ -227,12 +252,11 @@ tp_result tp_ktx2_write(const tp_blocks *b, const tp_options *opt, uint8_t *out,
     size_t need, idx_base, dfd_off;
     int ll, face;
     if (!b || !opt || !out) return TP_ERROR_INVALID_ARGUMENT;
-    if (b->num_levels > 32) return TP_ERROR_UNSUPPORTED;
-    if (!tp_ktx2_dims_ok(b->blk[0].width, b->blk[0].height))
-        return TP_ERROR_UNSUPPORTED;
+    if (!tp_blocks_shape_ok(b, opt)) return TP_ERROR_UNSUPPORTED;
     if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u)
         return TP_ERROR_UNSUPPORTED;
     need = tp_ktx2_layout(b, &d, level_off, level_len);
+    if (need == 0u) return TP_ERROR_INVALID_ARGUMENT; /* layout overflowed */
     if (out_size < need) return TP_ERROR_INVALID_ARGUMENT;
     memset(out, 0, need);
 
@@ -326,23 +350,21 @@ tp_result tp_ktx2_read(const uint8_t *data, size_t size, tp_ktx2_image *out) {
     return tp_ktx2_read_zstd(data, size, NULL, NULL, NULL, out);
 }
 
+/* Zeroes the whole image, not just the owned block: the level pointers alias
+ * either that block or the caller's source buffer, so after this call none of
+ * them are safe to follow and the struct must not look usable. */
 void tp_ktx2_image_free(const tir_allocator *a, tp_ktx2_image *img) {
-    if (img && img->_owned) {
-        tp_dealloc(a, img->_owned);
-        img->_owned = NULL;
-    }
+    if (!img) return;
+    tp_dealloc(a, img->_owned); /* NULL for a zero-copy scheme-0 read */
+    memset(img, 0, sizeof(*img));
 }
 
-tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
-                            const tir_allocator *a, tp_zstd_decompress_fn zdec,
-                            void *user, tp_ktx2_image *out) {
+static tp_result tp_ktx2_parse(const uint8_t *data, size_t size,
+                               const tir_allocator *a, tp_zstd_decompress_fn zdec,
+                               void *user, tp_ktx2_image *out) {
     uint32_t vk, layer_count, face_count, level_count, scheme;
     uint32_t dfd_off, dfd_len, kvd_off, kvd_len;
     int nlev, l;
-    if (!data || !out) return TP_ERROR_INVALID_ARGUMENT;
-    /* Cleared before the identifier check, not after: every other failure path
-     * hands back a zeroed struct, and a caller that inspects `out` on error must
-     * not get stack garbage from these two returns either. */
     memset(out, 0, sizeof(*out));
     if (size < 80u || memcmp(data, tp_ktx2_id, 12) != 0)
         return TP_ERROR_INVALID_ARGUMENT;
@@ -413,7 +435,8 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
          * pick an upload format and an alpha-capable transcode target. Parse the
          * two bytes we write; a DFD too short to hold them leaves the defaults
          * (linear, no alpha), which is what an absent DFD means anyway. */
-        if (dfd_len >= 44u) {
+        if (dfd_len >= 44u &&
+            data[(size_t)dfd_off + 12] == (uint8_t)TP_KDF_MODEL_UASTC) {
             uint8_t transfer = data[(size_t)dfd_off + 14];
             uint8_t channels = data[(size_t)dfd_off + 31] & 0x0fu;
             out->srgb = (transfer == (uint8_t)TP_KDF_TRANSFER_SRGB);
@@ -488,20 +511,16 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
             size_t got;
             if (!w) w = 1u;
             if (!h) h = 1u;
-            /* Both failures below happen with levels 0..l-1 already pointing
-             * into `owned`. Clear the image after freeing it: a caller that
-             * inspects it on error must not find dangling pointers, and _owned
-             * is still NULL here so tp_ktx2_image_free could not save them. */
+            /* `owned` must be released here (the caller gets no image to free on
+             * failure); the wrapper zeroes the half-filled level pointers. */
             if (off > size || clen > (uint64_t)size - off) {
                 tp_dealloc(a, owned);
-                memset(out, 0, sizeof(*out));
                 return TP_ERROR_INVALID_ARGUMENT;
             }
             got = zdec(user, owned + cursor, (size_t)ulen[l], data + (size_t)off,
                        (size_t)clen);
             if (got != (size_t)ulen[l]) {
                 tp_dealloc(a, owned);
-                memset(out, 0, sizeof(*out));
                 return TP_ERROR_INVALID_ARGUMENT;
             }
             out->levels[l].data = owned + cursor;
@@ -513,6 +532,21 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
         out->_owned = owned;
         return TP_SUCCESS;
     }
+}
+
+/* Every failure hands back a zeroed image -- no half-filled header, no level
+ * pointers into a buffer that was freed on the way out. tp_ktx2_parse bails from
+ * a dozen places, so the guarantee lives here rather than at each of them.
+ * Note `out` must not already hold a loaded image: reading into a live one
+ * overwrites its _owned pointer. Call tp_ktx2_image_free first. */
+tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
+                            const tir_allocator *a, tp_zstd_decompress_fn zdec,
+                            void *user, tp_ktx2_image *out) {
+    tp_result r;
+    if (!data || !out) return TP_ERROR_INVALID_ARGUMENT;
+    r = tp_ktx2_parse(data, size, a, zdec, user, out);
+    if (!TP_OK(r)) memset(out, 0, sizeof(*out));
+    return r;
 }
 
 /* Walk the KVD block: a sequence of {u32 keyAndValueByteLength, key NUL value,
@@ -931,6 +965,10 @@ done:
 
 /* ---- KTX2 texture arrays (layerCount) ---- */
 
+/* As tp_ktx2_layout, but every level holds num_layers copies. Returns 0 if the
+ * layout overflows size_t -- the multiply by num_layers makes that reachable on
+ * a 32-bit target long before the 64-bit one, and an under-reported size here is
+ * what the payload memcpy would then run off the end of. */
 static size_t tp_ktx2_array_layout(const tp_blocks *layers, int num_layers,
                                    const tp_codec_desc *d, uint64_t *level_off,
                                    uint64_t *level_len) {
@@ -940,8 +978,14 @@ static size_t tp_ktx2_array_layout(const tp_blocks *layers, int num_layers,
     int ll;
     if (align < 4u) align = 4u;
     for (ll = layers[0].num_levels - 1; ll >= 0; --ll) {
-        size_t len = (size_t)num_layers * tp_ktx2_level_len(&layers[0], ll);
+        size_t one = tp_ktx2_level_len(&layers[0], ll);
+        size_t len;
+        if (one == TP_SIZE_OVF) return 0;
+        if (one != 0u && (size_t)num_layers > TP_SIZE_OVF / one) return 0;
+        len = (size_t)num_layers * one;
+        if (cursor > TP_SIZE_OVF - (align - 1u)) return 0;
         cursor = tp_align_up(cursor, align);
+        if (len > TP_SIZE_OVF - cursor) return 0;
         if (level_off) level_off[ll] = cursor;
         if (level_len) level_len[ll] = len;
         cursor += len;
@@ -953,6 +997,7 @@ size_t tp_ktx2_array_size(const tp_blocks *layers, int num_layers,
                           const tp_options *opt) {
     tp_codec_desc d;
     if (!layers || num_layers < 1 || !opt) return 0;
+    if (!tp_blocks_shape_ok(&layers[0], opt)) return 0;
     if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u) return 0;
     return tp_ktx2_array_layout(layers, num_layers, &d, NULL, NULL);
 }
@@ -967,18 +1012,18 @@ tp_result tp_write_ktx2_array(const tp_blocks *layers, int num_layers,
     size_t need, idx_base, dfd_off;
     int ll, layer, face, nlev, nface, li;
     if (!layers || num_layers < 1 || !opt || !out) return TP_ERROR_INVALID_ARGUMENT;
+    /* Checks layers[0]'s shape and its codec against opt's, before anything
+     * reads blk[0]. */
+    if (!tp_blocks_shape_ok(&layers[0], opt)) return TP_ERROR_UNSUPPORTED;
     nlev = layers[0].num_levels;
     nface = layers[0].num_faces;
-    if (nlev > 32) return TP_ERROR_UNSUPPORTED;
     /* The reader refuses layerCount past this, so writing more would only make a
      * file that cannot be loaded back. */
     if (num_layers > TP_KTX2_MAX_LAYERS) return TP_ERROR_UNSUPPORTED;
-    if (!tp_ktx2_dims_ok(layers[0].blk[0].width, layers[0].blk[0].height))
-        return TP_ERROR_UNSUPPORTED;
     for (li = 1; li < num_layers; ++li) {
         int k;
-        if (layers[li].num_levels != nlev || layers[li].num_faces != nface ||
-            layers[li].codec != layers[0].codec)
+        if (!layers[li].blk || layers[li].num_levels != nlev ||
+            layers[li].num_faces != nface || layers[li].codec != layers[0].codec)
             return TP_ERROR_INVALID_ARGUMENT;
         /* Every level's byte length is computed from layers[0] and multiplied by
          * num_layers, but the payload loop below copies each layer's own
@@ -994,6 +1039,7 @@ tp_result tp_write_ktx2_array(const tp_blocks *layers, int num_layers,
     if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u)
         return TP_ERROR_UNSUPPORTED;
     need = tp_ktx2_array_layout(layers, num_layers, &d, level_off, level_len);
+    if (need == 0u) return TP_ERROR_INVALID_ARGUMENT; /* layout overflowed */
     if (out_size < need) return TP_ERROR_INVALID_ARGUMENT;
     memset(out, 0, need);
 
