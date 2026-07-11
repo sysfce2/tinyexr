@@ -67,6 +67,11 @@ void tc_encode_bc1_color_block(const uint8_t px[16][4], int dxt1, uint8_t out[8]
 void tc_decode_bc1_color_block(const uint8_t in[8], int dxt1, uint8_t px[16][4]);
 void tc_decode_bc4_block(const uint8_t in[8], uint8_t v[16]);
 
+/* One BC6H block -> 16 texels of FP16 RGB (row-major). Defined in
+ * texcomp_bc6h_decode.c; the public float/half surface decoders wrap it. */
+void tc_bc6h_decode_block_half(const uint8_t blk[16], int is_signed,
+                               uint16_t out[16][3]);
+
 /* EAC alpha block (defined in texcomp_eac.c), reused by texcomp_etc2.c. */
 uint64_t tc_encode_eac_alpha(const uint8_t alpha[16]);
 

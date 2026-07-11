@@ -198,6 +198,20 @@ tc_result tc_etc2_decompress_rgba8(const uint8_t *etc2, uint32_t width,
 tc_result tc_eac_decompress_rgba8(const uint8_t *eac, uint32_t width,
                                   uint32_t height, int rg11, size_t stride,
                                   uint8_t *out_rgba, size_t out_size);
+/* Decode a BC6H block stream (all 14 modes). BC6H is HDR, so there is no RGBA8
+ * form: the natural output is FP16 (tc_bc6h_decompress_rgb16f, 3 channels), and
+ * tc_bc6h_decompress_rgbaf converts to float RGBA with alpha 1 (BC6H carries no
+ * alpha). `is_signed` selects the sf16 variant over uf16 -- it must match how
+ * the blocks were encoded, since the two disagree on endpoint unquantisation.
+ * `stride_bytes` is the output row pitch in bytes. */
+tc_result tc_bc6h_decompress_rgb16f(const uint8_t *bc6h, uint32_t width,
+                                    uint32_t height, int is_signed,
+                                    size_t stride_bytes, uint16_t *out_rgb,
+                                    size_t out_size);
+tc_result tc_bc6h_decompress_rgbaf(const uint8_t *bc6h, uint32_t width,
+                                   uint32_t height, int is_signed,
+                                   size_t stride_bytes, float *out_rgba,
+                                   size_t out_size);
 /* Decode BC7 to float [0,1] RGBA. stride_bytes is row pitch in bytes
  * for the float output (typically width*4*sizeof(float)). */
 tc_result tc_bc7_decompress_rgbaf(const uint8_t *bc7, uint32_t width,

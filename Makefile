@@ -250,7 +250,8 @@ TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
   tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c \
   tools/texcomp/src/texcomp_astc_hdr.c tools/texcomp/src/texcomp_uni.c \
   tools/texcomp/src/texcomp_astc_decode.c \
-  tools/texcomp/src/texcomp_etc2_decode.c
+  tools/texcomp/src/texcomp_etc2_decode.c \
+  tools/texcomp/src/texcomp_bc6h_decode.c
 TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
 TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
 TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))

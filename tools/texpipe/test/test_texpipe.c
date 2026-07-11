@@ -1151,6 +1151,80 @@ static void test_kaiser(void) {
     free(img);
 }
 
+/* ------------------------------------------------------- KTX2 BC6H (HDR float) */
+
+/* BC6H is the one codec with no RGBA8 form, so it reads back through the float
+ * path. Covers both variants: uf16 (unsigned) and sf16, which disagree on
+ * endpoint unquantisation -- decoding one as the other is badly wrong, so the
+ * PSNR floor here also pins that img->is_signed survives the VkFormat round
+ * trip (BC6H_UFLOAT 143 vs BC6H_SFLOAT 144). */
+static void test_ktx2_bc6h_float(void) {
+    const int W = 64, H = 64;
+    tir_image_view v;
+    tp_options opt;
+    float *ref = (float *)malloc((size_t)W * H * 3u * sizeof(float));
+    float *dec = (float *)malloc((size_t)W * H * 4u * sizeof(float));
+    int sgn, x, y;
+
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            float *p = ref + ((size_t)y * W + x) * 3u;
+            /* HDR range: values well above 1.0 are the point of BC6H. */
+            p[0] = 0.25f + 3.0f * ((float)x / (float)W);
+            p[1] = 0.10f + 6.0f * ((float)y / (float)H);
+            p[2] = 1.50f;
+        }
+
+    for (sgn = 0; sgn < 2; ++sgn) {
+        uint8_t *ktx = NULL;
+        size_t ktx_n = 0;
+        tp_ktx2_image img;
+        double mse = 0.0, psnr, peak = 6.1;
+        size_t i;
+        v.data = ref; v.width = W; v.height = H; v.channels = 3;
+        v.type = TIR_F32; v.row_stride_bytes = 0;
+        tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC6H);
+        opt.container = TP_CONTAINER_KTX2;
+        opt.bc6h.signed_float = sgn;
+        CHECK(TP_OK(tp_process(NULL, &v, 1, &opt, &ktx, &ktx_n)), "bc6h ktx2 write");
+        CHECK(TP_OK(tp_ktx2_read(ktx, ktx_n, &img)), "bc6h ktx2 read");
+        CHECK(img.codec == TP_CODEC_BC6H && img.is_hdr, "bc6h codec mapped, hdr");
+        CHECK(img.is_signed == sgn, "bc6h signedness from vkFormat");
+
+        /* The RGBA8 path must refuse it rather than produce garbage. */
+        CHECK(tp_ktx2_decode_level_rgba8(&img, 0, (uint8_t *)dec,
+                                         (size_t)W * H * 4u) ==
+                  TP_ERROR_UNSUPPORTED, "bc6h rejected on the rgba8 path");
+
+        CHECK(TP_OK(tp_ktx2_decode_level_rgbaf(&img, 0, dec,
+                                               (size_t)W * H * 4u * sizeof(float))),
+              "bc6h float decode");
+        for (i = 0; i < (size_t)W * H; ++i) {
+            int ch;
+            for (ch = 0; ch < 3; ++ch) {
+                double d = (double)dec[i * 4u + (size_t)ch] -
+                           (double)ref[i * 3u + (size_t)ch];
+                mse += d * d;
+            }
+            CHECK(dec[i * 4u + 3u] == 1.0f, "bc6h alpha is 1.0");
+        }
+        mse /= (double)((size_t)W * H * 3u);
+        psnr = 10.0 * log10(peak * peak / (mse > 0.0 ? mse : 1e-12));
+        printf("    bc6h %s ktx2 read+float-decode PSNR=%.2f dB\n",
+               sgn ? "sf16" : "uf16", psnr);
+        CHECK(psnr >= 30.0, "bc6h float decode PSNR >= 30 dB");
+
+        /* An undersized float destination must be refused. */
+        CHECK(tp_ktx2_decode_level_rgbaf(&img, 0, dec,
+                                         (size_t)W * H * 4u * sizeof(float) - 1u) ==
+                  TP_ERROR_INVALID_ARGUMENT, "bc6h float rejects short output");
+        tp_free(NULL, ktx);
+    }
+    free(ref);
+    free(dec);
+    printf("  ktx2 bc6h float decode (uf16 + sf16): ok\n");
+}
+
 /* ------------------------------------------------------------ KTX2 key/value */
 
 static void wr_u32(uint8_t *p, uint32_t v) {
@@ -1580,6 +1654,7 @@ int main(void) {
     test_containers();
     test_ktx2_read_roundtrip();
     test_ktx2_kv();
+    test_ktx2_bc6h_float();
     test_ktx2_zstd_scheme();
     test_cube_seam_fixup();
     test_cube_split();

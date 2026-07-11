@@ -397,6 +397,7 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
         out->codec = c;
         out->srgb = srgb;
         out->is_hdr = d.is_hdr;
+        out->is_signed = d.is_signed;
         out->block_w = d.block_w;
         out->block_h = d.block_h;
         out->block_bytes = d.block_bytes;
@@ -507,19 +508,17 @@ tp_result tp_ktx2_kv_lookup(const tp_ktx2_image *img, const char *key,
     return TP_ERROR_NOT_FOUND;
 }
 
-tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
-                                     uint8_t *out_rgba, size_t out_size) {
-    return tp_ktx2_decode_slice_rgba8(img, level, 0, 0, out_rgba, out_size);
-}
-
-tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
-                                     int layer, int face, uint8_t *out_rgba,
-                                     size_t out_size) {
+/* Validate (level, layer, face) and locate that slice's blocks. `texel_bytes` is
+ * the size of one decoded output texel, so the caller's destination is checked
+ * with the same 64-bit arithmetic in both the 8-bit and the float path. */
+static tp_result tp_ktx2_slice(const tp_ktx2_image *img, int level, int layer,
+                               int face, size_t texel_bytes, size_t out_size,
+                               const uint8_t **out_blocks, uint32_t *out_w,
+                               uint32_t *out_h) {
     uint32_t w, h;
-    size_t need, img_bytes, slice;
-    const uint8_t *blocks;
+    size_t img_bytes, slice;
     int nlayers;
-    if (!img || !out_rgba) return TP_ERROR_INVALID_ARGUMENT;
+    if (!img) return TP_ERROR_INVALID_ARGUMENT;
     if (level < 0 || level >= img->num_levels) return TP_ERROR_INVALID_ARGUMENT;
     nlayers = img->num_layers ? img->num_layers : 1; /* 0 = non-array */
     if (layer < 0 || layer >= nlayers) return TP_ERROR_INVALID_ARGUMENT;
@@ -527,12 +526,12 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
     w = img->levels[level].width;
     h = img->levels[level].height;
     if (!w || !h) return TP_ERROR_INVALID_ARGUMENT;
-    /* w*h*4 is computed in 64 bits first: on a 32-bit size_t the RGBA8 surface
-     * for a large level wraps, which would let the out_size check pass. */
-    if ((uint64_t)w * (uint64_t)h * 4u > (uint64_t)(size_t)-1)
+    /* The surface size is computed in 64 bits first: on a 32-bit size_t it
+     * wraps for a large level, which would let the out_size check pass. */
+    if ((uint64_t)w * (uint64_t)h * (uint64_t)texel_bytes > (uint64_t)(size_t)-1)
         return TP_ERROR_UNSUPPORTED;
-    need = (size_t)w * (size_t)h * 4u;
-    if (out_size < need) return TP_ERROR_INVALID_ARGUMENT;
+    if (out_size < (size_t)w * (size_t)h * texel_bytes)
+        return TP_ERROR_INVALID_ARGUMENT;
 
     /* A level holds its slices in KTX2 order (layer, face), each one a tightly
      * packed block image of the level's dimensions. */
@@ -547,7 +546,48 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
      * could still come up short -- decoders read img_bytes without a length. */
     if (img->levels[level].size < slice + img_bytes)
         return TP_ERROR_INVALID_ARGUMENT;
-    blocks = img->levels[level].data + slice;
+    *out_blocks = img->levels[level].data + slice;
+    *out_w = w;
+    *out_h = h;
+    return TP_SUCCESS;
+}
+
+tp_result tp_ktx2_decode_level_rgbaf(const tp_ktx2_image *img, int level,
+                                     float *out_rgba, size_t out_size) {
+    return tp_ktx2_decode_slice_rgbaf(img, level, 0, 0, out_rgba, out_size);
+}
+
+tp_result tp_ktx2_decode_slice_rgbaf(const tp_ktx2_image *img, int level,
+                                     int layer, int face, float *out_rgba,
+                                     size_t out_size) {
+    uint32_t w, h;
+    const uint8_t *blocks;
+    tp_result r;
+    if (!img || !out_rgba) return TP_ERROR_INVALID_ARGUMENT;
+    r = tp_ktx2_slice(img, level, layer, face, 4u * sizeof(float), out_size,
+                      &blocks, &w, &h);
+    if (!TP_OK(r)) return r;
+    if (img->is_uni || img->codec != TP_CODEC_BC6H)
+        return TP_ERROR_UNSUPPORTED; /* LDR: use the rgba8 path. ASTC HDR: none */
+    return tp_from_tc(tc_bc6h_decompress_rgbaf(blocks, w, h, img->is_signed,
+                                               (size_t)w * 4u * sizeof(float),
+                                               out_rgba, out_size));
+}
+
+tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
+                                     uint8_t *out_rgba, size_t out_size) {
+    return tp_ktx2_decode_slice_rgba8(img, level, 0, 0, out_rgba, out_size);
+}
+
+tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
+                                     int layer, int face, uint8_t *out_rgba,
+                                     size_t out_size) {
+    uint32_t w, h;
+    const uint8_t *blocks;
+    tp_result r;
+    if (!img || !out_rgba) return TP_ERROR_INVALID_ARGUMENT;
+    r = tp_ktx2_slice(img, level, layer, face, 4u, out_size, &blocks, &w, &h);
+    if (!TP_OK(r)) return r;
 
     if (img->is_uni)
         return tp_from_tc(tc_uni_decompress_rgba8(blocks, w, h, (size_t)w * 4u,
@@ -581,8 +621,8 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
             blocks, w, h, (uint32_t)img->block_w, (uint32_t)img->block_h,
             out_rgba, out_size));
     default:
-        /* BC6H is HDR, so RGBA8 is the wrong target for it: upload its blocks
-         * directly, or transcode a uni source instead. */
+        /* BC6H is HDR: decode it with tp_ktx2_decode_slice_rgbaf instead.
+         * ASTC HDR has no decoder yet. */
         return TP_ERROR_UNSUPPORTED;
     }
 }

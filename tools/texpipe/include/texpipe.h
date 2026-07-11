@@ -278,6 +278,7 @@ typedef struct tp_ktx2_image {
     int is_uni;              /* 1 = uni/UASTC transcodable intermediate        */
     int is_hdr;
     int srgb;
+    int is_signed;           /* BC6H sf16 / BC5 snorm (vs the unsigned variant) */
     int block_w, block_h, block_bytes;
     uint32_t width, height;  /* base (level 0) dimensions                      */
     int num_levels;
@@ -354,6 +355,18 @@ tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,
  * by tp_write_ktx2 / tp_write_ktx2_array. Same codec support as above. */
 tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
                                      int layer, int face, uint8_t *out_rgba,
+                                     size_t out_size);
+
+/* Decode one level/slice to float RGBA (width*height*4 floats, tightly packed).
+ * This is the HDR path: BC6H has no meaningful RGBA8 form, so it is decodable
+ * only here (alpha comes out 1.0 — BC6H carries no alpha, and img->is_signed
+ * selects sf16 vs uf16). The LDR codecs stay on the RGBA8 path above rather
+ * than being widened here; ASTC HDR has no decoder yet. Both return
+ * TP_ERROR_UNSUPPORTED. */
+tp_result tp_ktx2_decode_level_rgbaf(const tp_ktx2_image *img, int level,
+                                     float *out_rgba, size_t out_size);
+tp_result tp_ktx2_decode_slice_rgbaf(const tp_ktx2_image *img, int level,
+                                     int layer, int face, float *out_rgba,
                                      size_t out_size);
 
 /* Serialize pre-encoded uni (UASTC) mip levels as a KTX2 (vkFormat = UNDEFINED,
