@@ -368,6 +368,61 @@ See [`tools/resize/`](tools/resize/) for the library and its README.
 
 ---
 
+# texcomp — GPU texture compression
+
+**[▶ Live browser demo](https://syoyo.github.io/tinyexr/texcomp/)** — resize,
+compress, decompress and compare, on your own image, entirely locally.
+
+The last mile of a VFX/CG asset pipeline is turning scene-linear EXRs into
+something a GPU can sample, and that step usually drags in a pile of C++
+dependencies. **texcomp** (`tools/texcomp/`) is a **pure-C11** block compressor —
+and decompressor — that does it in-tree:
+
+| codec | bpp | for |
+|---|---|---|
+| BC1 / BC3 / BC7 | 4 / 8 / 8 | desktop colour |
+| BC5 | 8 | desktop **normal maps** (UNORM + SNORM) |
+| BC6H | 8 | desktop **HDR** / IBL (uf16 + sf16) |
+| ETC2 / EAC | 4–8 | mobile |
+| ASTC (LDR + HDR) | 0.9–8 | mobile + desktop, variable block |
+| `uni` | 8 | UASTC intermediate: encode once, **transcode** per device |
+
+It comes with **tir** (resize, above), **texpipe** (`tools/texpipe/`: mip chains,
+alpha coverage, seam-free cube LOD, normal/roughness coherence, **KTX2 + DDS**
+read *and* write) and **envmap** (`tools/envmap/`: equirect ⇄ cubemap ⇄
+octahedral, SH, spherical gaussians).
+
+```c
+#include "texpipe.h"          /* resize -> mips -> compress -> container */
+tp_options opt;
+tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC7);
+opt.container  = TP_CONTAINER_KTX2;
+opt.srgb_aware = 1;           /* filter in linear light, not in sRGB */
+
+uint8_t *ktx2; size_t n;
+tp_process(NULL, &view, 1, &opt, &ktx2, &n);
+```
+
+```sh
+make texcomp && build/texcomp/texcomp --help
+make tools-test        # pure-C gates
+make tools-test-all    # + astcenc C++ conformance cross-checks
+```
+
+**Every decoder is cross-checked against an independent implementation** — BC7
+against [bcdec](https://github.com/iOrange/bcdec), ETC2/EAC against
+[Mesa](https://gitlab.freedesktop.org/mesa/mesa), ASTC (LDR and HDR) against
+[astcenc](https://github.com/ARM-software/astc-encoder), bit-exact on tens of
+thousands of foreign blocks. A round-trip test cannot catch a codec whose encoder
+and decoder share the same wrong assumption; doing this found six real bugs that
+every round-trip test had passed.
+
+See [`doc/texcomp.md`](doc/texcomp.md) for the full documentation — codecs,
+containers, the HDR / normal-map / cubemap / alpha-coverage cases, and the
+validation story.
+
+---
+
 # v1 — single-header C++ (stable)
 
 The original single-header C++ API (`tinyexr.h`) is the **old but stable**

@@ -5301,7 +5301,23 @@ uint64_t tc_encode_astc_hdr_cem15_block(const int lns[16][4], uint8_t out[16]) {
         uint8_t dualw[32], dual_packed[8];
         int dq0[4], dq1[4], dd[4];
         int64_t ddl = 0, dual_sse;
-        tc_astc_cem15_pack(e0, e1, e0[3], e1[3], 20, v);
+        uint32_t dwbits, davail, dcq;
+        /* The colour endpoints have to fit in what the weights leave behind, and
+         * the decoder derives their quant level from exactly that space -- so if
+         * we write them at a level that does not fit, the decoder reads the bits
+         * back at a *different* level and the block decodes to garbage. The
+         * dual-plane weights (32 symbols) are much bigger than the single-plane
+         * ones, and 8 values at quant 256 do not fit underneath them: they used
+         * to overlap the weight data outright. Pick the largest level that fits,
+         * exactly as the decoder will. */
+        dwbits = tc_astc_ise_sequence_bitcount(32u, 1u);
+        if (dwbits + 2u + 17u >= 128u) goto dual_done;
+        davail = 128u - dwbits - 2u /* CCS */ - 17u /* colour start */;
+        for (dcq = 20u; dcq >= 4u; --dcq)
+            if (tc_astc_ise_sequence_bitcount(8u, dcq) <= davail) break;
+        if (dcq < 4u) goto dual_done; /* no room for endpoints at all */
+
+        tc_astc_cem15_pack(e0, e1, e0[3], e1[3], (int)dcq, v);
         tc_astc_cem15_unpack(v, dq0, dq1);
         for (c = 0; c < 4; ++c) { dd[c] = dq1[c] - dq0[c]; ddl += (int64_t)dd[c] * dd[c]; }
         memset(dualw, 0, sizeof(dualw));
@@ -5352,15 +5368,18 @@ uint64_t tc_encode_astc_hdr_cem15_block(const int lns[16][4], uint8_t out[16]) {
                 tc_set_bits(out, &bitpos, dbm, 11u);
                 tc_set_bits(out, &bitpos, 0u, 2u);
                 tc_set_bits(out, &bitpos, 15u, 4u); /* CEM 15 */
-                tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 8u, v, dual_packed);
-                (void)tc_astc_ise_encode_bits(20u, 8u, dual_packed, out, 16u, 17u);
-                /* CCS stored at 128 - weight_bits - 2 (weight_bits for 32 syms at qm1) */
-                bitpos = 128u - tc_astc_ise_sequence_bitcount(32u, 1u) - 2u;
+                /* Same level the SSE above was measured at, and the same one the
+                 * decoder will derive from the leftover space. */
+                tc_astc_quantize_color_values(&tc_hdr_ctx, dcq, 8u, v, dual_packed);
+                (void)tc_astc_ise_encode_bits(dcq, 8u, dual_packed, out, 16u, 17u);
+                /* CCS sits directly below the weight data. */
+                bitpos = 128u - dwbits - 2u;
                 tc_set_bits(out, &bitpos, 3u, 2u); /* CCS = 3 (alpha) */
                 return (uint64_t)best_sse;
             }
         }
     }
+dual_done:
 
     memcpy(v, best_v, sizeof(v));
     memcpy(sw, best_sw, sizeof(sw));
@@ -5374,8 +5393,19 @@ uint64_t tc_encode_astc_hdr_cem15_block(const int lns[16][4], uint8_t out[16]) {
     tc_set_bits(out, &bitpos, bm, 11u);
     tc_set_bits(out, &bitpos, 0u, 2u);
     tc_set_bits(out, &bitpos, 15u, 4u); /* CEM 15 */
-    tc_astc_quantize_color_values(&tc_hdr_ctx, 20u, 8u, v, packed);
-    (void)tc_astc_ise_encode_bits(20u, 8u, packed, out, 16u, 17u);
+    /* The single-plane weights (16 symbols at QUANT_6) do leave room for all 8
+     * values at quant 256, but derive the level rather than assuming it -- the
+     * assumption is exactly what broke the dual-plane path above. */
+    {
+        uint32_t wbits = tc_astc_ise_sequence_bitcount(16u, 4u);
+        uint32_t avail = (wbits + 17u < 128u) ? 128u - wbits - 17u : 0u;
+        uint32_t cq;
+        for (cq = 20u; cq >= 4u; --cq)
+            if (tc_astc_ise_sequence_bitcount(8u, cq) <= avail) break;
+        if (cq < 4u) return (uint64_t)-1; /* cannot encode this block as CEM 15 */
+        tc_astc_quantize_color_values(&tc_hdr_ctx, cq, 8u, v, packed);
+        (void)tc_astc_ise_encode_bits(cq, 8u, packed, out, 16u, 17u);
+    }
     return (uint64_t)best_sse;
 }
 
