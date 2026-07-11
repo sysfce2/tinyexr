@@ -10,6 +10,7 @@
 #include "../src/texcomp_internal.h"
 
 #include "astc_ref_decode.h"
+#include "bc7_ref_decode.h"
 #include "astc_hdr_ref_decode.h"
 
 #include <math.h>
@@ -814,6 +815,49 @@ static int test_eac_orientation(void) {
             CHECK(got >= want - 24 && got <= want + 24,
                   "eac round-trip preserves the X ramp (not transposed)");
         }
+    return 0;
+}
+
+
+/* BC7 decoder conformance on arbitrary blocks.
+ *
+ * The xbc7 gate already cross-checks the library decoder against
+ * bc7_ref_decode.h, but only on blocks our own encoder produced -- which use a
+ * handful of the eight modes. Random blocks reach every mode, every partition,
+ * rotation, p-bit and index-selection combination a foreign encoder might emit
+ * (a BC7 block has no invalid bit patterns once its mode prefix is set).
+ *
+ * bc7_ref_decode.h is an independent implementation, and it was itself verified
+ * bit-exact against upstream bcdec (iOrange, public domain / MIT) over 320k
+ * random blocks -- 40k per mode -- so agreeing with it here is a real
+ * conformance statement, not just self-consistency.
+ */
+static uint32_t bc7c_rs = 99u;
+static uint32_t bc7c_rnd(void) {
+    bc7c_rs = bc7c_rs * 1664525u + 1013904223u;
+    return bc7c_rs >> 8;
+}
+
+static int test_bc7_decoder_conformance(void) {
+    int mode;
+    long total = 0;
+    for (mode = 0; mode < 8; ++mode) {
+        int i;
+        for (i = 0; i < 2000; ++i) {
+            uint8_t blk[16], ours[16 * 4], ref[16][4];
+            int k;
+            for (k = 0; k < 16; ++k) blk[k] = (uint8_t)bc7c_rnd();
+            /* Select the mode: `mode` low zero bits, then the marker bit. */
+            blk[0] = (uint8_t)((blk[0] & ~((1u << (mode + 1)) - 1u)) | (1u << mode));
+            CHECK(tc_bc7_decompress_rgba8(blk, 4, 4, 16, ours, sizeof(ours)) ==
+                      TC_SUCCESS, "bc7 conformance decode");
+            tc_bc7_ref_decode_block(blk, ref);
+            CHECK(memcmp(ours, &ref[0][0], 64) == 0,
+                  "bc7 decode matches the reference decoder on a random block");
+            total++;
+        }
+    }
+    printf("  bc7 decoder conformance: %ld random blocks over all 8 modes\n", total);
     return 0;
 }
 
@@ -1912,6 +1956,7 @@ int main(void) {
     if (astc_backend_parity_test()) return 1;
     if (astc_thread_parity_test()) return 1;
     if (test_bc_decoders()) return 1;
+    if (test_bc7_decoder_conformance()) return 1;
     if (test_etc2_decoders()) return 1;
     if (test_etc2_orientation()) return 1;
     if (test_eac_orientation()) return 1;
