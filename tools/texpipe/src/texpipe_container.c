@@ -109,9 +109,14 @@ tp_result tp_dds_write(const tp_blocks *b, const tp_options *opt, uint8_t *out,
 #define TP_KDF_MODEL_BC7 134u
 #define TP_KDF_MODEL_ETC2 161u
 #define TP_KDF_MODEL_ASTC 162u
+#define TP_KDF_MODEL_UASTC 166u
+#define TP_KDF_PRIMARIES_UNSPECIFIED 0u
 #define TP_KDF_PRIMARIES_BT709 1u
 #define TP_KDF_TRANSFER_LINEAR 1u
 #define TP_KDF_TRANSFER_SRGB 2u
+/* Sample channelType ids for the UASTC model (Khronos khr_df.h). */
+#define TP_KDF_CHANNEL_UASTC_RGB 0u
+#define TP_KDF_CHANNEL_UASTC_RGBA 3u
 
 static uint32_t tp_kdf_model(tp_codec codec) {
     switch (codec) {
@@ -170,6 +175,13 @@ static size_t tp_align_up(size_t v, size_t a) {
     return (v + (a - 1)) / a * a;
 }
 
+/* The dimension range the KTX2 reader accepts. A writer that goes outside it
+ * only produces files the library itself refuses to load. */
+static int tp_ktx2_dims_ok(uint32_t w, uint32_t h) {
+    return w != 0u && h != 0u && w <= (uint32_t)TP_KTX2_MAX_DIM &&
+           h <= (uint32_t)TP_KTX2_MAX_DIM;
+}
+
 /* Byte length of one mip level = sum of all faces at that level. */
 static size_t tp_ktx2_level_len(const tp_blocks *b, int level) {
     size_t total = 0;
@@ -216,6 +228,8 @@ tp_result tp_ktx2_write(const tp_blocks *b, const tp_options *opt, uint8_t *out,
     int ll, face;
     if (!b || !opt || !out) return TP_ERROR_INVALID_ARGUMENT;
     if (b->num_levels > 32) return TP_ERROR_UNSUPPORTED;
+    if (!tp_ktx2_dims_ok(b->blk[0].width, b->blk[0].height))
+        return TP_ERROR_UNSUPPORTED;
     if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u)
         return TP_ERROR_UNSUPPORTED;
     need = tp_ktx2_layout(b, &d, level_off, level_len);
@@ -326,9 +340,12 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
     uint32_t dfd_off, dfd_len, kvd_off, kvd_len;
     int nlev, l;
     if (!data || !out) return TP_ERROR_INVALID_ARGUMENT;
+    /* Cleared before the identifier check, not after: every other failure path
+     * hands back a zeroed struct, and a caller that inspects `out` on error must
+     * not get stack garbage from these two returns either. */
+    memset(out, 0, sizeof(*out));
     if (size < 80u || memcmp(data, tp_ktx2_id, 12) != 0)
         return TP_ERROR_INVALID_ARGUMENT;
-    memset(out, 0, sizeof(*out));
 
     vk = tp_rd_u32(data + 12);
     out->width = tp_rd_u32(data + 20);
@@ -388,6 +405,17 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
         out->block_w = 4;
         out->block_h = 4;
         out->block_bytes = 16;
+        /* A uni file carries no vkFormat, so the DFD is the only place the sRGB
+         * and alpha facts live -- and they are exactly what a consumer needs to
+         * pick an upload format and an alpha-capable transcode target. Parse the
+         * two bytes we write; a DFD too short to hold them leaves the defaults
+         * (linear, no alpha), which is what an absent DFD means anyway. */
+        if (dfd_len >= 44u) {
+            uint8_t transfer = data[(size_t)dfd_off + 14];
+            uint8_t channels = data[(size_t)dfd_off + 31] & 0x0fu;
+            out->srgb = (transfer == (uint8_t)TP_KDF_TRANSFER_SRGB);
+            out->has_alpha = (channels == (uint8_t)TP_KDF_CHANNEL_UASTC_RGBA);
+        }
     } else {
         tp_codec_desc d;
         tp_codec c;
@@ -645,10 +673,6 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
 
 /* ---- uni (UASTC) KTX2 writer: vkFormat=UNDEFINED, supercompression=0 ---- */
 
-#define TP_KDF_MODEL_UASTC 166u
-#define TP_KDF_PRIMARIES_UNSPECIFIED 0u
-#define TP_KDF_CHANNEL_UASTC_RGB 0u
-#define TP_KDF_CHANNEL_UASTC_RGBA 3u
 #define TP_UNI_FLAGS_ALL (TP_UNI_SRGB | TP_UNI_ALPHA)
 
 /* KHR_DF UASTC descriptor (44 bytes), matching the uni-in-KTX2 convention.
@@ -730,10 +754,7 @@ static tp_result tp_uni_check(const uint8_t *const *uni_levels,
     if (num_levels < 1 || num_levels > TP_KTX2_MAX_LEVELS)
         return TP_ERROR_INVALID_ARGUMENT;
     if (flags & ~TP_UNI_FLAGS_ALL) return TP_ERROR_INVALID_ARGUMENT;
-    /* The reader refuses dimensions past TP_KTX2_MAX_DIM. */
-    if (base_w == 0u || base_h == 0u || base_w > (uint32_t)TP_KTX2_MAX_DIM ||
-        base_h > (uint32_t)TP_KTX2_MAX_DIM)
-        return TP_ERROR_INVALID_ARGUMENT;
+    if (!tp_ktx2_dims_ok(base_w, base_h)) return TP_ERROR_INVALID_ARGUMENT;
     /* levelCount past the pyramid the base dimensions imply is invalid KTX2:
      * the surplus levels all clamp to 1x1, and a loader that trusts levelCount
      * would bind mips that do not exist. */
@@ -946,10 +967,27 @@ tp_result tp_write_ktx2_array(const tp_blocks *layers, int num_layers,
     nlev = layers[0].num_levels;
     nface = layers[0].num_faces;
     if (nlev > 32) return TP_ERROR_UNSUPPORTED;
-    for (li = 1; li < num_layers; ++li)
+    /* The reader refuses layerCount past this, so writing more would only make a
+     * file that cannot be loaded back. */
+    if (num_layers > TP_KTX2_MAX_LAYERS) return TP_ERROR_UNSUPPORTED;
+    if (!tp_ktx2_dims_ok(layers[0].blk[0].width, layers[0].blk[0].height))
+        return TP_ERROR_UNSUPPORTED;
+    for (li = 1; li < num_layers; ++li) {
+        int k;
         if (layers[li].num_levels != nlev || layers[li].num_faces != nface ||
             layers[li].codec != layers[0].codec)
             return TP_ERROR_INVALID_ARGUMENT;
+        /* Every level's byte length is computed from layers[0] and multiplied by
+         * num_layers, but the payload loop below copies each layer's own
+         * blk[].size. A layer that disagrees on dimensions therefore memcpy's
+         * past the end of `out`. Require the layers to be block-for-block
+         * identical in shape -- which is what a KTX2 array is. */
+        for (k = 0; k < nface * nlev; ++k)
+            if (layers[li].blk[k].size != layers[0].blk[k].size ||
+                layers[li].blk[k].width != layers[0].blk[k].width ||
+                layers[li].blk[k].height != layers[0].blk[k].height)
+                return TP_ERROR_INVALID_ARGUMENT;
+    }
     if (!TP_OK(tp_codec_describe(opt->codec, opt, &d)) || d.vk_format == 0u)
         return TP_ERROR_UNSUPPORTED;
     need = tp_ktx2_array_layout(layers, num_layers, &d, level_off, level_len);

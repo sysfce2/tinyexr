@@ -277,7 +277,8 @@ typedef struct tp_ktx2_image {
     tp_codec codec;          /* mapped block codec (valid only when !is_uni)   */
     int is_uni;              /* 1 = uni/UASTC transcodable intermediate        */
     int is_hdr;
-    int srgb;
+    int srgb;                /* for is_uni, read back from the DFD transfer fn  */
+    int has_alpha;           /* uni only: DFD says UASTC_RGBA (TP_UNI_ALPHA)    */
     int is_signed;           /* BC6H sf16 / BC5 snorm (vs the unsigned variant) */
     int block_w, block_h, block_bytes;
     uint32_t width, height;  /* base (level 0) dimensions                      */

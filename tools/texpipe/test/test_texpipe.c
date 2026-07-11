@@ -99,13 +99,18 @@ static double psnr_rg(const uint8_t *a, const uint8_t *b, size_t npix) {
 /* Smooth RGBA gradient (opaque). */
 static uint8_t *make_gradient(int w, int h) {
     uint8_t *img = (uint8_t *)malloc((size_t)w * h * 4);
+    /* A 1-wide or 1-tall image (the tail of any mip chain) has no span to
+     * divide by; hold that axis at 0 rather than dividing by zero. */
+    int dw = w > 1 ? w - 1 : 1;
+    int dh = h > 1 ? h - 1 : 1;
+    int dd = (w + h - 2) > 0 ? w + h - 2 : 1;
     int x, y;
     for (y = 0; y < h; ++y)
         for (x = 0; x < w; ++x) {
             uint8_t *p = img + (y * w + x) * 4;
-            p[0] = (uint8_t)(x * 255 / (w - 1));
-            p[1] = (uint8_t)(y * 255 / (h - 1));
-            p[2] = (uint8_t)((x + y) * 255 / (w + h - 2));
+            p[0] = (uint8_t)(x * 255 / dw);
+            p[1] = (uint8_t)(y * 255 / dh);
+            p[2] = (uint8_t)((x + y) * 255 / dd);
             p[3] = 255;
         }
     return img;
@@ -780,6 +785,41 @@ static void test_array_ktx2(void) {
                   TP_ERROR_INVALID_ARGUMENT, "array: reject out-of-range face");
         free(d0);
         free(dn);
+    }
+    /* Layers of differing dimensions: the file is sized from layers[0] but the
+     * payload loop copies each layer's own blocks, so a bigger layer used to
+     * memcpy straight off the end of `buf`. It must be refused instead. The
+     * existing cases above cannot catch this -- they reuse one tp_blocks for
+     * every layer, so the sizes trivially agree. */
+    {
+        tir_image_view v2;
+        tp_mip_chain chain2;
+        tp_blocks b2, mixed[2];
+        uint8_t *img2 = make_gradient(65, 65);
+        uint8_t *small = NULL;
+        size_t need2;
+        /* 65x65 has the same 7-level pyramid as 64x64 (so the existing
+         * num_levels/num_faces/codec equality check passes) but 17x17 blocks
+         * instead of 16x16 -- 4624 bytes at level 0 against 4096. */
+        view_u8(&v2, img2, 65, 65);
+        memset(&chain2, 0, sizeof(chain2));
+        memset(&b2, 0, sizeof(b2));
+        CHECK(TP_OK(tp_build_mips(NULL, &v2, 1, &opt, &chain2)), "array: build 65");
+        CHECK(TP_OK(tp_compress_chain(NULL, &chain2, &opt, &b2)), "array: compress 65");
+        CHECK(b2.num_levels == b.num_levels,
+              "array: 65x65 and 64x64 have the same level count");
+        CHECK(b2.blk[0].size > b.blk[0].size, "array: 65x65 level 0 is bigger");
+        mixed[0] = b;   /* 64x64, which the file gets sized from */
+        mixed[1] = b2;  /* 65x65, whose blocks are larger */
+        need2 = tp_ktx2_array_size(mixed, 2, &opt);
+        small = (uint8_t *)malloc(need2);
+        CHECK(tp_write_ktx2_array(mixed, 2, &opt, small, need2, &wrote) !=
+                  TP_SUCCESS,
+              "array: reject layers whose dimensions disagree");
+        free(small);
+        tp_blocks_free(NULL, &b2);
+        tp_mip_chain_free(NULL, &chain2);
+        free(img2);
     }
     printf("  array ktx2 (layerCount=3): ok\n");
     free(buf);
@@ -1740,6 +1780,14 @@ static void test_ktx2_uni_zstd_write(void) {
         CHECK(k2[dfd + 13] == 1u, "DFD primaries = BT709 (sRGB)");
         CHECK(k2[dfd + 14] == 2u, "DFD transfer = sRGB");
         CHECK(k2[dfd + 31] == 3u, "DFD channelType = UASTC_RGBA");
+        /* The flags must survive the round trip: a uni file has no vkFormat, so
+         * if the reader does not parse the DFD the caller cannot tell sRGB from
+         * linear or RGBA from RGB, and the flags buy nothing. */
+        CHECK(TP_OK(tp_ktx2_read_zstd(k2, k2n, NULL, passthrough_zdec, NULL,
+                                      &img)),
+              "read back srgb+alpha uni");
+        CHECK(img.srgb == 1 && img.has_alpha == 1, "reader recovers srgb + alpha");
+        tp_ktx2_image_free(NULL, &img);
         tp_free(NULL, k2);
 
         /* Linear + no alpha: the glTF profile pairs linear with UNSPECIFIED
@@ -1752,6 +1800,12 @@ static void test_ktx2_uni_zstd_write(void) {
         CHECK(k2[dfd + 13] == 0u, "DFD primaries = UNSPECIFIED (linear)");
         CHECK(k2[dfd + 14] == 1u, "DFD transfer = linear");
         CHECK(k2[dfd + 31] == 0u, "DFD channelType = UASTC_RGB");
+        CHECK(TP_OK(tp_ktx2_read_zstd(k2, k2n, NULL, passthrough_zdec, NULL,
+                                      &img)),
+              "read back linear uni");
+        CHECK(img.srgb == 0 && img.has_alpha == 0,
+              "reader recovers linear + no alpha");
+        tp_ktx2_image_free(NULL, &img);
         tp_free(NULL, k2);
 
         /* An unknown flag bit is a caller bug, not something to silently drop. */
@@ -1889,6 +1943,67 @@ static void test_ktx2_uni_zstd_write(void) {
             free(raw);
         }
         for (l = 0; l < NL; ++l) { free(mref[l]); free(muni[l]); }
+    }
+
+    /* Non-power-of-two, where the block grid does not divide the dimensions and
+     * the mip chain stops halving cleanly (65 -> 32 -> 16). Every level size the
+     * writer demands is computed from the base dims, so an NPOT rounding
+     * disagreement between writer and reader shows up here and nowhere else. */
+    {
+        const uint32_t NW = 65, NH = 33;
+        const int NNL = 7; /* tp_level_count(65, 33) */
+        uint8_t *nref[7], *nuni[7];
+        const uint8_t *nlev[7];
+        size_t nsz[7];
+        uint8_t *k2 = NULL;
+        size_t k2n = 0;
+        int l;
+        for (l = 0; l < NNL; ++l) {
+            uint32_t w = NW >> l, h = NH >> l;
+            if (!w) w = 1u;
+            if (!h) h = 1u;
+            nref[l] = make_gradient((int)w, (int)h);
+            nsz[l] = tc_uni_compressed_size(w, h);
+            nuni[l] = (uint8_t *)malloc(nsz[l]);
+            CHECK(tc_uni_compress_rgba8(nref[l], w, h, (size_t)w * 4u, nuni[l],
+                                        nsz[l]) == TC_SUCCESS,
+                  "npot uni compress");
+            nlev[l] = nuni[l];
+        }
+        CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
+                                           passthrough_zenc, NULL, nlev, nsz, NW,
+                                           NH, NNL, TP_UNI_SRGB, &k2, &k2n)),
+              "write NPOT (65x33) uni zstd ktx2");
+        CHECK(TP_OK(tp_ktx2_read_zstd(k2, k2n, NULL, passthrough_zdec, NULL,
+                                      &img)),
+              "read back NPOT uni zstd ktx2");
+        CHECK(img.width == NW && img.height == NH && img.num_levels == NNL,
+              "NPOT header round-trips");
+        for (l = 0; l < NNL; ++l) {
+            uint32_t w = NW >> l, h = NH >> l;
+            size_t n;
+            uint8_t *d;
+            if (!w) w = 1u;
+            if (!h) h = 1u;
+            n = (size_t)w * h;
+            d = (uint8_t *)malloc(n * 4u);
+            CHECK(img.levels[l].width == w && img.levels[l].height == h,
+                  "NPOT level dimensions");
+            CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, l, d, n * 4u)),
+                  "decode NPOT mip level");
+            /* What is under test is the container, not UASTC's rate-distortion:
+             * the tiny levels are one or two blocks of a steep gradient, where
+             * 25 dB is simply what the codec gives (a mixed-up level would come
+             * back at single-digit dB, not 25). Hold the big levels to the usual
+             * bar and only require the small ones to be recognizably the right
+             * image. */
+            CHECK(psnr_rgba(nref[l], d, n) >= (n >= 256 ? 30.0 : 20.0),
+                  "NPOT mip round-trips to the right image");
+            free(d);
+        }
+        tp_ktx2_image_free(NULL, &img);
+        tp_free(NULL, k2);
+        for (l = 0; l < NNL; ++l) { free(nref[l]); free(nuni[l]); }
     }
 
     free(dec);
