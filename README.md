@@ -21,6 +21,12 @@ embed into your application. It comes in two flavours:
 > EXR and apply an **OpenColorIO** transform (incl. the **ACES 2.0** output transforms) on **WebGL2**, with a
 > live, editable OCIO config that **JIT-compiles to a GLSL shader**. See [tocio](#tocio--tiny-pure-c11-opencolorio-engine) below.
 
+> 🧊 **Live demo (texcomp):** [**GPU texture compression**](https://syoyo.github.io/tinyexr/texcomp/) — compress
+> an EXR to **BC1/3/5/6H/7, ETC2, EAC, ASTC (LDR + HDR)** and decompress it back in the browser, side by side with
+> an amplified error view. HDR codecs vs an 8-bit one under exposure, normal maps ranked by **angular error**
+> (where BC5 beats BC7), cubemap/octahedral projection, and a downloadable **KTX2 / DDS**.
+> See [texcomp](#texcomp--gpu-texture-compression) below.
+
 **Performance (v3) at a glance** — single-thread decode/encode vs the reference
 OpenEXR library, with the vendored **libdeflate** backend on/off (and HTJ2K,
 which has no deflate path). With the same backend TinyEXR meets or beats OpenEXR
@@ -369,9 +375,6 @@ See [`tools/resize/`](tools/resize/) for the library and its README.
 ---
 
 # texcomp — GPU texture compression
-
-**[▶ Live browser demo](https://syoyo.github.io/tinyexr/texcomp/)** — resize,
-compress, decompress and compare, on your own image, entirely locally.
 
 The last mile of a VFX/CG asset pipeline is turning scene-linear EXRs into
 something a GPU can sample, and that step usually drags in a pile of C++

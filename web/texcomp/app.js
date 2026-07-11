@@ -144,17 +144,37 @@ function setStats(el, r, label) {
 
 /* ------------------------------------------------------ resize + compress --- */
 
+/* Put the source into the working slot: either as loaded, or resized. The
+ * filter and the sRGB-aware toggle only mean anything when we actually resample,
+ * so they are disabled at original size. */
+function prepareWork() {
+  const size = +$("size").value;
+  if (size === 0) {
+    if (!M._tcw_use_source()) throw new Error(msg());
+    return;
+  }
+  if (!M._tcw_resize(size, size, +$("filter").value, 0,
+                     $("srgbAware").checked ? 1 : 0, 0))
+    throw new Error(msg());
+}
+
+function syncResizeControls() {
+  const off = +$("size").value === 0;
+  $("filter").disabled = off;
+  $("srgbAware").disabled = off;
+}
+$("size").addEventListener("change", syncResizeControls);
+syncResizeControls();
+
 $("btnRun").addEventListener("click", () => {
   try {
     need();
-    const size = +$("size").value;
     const [bx, by] = astcBlock();
     const codec = +$("codec").value;
     const isHdr = M._tcw_codec_is_hdr(codec);
-    if (!M._tcw_resize(size, size, +$("filter").value, 0,
-                       $("srgbAware").checked ? 1 : 0, 0))
-      throw new Error(msg());
-    const r = runCodec(codec, +$("quality").value, bx, by, $("srgbAware").checked, false);
+    prepareWork();
+    const srgb = +$("size").value !== 0 && $("srgbAware").checked;
+    const r = runCodec(codec, +$("quality").value, bx, by, srgb, false);
     const gamma = isHdr || M._tcw_src_is_hdr() ? 2.2 : 1.0;
     draw("cA", 0, 1, gamma, 1);
     draw("cB", 1, 1, gamma, 1);
@@ -177,8 +197,10 @@ function writeContainer(container, ext, mime) {
     need();
     const codec = +$("codec").value;
     const [bx, by] = astcBlock();
+    prepareWork();
+    const srgb = +$("size").value !== 0 && $("srgbAware").checked;
     const n = M._tcw_write_container(codec, container, 0, +$("quality").value,
-                                     bx, by, $("srgbAware").checked ? 1 : 0, 1);
+                                     bx, by, srgb ? 1 : 0, 1);
     if (!n) throw new Error(msg());
     const ptr = M._tcw_container_ptr();
     const bytes = new Uint8Array(M.HEAPU8.buffer, ptr, n).slice();
