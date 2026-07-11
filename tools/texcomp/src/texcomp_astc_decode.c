@@ -2,11 +2,13 @@
  * TinyEXR texcomp - ASTC block decoder (pure-C11, UASTC-capable).
  *
  * Independent decoder for the ASTC spec bit-level semantics: ISE decode,
- * bilinear weight infill (spec C.2.18), partition hash (C.2.21), and LDR
- * CEM 0/4/6/8/10/12 decode including the endpoint-swap + blue-contract rule
- * for CEM 8/12. Handles all ASTC 2D block modes (including void-extent),
- * not just the UASTC subset — the encoder emits only UASTC modes, but a
- * conformant decoder must accept all valid ASTC blocks.
+ * bilinear weight infill (spec C.2.18), partition hash (C.2.21), and all 16
+ * endpoint modes -- the direct ones, the base+scale ones, and the base+offset
+ * (delta) ones with their bit-transfer, endpoint-swap and blue-contract rules.
+ * Handles all ASTC 2D block modes (including void-extent) and mixed-CEM
+ * partitions, not just the UASTC subset — the encoder emits only UASTC modes,
+ * but a conformant decoder must accept all valid ASTC blocks. The HDR decoder
+ * at the bottom of this file shares all of that machinery.
  *
  * Final texel interpolation uses the 8-bit model
  * (e0*(64-w) + e1*w + 32) >> 6, matching the encoder's error model.
@@ -337,8 +339,70 @@ static void tacd_blue_contract(uint32_t v[4]) {
     v[0] = (v[0] + v[2]) >> 1; v[1] = (v[1] + v[2]) >> 1;
 }
 
+/* Signed blue-uncontract: the base+offset modes can carry negative values. */
+static void tacd_blue_contract_s(int v[4]) {
+    v[0] = (v[0] + v[2]) >> 1; v[1] = (v[1] + v[2]) >> 1;
+}
+
+static int tacd_clamp255(int x) { return x < 0 ? 0 : (x > 255 ? 255 : x); }
+
+/* The "bit transfer" of the base+offset modes: the offset donates its top bit
+ * to the base, and what remains of it is a 6-bit signed offset. */
+static void tacd_bit_transfer_signed(int *base, int *delta) {
+    *base = (*base >> 1) | (*delta & 0x80);
+    *delta = (*delta >> 1) & 0x3f;
+    if (*delta & 0x20) *delta -= 0x40;
+}
+
+/* CEM 9 / 13: RGB(A) base+offset. `n` = 3 or 4 channels. */
+static void tacd_decode_cem_delta(const uint8_t *v, int n, uint32_t e0[4],
+                                  uint32_t e1[4]) {
+    int base[4], delta[4], sum, c;
+    for (c = 0; c < n; ++c) {
+        base[c] = v[c * 2];
+        delta[c] = v[c * 2 + 1];
+        tacd_bit_transfer_signed(&base[c], &delta[c]);
+    }
+    if (n == 3) { base[3] = 255; delta[3] = 0; }
+    sum = delta[0] + delta[1] + delta[2];
+    for (c = 0; c < 4; ++c) delta[c] += base[c]; /* delta becomes endpoint 1 */
+    if (sum < 0) { /* the endpoints were stored blue-contracted and swapped */
+        int t;
+        tacd_blue_contract_s(base);
+        tacd_blue_contract_s(delta);
+        for (c = 0; c < 4; ++c) { t = base[c]; base[c] = delta[c]; delta[c] = t; }
+    }
+    for (c = 0; c < 4; ++c) {
+        e0[c] = (uint32_t)tacd_clamp255(base[c]);
+        e1[c] = (uint32_t)tacd_clamp255(delta[c]);
+    }
+    if (n == 3) { e0[3] = e1[3] = 255u; }
+}
+
 static uint32_t tacd_decode_cem(uint32_t cem, const uint8_t *v, uint32_t e0[4], uint32_t e1[4]) {
     switch (cem) {
+        case 1u: { /* LDR luminance, base+offset */
+            int l0 = (v[0] >> 2) | (v[1] & 0xc0);
+            int l1 = l0 + (v[1] & 0x3f);
+            if (l1 > 255) l1 = 255;
+            e0[0] = e0[1] = e0[2] = (uint32_t)l0;
+            e1[0] = e1[1] = e1[2] = (uint32_t)l1;
+            e0[3] = e1[3] = 255u; return 2u;
+        }
+        case 5u: { /* LDR luminance+alpha, base+offset */
+            int l0 = v[0], l1 = v[1], a0 = v[2], a1 = v[3];
+            tacd_bit_transfer_signed(&l0, &l1);
+            tacd_bit_transfer_signed(&a0, &a1);
+            l1 += l0;
+            a1 += a0;
+            e0[0] = e0[1] = e0[2] = (uint32_t)tacd_clamp255(l0);
+            e1[0] = e1[1] = e1[2] = (uint32_t)tacd_clamp255(l1);
+            e0[3] = (uint32_t)tacd_clamp255(a0);
+            e1[3] = (uint32_t)tacd_clamp255(a1);
+            return 4u;
+        }
+        case 9u:  tacd_decode_cem_delta(v, 3, e0, e1); return 6u;
+        case 13u: tacd_decode_cem_delta(v, 4, e0, e1); return 8u;
         case 0u:
             e0[0] = e0[1] = e0[2] = v[0]; e1[0] = e1[1] = e1[2] = v[1];
             e0[3] = e1[3] = 255u; return 2u;
@@ -555,16 +619,20 @@ tc_result tc_astc_decompress_rgba8(const uint8_t *astc, uint32_t width,
 
 /* ===================================================== ASTC HDR block decode */
 /* Promoted from test/astc_hdr_ref_decode.h, which was the pure-C oracle for
- * texcomp-astc-hdr-gate. It now lives here as the library's HDR decoder,
- * reusing this file's block-mode / ISE / partition / infill machinery instead
- * of the parallel copy in the test tree. The astc-hdr gate still cross-checks
- * it, block for block, against astcenc's conformant HDR decoder.
+ * texcomp-astc-hdr-gate, then extended to the whole 2D HDR format. It reuses
+ * this file's block-mode / ISE / partition / infill machinery rather than the
+ * parallel copy that used to live in the test tree.
  *
- * Coverage is the set the texcomp HDR encoder emits: HDR void-extent and CEM 7
- * (RGB base+scale), CEM 11 (RGB direct) and CEM 15 (RGB + HDR alpha), with all
- * subsets sharing one CEM. Anything else in a foreign file -- CEM 14 (HDR RGB +
- * LDR alpha), mixed-CEM partitions, an LDR block or LDR void-extent inside an
- * HDR texture -- is reported unsupported rather than guessed at.
+ * Conformant over: all 16 endpoint modes (HDR luminance 2/3, HDR RGB 7/11, HDR
+ * RGB + LDR alpha 14, HDR RGB + HDR alpha 15, and the LDR modes -- legal inside
+ * an HDR texture, where they decode through the UNORM16 path instead of the LNS
+ * one), mixed-CEM partitions, dual-plane blocks with any component (alpha
+ * included) as the second plane, and both HDR and LDR void-extent.
+ *
+ * The endpoint/interpolation model mirrors the spec's HDR profile: endpoints
+ * live in a 16-bit domain (LDR ones bit-replicated up from 8-bit), are lerped
+ * as (e0*(64-w) + e1*w + 32) >> 6, and each lane is then converted to FP16 by
+ * either the LNS rule (HDR lanes) or the UNORM16 rule (LDR lanes).
  */
 
 /* IEEE half (sf16 bit pattern) -> float. */
@@ -592,27 +660,122 @@ static float tacd_half_to_float(uint16_t h) {
     return f;
 }
 
+/* UNORM16 -> FP16 bit pattern (astcenc unorm16_to_sf16 / spec C.2.19). LDR
+ * endpoints inside an HDR block take this path instead of the LNS one. */
+static uint16_t tacd_unorm16_to_sf16(uint32_t p) {
+    uint32_t lz = 0, t;
+    if (p == 0xffffu) return 0x3c00u;    /* exactly 1.0 */
+    if (p < 4u) return (uint16_t)(p << 8); /* subnormal */
+    t = p;
+    while (!(t & 0x8000u)) { t <<= 1; ++lz; }
+    p = (p << (lz + 1u)) & 0xffffu;
+    p >>= 6;
+    p |= (14u - lz) << 10;
+    return (uint16_t)p;
+}
+
+/* Unpack one partition's endpoints into the 16-bit interpolation domain, and
+ * report whether RGB / alpha are HDR (LNS) lanes. Mirrors astcenc's
+ * unpack_color_endpoints for ASTCENC_PRF_HDR: HDR endpoints are already 16-bit,
+ * LDR ones are 8-bit and get bit-replicated (*257) on the way in. */
+static int tacd_hdr_unpack_endpoints(uint32_t cem, const uint8_t *v, int e0[4],
+                                     int e1[4], int *rgb_hdr, int *alpha_hdr) {
+    int lns0[4], lns1[4];
+    int c, alpha_hdr_default = 0;
+    *rgb_hdr = 0;
+    *alpha_hdr = 0;
+    switch (cem) {
+    case 2u: { /* HDR luminance, large range */
+        int v0 = v[0], v1 = v[1], y0, y1;
+        if (v1 >= v0) { y0 = v0 << 4; y1 = v1 << 4; }
+        else { y0 = (v1 << 4) + 8; y1 = (v0 << 4) - 8; }
+        e0[0] = e0[1] = e0[2] = y0 << 4;
+        e1[0] = e1[1] = e1[2] = y1 << 4;
+        *rgb_hdr = 1; alpha_hdr_default = 1;
+        break;
+    }
+    case 3u: { /* HDR luminance, small range */
+        int v0 = v[0], v1 = v[1], y0, y1;
+        if (v0 & 0x80) {
+            y0 = ((v1 & 0xe0) << 4) | ((v0 & 0x7f) << 2);
+            y1 = (v1 & 0x1f) << 2;
+        } else {
+            y0 = ((v1 & 0xf0) << 4) | ((v0 & 0x7f) << 1);
+            y1 = (v1 & 0x0f) << 1;
+        }
+        y1 += y0;
+        if (y1 > 0xfff) y1 = 0xfff;
+        e0[0] = e0[1] = e0[2] = y0 << 4;
+        e1[0] = e1[1] = e1[2] = y1 << 4;
+        *rgb_hdr = 1; alpha_hdr_default = 1;
+        break;
+    }
+    case 7u: /* HDR RGB base+scale */
+        if (!tc_astc_cem7_unpack(v, lns0, lns1)) return 0;
+        for (c = 0; c < 3; ++c) { e0[c] = lns0[c]; e1[c] = lns1[c]; }
+        *rgb_hdr = 1; alpha_hdr_default = 1;
+        break;
+    case 11u: /* HDR RGB direct */
+        if (!tc_astc_cem11_unpack(v, lns0, lns1)) return 0;
+        for (c = 0; c < 3; ++c) { e0[c] = lns0[c]; e1[c] = lns1[c]; }
+        *rgb_hdr = 1; alpha_hdr_default = 1;
+        break;
+    case 14u: /* HDR RGB + LDR alpha: the RGB half is CEM 11, alpha is 8-bit */
+        if (!tc_astc_cem11_unpack(v, lns0, lns1)) return 0;
+        for (c = 0; c < 3; ++c) { e0[c] = lns0[c]; e1[c] = lns1[c]; }
+        e0[3] = v[6];
+        e1[3] = v[7];
+        *rgb_hdr = 1;
+        break;
+    case 15u: /* HDR RGB + HDR alpha */
+        if (!tc_astc_cem15_unpack(v, lns0, lns1)) return 0;
+        for (c = 0; c < 4; ++c) { e0[c] = lns0[c]; e1[c] = lns1[c]; }
+        *rgb_hdr = 1;
+        *alpha_hdr = 1;
+        break;
+    default: { /* an LDR endpoint mode, legal inside an HDR block */
+        uint32_t le0[4], le1[4];
+        if (!tacd_decode_cem(cem, v, le0, le1)) return 0;
+        for (c = 0; c < 4; ++c) { e0[c] = (int)le0[c]; e1[c] = (int)le1[c]; }
+        break;
+    }
+    }
+    if (alpha_hdr_default) { /* HDR-RGB modes carry no alpha: opaque, LNS */
+        e0[3] = e1[3] = 0x7800;
+        *alpha_hdr = 1;
+    }
+    /* LDR lanes are 8-bit; widen them to the 16-bit interpolation domain. */
+    for (c = 0; c < 3; ++c)
+        if (!*rgb_hdr) { e0[c] *= 257; e1[c] *= 257; }
+    if (!*alpha_hdr) { e0[3] *= 257; e1[3] *= 257; }
+    return 1;
+}
+
 int tc_astc_decode_block_hdr_rgbaf(const uint8_t block[16], uint32_t bx,
-                                  uint32_t by, float *out_rgba) {
+                                   uint32_t by, float *out_rgba) {
     uint32_t mode = tacd_rd_bits(block, 0, 11);
     uint32_t wx, wy, wquant, dual;
-    uint32_t part_count, weight_count, weight_bits;
-    uint32_t pindex = 0, color_start, ccs = 3u, ccs_bits = 0;
+    uint32_t part_count, weight_count, weight_bits, below_weights;
+    uint32_t pindex = 0, color_start, ccs = 4u; /* 4 = "no second plane" */
     uint32_t cems[4] = {0, 0, 0, 0};
-    int lns0[4][4], lns1[4][4]; /* per-subset LNS endpoints (RGBA for CEM 15) */
-    int has_alpha;
+    int e0[4][4], e1[4][4], rgb_hdr[4], alpha_hdr[4];
     uint8_t rev[16], wsyms[64], wgrid[2][64], csyms[18], vals[18];
-    uint32_t vcount = 0, used, avail, i, x, y;
+    uint32_t vcount = 0, avail, i, x, y;
     int cq = -1, small_block;
 
-    if ((mode & 0x1ffu) == 0x1fcu) { /* void-extent (constant colour) */
+    if ((mode & 0x1ffu) == 0x1fcu) { /* void-extent: one constant colour */
         float px[4];
         uint32_t c;
-        if (!(mode & (1u << 9))) return 0; /* LDR void-extent: not ours */
-        for (c = 0; c < 4u; ++c)
-            px[c] = tacd_half_to_float((uint16_t)(block[8u + c * 2u] |
-                                                   (block[9u + c * 2u] << 8)));
-        for (i = 0; i < bx * by; ++i) memcpy(out_rgba + i * 4u, px, 4u * 4u);
+        int hdr = (mode & (1u << 9)) != 0;
+        for (c = 0; c < 4u; ++c) {
+            uint32_t v = (uint32_t)block[8u + c * 2u] |
+                         ((uint32_t)block[9u + c * 2u] << 8);
+            /* An HDR void-extent stores FP16 directly; an LDR one stores
+             * UNORM16, which still has a meaning in an HDR texture. */
+            px[c] = hdr ? tacd_half_to_float((uint16_t)v)
+                        : tacd_half_to_float(tacd_unorm16_to_sf16(v));
+        }
+        for (i = 0; i < bx * by; ++i) memcpy(out_rgba + i * 4u, px, 4u * sizeof(float));
         return 1;
     }
 
@@ -636,6 +799,10 @@ int tc_astc_decode_block_hdr_rgbaf(const uint8_t block[16], uint32_t bx,
         }
     }
 
+    /* Below the weight data sit, in order: the extra CEM bits of a mixed-CEM
+     * block, then the dual-plane colour-component selector. Both shrink the
+     * space left for the colour endpoints. */
+    below_weights = 128u - weight_bits;
     if (part_count == 1u) {
         cems[0] = tacd_rd_bits(block, 13, 4);
         color_start = 17u;
@@ -643,30 +810,41 @@ int tc_astc_decode_block_hdr_rgbaf(const uint8_t block[16], uint32_t bx,
         uint32_t cf = tacd_rd_bits(block, 23, 6);
         pindex = tacd_rd_bits(block, 13, 10);
         color_start = 29u;
-        if ((cf & 3u) != 0u) return 0; /* HDR encoder only emits all-same CEM */
-        for (i = 0; i < part_count; ++i) cems[i] = cf >> 2;
+        if ((cf & 3u) == 0u) {
+            for (i = 0; i < part_count; ++i) cems[i] = cf >> 2;
+        } else {
+            /* Mixed CEMs: a 3n-bit string whose low 4 bits live in the header
+             * field and whose high (3n-4) bits sit just below the weights. The
+             * first n bits are per-subset class offsets, then n 2-bit indices. */
+            uint32_t hp_bits = 3u * part_count - 4u;
+            uint32_t enc, base, bitpos;
+            if (below_weights < hp_bits) return 0;
+            below_weights -= hp_bits;
+            enc = cf | (tacd_rd_bits(block, below_weights, hp_bits) << 6);
+            base = (enc & 3u) - 1u;
+            bitpos = 2u;
+            for (i = 0; i < part_count; ++i)
+                cems[i] = (((enc >> (bitpos + i)) & 1u) + base) << 2;
+            bitpos += part_count;
+            for (i = 0; i < part_count; ++i) {
+                cems[i] |= (enc >> bitpos) & 3u;
+                bitpos += 2u;
+            }
+        }
     }
-    for (i = 0; i < part_count; ++i)
-        if (cems[i] != 11u && cems[i] != 7u && cems[i] != 15u)
-            return 0; /* CEM 7 / 11 / 15 only */
-    has_alpha = (cems[0] == 15u);
 
     if (dual) {
-        ccs_bits = 2u;
-        if (weight_bits + 2u > 128u - color_start) return 0;
-        ccs = tacd_rd_bits(block, 128u - weight_bits - 2u, 2);
+        if (below_weights < 2u) return 0;
+        below_weights -= 2u;
+        ccs = tacd_rd_bits(block, below_weights, 2);
     }
 
-    /* values per subset: CEM 7 = 4, CEM 11 = 6, CEM 15 = 8 */
-    vcount = part_count * (cems[0] == 7u ? 4u : cems[0] == 15u ? 8u : 6u);
-    used = color_start + weight_bits + ccs_bits;
-    if (used > 128u) return 0;
-    avail = 128u - used;
+    for (i = 0; i < part_count; ++i) vcount += 2u * ((cems[i] >> 2) + 1u);
+    if (vcount > 18u) return 0;
+    if (below_weights <= color_start) return 0;
+    avail = below_weights - color_start;
     for (i = 20u; i >= 4u; --i) {
-        if (tacd_ise_bitcount(vcount, i) <= avail) {
-            cq = (int)i;
-            break;
-        }
+        if (tacd_ise_bitcount(vcount, i) <= avail) { cq = (int)i; break; }
         if (i == 4u) break;
     }
     if (cq < 0) return 0;
@@ -678,16 +856,10 @@ int tc_astc_decode_block_hdr_rgbaf(const uint8_t block[16], uint32_t bx,
     {
         uint32_t off = 0;
         for (i = 0; i < part_count; ++i) {
-            if (cems[i] == 7u) {
-                tc_astc_cem7_unpack(vals + off, lns0[i], lns1[i]);
-                off += 4u;
-            } else if (cems[i] == 15u) {
-                tc_astc_cem15_unpack(vals + off, lns0[i], lns1[i]);
-                off += 8u;
-            } else {
-                tc_astc_cem11_unpack(vals + off, lns0[i], lns1[i]);
-                off += 6u;
-            }
+            if (!tacd_hdr_unpack_endpoints(cems[i], vals + off, e0[i], e1[i],
+                                           &rgb_hdr[i], &alpha_hdr[i]))
+                return 0;
+            off += 2u * ((cems[i] >> 2) + 1u);
         }
     }
 
@@ -704,18 +876,17 @@ int tc_astc_decode_block_hdr_rgbaf(const uint8_t block[16], uint32_t bx,
             uint32_t c;
             float *o = out_rgba + (y * bx + x) * 4u;
             if (part >= part_count) part = part_count - 1u;
-            for (c = 0; c < 3u; ++c) {
-                uint32_t w = (dual && c == ccs) ? w1 : w0;
-                int rec = (lns0[part][c] * (int)(64u - w) + lns1[part][c] * (int)w +
-                           32) >> 6;
-                o[c] = tacd_half_to_float(tc_astc_lns16_to_sf16(rec));
-            }
-            if (has_alpha) { /* CEM 15: alpha shares the single weight plane */
-                int rec = (lns0[part][3] * (int)(64u - w0) +
-                           lns1[part][3] * (int)w0 + 32) >> 6;
-                o[3] = tacd_half_to_float(tc_astc_lns16_to_sf16(rec));
-            } else {
-                o[3] = 1.0f; /* CEM 7/11 have no alpha; astcenc yields 1.0 */
+            for (c = 0; c < 4u; ++c) {
+                /* The second plane can select any component, alpha included --
+                 * so the weight choice is per-channel, not RGB-only. */
+                uint32_t w = (c == ccs) ? w1 : w0;
+                int hdr = (c == 3u) ? alpha_hdr[part] : rgb_hdr[part];
+                int rec = (e0[part][c] * (int)(64u - w) +
+                           e1[part][c] * (int)w + 32) >> 6;
+                if (rec < 0) rec = 0;
+                if (rec > 0xffff) rec = 0xffff;
+                o[c] = tacd_half_to_float(hdr ? tc_astc_lns16_to_sf16(rec)
+                                              : tacd_unorm16_to_sf16((uint32_t)rec));
             }
         }
     return 1;

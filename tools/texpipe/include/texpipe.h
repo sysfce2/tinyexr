@@ -360,8 +360,8 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
 /* Decode one level/slice to float RGBA (width*height*4 floats, tightly packed).
  * This is the HDR path — BC6H and ASTC HDR have no meaningful RGBA8 form, so
  * they are decodable only here. BC6H yields alpha 1.0 (it carries no alpha) and
- * img->is_signed selects sf16 vs uf16; ASTC HDR yields alpha 1.0 except for
- * CEM 15 blocks, which carry HDR alpha. The LDR codecs stay on the RGBA8 path
+ * img->is_signed selects sf16 vs uf16; ASTC HDR decodes the full 2D HDR format
+ * (every endpoint mode, mixed-CEM partitions, both void-extent kinds). The LDR codecs stay on the RGBA8 path
  * above rather than being widened here, and return TP_ERROR_UNSUPPORTED. */
 tp_result tp_ktx2_decode_level_rgbaf(const tp_ktx2_image *img, int level,
                                      float *out_rgba, size_t out_size);
