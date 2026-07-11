@@ -19,6 +19,7 @@
  */
 #include "astcenc.h"
 #include "texcomp.h"
+#include "../src/texcomp_internal.h" /* tc_astc_decode_block_rgba8 */
 
 #include <math.h>
 #include <stdio.h>
@@ -117,6 +118,99 @@ static void fill_image(uint8_t *img, uint32_t w, uint32_t h) {
             p[3] = 255u;
         }
     }
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Foreign-block decode conformance for the LDR decoder.
+ *
+ * Everything else in this gate feeds our decoder blocks our own encoder made,
+ * which only uses a corner of the format. Here astcenc encodes and *we* decode,
+ * so the decoder sees what a real third-party ASTC LDR asset contains: the
+ * base+offset endpoint modes, mixed-CEM partitions, dual-plane blocks and a
+ * spread of footprints. The two decodes must agree exactly -- this is the check
+ * that caught our texel interpolation being off by 1 LSB from a GPU (we
+ * interpolated in 8 bits; the spec bit-replicates the endpoints to 16 first).
+ * ------------------------------------------------------------------------- */
+static uint32_t ldrx_rs = 7u;
+static uint32_t ldrx_rnd(void) {
+    ldrx_rs = ldrx_rs * 1664525u + 1013904223u;
+    return ldrx_rs >> 8;
+}
+
+static int ldr_foreign_xcheck(void) {
+    enum { W = 32, H = 32 };
+    static uint8_t src[W * H * 4];
+    static uint8_t adec[W * H * 4];
+    static uint8_t blocks[64 * 64 * 16];
+    static const uint32_t bs[6][2] = {{4,4},{5,4},{6,6},{8,5},{8,8},{10,6}};
+    static const float pres[3] = {ASTCENC_PRE_FAST, ASTCENC_PRE_MEDIUM,
+                                  ASTCENC_PRE_THOROUGH};
+    long tot = 0, bad = 0, unsup = 0;
+    int trial;
+
+    for (trial = 0; trial < 120; ++trial) {
+        uint32_t bx = bs[trial % 6][0], by = bs[trial % 6][1];
+        int kind = (trial / 6) % 5;
+        size_t nb = (size_t)((W + bx - 1u) / bx) * ((H + by - 1u) / by);
+        size_t len = nb * 16u;
+        uint32_t x, y, i, bxc = (W + bx - 1u) / bx;
+
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                uint8_t *p = src + ((size_t)y * W + x) * 4u;
+                switch (kind) {
+                case 0: p[0]=(uint8_t)ldrx_rnd(); p[1]=(uint8_t)ldrx_rnd();
+                        p[2]=(uint8_t)ldrx_rnd(); p[3]=(uint8_t)ldrx_rnd(); break;
+                case 1: p[0]=(uint8_t)(x*8u); p[1]=(uint8_t)(y*8u); p[2]=128u; p[3]=255u; break;
+                case 2: { uint8_t g=(uint8_t)ldrx_rnd(); p[0]=p[1]=p[2]=g; p[3]=255u; break; }
+                case 3: p[0]=200u; p[1]=100u; p[2]=50u;
+                        p[3]=(uint8_t)((x * 7u + y * 3u) & 0xffu); break;
+                default: p[0]=(uint8_t)((x & 1u) ? 255u : 0u);
+                         p[1]=(uint8_t)((y & 1u) ? 255u : 0u);
+                         p[2]=(uint8_t)ldrx_rnd(); p[3]=255u; break;
+                }
+            }
+
+        if (len > sizeof(blocks)) return 1;
+        if (arm_encode(src, W, H, bx, by, pres[trial % 3], blocks, len) != 0) {
+            fprintf(stderr, "FAIL: astcenc encode (LDR foreign sweep)\n");
+            return 1;
+        }
+        if (astc_decode(blocks, len, W, H, bx, by, adec) != 0) {
+            fprintf(stderr, "FAIL: astcenc decode (LDR foreign sweep)\n");
+            return 1;
+        }
+        for (i = 0; i < nb; ++i) {
+            uint8_t ours[12 * 12 * 4];
+            const uint8_t *b = blocks + (size_t)i * 16u;
+            uint32_t ox = (i % bxc) * bx, oy = (i / bxc) * by, xx, yy;
+            int isbad = 0;
+            tot++;
+            if (!tc_astc_decode_block_rgba8(b, bx, by, ours)) { unsup++; continue; }
+            for (yy = 0; yy < by && !isbad; ++yy)
+                for (xx = 0; xx < bx && !isbad; ++xx) {
+                    uint32_t px = ox + xx, py = oy + yy, c;
+                    if (px >= W || py >= H) continue;
+                    for (c = 0; c < 4u; ++c)
+                        if (ours[(yy * bx + xx) * 4u + c] !=
+                            adec[((size_t)py * W + px) * 4u + c]) {
+                            bad++; isbad = 1; break;
+                        }
+                }
+        }
+    }
+    printf("astc-ldr foreign blocks (astcenc-encoded): %ld blocks, %ld unsupported, "
+           "%ld mismatched\n", tot, unsup, bad);
+    if (tot < 2000) {
+        fprintf(stderr, "FAIL: LDR foreign sweep coverage floor\n");
+        return 1;
+    }
+    if (unsup || bad) {
+        fprintf(stderr, "FAIL: pure-C LDR decoder disagrees with astcenc\n");
+        return 1;
+    }
+    return 0;
 }
 
 int main(void) {
@@ -283,6 +377,8 @@ int main(void) {
             }
         }
     }
+
+    if (ldr_foreign_xcheck()) return 1;
 
     printf("astc arm xcheck: OK\n");
     return 0;

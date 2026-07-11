@@ -10,8 +10,8 @@
  * but a conformant decoder must accept all valid ASTC blocks. The HDR decoder
  * at the bottom of this file shares all of that machinery.
  *
- * Final texel interpolation uses the 8-bit model
- * (e0*(64-w) + e1*w + 32) >> 6, matching the encoder's error model.
+ * Final texel interpolation follows the spec/GPU model: 8-bit endpoints are
+ * bit-replicated to 16 bits, interpolated there, and the top byte is taken.
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
  * SPDX-License-Identifier: Apache-2.0
@@ -561,8 +561,13 @@ int tc_astc_decode_block_rgba8(const uint8_t block[16], uint32_t bx, uint32_t by
             if (part >= part_count) part = part_count - 1u;
             for (c = 0; c < 4u; ++c) {
                 uint32_t w = (dual && c == ccs) ? w1 : w0;
-                uint32_t recon = (e0[part][c] * (64u - w) + e1[part][c] * w + 32u) >> 6;
-                out_rgba[(y * bx + x) * 4u + c] = (uint8_t)recon;
+                /* Spec/GPU model: the 8-bit endpoints are bit-replicated to 16
+                 * bits, interpolated there, and the top byte is the result.
+                 * Interpolating in 8 bits instead is off by 1 LSB on most
+                 * texels -- close, but not what a GPU decodes. */
+                uint32_t recon = ((e0[part][c] * (64u - w) + e1[part][c] * w) *
+                                      257u + 32u) >> 6;
+                out_rgba[(y * bx + x) * 4u + c] = (uint8_t)(recon >> 8);
             }
         }
     }
