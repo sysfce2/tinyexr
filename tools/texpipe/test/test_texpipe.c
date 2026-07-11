@@ -1300,6 +1300,31 @@ static void test_ktx2_read_roundtrip(void) {
         }
     }
 
+    /* --- ETC2 / EAC: the mobile half of the writer set. EAC carries only R
+     * (R11) or R+G (RG11), so those are scored on the channels they keep. --- */
+    {
+        static const struct { tp_codec codec; const char *name; int nc; double floor; }
+        et[4] = {{TP_CODEC_ETC2_RGB, "etc2_rgb", 3, 24.0},
+                 {TP_CODEC_ETC2_RGBA, "etc2_rgba", 3, 24.0},
+                 {TP_CODEC_EAC_R11, "eac_r11", 1, 24.0},
+                 {TP_CODEC_EAC_RG11, "eac_rg11", 2, 24.0}};
+        int ci;
+        for (ci = 0; ci < 4; ++ci) {
+            tp_options_init(&opt, TP_CONTENT_COLOR, et[ci].codec);
+            opt.container = TP_CONTAINER_KTX2;
+            CHECK(TP_OK(tp_process(NULL, &v, 1, &opt, &ktx, &ktx_n)),
+                  "process etc2/eac ktx2");
+            CHECK(TP_OK(tp_ktx2_read(ktx, ktx_n, &img)), "read etc2/eac ktx2");
+            CHECK(!img.is_uni && img.codec == et[ci].codec, "etc2/eac codec mapped");
+            CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, 0, dec, npix * 4u)),
+                  "decode etc2/eac l0");
+            p = psnr_nc(ref, dec, npix, et[ci].nc);
+            printf("    %s ktx2 read+decode level0 PSNR=%.2f dB\n", et[ci].name, p);
+            CHECK(p >= et[ci].floor, "etc2/eac ktx2 decode PSNR above floor");
+            tp_free(NULL, ktx); ktx = NULL;
+        }
+    }
+
     /* --- ASTC 4x4 KTX2: exercises the newly-exposed ASTC decoder --- */
     tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_ASTC);
     opt.container = TP_CONTAINER_KTX2;
@@ -1424,7 +1449,7 @@ static void test_ktx2_read_roundtrip(void) {
 
     free(dec);
     free(ref);
-    printf("  ktx2 read + decode (bc7 / bc1 / bc3 / bc5 / astc / uni) + transcode: ok\n");
+    printf("  ktx2 read + decode (bc1/3/5/7, etc2, eac, astc, uni) + transcode: ok\n");
 }
 
 /* Identity "decompressor": the scheme-2 payloads in this test are stored

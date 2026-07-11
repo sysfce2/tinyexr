@@ -337,10 +337,11 @@ tp_result tp_ktx2_kv_lookup(const tp_ktx2_image *img, const char *key,
                             const uint8_t **value, size_t *value_size);
 
 /* Decode one level of a parsed KTX2 to RGBA8 (width*height*4 bytes, tightly
- * packed, top-to-bottom). Handles the LDR set: uni, BC7, BC1, BC3, BC5, and
- * ASTC LDR. BC6H (HDR, so RGBA8 is the wrong target) and ETC2/EAC return
- * TP_ERROR_UNSUPPORTED — upload their blocks directly instead, or transcode a
- * uni source via texcomp's tc_uni_transcode_*.
+ * packed, top-to-bottom). Handles the whole LDR set: uni, BC7, BC1, BC3, BC5,
+ * ETC2 (RGB/RGBA), EAC (R11/RG11) and ASTC LDR. Only BC6H returns
+ * TP_ERROR_UNSUPPORTED — it is HDR, so RGBA8 is the wrong target: upload its
+ * blocks directly, or transcode a uni source via texcomp's tc_uni_transcode_*.
+ * EAC decodes its 11-bit channels into R (and G for RG11), with B = 0, A = 255.
  * For a cube or array KTX2 this decodes the first slice (layer 0, face 0); use
  * tp_ktx2_decode_slice_rgba8 to reach the others. */
 tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,

@@ -481,8 +481,13 @@ tc_result tc_etc2_compress_rgba8(const uint8_t *rgba, uint32_t width,
                     x = bx + xx;
                     if (x >= width) x = width - 1u;
                     src = rgba + (size_t)y * stride + (size_t)x * 4u;
-                    memcpy(block[yy * 4u + xx], src, 4u);
-                    alpha[yy * 4u + xx] = src[3];
+                    /* ETC numbers texels down columns first (index = x*4 + y),
+                     * which is what the bit packing below assumes: the selector
+                     * for texel i goes to bit i, and the flip/planar axes are
+                     * derived from i the same way. Gathering row-major here
+                     * transposed every block. */
+                    memcpy(block[xx * 4u + yy], src, 4u);
+                    alpha[xx * 4u + yy] = src[3];
                 }
             }
             if (opt->alpha) {

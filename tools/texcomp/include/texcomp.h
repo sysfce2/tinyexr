@@ -186,6 +186,18 @@ tc_result tc_bc3_decompress_rgba8(const uint8_t *bc3, uint32_t width,
 tc_result tc_bc5_decompress_rgba8(const uint8_t *bc5, uint32_t width,
                                   uint32_t height, size_t stride,
                                   uint8_t *out_rgba, size_t out_size);
+/* Decode an ETC2 block stream to RGBA8. `alpha` selects ETC2 RGBA (16-byte
+ * blocks: an EAC alpha block then the RGB block) over ETC2 RGB (8-byte blocks,
+ * alpha forced to 255). All five RGB modes are handled (individual,
+ * differential, T, H, planar). */
+tc_result tc_etc2_decompress_rgba8(const uint8_t *etc2, uint32_t width,
+                                   uint32_t height, int alpha, size_t stride,
+                                   uint8_t *out_rgba, size_t out_size);
+/* Decode an EAC R11 (or RG11, when `rg11`) block stream to RGBA8: the 11-bit
+ * channels are scaled to 8-bit and placed in R (and G); B is 0 and A is 255. */
+tc_result tc_eac_decompress_rgba8(const uint8_t *eac, uint32_t width,
+                                  uint32_t height, int rg11, size_t stride,
+                                  uint8_t *out_rgba, size_t out_size);
 /* Decode BC7 to float [0,1] RGBA. stride_bytes is row pitch in bytes
  * for the float output (typically width*4*sizeof(float)). */
 tc_result tc_bc7_decompress_rgbaf(const uint8_t *bc7, uint32_t width,
