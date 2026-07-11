@@ -1655,19 +1655,49 @@ static void test_ktx2_uni_zstd_write(void) {
     tp_ktx2_image_free(NULL, &img);
     tp_free(NULL, ktx);
 
-    /* A level size that disagrees with the dimensions would make a file the
-     * scheme-2 reader rejects (it pins uncompressedByteLength to the exact block
-     * payload), so the writer must refuse it -- and leave *out cleared. */
+    /* Inputs the writer must refuse, because each one yields a file that either
+     * its own reader or `ktx validate` rejects. Every rejection must also leave
+     * *out / *out_size cleared: callers free unconditionally. */
     {
-        uint8_t *bad = (uint8_t *)0x1; /* must be overwritten with NULL */
-        size_t bad_n = 123u;
-        sizes[0] = usz - 16u;
-        CHECK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound, passthrough_zenc,
-                                     NULL, levels, sizes, lw, lh, 1, &bad,
-                                     &bad_n) == TP_ERROR_INVALID_ARGUMENT,
-              "writer refuses a level size that mismatches the dimensions");
-        CHECK(bad == NULL && bad_n == 0u, "outputs cleared on failure");
-        sizes[0] = usz;
+        struct { const char *what; size_t sz; uint32_t w, h; int n; } bad_in[] = {
+            /* size disagrees with the dims (reader pins uncompressedByteLength) */
+            {"level size mismatches the dimensions", 0, 64, 64, 1},
+            /* dims past TP_KTX2_MAX_DIM: the reader refuses to load them back */
+            {"dimension over TP_KTX2_MAX_DIM", 0, 131072, 64, 1},
+            /* more levels than the 64x64 pyramid has (7) */
+            {"levelCount past the mip pyramid", 0, 64, 64, 9},
+        };
+        size_t i;
+        bad_in[0].sz = usz - 16u;
+        bad_in[1].sz = usz;
+        bad_in[2].sz = usz;
+        for (i = 0; i < sizeof(bad_in) / sizeof(bad_in[0]); ++i) {
+            uint8_t *bad = (uint8_t *)0x1; /* must be overwritten with NULL */
+            size_t bad_n = 123u;
+            sizes[0] = bad_in[i].sz; lw[0] = bad_in[i].w; lh[0] = bad_in[i].h;
+            CHECK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
+                                         passthrough_zenc, NULL, levels, sizes,
+                                         lw, lh, bad_in[i].n, &bad,
+                                         &bad_n) == TP_ERROR_INVALID_ARGUMENT,
+                  bad_in[i].what);
+            CHECK(bad == NULL && bad_n == 0u, "outputs cleared on failure");
+        }
+        sizes[0] = usz; lw[0] = W; lh[0] = H;
+    }
+
+    /* KTX2 >= 2.0.4: a supercompressed file keeps the real pre-deflation
+     * bytesPlane0 (the old "must be 0" rule is retired), so the DFD the writer
+     * emits must still say 16 even under scheme 2. */
+    {
+        uint8_t *k2 = NULL;
+        size_t k2n = 0, dfd_off;
+        CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
+                                           passthrough_zenc, NULL, levels, sizes,
+                                           lw, lh, 1, &k2, &k2n)),
+              "rewrite for DFD check");
+        dfd_off = rd_u32(k2 + 48);
+        CHECK(k2[dfd_off + 20] == 16u, "DFD bytesPlane0 = 16 under scheme 2");
+        tp_free(NULL, k2);
     }
 
     free(dec);
