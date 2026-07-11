@@ -1759,6 +1759,17 @@ static void test_ktx2_uni_zstd_write(void) {
                                      NULL, levels, sizes, W, H, 1, 0x8u, &k2,
                                      &k2n) == TP_ERROR_INVALID_ARGUMENT,
               "reject an unknown uni flag bit");
+
+        /* A host built without zstd passes no callbacks. That rejection must
+         * clear the outputs too -- it is the one path that returns before the
+         * argument checks, and the header promises the clear unconditionally. */
+        k2 = (uint8_t *)0x1;
+        k2n = 123u;
+        CHECK(tp_ktx2_write_uni_zstd(NULL, NULL, NULL, NULL, levels, sizes, W, H,
+                                     1, 0u, &k2,
+                                     &k2n) == TP_ERROR_INVALID_ARGUMENT,
+              "reject a missing zstd callback pair");
+        CHECK(k2 == NULL && k2n == 0u, "outputs cleared when callbacks are NULL");
     }
 
     /* A real mip chain. The single-level case above exercises none of the actual
@@ -1828,6 +1839,44 @@ static void test_ktx2_uni_zstd_write(void) {
         }
         tp_ktx2_image_free(NULL, &img);
         tp_free(NULL, k2);
+
+        /* The same chain through the scheme-0 writer, which shares the layout
+         * and emit helpers but keeps its own 16-byte level alignment. Without
+         * this, dropping the tp_align_up or reversing the layout loop would
+         * leave the suite green while every multi-mip uni KTX2 came out with
+         * misaligned or aliased levels. */
+        {
+            size_t raw_n = tp_ktx2_uni_size(msz, NL);
+            uint8_t *raw = (uint8_t *)malloc(raw_n);
+            uint64_t prev_end = 0;
+            CHECK(raw_n > 0, "uni size for a 3-level chain");
+            CHECK(TP_OK(tp_ktx2_write_uni(mlev, msz, W, H, NL, TP_UNI_SRGB, raw,
+                                          raw_n, NULL)),
+                  "write 3-level uni ktx2 (scheme 0)");
+            for (l = NL - 1; l >= 0; --l) { /* smallest first = ascending offset */
+                uint64_t off = rd_u64(raw + 80 + (size_t)l * 24 + 0);
+                uint64_t blen = rd_u64(raw + 80 + (size_t)l * 24 + 8);
+                CHECK(off % 16u == 0u, "scheme-0 level is 16-byte aligned");
+                CHECK(off >= prev_end, "scheme-0 level does not overlap the previous");
+                CHECK(blen == (uint64_t)msz[l], "scheme-0 byteLength = uni size");
+                CHECK(off + blen <= (uint64_t)raw_n, "scheme-0 level is in-bounds");
+                prev_end = off + blen;
+            }
+            CHECK(TP_OK(tp_ktx2_read(raw, raw_n, &img)), "read 3-level uni ktx2");
+            CHECK(img.num_levels == NL, "scheme-0 3-level header");
+            for (l = 0; l < NL; ++l) {
+                uint32_t w = W >> l, h = H >> l;
+                size_t n = (size_t)w * h;
+                uint8_t *d = (uint8_t *)malloc(n * 4u);
+                CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, l, d, n * 4u)),
+                      "decode scheme-0 mip level");
+                CHECK(psnr_rgba(mref[l], d, n) >= 30.0,
+                      "scheme-0 mip round-trips to the right image");
+                free(d);
+            }
+            tp_ktx2_image_free(NULL, &img);
+            free(raw);
+        }
         for (l = 0; l < NL; ++l) { free(mref[l]); free(muni[l]); }
     }
 

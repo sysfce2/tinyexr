@@ -786,7 +786,9 @@ tp_result tp_ktx2_write_uni(const uint8_t *const *uni_levels,
                             const size_t *uni_sizes, uint32_t base_w,
                             uint32_t base_h, int num_levels, uint32_t flags,
                             uint8_t *out, size_t out_size, size_t *written) {
-    uint64_t loff[TP_KTX2_MAX_LEVELS];
+    /* Zeroed because tp_ktx2_uni_layout fills only [0, num_levels) and the
+     * compiler cannot see that across the call into tp_ktx2_uni_emit. */
+    uint64_t loff[TP_KTX2_MAX_LEVELS] = {0};
     size_t need;
     tp_result r;
     int l;
@@ -813,19 +815,23 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
                                  const size_t *uni_sizes, uint32_t base_w,
                                  uint32_t base_h, int num_levels, uint32_t flags,
                                  uint8_t **out, size_t *out_size) {
-    size_t clen[TP_KTX2_MAX_LEVELS];
-    uint64_t loff[TP_KTX2_MAX_LEVELS];
+    /* Zeroed for the same reason as in tp_ktx2_write_uni: the compiler cannot
+     * see that the loop below fills exactly [0, num_levels) before both arrays
+     * are handed to tp_ktx2_uni_emit. */
+    size_t clen[TP_KTX2_MAX_LEVELS] = {0};
+    uint64_t loff[TP_KTX2_MAX_LEVELS] = {0};
     const size_t smax = (size_t)-1;
     size_t head, cap, cursor;
-    uint8_t *buf = NULL;
+    uint8_t *buf = NULL, *fit = NULL;
     tp_result r;
     int l;
 
-    if (!zbound || !zenc || !out || !out_size) return TP_ERROR_INVALID_ARGUMENT;
-    /* Cleared before any other rejection: the contract is that a failed call
-     * leaves nothing for the caller to free. */
+    if (!out || !out_size) return TP_ERROR_INVALID_ARGUMENT;
+    /* Cleared before every other rejection, including the missing-callback one:
+     * the contract is that a failed call leaves nothing for the caller to free. */
     *out = NULL;
     *out_size = 0;
+    if (!zbound || !zenc) return TP_ERROR_INVALID_ARGUMENT;
     r = tp_uni_check(uni_levels, uni_sizes, base_w, base_h, num_levels, flags);
     if (!TP_OK(r)) return r;
 
@@ -833,12 +839,13 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
      * smallest-first. Supercompressed levels carry no mip padding -- KTX2 sets
      * required_alignment = 1 when supercompressionScheme != 0.
      *
-     * Size the buffer for the worst case (every level incompressible) and
-     * compress straight into it at a running cursor, rather than into per-level
-     * scratch that is then copied in. The compressed sizes are not known up
-     * front, so the buffer ends up larger than the file: *out_size is the real
-     * length. This keeps peak memory at one buffer instead of the scratch and
-     * the output at once, which is what the 32-bit wasm heap has room for. */
+     * The compressed sizes are not known up front, so compress into a worst-case
+     * buffer (every level incompressible) at a running cursor, then copy the
+     * result down into an exact-sized one. Compressing in place rather than into
+     * per-level scratch keeps this to two allocations instead of num_levels + 1,
+     * and the caller is handed a buffer the size of the actual file -- handing
+     * back the worst-case block would mean holding the whole uncompressed
+     * pyramid alive for a file that is typically a fraction of it. */
     head = 80u + (size_t)num_levels * 24u + 44u;
     cap = head;
     for (l = 0; l < num_levels; ++l) {
@@ -871,6 +878,14 @@ tp_result tp_ktx2_write_uni_zstd(const tir_allocator *a, tp_zstd_bound_fn zbound
      * from `head` to `cursor` -- so no memset is needed anywhere. */
     tp_ktx2_uni_emit(buf, base_w, base_h, num_levels, 2u, flags, loff, clen,
                      uni_sizes);
+
+    if (cursor < cap) {
+        fit = (uint8_t *)tp_alloc(a, cursor);
+        if (!fit) { r = TP_ERROR_OUT_OF_MEMORY; goto done; }
+        memcpy(fit, buf, cursor);
+        tp_dealloc(a, buf);
+        buf = fit;
+    }
     *out = buf;
     *out_size = cursor;
     return TP_SUCCESS;
