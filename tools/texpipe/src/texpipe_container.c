@@ -323,7 +323,7 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
                             const tir_allocator *a, tp_zstd_decompress_fn zdec,
                             void *user, tp_ktx2_image *out) {
     uint32_t vk, layer_count, face_count, level_count, scheme;
-    uint32_t dfd_off, dfd_len;
+    uint32_t dfd_off, dfd_len, kvd_off, kvd_len;
     int nlev, l;
     if (!data || !out) return TP_ERROR_INVALID_ARGUMENT;
     if (size < 80u || memcmp(data, tp_ktx2_id, 12) != 0)
@@ -339,6 +339,8 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
     scheme = tp_rd_u32(data + 44);
     dfd_off = tp_rd_u32(data + 48);
     dfd_len = tp_rd_u32(data + 52);
+    kvd_off = tp_rd_u32(data + 56);
+    kvd_len = tp_rd_u32(data + 60);
     out->supercompression = scheme;
     if (scheme == 1u) return TP_ERROR_UNSUPPORTED;          /* BasisLZ */
     if (scheme == 2u && !zdec) return TP_ERROR_UNSUPPORTED; /* need a decompressor */
@@ -369,6 +371,17 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
         ((uint64_t)dfd_off + (uint64_t)dfd_len > (uint64_t)size ||
          dfd_off < 80u + (uint64_t)nlev * 24u))
         return TP_ERROR_INVALID_ARGUMENT;
+
+    /* Key/value data: bounds-checked here, walked lazily by tp_ktx2_kv_lookup.
+     * It is stored uncompressed even in a supercompressed file, so it aliases
+     * the source for both schemes. */
+    if (kvd_len != 0u) {
+        if ((uint64_t)kvd_off + (uint64_t)kvd_len > (uint64_t)size ||
+            kvd_off < 80u + (uint64_t)nlev * 24u)
+            return TP_ERROR_INVALID_ARGUMENT;
+        out->kvd = data + kvd_off;
+        out->kvd_size = (size_t)kvd_len;
+    }
 
     if (vk == 0u) {
         out->is_uni = 1;              /* UASTC transcodable intermediate */
@@ -462,6 +475,36 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
         out->_owned = owned;
         return TP_SUCCESS;
     }
+}
+
+/* Walk the KVD block: a sequence of {u32 keyAndValueByteLength, key NUL value,
+ * padding to a 4-byte boundary}. Keys are unique and sorted in a valid file,
+ * but a linear scan is both simpler and tolerant of files that are not. */
+tp_result tp_ktx2_kv_lookup(const tp_ktx2_image *img, const char *key,
+                            const uint8_t **value, size_t *value_size) {
+    size_t pos = 0, klen;
+    if (!img || !key || !value || !value_size) return TP_ERROR_INVALID_ARGUMENT;
+    if (!img->kvd || img->kvd_size == 0u) return TP_ERROR_NOT_FOUND;
+    klen = strlen(key);
+    while (pos + 4u <= img->kvd_size) {
+        uint32_t kv_len = tp_rd_u32(img->kvd + pos);
+        const uint8_t *kv = img->kvd + pos + 4u;
+        size_t i, keyz = 0;
+        if (kv_len == 0u || kv_len > img->kvd_size - pos - 4u)
+            return TP_ERROR_INVALID_ARGUMENT; /* entry runs past the block */
+        /* The key is NUL-terminated inside the entry; without a NUL the entry is
+         * malformed (and a strcmp here would read past it). */
+        for (i = 0; i < kv_len; ++i)
+            if (kv[i] == 0u) { keyz = i; break; }
+        if (i == kv_len) return TP_ERROR_INVALID_ARGUMENT;
+        if (keyz == klen && memcmp(kv, key, klen) == 0) {
+            *value = kv + keyz + 1u;
+            *value_size = kv_len - keyz - 1u;
+            return TP_SUCCESS;
+        }
+        pos = tp_align_up(pos + 4u + kv_len, 4u);
+    }
+    return TP_ERROR_NOT_FOUND;
 }
 
 tp_result tp_ktx2_decode_level_rgba8(const tp_ktx2_image *img, int level,

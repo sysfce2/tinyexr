@@ -38,7 +38,8 @@ typedef enum tp_result {
     TP_ERROR_INVALID_ARGUMENT = -1,
     TP_ERROR_OUT_OF_MEMORY = -2,
     TP_ERROR_UNSUPPORTED = -3,
-    TP_ERROR_IO = -4
+    TP_ERROR_IO = -4,
+    TP_ERROR_NOT_FOUND = -5 /* a lookup missed; the input is not malformed */
 } tp_result;
 
 #define TP_OK(r) ((int)(r) == 0)
@@ -283,6 +284,10 @@ typedef struct tp_ktx2_image {
     int num_faces;           /* 1 (2D) or 6 (cube)                             */
     int num_layers;          /* 0 or 1 = non-array                             */
     uint32_t supercompression; /* 0 = none, 2 = Zstd (via tp_ktx2_read_zstd)    */
+    /* Key/value data block, aliasing the source buffer (NULL when absent).
+     * Query it with tp_ktx2_kv_lookup. */
+    const uint8_t *kvd;
+    size_t kvd_size;
     tp_ktx2_level levels[TP_KTX2_MAX_LEVELS]; /* level 0 = largest             */
     /* Internal: allocation backing the decompressed levels for a supercompressed
      * read (NULL for a zero-copy scheme-0 read). Release with tp_ktx2_image_free. */
@@ -321,6 +326,15 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
 /* Release the buffer allocated by a supercompressed tp_ktx2_read_zstd (no-op
  * when `_owned` is NULL). Use the same allocator passed to the read. */
 void tp_ktx2_image_free(const tir_allocator *a, tp_ktx2_image *img);
+
+/* Look up a NUL-terminated key in the parsed key/value data. On a hit, *value
+ * points into the source buffer and *value_size is the value's byte length
+ * (which includes the trailing NUL for the string-valued keys the spec defines,
+ * e.g. "KTXorientation" -> "rd\0"). Returns TP_ERROR_NOT_FOUND when the key is
+ * absent or the file carries no KVD, TP_ERROR_INVALID_ARGUMENT on a malformed
+ * KVD block. The KVD is not decompressed: for a Zstd file it is stored plain. */
+tp_result tp_ktx2_kv_lookup(const tp_ktx2_image *img, const char *key,
+                            const uint8_t **value, size_t *value_size);
 
 /* Decode one level of a parsed KTX2 to RGBA8 (width*height*4 bytes, tightly
  * packed, top-to-bottom). Handles the LDR set: uni, BC7, BC1, BC3, BC5, and

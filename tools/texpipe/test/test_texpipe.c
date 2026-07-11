@@ -1151,6 +1151,100 @@ static void test_kaiser(void) {
     free(img);
 }
 
+/* ------------------------------------------------------------ KTX2 key/value */
+
+static void wr_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static void wr_u64(uint8_t *p, uint64_t v) {
+    wr_u32(p, (uint32_t)v);
+    wr_u32(p + 4, (uint32_t)(v >> 32));
+}
+
+/* Our writers emit no KVD, so build a KTX2 by hand: one 4x4 BC7 level plus a
+ * key/value block. Doubles as the reader's only test against a file it did not
+ * produce itself. Layout: id(12) hdr(68) index(24) dfd(44) kvd level(16). */
+static void test_ktx2_kv(void) {
+    /* "KTXorientation" -> "rd", then "tinyexr" -> "1" (unsorted on purpose:
+     * the lookup must not assume the sorted order a valid file would have). */
+    static const uint8_t kvd[] = {
+        18, 0, 0, 0, /* keyAndValueByteLength: key 14+NUL, value "rd"+NUL */
+        'K','T','X','o','r','i','e','n','t','a','t','i','o','n',0, 'r','d',0,
+        0, 0, /* pad 18 -> 20 */
+        10, 0, 0, 0, /* key 7+NUL, value "1"+NUL */
+        't','i','n','y','e','x','r',0, '1',0,
+        0, 0, /* pad to 4 */
+    };
+    const size_t kvd_off = 148u, kvd_len = sizeof(kvd);
+    const size_t lvl_off = ((kvd_off + kvd_len) + 15u) & ~(size_t)15u;
+    const size_t total = lvl_off + 16u;
+    uint8_t *f = (uint8_t *)calloc(1, total);
+    static const uint8_t id[12] = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32,
+                                   0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    tp_ktx2_image img;
+    const uint8_t *val = NULL;
+    size_t val_n = 0;
+
+    memcpy(f, id, 12);
+    wr_u32(f + 12, 145u);       /* vkFormat = BC7_UNORM */
+    wr_u32(f + 16, 1u);         /* typeSize */
+    wr_u32(f + 20, 4u);         /* pixelWidth */
+    wr_u32(f + 24, 4u);         /* pixelHeight */
+    wr_u32(f + 40, 1u);         /* levelCount */
+    wr_u32(f + 48, 104u);       /* dfdByteOffset */
+    wr_u32(f + 52, 44u);        /* dfdByteLength */
+    wr_u32(f + 56, (uint32_t)kvd_off);
+    wr_u32(f + 60, (uint32_t)kvd_len);
+    wr_u64(f + 80, (uint64_t)lvl_off); /* level 0: offset / len / ulen */
+    wr_u64(f + 88, 16u);
+    wr_u64(f + 96, 16u);
+    memcpy(f + kvd_off, kvd, kvd_len);
+
+    CHECK(TP_OK(tp_ktx2_read(f, total, &img)), "kv: read hand-built ktx2");
+    CHECK(img.codec == TP_CODEC_BC7 && img.width == 4 && img.height == 4,
+          "kv: header parsed");
+    CHECK(img.kvd != NULL && img.kvd_size == kvd_len, "kv: kvd located");
+
+    CHECK(TP_OK(tp_ktx2_kv_lookup(&img, "KTXorientation", &val, &val_n)),
+          "kv: find KTXorientation");
+    CHECK(val_n == 3 && memcmp(val, "rd", 3) == 0, "kv: orientation value 'rd'");
+    /* The second entry is only reachable through correct padding arithmetic. */
+    CHECK(TP_OK(tp_ktx2_kv_lookup(&img, "tinyexr", &val, &val_n)),
+          "kv: find second key past the pad");
+    CHECK(val_n == 2 && memcmp(val, "1", 2) == 0, "kv: second value");
+    CHECK(tp_ktx2_kv_lookup(&img, "absent", &val, &val_n) == TP_ERROR_NOT_FOUND,
+          "kv: absent key -> NOT_FOUND");
+    /* A prefix of a present key must not match it. */
+    CHECK(tp_ktx2_kv_lookup(&img, "KTX", &val, &val_n) == TP_ERROR_NOT_FOUND,
+          "kv: prefix is not a match");
+
+    /* An entry length that runs past the block is malformed, not "not found". */
+    wr_u32(f + kvd_off, 0xFFFFu);
+    CHECK(TP_OK(tp_ktx2_read(f, total, &img)), "kv: re-read with bad entry");
+    CHECK(tp_ktx2_kv_lookup(&img, "tinyexr", &val, &val_n) ==
+              TP_ERROR_INVALID_ARGUMENT, "kv: overlong entry rejected");
+    wr_u32(f + kvd_off, 18u);
+
+    /* A KVD range outside the file must be rejected by the parser itself. */
+    wr_u32(f + 60, (uint32_t)(total - kvd_off + 1u));
+    CHECK(tp_ktx2_read(f, total, &img) == TP_ERROR_INVALID_ARGUMENT,
+          "kv: out-of-bounds kvd range rejected");
+    wr_u32(f + 60, (uint32_t)kvd_len);
+
+    /* No KVD at all is a miss, not an error. */
+    wr_u32(f + 56, 0u);
+    wr_u32(f + 60, 0u);
+    CHECK(TP_OK(tp_ktx2_read(f, total, &img)), "kv: read without kvd");
+    CHECK(img.kvd == NULL, "kv: no kvd");
+    CHECK(tp_ktx2_kv_lookup(&img, "KTXorientation", &val, &val_n) ==
+              TP_ERROR_NOT_FOUND, "kv: lookup without kvd -> NOT_FOUND");
+
+    free(f);
+    printf("  ktx2 key/value lookup: ok\n");
+}
+
 /* ------------------------------------------------- KTX2 read / decode / uni */
 
 static void test_ktx2_read_roundtrip(void) {
@@ -1460,6 +1554,7 @@ int main(void) {
     test_alpha_coverage();
     test_containers();
     test_ktx2_read_roundtrip();
+    test_ktx2_kv();
     test_ktx2_zstd_scheme();
     test_cube_seam_fixup();
     test_cube_split();

@@ -47,6 +47,7 @@ const char *tp_result_string(tp_result r) {
     case TP_ERROR_OUT_OF_MEMORY: return "out of memory";
     case TP_ERROR_UNSUPPORTED: return "unsupported";
     case TP_ERROR_IO: return "i/o error";
+    case TP_ERROR_NOT_FOUND: return "not found";
     }
     return "unknown";
 }
