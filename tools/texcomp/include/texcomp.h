@@ -69,6 +69,11 @@ typedef struct tc_bc3_options {
 } tc_bc3_options;
 
 typedef struct tc_bc5_options {
+    /* Store the two channels as BC5_SNORM (signed int8 endpoints) rather than
+     * BC5_UNORM, and tag the container to match. The encoder's input is still
+     * UNORM8: a byte u denotes x = 2*(u/255) - 1 in [-1,1] (the normal-map
+     * convention) and is stored as round(x * 127), which is exactly what a GPU
+     * sampling BC5_SNORM reads back. */
     int snorm;
 } tc_bc5_options;
 
@@ -183,8 +188,13 @@ tc_result tc_bc1_decompress_rgba8(const uint8_t *bc1, uint32_t width,
 tc_result tc_bc3_decompress_rgba8(const uint8_t *bc3, uint32_t width,
                                   uint32_t height, size_t stride,
                                   uint8_t *out_rgba, size_t out_size);
+/* `snorm` must match how the blocks were encoded (tc_bc5_options.snorm): the
+ * signed form reinterprets the stored bytes as int8 and uses a different
+ * 6-value palette, so decoding one as the other is wrong. Input and output stay
+ * UNORM8 either way -- snorm selects the storage form, not the caller's
+ * convention (a unorm byte u denotes x = 2*(u/255) - 1, stored as x * 127). */
 tc_result tc_bc5_decompress_rgba8(const uint8_t *bc5, uint32_t width,
-                                  uint32_t height, size_t stride,
+                                  uint32_t height, int snorm, size_t stride,
                                   uint8_t *out_rgba, size_t out_size);
 /* Decode an ETC2 block stream to RGBA8. `alpha` selects ETC2 RGBA (16-byte
  * blocks: an EAC alpha block then the RGB block) over ETC2 RGB (8-byte blocks,

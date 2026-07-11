@@ -1412,6 +1412,25 @@ static void test_ktx2_read_roundtrip(void) {
         }
     }
 
+    /* --- BC5_SNORM: the signed variant is a different decode (int8 endpoints,
+     * a different 6-value palette), and the reader has to carry that through
+     * from the VkFormat (BC5_SNORM 142 vs BC5_UNORM 141). --- */
+    {
+        tp_options_init(&opt, TP_CONTENT_COLOR, TP_CODEC_BC5);
+        opt.container = TP_CONTAINER_KTX2;
+        opt.bc5.snorm = 1;
+        CHECK(TP_OK(tp_process(NULL, &v, 1, &opt, &ktx, &ktx_n)), "process bc5 snorm ktx2");
+        CHECK(TP_OK(tp_ktx2_read(ktx, ktx_n, &img)), "read bc5 snorm ktx2");
+        CHECK(img.codec == TP_CODEC_BC5 && img.is_signed,
+              "bc5 snorm: signedness from vkFormat");
+        CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, 0, dec, npix * 4u)),
+              "decode bc5 snorm l0");
+        p = psnr_rg(ref, dec, npix);
+        printf("    bc5_snorm ktx2 read+decode level0 PSNR=%.2f dB\n", p);
+        CHECK(p >= 24.0, "bc5 snorm ktx2 decode PSNR above floor");
+        tp_free(NULL, ktx); ktx = NULL;
+    }
+
     /* --- ETC2 / EAC: the mobile half of the writer set. EAC carries only R
      * (R11) or R+G (RG11), so those are scored on the channels they keep. --- */
     {

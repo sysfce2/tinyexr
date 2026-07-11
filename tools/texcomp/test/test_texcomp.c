@@ -630,7 +630,7 @@ static int test_bc_decoders(void) {
 
     CHECK(tc_bc5_compress_rgba8(src, W, H, W * 4u, &o5, bc5, sizeof(bc5)) ==
               TC_SUCCESS, "bc5 compress (decoder xcheck)");
-    CHECK(tc_bc5_decompress_rgba8(bc5, W, H, W * 4u, dec, sizeof(dec)) ==
+    CHECK(tc_bc5_decompress_rgba8(bc5, W, H, 0, W * 4u, dec, sizeof(dec)) ==
               TC_SUCCESS, "bc5 decompress");
     for (by = 0; by < H; by += 4u)
         for (bx = 0; bx < W; bx += 4u) {
@@ -652,7 +652,7 @@ static int test_bc_decoders(void) {
               TC_ERROR_INVALID_ARGUMENT, "bc1 decompress rejects short output");
     CHECK(tc_bc3_decompress_rgba8(bc3, W, H, W * 4u - 1u, dec, sizeof(dec)) ==
               TC_ERROR_INVALID_ARGUMENT, "bc3 decompress rejects short stride");
-    CHECK(tc_bc5_decompress_rgba8(NULL, W, H, W * 4u, dec, sizeof(dec)) ==
+    CHECK(tc_bc5_decompress_rgba8(NULL, W, H, 0, W * 4u, dec, sizeof(dec)) ==
               TC_ERROR_INVALID_ARGUMENT, "bc5 decompress rejects null input");
     return 0;
 }
@@ -858,6 +858,144 @@ static int test_bc7_decoder_conformance(void) {
         }
     }
     printf("  bc7 decoder conformance: %ld random blocks over all 8 modes\n", total);
+    return 0;
+}
+
+
+/* Reference decode of a BC4_SNORM block, written from the spec: the stored
+ * endpoints are int8, and the 6-value palette substitutes the signed extremes
+ * -1.0 (-127) and +1.0 (127) for the unsigned 0 and 255. Independent of the
+ * library's tc_decode_bc4_block_snorm, which it is used to check. */
+static void bc4_decode_snorm(const uint8_t in[8], int out[16]) {
+    int r0 = (int8_t)in[0], r1 = (int8_t)in[1], pal[8], i;
+    uint64_t bits = 0;
+    pal[0] = r0;
+    pal[1] = r1;
+    if (r0 > r1) {
+        for (i = 1; i <= 6; ++i) pal[i + 1] = ((7 - i) * r0 + i * r1) / 7;
+    } else {
+        for (i = 1; i <= 4; ++i) pal[i + 1] = ((5 - i) * r0 + i * r1) / 5;
+        pal[6] = -127;
+        pal[7] = 127;
+    }
+    for (i = 0; i < 6; ++i) bits |= (uint64_t)in[2 + i] << (8 * i);
+    for (i = 0; i < 16; ++i) {
+        int p = pal[(bits >> (3 * i)) & 7u];
+        out[i] = p < -127 ? -127 : p;
+    }
+}
+
+/* BC5_SNORM: the stored bytes must be *signed*, and must round-trip.
+ *
+ * This used to be broken in a way nothing could see: tc_bc5_compress_rgba8
+ * ignored the options entirely and stored UNORM bytes, while the DDS/KTX2
+ * writers tagged the format as SNORM -- so a GPU read a stored 200 as -56.
+ * The checks below pin both halves: the bytes really are signed (a mid-grey
+ * input, meaning x = 0, must store ~0 rather than ~128), and encode -> decode
+ * returns what went in. */
+static int test_bc5_snorm(void) {
+    enum { W = 16, H = 8 };
+    uint8_t src[W * H * 4], dec[W * H * 4], enc[32 * 16], enc_u[32 * 16];
+    tc_bc5_options os, ou;
+    uint32_t x, y, bxc = (W + 3u) / 4u, bx, by;
+    tc_bc5_options_init(&os);
+    tc_bc5_options_init(&ou);
+    os.snorm = 1;
+    ou.snorm = 0;
+
+    for (y = 0; y < H; ++y)
+        for (x = 0; x < W; ++x) {
+            uint8_t *p = src + ((size_t)y * W + x) * 4u;
+            p[0] = (uint8_t)(x * 17u);  /* sweeps the full [-1,1] range */
+            p[1] = (uint8_t)(y * 36u);
+            p[2] = 0u;
+            p[3] = 255u;
+        }
+    CHECK(tc_bc5_compress_rgba8(src, W, H, W * 4u, &os, enc, sizeof(enc)) ==
+              TC_SUCCESS, "bc5 snorm compress");
+    CHECK(tc_bc5_compress_rgba8(src, W, H, W * 4u, &ou, enc_u, sizeof(enc_u)) ==
+              TC_SUCCESS, "bc5 unorm compress");
+    /* The option must actually change the stored bytes. It used to not. */
+    CHECK(memcmp(enc, enc_u, sizeof(enc)) != 0,
+          "bc5 snorm changes the encoded bytes (not just the container tag)");
+
+    /* Block decode must match the independent signed reference decoder. */
+    for (by = 0; by < H; by += 4u)
+        for (bx = 0; bx < W; bx += 4u) {
+            size_t bi = ((size_t)(by / 4u) * bxc + bx / 4u) * 16u;
+            int refr[16], refg[16];
+            int8_t sr[16], sg[16];
+            int k;
+            bc4_decode_snorm(enc + bi, refr);
+            bc4_decode_snorm(enc + bi + 8u, refg);
+            tc_decode_bc4_block_snorm(enc + bi, sr);
+            tc_decode_bc4_block_snorm(enc + bi + 8u, sg);
+            for (k = 0; k < 16; ++k)
+                CHECK((int)sr[k] == refr[k] && (int)sg[k] == refg[k],
+                      "bc5 snorm block decode matches the reference decoder");
+        }
+
+    /* Round-trip through the public decoder, in the caller's UNORM8 convention.
+     * Judged against the UNORM path rather than an absolute bound: BC4's 8-level
+     * palette has its own error on this ramp, and the point here is that the
+     * signed storage costs essentially nothing on top of it. */
+    {
+        int worst_s = 0, worst_u = 0;
+        CHECK(tc_bc5_decompress_rgba8(enc, W, H, 1, W * 4u, dec, sizeof(dec)) ==
+                  TC_SUCCESS, "bc5 snorm decompress");
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                const uint8_t *sp = src + ((size_t)y * W + x) * 4u;
+                const uint8_t *d = dec + ((size_t)y * W + x) * 4u;
+                int e0 = abs((int)d[0] - (int)sp[0]), e1 = abs((int)d[1] - (int)sp[1]);
+                if (e0 > worst_s) worst_s = e0;
+                if (e1 > worst_s) worst_s = e1;
+            }
+        CHECK(tc_bc5_decompress_rgba8(enc_u, W, H, 0, W * 4u, dec, sizeof(dec)) ==
+                  TC_SUCCESS, "bc5 unorm decompress");
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                const uint8_t *sp = src + ((size_t)y * W + x) * 4u;
+                const uint8_t *d = dec + ((size_t)y * W + x) * 4u;
+                int e0 = abs((int)d[0] - (int)sp[0]), e1 = abs((int)d[1] - (int)sp[1]);
+                if (e0 > worst_u) worst_u = e0;
+                if (e1 > worst_u) worst_u = e1;
+            }
+        printf("  bc5 round-trip worst error: unorm=%d snorm=%d\n", worst_u, worst_s);
+        CHECK(worst_s <= worst_u + 2,
+              "bc5 snorm round-trip is no worse than the unorm path");
+    }
+
+    /* Mid-grey means x = 0, so a signed store must be ~0, not ~128 -- this is
+     * the check that fails if the encoder quietly stores unorm bytes. */
+    {
+        uint8_t flat[4 * 4 * 4], one[16];
+        int i;
+        for (i = 0; i < 16; ++i) {
+            flat[i * 4 + 0] = 128u;
+            flat[i * 4 + 1] = 128u;
+            flat[i * 4 + 2] = 0u;
+            flat[i * 4 + 3] = 255u;
+        }
+        CHECK(tc_bc5_compress_rgba8(flat, 4, 4, 16u, &os, one, sizeof(one)) ==
+                  TC_SUCCESS, "bc5 snorm flat compress");
+        CHECK(abs((int)(int8_t)one[0]) <= 2 && abs((int)(int8_t)one[1]) <= 2,
+              "bc5 snorm stores x=0 as ~0 (signed), not ~128 (unsigned)");
+    }
+
+    /* Decoding snorm blocks as unorm (or vice versa) must not silently pass. */
+    CHECK(tc_bc5_decompress_rgba8(enc, W, H, 0, W * 4u, dec, sizeof(dec)) ==
+              TC_SUCCESS, "bc5 snorm-as-unorm decodes (but wrongly)");
+    {
+        int differs = 0;
+        for (y = 0; y < H && !differs; ++y)
+            for (x = 0; x < W; ++x) {
+                const uint8_t *s = src + ((size_t)y * W + x) * 4u;
+                const uint8_t *d = dec + ((size_t)y * W + x) * 4u;
+                if (abs((int)d[0] - (int)s[0]) > 8) { differs = 1; break; }
+            }
+        CHECK(differs, "bc5 signedness is load-bearing (mismatched decode is wrong)");
+    }
     return 0;
 }
 
@@ -1957,6 +2095,7 @@ int main(void) {
     if (astc_thread_parity_test()) return 1;
     if (test_bc_decoders()) return 1;
     if (test_bc7_decoder_conformance()) return 1;
+    if (test_bc5_snorm()) return 1;
     if (test_etc2_decoders()) return 1;
     if (test_etc2_orientation()) return 1;
     if (test_eac_orientation()) return 1;

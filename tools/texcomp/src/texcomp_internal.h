@@ -66,6 +66,7 @@ void tc_encode_bc1_color_block(const uint8_t px[16][4], int dxt1, uint8_t out[8]
  * BC3 the colour block is always 4-colour regardless of endpoint order. */
 void tc_decode_bc1_color_block(const uint8_t in[8], int dxt1, uint8_t px[16][4]);
 void tc_decode_bc4_block(const uint8_t in[8], uint8_t v[16]);
+void tc_decode_bc4_block_snorm(const uint8_t in[8], int8_t v[16]);
 
 /* One BC6H block -> 16 texels of FP16 RGB (row-major). Defined in
  * texcomp_bc6h_decode.c; the public float/half surface decoders wrap it. */

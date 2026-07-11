@@ -613,8 +613,9 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
         return tp_from_tc(tc_bc3_decompress_rgba8(blocks, w, h, (size_t)w * 4u,
                                                   out_rgba, out_size));
     case TP_CODEC_BC5:
-        return tp_from_tc(tc_bc5_decompress_rgba8(blocks, w, h, (size_t)w * 4u,
-                                                  out_rgba, out_size));
+        return tp_from_tc(tc_bc5_decompress_rgba8(blocks, w, h, img->is_signed,
+                                                  (size_t)w * 4u, out_rgba,
+                                                  out_size));
     case TP_CODEC_ETC2_RGB:
     case TP_CODEC_ETC2_RGBA:
         return tp_from_tc(tc_etc2_decompress_rgba8(

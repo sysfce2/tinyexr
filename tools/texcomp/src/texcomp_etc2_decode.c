@@ -65,20 +65,16 @@ static uint32_t tc_etc_sel(const uint8_t b[8], uint32_t x, uint32_t y) {
 }
 
 /* Decode an 8-byte ETC2 RGB block to 16 row-major RGBA8 texels (alpha 255).
- * `punchthrough` selects the RGB8A1 variant, where the "diff" bit instead means
- * "opaque" and selector 2 is a transparent black texel. */
-static void tc_decode_etc2_rgb_block(const uint8_t b[8], int punchthrough,
-                                     uint8_t px[16][4]) {
+ * The RGB8A1 (punch-through) variant is a different format with its own
+ * VkFormats; it is not mapped by the reader and is deliberately not handled
+ * here rather than carried as an untested code path. */
+static void tc_decode_etc2_rgb_block(const uint8_t b[8], uint8_t px[16][4]) {
     uint32_t flip = b[3] & 1u;
-    uint32_t opaque = (b[3] >> 1) & 1u; /* "diff" bit; "opaque" when punchthrough */
+    uint32_t differential = (b[3] >> 1) & 1u;
     int32_t r = (int32_t)(b[0] >> 3), dr = tc_etc_s3(b[0] & 7u);
     int32_t g = (int32_t)(b[1] >> 3), dg = tc_etc_s3(b[1] & 7u);
     int32_t bl = (int32_t)(b[2] >> 3), db = tc_etc_s3(b[2] & 7u);
     uint32_t x, y;
-
-    /* The three "overflow" escapes are only reachable in differential mode; in
-     * punch-through mode they are reachable regardless of the opaque bit. */
-    int differential = punchthrough || opaque;
 
     if (differential && (r + dr < 0 || r + dr > 31)) {
         /* T mode: two base colours, the second offset by +/- a distance. */
@@ -104,10 +100,6 @@ static void tc_decode_etc2_rgb_block(const uint8_t b[8], int punchthrough,
             for (y = 0; y < 4u; ++y) {
                 uint32_t s = tc_etc_sel(b, x, y);
                 uint8_t *o = px[y * 4u + x];
-                if (punchthrough && !opaque && s == 2u) {
-                    o[0] = o[1] = o[2] = o[3] = 0u;
-                    continue;
-                }
                 o[0] = pal[s][0];
                 o[1] = pal[s][1];
                 o[2] = pal[s][2];
@@ -148,10 +140,6 @@ static void tc_decode_etc2_rgb_block(const uint8_t b[8], int punchthrough,
             for (y = 0; y < 4u; ++y) {
                 uint32_t s = tc_etc_sel(b, x, y);
                 uint8_t *o = px[y * 4u + x];
-                if (punchthrough && !opaque && s == 2u) {
-                    o[0] = o[1] = o[2] = o[3] = 0u;
-                    continue;
-                }
                 o[0] = pal[s][0];
                 o[1] = pal[s][1];
                 o[2] = pal[s][2];
@@ -214,16 +202,7 @@ static void tc_decode_etc2_rgb_block(const uint8_t b[8], int punchthrough,
                 uint32_t sub = flip ? (y >> 1) : (x >> 1);
                 uint32_t s = tc_etc_sel(b, x, y);
                 uint8_t *o = px[y * 4u + x];
-                int32_t m;
-                if (punchthrough && !opaque && s == 2u) {
-                    o[0] = o[1] = o[2] = o[3] = 0u;
-                    continue;
-                }
-                m = tc_etc_mod[cw[sub]][s];
-                /* RGB8A1 halves the modifier's magnitude for the opaque texels
-                 * it keeps: index 0/2 map to 0/-m in that variant. */
-                if (punchthrough && !opaque)
-                    m = (s == 0u) ? 0 : (s == 1u ? m : -tc_etc_mod[cw[sub]][1]);
+                int32_t m = tc_etc_mod[cw[sub]][s];
                 o[0] = tc_etc_clamp255((int32_t)base[sub][0] + m);
                 o[1] = tc_etc_clamp255((int32_t)base[sub][1] + m);
                 o[2] = tc_etc_clamp255((int32_t)base[sub][2] + m);
@@ -297,9 +276,9 @@ tc_result tc_etc2_decompress_rgba8(const uint8_t *etc2, uint32_t width,
             if (alpha) {
                 /* ETC2 RGBA: an EAC alpha block, then the RGB block. */
                 tc_decode_eac_a8_block(blk, a);
-                tc_decode_etc2_rgb_block(blk + 8u, 0, px);
+                tc_decode_etc2_rgb_block(blk + 8u, px);
             } else {
-                tc_decode_etc2_rgb_block(blk, 0, px);
+                tc_decode_etc2_rgb_block(blk, px);
             }
             for (yy = 0; yy < 4u && by + yy < height; ++yy)
                 for (xx = 0; xx < 4u && bx + xx < width; ++xx) {
