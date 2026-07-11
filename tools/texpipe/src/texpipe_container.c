@@ -382,8 +382,11 @@ tp_result tp_ktx2_read_zstd(const uint8_t *data, size_t size,
 
     if (size < 80u + (size_t)nlev * 24u) return TP_ERROR_INVALID_ARGUMENT;
 
-    /* The DFD is not parsed (vkFormat carries everything we need), but a file
-     * claiming one outside the blob is malformed. */
+    /* For a real vkFormat the DFD is redundant (the format carries everything),
+     * but a uni file has no format, so the uni branch below reads its transfer
+     * and channelType. This bound is what makes those reads safe: with dfd_len
+     * >= 44 the whole descriptor is inside the blob. A file claiming a DFD
+     * outside it is malformed either way. */
     if (dfd_len != 0u &&
         ((uint64_t)dfd_off + (uint64_t)dfd_len > (uint64_t)size ||
          dfd_off < 80u + (uint64_t)nlev * 24u))
