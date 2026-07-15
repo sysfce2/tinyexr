@@ -109,14 +109,15 @@ tp_result tp_dds_write(const tp_blocks *b, const tp_options *opt, uint8_t *out,
 #define TP_KDF_MODEL_BC7 134u
 #define TP_KDF_MODEL_ETC2 161u
 #define TP_KDF_MODEL_ASTC 162u
-#define TP_KDF_MODEL_UASTC 166u
+#define TP_KDF_MODEL_UNSPECIFIED 0u
 #define TP_KDF_PRIMARIES_UNSPECIFIED 0u
 #define TP_KDF_PRIMARIES_BT709 1u
 #define TP_KDF_TRANSFER_LINEAR 1u
 #define TP_KDF_TRANSFER_SRGB 2u
-/* Sample channelType ids for the UASTC model (Khronos khr_df.h). */
-#define TP_KDF_CHANNEL_UASTC_RGB 0u
-#define TP_KDF_CHANNEL_UASTC_RGBA 3u
+/* Private uni channel ids. The private descriptor deliberately uses the
+ * UNSPECIFIED model rather than claiming Basis UASTC compatibility. */
+#define TP_KDF_CHANNEL_UNI_RGB 0u
+#define TP_KDF_CHANNEL_UNI_RGBA 3u
 
 static uint32_t tp_kdf_model(tp_codec codec) {
     switch (codec) {
@@ -426,7 +427,13 @@ static tp_result tp_ktx2_parse(const uint8_t *data, size_t size,
     }
 
     if (vk == 0u) {
-        out->is_uni = 1;              /* UASTC transcodable intermediate */
+        /* Basis UASTC also has vkFormat=UNDEFINED, but its wire representation
+         * is not texcomp uni. Only accept our private UNSPECIFIED-model DFD;
+         * treating KHR_DF_MODEL_UASTC as uni silently decodes corrupted pixels. */
+        if (dfd_len < 44u ||
+            data[(size_t)dfd_off + 12] != (uint8_t)TP_KDF_MODEL_UNSPECIFIED)
+            return TP_ERROR_UNSUPPORTED;
+        out->is_uni = 1;
         out->block_w = 4;
         out->block_h = 4;
         out->block_bytes = 16;
@@ -435,12 +442,11 @@ static tp_result tp_ktx2_parse(const uint8_t *data, size_t size,
          * pick an upload format and an alpha-capable transcode target. Parse the
          * two bytes we write; a DFD too short to hold them leaves the defaults
          * (linear, no alpha), which is what an absent DFD means anyway. */
-        if (dfd_len >= 44u &&
-            data[(size_t)dfd_off + 12] == (uint8_t)TP_KDF_MODEL_UASTC) {
+        {
             uint8_t transfer = data[(size_t)dfd_off + 14];
             uint8_t channels = data[(size_t)dfd_off + 31] & 0x0fu;
             out->srgb = (transfer == (uint8_t)TP_KDF_TRANSFER_SRGB);
-            out->has_alpha = (channels == (uint8_t)TP_KDF_CHANNEL_UASTC_RGBA);
+            out->has_alpha = (channels == (uint8_t)TP_KDF_CHANNEL_UNI_RGBA);
         }
     } else {
         tp_codec_desc d;
@@ -708,23 +714,20 @@ tp_result tp_ktx2_decode_slice_rgba8(const tp_ktx2_image *img, int level,
     }
 }
 
-/* ---- uni (UASTC) KTX2 writer: vkFormat=UNDEFINED, supercompression=0 ---- */
+/* ---- uni KTX2 writer: private carrier or standard ASTC 4x4 ---- */
 
-#define TP_UNI_FLAGS_ALL (TP_UNI_SRGB | TP_UNI_ALPHA)
+#define TP_UNI_FLAGS_ALL (TP_UNI_SRGB | TP_UNI_ALPHA | TP_UNI_ASTC_KTX2)
+#define TP_VK_ASTC_4X4_UNORM_BLOCK 157u
+#define TP_VK_ASTC_4X4_SRGB_BLOCK 158u
 
-/* KHR_DF UASTC descriptor (44 bytes), matching the uni-in-KTX2 convention.
- * `flags` is the caller's TP_UNI_SRGB / TP_UNI_ALPHA: neither is recoverable
- * from the block bytes, and both are what a DFD-honouring consumer keys off to
- * decide sRGB decode and whether to transcode into a format that has alpha. */
+/* Private uni descriptor (44 bytes). It deliberately uses colorModel =
+ * UNSPECIFIED: uni is not the Basis UASTC wire representation, and labelling it
+ * UASTC causes standards-compliant consumers to silently decode wrong pixels. */
 static void tp_write_uni_dfd(uint8_t *p, uint32_t flags) {
     memset(p, 0, 44);
     tp_wr_u32(p + 0, 44u);                 /* dfdTotalSize */
     tp_wr_u32(p + 8, 2u | (40u << 16));    /* version | descriptorBlockSize */
-    p[12] = (uint8_t)TP_KDF_MODEL_UASTC;
-    /* The glTF KHR_texture_basisu profile that `ktx validate` enforces admits
-     * exactly two colour pairings: BT709 primaries with sRGB transfer, or
-     * UNSPECIFIED primaries with linear. Non-colour uni data (normal, roughness)
-     * has no meaningful primaries, so pair linear with UNSPECIFIED. */
+    p[12] = (uint8_t)TP_KDF_MODEL_UNSPECIFIED;
     p[13] = (uint8_t)((flags & TP_UNI_SRGB) ? TP_KDF_PRIMARIES_BT709
                                             : TP_KDF_PRIMARIES_UNSPECIFIED);
     p[14] = (uint8_t)((flags & TP_UNI_SRGB) ? TP_KDF_TRANSFER_SRGB
@@ -735,8 +738,8 @@ static void tp_write_uni_dfd(uint8_t *p, uint32_t flags) {
      * and now requires the real value (0 merely warns as deprecated). */
     p[20] = 16u;                           /* bytesPlane0 */
     p[30] = 127u;                          /* sample bitLength (128 bits) */
-    p[31] = (uint8_t)((flags & TP_UNI_ALPHA) ? TP_KDF_CHANNEL_UASTC_RGBA
-                                             : TP_KDF_CHANNEL_UASTC_RGB);
+    p[31] = (uint8_t)((flags & TP_UNI_ALPHA) ? TP_KDF_CHANNEL_UNI_RGBA
+                                             : TP_KDF_CHANNEL_UNI_RGB);
     tp_wr_u32(p + 40, 0xffffffffu);        /* sampleUpper */
 }
 
@@ -815,9 +818,14 @@ static void tp_ktx2_uni_emit(uint8_t *buf, uint32_t base_w, uint32_t base_h,
                              const uint64_t *loff, const size_t *byte_len,
                              const size_t *uncompressed_len) {
     size_t dfd_off = 80u + (size_t)num_levels * 24u;
+    int astc_ktx2 = (flags & TP_UNI_ASTC_KTX2) != 0u;
     int l;
     memcpy(buf, tp_ktx2_id, 12);
-    tp_wr_u32(buf + 12, 0u);        /* vkFormat = UNDEFINED (uni) */
+    tp_wr_u32(buf + 12,
+              astc_ktx2 ? ((flags & TP_UNI_SRGB)
+                                ? TP_VK_ASTC_4X4_SRGB_BLOCK
+                                : TP_VK_ASTC_4X4_UNORM_BLOCK)
+                        : 0u);
     tp_wr_u32(buf + 16, 1u);        /* typeSize                   */
     tp_wr_u32(buf + 20, base_w);
     tp_wr_u32(buf + 24, base_h);
@@ -838,7 +846,17 @@ static void tp_ktx2_uni_emit(uint8_t *buf, uint32_t base_w, uint32_t base_h,
         tp_wr_u64(e + 8, (uint64_t)byte_len[l]);
         tp_wr_u64(e + 16, (uint64_t)uncompressed_len[l]);
     }
-    tp_write_uni_dfd(buf + dfd_off, flags);
+    if (astc_ktx2) {
+        tp_codec_desc d;
+        memset(&d, 0, sizeof(d));
+        d.block_w = 4;
+        d.block_h = 4;
+        d.block_bytes = 16;
+        tp_write_dfd(buf + dfd_off, &d, TP_CODEC_ASTC,
+                     (flags & TP_UNI_SRGB) != 0u);
+    } else {
+        tp_write_uni_dfd(buf + dfd_off, flags);
+    }
 }
 
 tp_result tp_ktx2_write_uni_ex(const uint8_t *const *uni_levels,

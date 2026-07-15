@@ -1550,7 +1550,7 @@ static void test_ktx2_read_roundtrip(void) {
     CHECK(p >= 30.0, "astc ktx2 decode PSNR >= 30 dB");
     tp_free(NULL, ktx); ktx = NULL;
 
-    /* --- uni (UASTC) KTX2: write_uni -> read -> decode + transcode --- */
+    /* --- private uni KTX2: write_uni -> read -> decode + transcode --- */
     {
         size_t usz = tc_uni_compressed_size(64, 64);
         uint8_t *uni = (uint8_t *)malloc(usz);
@@ -1568,6 +1568,8 @@ static void test_ktx2_read_roundtrip(void) {
          * and channelType RGB (0) since TP_UNI_ALPHA was not passed. */
         {
             size_t dfd = rd_u32(ubuf + 48);
+            CHECK(ubuf[dfd + 12] == 0u,
+                  "private uni DFD does not claim Basis UASTC");
             CHECK(ubuf[dfd + 14] == 2u, "uni DFD transfer = sRGB");
             CHECK(ubuf[dfd + 31] == 0u, "uni DFD channelType = RGB");
         }
@@ -1578,6 +1580,15 @@ static void test_ktx2_read_roundtrip(void) {
         p = psnr_rgba(ref, dec, npix);
         printf("    uni ktx2 read+decode level0 PSNR=%.2f dB\n", p);
         CHECK(p >= 25.0, "uni ktx2 decode PSNR >= 25 dB");
+        {
+            size_t dfd = rd_u32(ubuf + 48);
+            ubuf[dfd + 12] = 166u;
+            CHECK(tp_ktx2_read(ubuf, ktx_size, &img) == TP_ERROR_UNSUPPORTED,
+                  "Basis UASTC is not mistaken for private uni");
+            ubuf[dfd + 12] = 0u;
+            CHECK(TP_OK(tp_ktx2_read(ubuf, ktx_size, &img)),
+                  "restore private uni parse after rejection check");
+        }
         /* transcode uni -> BC7, decode, and confirm it survives the transcode */
         {
             size_t bsz = tc_bc7_compressed_size(64, 64);
@@ -1591,6 +1602,31 @@ static void test_ktx2_read_roundtrip(void) {
             CHECK(p >= 25.0, "uni->bc7 PSNR >= 25 dB");
             free(bc7);
         }
+
+        /* The same uni bytes are valid standard ASTC 4x4 blocks. This mode is
+         * the interoperable KTX2 carrier: it must not advertise private uni or
+         * Basis UASTC semantics. */
+        CHECK(TP_OK(tp_ktx2_write_uni_ex(
+                  levels, sizes, 64, 64, 1,
+                  TP_UNI_SRGB | TP_UNI_ALPHA | TP_UNI_ASTC_KTX2, ubuf,
+                  ktx_size, NULL)),
+              "write uni bytes as standard ASTC ktx2");
+        {
+            size_t dfd = rd_u32(ubuf + 48);
+            CHECK(rd_u32(ubuf + 12) == 158u,
+                  "ASTC carrier vkFormat = ASTC_4x4_SRGB_BLOCK");
+            CHECK(ubuf[dfd + 12] == 162u, "ASTC carrier DFD colorModel = ASTC");
+            CHECK(ubuf[dfd + 14] == 2u, "ASTC carrier DFD transfer = sRGB");
+        }
+        CHECK(TP_OK(tp_ktx2_read(ubuf, ktx_size, &img)),
+              "read standard ASTC carrier");
+        CHECK(!img.is_uni && img.codec == TP_CODEC_ASTC && img.srgb,
+              "ASTC carrier is parsed as standard ASTC");
+        CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, 0, dec, npix * 4u)),
+              "decode standard ASTC carrier");
+        p = psnr_rgba(ref, dec, npix);
+        printf("    uni bytes -> ASTC KTX2 -> decode PSNR=%.2f dB\n", p);
+        CHECK(p >= 25.0, "ASTC carrier decode PSNR >= 25 dB");
         free(ubuf); free(uni);
     }
 
@@ -1683,7 +1719,7 @@ static void test_ktx2_read_roundtrip(void) {
         CHECK(tp_ktx2_write_uni_ex(ulev, usz, 131072, 4, 2, 0u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects a dimension over TP_KTX2_MAX_DIM");
-        CHECK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 2, 0x4u, obuf, sizeof(obuf),
+        CHECK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 2, 0x8u, obuf, sizeof(obuf),
                                 &wrote) == TP_ERROR_INVALID_ARGUMENT,
               "write_uni rejects an unknown flag bit");
         CHECK(tp_ktx2_write_uni_ex(ulev, usz, 4, 4, 8, 0u, obuf, sizeof(obuf),
@@ -1847,14 +1883,12 @@ static void test_ktx2_uni_zstd_write(void) {
         sizes[0] = usz;
     }
 
-    /* The DFD must describe what the caller actually encoded. Neither fact is
-     * recoverable from the block bytes, and a consumer that honours the DFD
-     * (libktx, glTF KHR_texture_basisu) decodes sRGB and picks an alpha-capable
-     * transcode target from exactly these two fields. */
+    /* The private DFD must describe what the caller actually encoded without
+     * falsely claiming the Basis UASTC color model. */
     {
         uint8_t *k2 = NULL;
         size_t k2n = 0, dfd;
-        /* sRGB + alpha: BT709 primaries are the pairing the glTF profile wants. */
+        /* sRGB + alpha. */
         CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
                                            passthrough_zenc, NULL, levels, sizes,
                                            W, H, 1, TP_UNI_SRGB | TP_UNI_ALPHA,
@@ -1864,10 +1898,10 @@ static void test_ktx2_uni_zstd_write(void) {
         /* KTX2 >= 2.0.4 keeps the real pre-deflation bytesPlane0 even when
          * supercompressed; the old "must be 0" rule is retired. */
         CHECK(k2[dfd + 20] == 16u, "DFD bytesPlane0 = 16 under scheme 2");
-        CHECK(k2[dfd + 12] == 166u, "DFD colorModel = UASTC");
+        CHECK(k2[dfd + 12] == 0u, "private DFD colorModel = UNSPECIFIED");
         CHECK(k2[dfd + 13] == 1u, "DFD primaries = BT709 (sRGB)");
         CHECK(k2[dfd + 14] == 2u, "DFD transfer = sRGB");
-        CHECK(k2[dfd + 31] == 3u, "DFD channelType = UASTC_RGBA");
+        CHECK(k2[dfd + 31] == 3u, "private DFD channelType = RGBA");
         /* The flags must survive the round trip: a uni file has no vkFormat, so
          * if the reader does not parse the DFD the caller cannot tell sRGB from
          * linear or RGBA from RGB, and the flags buy nothing. */
@@ -1878,8 +1912,7 @@ static void test_ktx2_uni_zstd_write(void) {
         tp_ktx2_image_free(NULL, &img);
         tp_free(NULL, k2);
 
-        /* Linear + no alpha: the glTF profile pairs linear with UNSPECIFIED
-         * primaries, and an alpha-less payload must not claim RGBA. */
+        /* Linear + no alpha. */
         CHECK(TP_OK(tp_ktx2_write_uni_zstd(NULL, passthrough_zbound,
                                            passthrough_zenc, NULL, levels, sizes,
                                            W, H, 1, 0u, &k2, &k2n)),
@@ -1887,12 +1920,38 @@ static void test_ktx2_uni_zstd_write(void) {
         dfd = rd_u32(k2 + 48);
         CHECK(k2[dfd + 13] == 0u, "DFD primaries = UNSPECIFIED (linear)");
         CHECK(k2[dfd + 14] == 1u, "DFD transfer = linear");
-        CHECK(k2[dfd + 31] == 0u, "DFD channelType = UASTC_RGB");
+        CHECK(k2[dfd + 31] == 0u, "private DFD channelType = RGB");
         CHECK(TP_OK(tp_ktx2_read_zstd(k2, k2n, NULL, passthrough_zdec, NULL,
                                       &img)),
               "read back linear uni");
         CHECK(img.srgb == 0 && img.has_alpha == 0,
               "reader recovers linear + no alpha");
+        tp_ktx2_image_free(NULL, &img);
+        tp_free(NULL, k2);
+
+        /* Standard scheme-2 ASTC carrier: unlike the default private wrapper,
+         * this is safe to hand to external KTX2 consumers. */
+        CHECK(TP_OK(tp_ktx2_write_uni_zstd(
+                  NULL, passthrough_zbound, passthrough_zenc, NULL, levels,
+                  sizes, W, H, 1,
+                  TP_UNI_SRGB | TP_UNI_ALPHA | TP_UNI_ASTC_KTX2, &k2, &k2n)),
+              "write uni zstd as standard ASTC");
+        dfd = rd_u32(k2 + 48);
+        CHECK(rd_u32(k2 + 12) == 158u,
+              "zstd ASTC carrier vkFormat = ASTC_4x4_SRGB_BLOCK");
+        CHECK(k2[dfd + 12] == 162u, "zstd ASTC carrier DFD colorModel = ASTC");
+        CHECK(TP_OK(tp_ktx2_read_zstd(k2, k2n, NULL, passthrough_zdec, NULL,
+                                      &img)),
+              "read back zstd ASTC carrier");
+        CHECK(!img.is_uni && img.codec == TP_CODEC_ASTC && img.srgb,
+              "zstd ASTC carrier parsed as standard ASTC");
+        CHECK(TP_OK(tp_ktx2_decode_level_rgba8(&img, 0, dec, npix * 4u)),
+              "decode zstd ASTC carrier");
+        {
+            double p = psnr_rgba(ref, dec, npix);
+            printf("    uni->zstd-ASTC-KTX2->decode PSNR=%.2f dB\n", p);
+            CHECK(p >= 30.0, "zstd ASTC carrier decode PSNR >= 30 dB");
+        }
         tp_ktx2_image_free(NULL, &img);
         tp_free(NULL, k2);
 

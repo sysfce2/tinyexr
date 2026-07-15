@@ -1,0 +1,12 @@
+{
+  "name": "tinyexr-three-ktx2-loader-test",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs ../../../../build/texpipe/three-ktx2.ktx2"
+  },
+  "devDependencies": {
+    "puppeteer": "^24.25.0",
+    "three": ">=0.177.0"
+  }
+}
