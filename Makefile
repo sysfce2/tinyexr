@@ -12,6 +12,7 @@ CC  ?= gcc
 CXX ?= g++
 EMCC ?= emcc
 EMAR ?= emar
+NODE ?= node
 
 CFLAGS   ?= -O2
 CXXFLAGS ?= -O2 -std=c++11
@@ -498,7 +499,7 @@ TEXPIPE_LIB_SRC = tools/texpipe/src/texpipe.c tools/texpipe/src/texpipe_mip.c \
 TEXPIPE_HDRS = tools/texpipe/include/texpipe.h tools/texpipe/src/texpipe_internal.h
 TEXPIPE_OBJ = $(patsubst tools/texpipe/src/%.c,build/texpipe/%.o,$(TEXPIPE_LIB_SRC))
 
-.PHONY: texpipe texpipe-c11-gate texpipe-test
+.PHONY: texpipe texpipe-c11-gate texpipe-test texpipe-three-ktx2-test
 
 build/texpipe:
 	@mkdir -p build/texpipe
@@ -534,6 +535,24 @@ texpipe-test: resize-lib texcomp tools/texpipe/test/test_texpipe.c $(TEXPIPE_HDR
 	  tools/texpipe/test/test_texpipe.c $(TEXPIPE_LIB_SRC) build/libtir.a \
 	  build/libtexcomp.a -lm -o build/test_texpipe
 	./build/test_texpipe
+
+# Optional browser interoperability gate. This stays outside tools-test because
+# it needs Node, Puppeteer, Three.js and Chrome. Install dependencies in the test
+# directory, or point THREE_KTX2_NODE_ROOT at an existing web project.
+THREE_KTX2_NODE_ROOT ?= tools/texpipe/test/three_ktx2_loader
+
+build/texpipe/three_ktx2_fixture: texpipe \
+  tools/texpipe/test/three_ktx2_loader/generate_fixture.c
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) -Ideps/zstd -O2 -g \
+	  tools/texpipe/test/three_ktx2_loader/generate_fixture.c \
+	  build/libtexpipe.a build/libtir.a build/libtexcomp.a $(ZSTD_OBJ) \
+	  -pthread -lm -o $@
+
+texpipe-three-ktx2-test: build/texpipe/three_ktx2_fixture
+	./build/texpipe/three_ktx2_fixture build/texpipe/three-ktx2.ktx2
+	THREE_KTX2_NODE_ROOT="$(THREE_KTX2_NODE_ROOT)" \
+	  $(NODE) tools/texpipe/test/three_ktx2_loader/test.mjs \
+	  build/texpipe/three-ktx2.ktx2
 
 # ---- tools/envmap: environment-map projections, SH, spherical gaussians ----
 # Pure C11. Links tir + texcomp + texpipe + libtinyexr3 (CLI does HDR EXR I/O).
@@ -1139,6 +1158,7 @@ help:
 	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
 	@echo "make texcomp-astc-arm-gate - self-contained astcenc build + PSNR cross-check (CI gate)"
 	@echo "make texcomp-basis-gate  - Basis Universal transcoder validation (cp basisu_transcoder to deps/basisu/)"
+	@echo "make texpipe-three-ktx2-test - Three.js KTX2Loader browser interop (optional Node/Chrome deps)"
 	@echo "make texcomp-wasm - Emscripten texcomp C API + Node CLI (scalar wasm)"
 	@echo "make texcomp-wasm-simd - Emscripten texcomp C API + Node CLI (-msimd128)"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"

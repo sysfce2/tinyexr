@@ -580,9 +580,9 @@ static int build_mips(const uint8_t *base, uint32_t w, uint32_t h,
     return n;
 }
 
-/* Write uni levels as a KTX2 (vkFormat=UNDEFINED, supercompressionScheme=2/Zstd).
+/* Write uni levels as standard ASTC 4x4 KTX2 with Zstd supercompression.
  * Each mip level is Zstd-compressed independently; data is packed smallest-first
- * (KTX2 convention). Our loader identifies the file by vkFormat==0 && scheme==2. */
+ * (KTX2 convention). Uni blocks are valid ASTC; they are not Basis UASTC. */
 static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
                                 const size_t uni_sizes[], const uint32_t lw[],
                                 const uint32_t lh[], int nlevels, int basis,
@@ -596,7 +596,7 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
     int l;
     tc_result r = TC_SUCCESS;
     (void)lh;
-    (void)basis; (void)rdo; /* Basis codebook layer removed (incompatible with UASTC block layout). */
+    (void)basis; (void)rdo; /* Codebook layer removed from the private uni layout. */
     for (l = 0; l < nlevels; ++l) {
         const uint8_t *src = uni[l];
         size_t src_size = uni_sizes[l], bound;
@@ -615,7 +615,7 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
     ktx = (uint8_t *)calloc(1, total);
     if (!ktx) { r = TC_ERROR_OUT_OF_MEMORY; goto done; }
     memcpy(ktx, id, 12);
-    xbc7_put32(ktx + 12, 0u);              /* vkFormat = UNDEFINED */
+    xbc7_put32(ktx + 12, 157u);            /* ASTC_4x4_UNORM_BLOCK */
     xbc7_put32(ktx + 16, 1u);              /* typeSize */
     xbc7_put32(ktx + 20, lw[0]);
     xbc7_put32(ktx + 24, lh[0]);
@@ -632,13 +632,14 @@ static tc_result write_uni_ktx2(const char *path, uint8_t *const uni[],
     }
     xbc7_put32(ktx + dfd_off, 44u);
     xbc7_put32(ktx + dfd_off + 8, 2u | (40u << 16));
-    ktx[dfd_off + 12] = 166u; ktx[dfd_off + 13] = 1u; ktx[dfd_off + 14] = 1u;
+    ktx[dfd_off + 12] = 162u; ktx[dfd_off + 13] = 1u; ktx[dfd_off + 14] = 1u;
     ktx[dfd_off + 16] = 3u; ktx[dfd_off + 17] = 3u; ktx[dfd_off + 20] = 16u;
     ktx[dfd_off + 30] = 127u; xbc7_put32(ktx + dfd_off + 40, 0xffffffffu);
     for (l = 0; l < nlevels; ++l) memcpy(ktx + loff[l], comp[l], clen[l]);
     r = write_file(path, ktx, total);
     if (r == TC_SUCCESS)
-        printf("wrote %s (uni UASTC KTX2, %d mip levels, Zstd, %zu bytes)\n", path, nlevels, total);
+        printf("wrote %s (uni as ASTC 4x4 KTX2, %d mip levels, Zstd, %zu bytes)\n",
+               path, nlevels, total);
 done:
     for (l = 0; l < nlevels; ++l) { free(comp[l]); free(bbuf[l]); }
     free(ktx);
@@ -654,7 +655,9 @@ static int read_uni_ktx2(const char *path, uint8_t *uni[], size_t uni_sizes[],
     uint32_t pw, ph;
     int nlevels, l;
     if (!buf) return -1;
-    if (fsz < 80u || xbc7_get32(buf + 12) != 0u || xbc7_get32(buf + 44) != 2u) {
+    if (fsz < 80u ||
+        (xbc7_get32(buf + 12) != 157u && xbc7_get32(buf + 12) != 158u) ||
+        xbc7_get32(buf + 44) != 2u) {
         free(buf); return -1;
     }
     nlevels = (int)xbc7_get32(buf + 40);
@@ -768,7 +771,9 @@ static int encode_one(const char *in, const char *out,
             if (cat) { p = cat; for (l = 0; l < nl; ++l) { memcpy(p, blocks[l], bsz[l]); p += bsz[l]; } tr = write_file(out, cat, total); }
             else tr = TC_ERROR_OUT_OF_MEMORY;
         }
-        if (tr == TC_SUCCESS) printf("transcoded UASTC %s -> %s (%s, %d level%s, %zu bytes)\n", in, out, format, nl, nl == 1 ? "" : "s", total);
+        if (tr == TC_SUCCESS)
+            printf("converted uni %s -> %s (%s, %d level%s, %zu bytes)\n", in,
+                   out, format, nl, nl == 1 ? "" : "s", total);
         else fprintf(stderr, "texcomp: uni transcode failed\n");
         for (l = 0; l < nl; ++l) { free(blocks[l]); free(ulev[l]); }
         free(cat);
@@ -990,9 +995,9 @@ static void usage(void) {
             "        color axis, keep-best (off by default; ~+0.09 dB, ~1.7x slower).\n"
             "  --hdr-alpha: for --format astc_hdr on an EXR, encode the alpha\n"
             "        channel too (ASTC HDR CEM 15); default is RGB-only.\n"
-            "  uni: universal transcodable intermediate (UASTC block format).\n"
+            "  uni: private universal intermediate made of valid ASTC 4x4 blocks.\n"
             "        `--format uni -o x.uni` (raw, level 0) or `-o x.ktx2` (KTX2,\n"
-            "        full mip chain, Zstd-supercompressed). Transcode all levels\n"
+            "        standard ASTC KTX2 mip chain, Zstd-supercompressed). Convert levels\n"
             "        with `-i x.{uni,ktx2} -o out.bin --format bc7|bc1|astc|etc2`.\n"
             "        ASTC 4x4 is a byte-copy (the stored blocks are valid ASTC);\n"
             "        bc7/bc1/etc2 go through decode+re-encode.\n"

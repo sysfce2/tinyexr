@@ -36,12 +36,12 @@ one exception, and it is opt-in.
 | EAC R11 / RG11 | 4 / 8 | R / RG | mobile, masks and normal maps |
 | ASTC | 0.9–8 | RGBA | mobile + desktop, variable block size |
 | ASTC HDR | 8 | RGB **HDR** | mobile HDR |
-| `uni` | 8 | RGBA | a UASTC intermediate: encode once, **transcode** per device |
+| `uni` | 8 | RGBA | private ASTC-backed intermediate: encode once, convert per device |
 
-`uni` is the Basis-free transcodable carrier. Encode a texture once, ship it, and
-transcode on load to whatever the device actually has — BC7 on desktop, ASTC or
-ETC2 on mobile — with no re-encode. ASTC 4×4 is a byte copy, because the stored
-blocks *are* valid ASTC blocks.
+`uni` is a texcomp-native carrier. Encode once, then convert on load to the
+device format — BC7 on desktop, ASTC or ETC2 on mobile. ASTC 4×4 is a byte copy
+because the stored blocks are valid ASTC; BC7, BC1 and ETC2 use decode/re-encode
+conversion. It is not the Basis UASTC representation.
 
 ## Containers
 
@@ -184,10 +184,14 @@ wasm module. Nothing is uploaded: every byte stays in the tab.
 ```sh
 make tools-test        # pure-C gates: texcomp, tir, texpipe, envmap
 make tools-test-all    # + the astcenc C++ conformance cross-checks
+make texpipe-three-ktx2-test  # optional Three.js KTX2 browser interop
 ```
 
 `tools-test-all` runs the foreign-block sweeps described above, so a decoder that
 drifts from astcenc, Mesa or bcdec fails the build.
+The standalone browser gate needs Node, Three.js, Puppeteer and Chrome; setup
+and dependency-reuse instructions are in
+`tools/texpipe/test/three_ktx2_loader/README.md`.
 
 ## Status and known gaps
 
@@ -195,3 +199,10 @@ drifts from astcenc, Mesa or bcdec fails the build.
   `tools/texcomp/ASTC_PORT_NOTES.md`.
 - BasisLZ (KTX2 `supercompressionScheme = 1`) is not implemented, and will not be
   until it can be validated against Basis's own transcoder.
+- Raw `uni` blocks are valid ASTC 4×4 blocks but are not the Basis UASTC wire
+  representation. The default KTX2 wrapper is therefore a TinyEXR-private
+  carrier and must be read by texpipe. Pass `TP_UNI_ASTC_KTX2` to the raw or
+  scheme-2 writer for a standards-defined ASTC KTX2 that interoperates with
+  external consumers such as Three.js `KTX2Loader`. The texcomp-native
+  `--basis` codebook is separate from BasisLZ and does not change the scheme-1
+  limitation.
