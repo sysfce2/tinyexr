@@ -22,7 +22,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
 
 all: $(TARGET)
 
@@ -45,11 +45,18 @@ tools-test: texcomp-c11-gate texcomp-test texcomp-uni-gate texcomp-xbc7-gate \
             texcomp-bc6h-gate \
             resize-c11-gate resize-test \
             texpipe-c11-gate texpipe-test \
-            envmap-c11-gate envmap-test envmap-pbr-test
+            envmap-c11-gate envmap-test envmap-pbr-test ptexatlas-c11-gate
 	@echo "tools-test: all self-contained tool gates passed"
 
 tools-test-all: tools-test texcomp-astc-hdr-gate texcomp-astc-arm-gate
 	@echo "tools-test-all: all tool gates (incl. astcenc cross-checks) passed"
+
+# TinyEXR/TinyUSDZ shared Ptex reader + coarse atlas packer.  Keep this gate
+# independent of the C++ legacy library so it remains usable in freestanding
+# and WASM-oriented builds.
+ptexatlas-c11-gate:
+	$(CC) -std=c11 -Wall -Wextra -Werror -Itools/ptexatlas -Ideps/miniz \
+	  -fsyntax-only tools/ptexatlas/ptex.c tools/ptexatlas/texatlas.c
 
 # ---- pure-C11 v3 library + tests ------------------------------------------
 V3_INC   = -Iinclude -Isrc -Ideps/zstd
