@@ -852,7 +852,13 @@ static void tc_bc7_decode_block(const uint8_t blk[16], uint8_t out[16][4]) {
     uint64_t lo, hi;
     int mode, partition = 0, numPart = 1, numEp, rotation = 0, idxSelBit = 0;
     int ib, ib2, i, j, k;
-    int ep[6][4];
+    /* Zero-initialized: for the modes with no alpha bits (0/1/3) the alpha lane
+     * is never read from the block, yet the p-bit and expansion steps below run
+     * over all four lanes. Leaving it indeterminate meant shifting a garbage
+     * (possibly negative) int -- undefined behaviour, which UBSan trips on
+     * arbitrary blocks. The alpha lane is overwritten with 0xFF for those modes
+     * anyway, so this only fixes the UB, not the decoded output. */
+    int ep[6][4] = {{0}};
     signed char cidx[4][4];
     const int *w, *w2;
     memcpy(&lo, blk, 8);

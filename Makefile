@@ -12,6 +12,7 @@ CC  ?= gcc
 CXX ?= g++
 EMCC ?= emcc
 EMAR ?= emar
+NODE ?= node
 
 CFLAGS   ?= -O2
 CXXFLAGS ?= -O2 -std=c++11
@@ -22,7 +23,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate texcomp-web fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
 
 all: $(TARGET)
 
@@ -256,7 +257,9 @@ TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
   tools/texcomp/src/texcomp_bc7.c tools/texcomp/src/texcomp_etc2.c \
   tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c \
   tools/texcomp/src/texcomp_astc_hdr.c tools/texcomp/src/texcomp_uni.c \
-  tools/texcomp/src/texcomp_astc_decode.c
+  tools/texcomp/src/texcomp_astc_decode.c \
+  tools/texcomp/src/texcomp_etc2_decode.c \
+  tools/texcomp/src/texcomp_bc6h_decode.c
 TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
 TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
 TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))
@@ -339,6 +342,13 @@ texcomp-wasm: build/texcomp/wasm/libtexcomp.a build/texcomp/wasm/texcomp.mjs bui
 
 texcomp-wasm-simd: build/texcomp/wasm-simd/libtexcomp.a build/texcomp/wasm-simd/texcomp.mjs build/texcomp/wasm-simd/texcomp_cli.js
 	@echo "built build/texcomp/wasm-simd/libtexcomp.a, texcomp.mjs/.wasm, texcomp_cli.js/.wasm"
+
+# Browser demo: web/texcomp (tir + texcomp + texpipe + envmap + EXR decode).
+# Needs emcc on PATH. Artifacts land next to index.html so the page can be
+# served straight from a checkout.
+.PHONY: texcomp-web
+texcomp-web:
+	cd web/texcomp && EMCC=$(EMCC) ./build.sh
 
 wasm-texcomp: texcomp-wasm
 
@@ -496,7 +506,7 @@ TEXPIPE_LIB_SRC = tools/texpipe/src/texpipe.c tools/texpipe/src/texpipe_mip.c \
 TEXPIPE_HDRS = tools/texpipe/include/texpipe.h tools/texpipe/src/texpipe_internal.h
 TEXPIPE_OBJ = $(patsubst tools/texpipe/src/%.c,build/texpipe/%.o,$(TEXPIPE_LIB_SRC))
 
-.PHONY: texpipe texpipe-c11-gate texpipe-test
+.PHONY: texpipe texpipe-c11-gate texpipe-test texpipe-three-ktx2-test
 
 build/texpipe:
 	@mkdir -p build/texpipe
@@ -532,6 +542,24 @@ texpipe-test: resize-lib texcomp tools/texpipe/test/test_texpipe.c $(TEXPIPE_HDR
 	  tools/texpipe/test/test_texpipe.c $(TEXPIPE_LIB_SRC) build/libtir.a \
 	  build/libtexcomp.a -lm -o build/test_texpipe
 	./build/test_texpipe
+
+# Optional browser interoperability gate. This stays outside tools-test because
+# it needs Node, Puppeteer, Three.js and Chrome. Install dependencies in the test
+# directory, or point THREE_KTX2_NODE_ROOT at an existing web project.
+THREE_KTX2_NODE_ROOT ?= tools/texpipe/test/three_ktx2_loader
+
+build/texpipe/three_ktx2_fixture: texpipe \
+  tools/texpipe/test/three_ktx2_loader/generate_fixture.c
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) -Ideps/zstd -O2 -g \
+	  tools/texpipe/test/three_ktx2_loader/generate_fixture.c \
+	  build/libtexpipe.a build/libtir.a build/libtexcomp.a $(ZSTD_OBJ) \
+	  -pthread -lm -o $@
+
+texpipe-three-ktx2-test: build/texpipe/three_ktx2_fixture
+	./build/texpipe/three_ktx2_fixture build/texpipe/three-ktx2.ktx2
+	THREE_KTX2_NODE_ROOT="$(THREE_KTX2_NODE_ROOT)" \
+	  $(NODE) tools/texpipe/test/three_ktx2_loader/test.mjs \
+	  build/texpipe/three-ktx2.ktx2
 
 # ---- tools/envmap: environment-map projections, SH, spherical gaussians ----
 # Pure C11. Links tir + texcomp + texpipe + libtinyexr3 (CLI does HDR EXR I/O).
@@ -1137,6 +1165,7 @@ help:
 	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
 	@echo "make texcomp-astc-arm-gate - self-contained astcenc build + PSNR cross-check (CI gate)"
 	@echo "make texcomp-basis-gate  - Basis Universal transcoder validation (cp basisu_transcoder to deps/basisu/)"
+	@echo "make texpipe-three-ktx2-test - Three.js KTX2Loader browser interop (optional Node/Chrome deps)"
 	@echo "make texcomp-wasm - Emscripten texcomp C API + Node CLI (scalar wasm)"
 	@echo "make texcomp-wasm-simd - Emscripten texcomp C API + Node CLI (-msimd128)"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
