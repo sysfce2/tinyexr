@@ -120,6 +120,8 @@ typedef struct {
     uint16_t long_index[DFL_FAST_SIZE];
     uint16_t long_table[DFL_LONG_TABLE_SIZE];
     int long_count;
+    uint16_t length_info[29];  /* base | (extra << 9) */
+    uint32_t distance_info[30]; /* base | (extra << 15) */
     uint16_t slow_table[640];
     int slow_count;
     int max_bits;
@@ -130,10 +132,16 @@ static void ht_fixed_litlen(dfl_huff *t) {
     t->max_bits = 9;
     t->slow_count = 0;
     t->long_count = 0;
+    memset(t->length_info, 0, sizeof(t->length_info));
+    memset(t->distance_info, 0, sizeof(t->distance_info));
     memset(t->fast_table, 0, sizeof(t->fast_table));
     memset(t->long_index, 0, sizeof(t->long_index));
     memset(t->long_table, 0, sizeof(t->long_table));
     memset(t->slow_table, 0, sizeof(t->slow_table));
+    for (sym = 0; sym < 29; ++sym)
+        t->length_info[sym] =
+            (uint16_t)(dfl_length_base[sym] |
+                       ((uint16_t)dfl_length_extra[sym] << 9));
     for (sym = 0; sym <= 287; sym++) {
         int len, code, rev = 0, i, fill;
         if (sym <= 143) { len = 8; code = 0x30 + sym; }
@@ -154,10 +162,16 @@ static void ht_fixed_dist(dfl_huff *t) {
     t->max_bits = 5;
     t->slow_count = 0;
     t->long_count = 0;
+    memset(t->length_info, 0, sizeof(t->length_info));
+    memset(t->distance_info, 0, sizeof(t->distance_info));
     memset(t->fast_table, 0, sizeof(t->fast_table));
     memset(t->long_index, 0, sizeof(t->long_index));
     memset(t->long_table, 0, sizeof(t->long_table));
     memset(t->slow_table, 0, sizeof(t->slow_table));
+    for (sym = 0; sym < 30; ++sym)
+        t->distance_info[sym] =
+            (uint32_t)dfl_dist_base[sym] |
+            ((uint32_t)dfl_dist_extra[sym] << 15);
     for (sym = 0; sym < 32; sym++) {
         int rev = 0, i, fill;
         for (i = 0; i < 5; i++) rev = (rev << 1) | ((sym >> i) & 1);
@@ -195,6 +209,8 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
     table->max_bits = max_len;
     table->slow_count = 0;
     table->long_count = 0;
+    memset(table->length_info, 0, sizeof(table->length_info));
+    memset(table->distance_info, 0, sizeof(table->distance_info));
     memset(table->fast_table, 0, sizeof(table->fast_table));
     memset(table->long_index, 0, sizeof(table->long_index));
     memset(table->long_table, 0, sizeof(table->long_table));
@@ -249,6 +265,18 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
                 slow_total++;
             }
         }
+    }
+
+    if (count > DFL_DIST_CODES) {
+        for (i = 0; i < 29; ++i)
+            table->length_info[i] =
+                (uint16_t)(dfl_length_base[i] |
+                           ((uint16_t)dfl_length_extra[i] << 9));
+    } else {
+        for (i = 0; i < 30 && i < count; ++i)
+            table->distance_info[i] =
+                (uint32_t)dfl_dist_base[i] |
+                ((uint32_t)dfl_dist_extra[i] << 15);
     }
 
     {
@@ -462,8 +490,11 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             }
             length_sym = sym - 257;
             if (DFL_UNLIKELY(length_sym >= 29)) return 0;
-            length = dfl_length_base[length_sym];
-            extra = dfl_length_extra[length_sym];
+            {
+                uint16_t info = litlen_t->length_info[length_sym];
+                length = info & 0x1FF;
+                extra = info >> 9;
+            }
             if (extra > 0) {
                 if (DFL_UNLIKELY(count < extra))
                     br_refill_fast_state(&bits, &count, &ptr, reader->end);
@@ -489,8 +520,11 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                 ptr = reader->ptr;
             }
             if (DFL_UNLIKELY(dist_sym < 0 || dist_sym >= 30)) return 0;
-            distance = dfl_dist_base[dist_sym];
-            extra = dfl_dist_extra[dist_sym];
+            {
+                uint32_t info = dist_t->distance_info[dist_sym];
+                distance = info & 0x7FFF;
+                extra = (int)(info >> 15);
+            }
             if (extra > 0) {
                 if (DFL_UNLIKELY(count < extra))
                     br_refill_fast_state(&bits, &count, &ptr, reader->end);
