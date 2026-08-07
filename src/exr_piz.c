@@ -130,6 +130,29 @@ static void wdec16(uint16_t l, uint16_t h, uint16_t *a, uint16_t *b) {
     *a = (uint16_t)aa;
 }
 
+static void wdec16_4(uint16_t *px, uint16_t *p01, uint16_t *p10,
+                     uint16_t *p11) {
+    int a0, b0, a1, b1;
+    int x0 = (int)*px;
+    int x1 = (int)*p01;
+    int y0 = (int)*p10;
+    int y1 = (int)*p11;
+
+    b0 = (x0 - (y0 >> 1)) & WAV_MOD_MASK;
+    a0 = (y0 + b0 - WAV_A_OFFSET) & WAV_MOD_MASK;
+    b1 = (x1 - (y1 >> 1)) & WAV_MOD_MASK;
+    a1 = (y1 + b1 - WAV_A_OFFSET) & WAV_MOD_MASK;
+    x0 = (a0 - (a1 >> 1)) & WAV_MOD_MASK;
+    x1 = (a1 + x0 - WAV_A_OFFSET) & WAV_MOD_MASK;
+    y0 = (b0 - (b1 >> 1)) & WAV_MOD_MASK;
+    y1 = (b1 + y0 - WAV_A_OFFSET) & WAV_MOD_MASK;
+
+    *px = (uint16_t)x1;
+    *p01 = (uint16_t)x0;
+    *p10 = (uint16_t)y1;
+    *p11 = (uint16_t)y0;
+}
+
 static void wdec14_4(uint16_t *px, uint16_t *p01, uint16_t *p10,
                      uint16_t *p11) {
     int ai = (int)(int16_t)*px;
@@ -156,7 +179,7 @@ static void wav2_decode(uint16_t *in, int nx, int ox, int ny, int oy,
     int w14 = (mx < (1 << 14));
     int n = (nx > ny) ? ny : nx;
     int p = 1, p2;
-    uint16_t i00, i01, i10, i11;
+    uint16_t i00;
 
     while (p <= n) p <<= 1;
     p >>= 1;
@@ -178,10 +201,7 @@ static void wav2_decode(uint16_t *in, int nx, int ox, int ny, int oy,
                 if (w14) {
                     wdec14_4(px, p01, p10, p11);
                 } else {
-                    wdec16(*px, *p10, &i00, &i10);
-                    wdec16(*p01, *p11, &i01, &i11);
-                    wdec16(i00, i01, px, p01);
-                    wdec16(i10, i11, p10, p11);
+                    wdec16_4(px, p01, p10, p11);
                 }
             }
             if (nx & p) {
