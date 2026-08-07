@@ -355,6 +355,20 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             if (DFL_LIKELY(sym < 256)) {
                 if (DFL_UNLIKELY(op >= out_end)) return 0;
                 *op++ = (uint8_t)sym;
+                /* Literal runs are common after the EXR predictor. Decode one
+                 * more fast literal without paying the outer-loop branch and
+                 * refill checks. Leave a match/end marker for the normal path. */
+                if (DFL_LIKELY(count >= 15)) {
+                    uint16_t next = litlen_t->fast_table[
+                        (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
+                    int next_sym = (next >> 4) & 0x7FF;
+                    if (DFL_LIKELY((next & 0x8000) && next_sym < 256)) {
+                        bits >>= next & 0xF;
+                        count -= next & 0xF;
+                        if (DFL_UNLIKELY(op >= out_end)) return 0;
+                        *op++ = (uint8_t)next_sym;
+                    }
+                }
                 continue;
             }
             if (sym == 256) {
