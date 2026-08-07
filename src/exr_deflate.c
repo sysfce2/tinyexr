@@ -181,8 +181,10 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
     int max_len = 0, i, code, sym, bits;
     uint16_t slow_codes[320], slow_syms[320];
     uint8_t slow_lens[320];
+    uint16_t slow_counts[DFL_MAX_BITS + 1] = {0};
+    uint16_t slow_offsets[DFL_MAX_BITS + 1] = {0};
+    uint16_t slow_write[DFL_MAX_BITS + 1] = {0};
     int slow_total = 0;
-    uint16_t *slow_ptr;
 
     for (i = 0; i < count; i++) {
         if (lens[i] > 0) {
@@ -243,26 +245,35 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
                 slow_codes[slow_total] = (uint16_t)rev;
                 slow_syms[slow_total] = (uint16_t)sym;
                 slow_lens[slow_total] = (uint8_t)len;
+                slow_counts[len]++;
                 slow_total++;
             }
         }
     }
 
-    slow_ptr = table->slow_table;
-    for (bits = DFL_FAST_BITS + 1; bits <= max_len && bits <= 15; bits++) {
-        uint16_t *count_ptr = slow_ptr++;
-        uint16_t bc = 0;
-        /* bound: 1 count + 2*slow_total entries must fit in slow_table[640] */
-        for (i = 0; i < slow_total; i++) {
-            if (slow_lens[i] == bits) {
-                if ((size_t)(slow_ptr - table->slow_table) + 2 > 640) return 0;
-                *slow_ptr++ = slow_codes[i];
-                *slow_ptr++ = slow_syms[i];
-                bc++;
-                table->slow_count++;
-            }
+    {
+        uint16_t *slow_ptr = table->slow_table;
+        for (bits = DFL_FAST_BITS + 1;
+             bits <= max_len && bits <= DFL_MAX_BITS; ++bits) {
+            slow_offsets[bits] = (uint16_t)(slow_ptr - table->slow_table);
+            slow_write[bits] = slow_offsets[bits] + 1;
+            if ((size_t)(slow_ptr - table->slow_table) +
+                    1 + 2 * slow_counts[bits] >
+                sizeof(table->slow_table) / sizeof(table->slow_table[0]))
+                return 0;
+            *slow_ptr++ = slow_counts[bits];
+            slow_ptr += 2 * slow_counts[bits];
+            table->slow_count += slow_counts[bits];
         }
-        *count_ptr = bc;
+    }
+    for (i = 0; i < slow_total; ++i) {
+        int len = slow_lens[i];
+        uint16_t pos;
+        if (len <= DFL_FAST_BITS || len > DFL_MAX_BITS) continue;
+        pos = slow_write[len];
+        table->slow_table[pos++] = slow_codes[i];
+        table->slow_table[pos] = slow_syms[i];
+        slow_write[len] = pos + 1;
     }
     return 1;
 }
