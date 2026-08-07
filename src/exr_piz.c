@@ -284,19 +284,18 @@ static int unpack_enc_table(const uint8_t **pcode, int ni, int im, int iM,
         int64_t l;
         if (p - *pcode >= ni) return 0;
         l = (int64_t)hgetbits(6, &c, &lc, &p, end);
-        lengths[im] = (uint8_t)l;
         if (l == (int64_t)LONG_ZEROCODE_RUN) {
             int zerun;
             if (p - *pcode > ni) return 0;
             zerun = (int)hgetbits(8, &c, &lc, &p, end) + SHORTEST_LONG_RUN;
             if (im + zerun > iM + 1) return 0;
-            while (zerun--) lengths[im++] = 0;
-            im--;
+            im += zerun - 1;
         } else if (l >= (int64_t)SHORT_ZEROCODE_RUN) {
             int zerun = (int)(l - SHORT_ZEROCODE_RUN + 2);
             if (im + zerun > iM + 1) return 0;
-            while (zerun--) lengths[im++] = 0;
-            im--;
+            im += zerun - 1;
+        } else {
+            lengths[im] = (uint8_t)l;
         }
     }
     *pcode = p;
