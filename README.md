@@ -112,9 +112,10 @@ same thread count. Throughput in megapixels/s. Full writeup + charts:
   data (~+8% on 4K texture packs) but slower on high-entropy natural images, so
   libdeflate is the safer hosted default; both link and switch at runtime via
   `exr_zlib_set_backend()`.
-- **In-tree codec tuning:** **PIZ decode ~+14%** (inline Huffman literal store +
-  tighter canonical-table scan); ZSTD (vendored upstream) decodes ~410–420 Mpix/s
-  here, ahead of the libdeflate ZIP path.
+- **In-tree codec tuning:** PIZ now has an OpenEXR-style two-window Huffman
+  reader and is effectively on-par on the Ryzen 9 3950X snapshot (**33.8 vs
+  35.6 MP/s** decode). ZSTD (vendored upstream) decodes ~410–420 Mpix/s here,
+  ahead of the libdeflate ZIP path.
 - **Multi-threaded** (opt-in C11 threads, `make … THREADS=1` +
   `exr_set_num_threads(n)`): per-block parallel encode/decode scales **~5×
   (ZIP) to ~8.8× (ZIPS)** to 16 threads. At 16 threads TinyEXR **out-decodes

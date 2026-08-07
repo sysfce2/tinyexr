@@ -11,7 +11,6 @@
 
 #include "exr_internal.h"
 
-
 #define PIZ_BITMAP_SIZE 8192
 #define PIZ_USHORT_RANGE 65536
 #define PIZ_HUF_ENCSIZE (PIZ_USHORT_RANGE + 1) /* 65537 */
@@ -19,6 +18,11 @@
 #define HUF_DECBITS 12
 #define HUF_DECSIZE (1 << HUF_DECBITS)
 #define HUF_DECMASK (HUF_DECSIZE - 1)
+#if defined(__GNUC__) && !defined(__clang__)
+#define PIZ_OPT_O3 __attribute__((optimize("O3")))
+#else
+#define PIZ_OPT_O3
+#endif
 #define SHORT_ZEROCODE_RUN 59
 #define LONG_ZEROCODE_RUN 63
 #define SHORTEST_LONG_RUN (2 + LONG_ZEROCODE_RUN - SHORT_ZEROCODE_RUN)
@@ -43,6 +47,8 @@ typedef struct {
     uint32_t *counts;
     uint32_t *long_storage;
     size_t long_capacity;
+    uint32_t *ids;
+    size_t ids_capacity;
     uint16_t *rev_lut;
     uint16_t *tmp;
     size_t tmp_capacity;
@@ -65,6 +71,7 @@ void exr_piz_context_free(exr_context *ctx) {
     if (!w) return;
     a = exr_context_allocator(ctx);
     exr_free(a, w->long_storage);
+    exr_free(a, w->ids);
     exr_free(a, w->emitted);
     exr_free(a, w->channels);
     exr_free(a, w->tmp);
@@ -82,10 +89,24 @@ void exr_piz_context_free(exr_context *ctx) {
 
 /* ---- range LUT ------------------------------------------------------------ */
 
-static uint16_t reverse_lut_from_bitmap(const uint8_t *bitmap, uint16_t *lut) {
-    int k = 0, i;
-    for (i = 0; i < PIZ_USHORT_RANGE; ++i)
-        if (i == 0 || (bitmap[i >> 3] & (1 << (i & 7)))) lut[k++] = (uint16_t)i;
+static PIZ_OPT_O3 uint16_t reverse_lut_from_bitmap(const uint8_t *bitmap,
+                                                   uint16_t *lut) {
+    int k = 1, i;
+    lut[0] = 0;
+    for (i = 0; i < PIZ_BITMAP_SIZE; ++i) {
+        unsigned bits = bitmap[i];
+        if (i == 0) bits &= ~1u; /* value zero is always emitted above */
+        while (bits != 0) {
+#if defined(__GNUC__) || defined(__clang__)
+            unsigned bit = (unsigned)__builtin_ctz(bits);
+#else
+            unsigned bit = 0;
+            while (((bits >> bit) & 1u) == 0) ++bit;
+#endif
+            lut[k++] = (uint16_t)((i << 3) + (int)bit);
+            bits &= bits - 1u;
+        }
+    }
     {
         uint16_t n = (uint16_t)(k - 1);
         while (k < PIZ_USHORT_RANGE) lut[k++] = 0;
@@ -93,7 +114,8 @@ static uint16_t reverse_lut_from_bitmap(const uint8_t *bitmap, uint16_t *lut) {
     }
 }
 
-static void apply_lut(const uint16_t *lut, uint16_t *data, size_t n) {
+static PIZ_OPT_O3 void apply_lut(const uint16_t *restrict lut,
+                                 uint16_t *restrict data, size_t n) {
     while (n >= 8) {
         data[0] = lut[data[0]];
         data[1] = lut[data[1]];
@@ -174,8 +196,8 @@ static void wdec14_4(uint16_t *px, uint16_t *p01, uint16_t *p10,
     *p11 = (uint16_t)di;
 }
 
-static void wav2_decode(uint16_t *in, int nx, int ox, int ny, int oy,
-                        uint16_t mx) {
+static PIZ_OPT_O3 void wav2_decode(uint16_t *in, int nx, int ox, int ny,
+                                   int oy, uint16_t mx) {
     int w14 = (mx < (1 << 14));
     int n = (nx > ny) ? ny : nx;
     int p = 1, p2;
@@ -441,9 +463,145 @@ static int get_code(int po, int rlc, uint64_t *c, int *lc, const uint8_t **in,
     return 1;
 }
 
-static int huf_uncompress(const exr_allocator *a, exr_context *context,
-                          const uint8_t *in, size_t in_len, uint16_t *out,
-                          size_t out_len) {
+static uint64_t piz_read64be(const uint8_t *p) {
+    return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+           ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+           ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+           ((uint64_t)p[6] << 8) | (uint64_t)p[7];
+}
+
+/* Refill the OpenEXR-style two-window reader. `bits_left` counts source bits
+ * not yet copied into the refill window; the final partial byte is zero-padded
+ * and never read past `end`. */
+static PIZ_OPT_O3 inline void piz_fast_refill(
+    uint64_t *buffer, int num_bits, uint64_t *buffer_back, int *back_bits,
+    const uint8_t **cur, int *bits_left, const uint8_t *end) {
+    int need = num_bits;
+    int consume = num_bits;
+    *buffer |= *buffer_back >> (64 - num_bits);
+    if (*back_bits < num_bits) {
+        need = num_bits - *back_bits;
+        consume = need;
+        int read_bits = *bits_left;
+        uint64_t next = 0;
+        if (read_bits >= 64) {
+            next = piz_read64be(*cur);
+            *cur += 8;
+            *bits_left -= 64;
+        } else {
+            int bytes = (read_bits + 7) / 8;
+            int i;
+            if (bytes > (int)(end - *cur))
+                bytes = (int)(end - *cur);
+            for (i = 0; i < bytes && *cur < end; ++i)
+                next |= (uint64_t)*(*cur)++ << (56 - i * 8);
+            *bits_left = 0;
+        }
+        *buffer_back = next;
+        *back_bits = 64;
+        *buffer |= *buffer_back >> (64 - need);
+    }
+    if (*back_bits <= consume) {
+        *buffer_back = 0;
+    } else {
+        *buffer_back <<= consume;
+    }
+    *back_bits -= consume;
+}
+
+static PIZ_OPT_O3 int piz_fast_huf_decode(
+    const uint8_t *src, size_t src_len, int nbits, const uint32_t *fast,
+    const uint32_t *ids, size_t symbol_count, const uint64_t *ljbase,
+    const uint64_t *ljoffset, uint64_t table_min, int max_len, uint32_t rlc,
+    uint16_t *dst, size_t dst_len) {
+    const uint8_t *cur, *end = src + src_len;
+    uint64_t buffer, buffer_back;
+    int buffer_bits = 64, back_bits = 64;
+    int bits_left = nbits - 128;
+    size_t out = 0;
+
+    if (nbits < 128 || src_len < 16) return 0;
+    cur = src + 16;
+    buffer = piz_read64be(src);
+    buffer_back = piz_read64be(src + 8);
+    while (out < dst_len) {
+        uint32_t packed;
+        uint32_t symbol;
+        int code_len;
+        packed = buffer >= table_min ? fast[buffer >> (64 - HUF_DECBITS)] : 0;
+        if (packed != 0) {
+            code_len = (int)(packed & 63u);
+            symbol = packed >> 6;
+        } else {
+            uint64_t id;
+            if (buffer_bits < 64) {
+                piz_fast_refill(&buffer, 64 - buffer_bits, &buffer_back,
+                                &back_bits, &cur, &bits_left, end);
+                buffer_bits = 64;
+            }
+            code_len = HUF_DECBITS + 1;
+            while (code_len <= max_len && buffer < ljbase[code_len])
+                ++code_len;
+            if (code_len > max_len) return 0;
+            id = ljoffset[code_len] + (buffer >> (64 - code_len));
+            if (id >= symbol_count) return 0;
+            symbol = ids[id];
+        }
+        if (code_len <= 0 || code_len > buffer_bits) return 0;
+        buffer <<= code_len;
+        buffer_bits -= code_len;
+        if (symbol == (uint32_t)rlc) {
+            uint32_t count;
+            if (buffer_bits < 8) {
+                piz_fast_refill(&buffer, 64 - buffer_bits, &buffer_back,
+                                &back_bits, &cur, &bits_left, end);
+                buffer_bits = 64;
+            }
+            count = (uint32_t)(buffer >> 56);
+            if (count == 0 || out == 0 || count > dst_len - out) return 0;
+            while (count-- != 0) {
+                dst[out] = dst[out - 1];
+                ++out;
+            }
+            buffer <<= 8;
+            buffer_bits -= 8;
+        } else {
+            if (symbol > UINT16_MAX || out >= dst_len) return 0;
+            dst[out++] = (uint16_t)symbol;
+        }
+        if (buffer_bits < HUF_DECBITS) {
+            piz_fast_refill(&buffer, 64 - buffer_bits, &buffer_back,
+                            &back_bits, &cur, &bits_left, end);
+            buffer_bits = 64;
+        }
+    }
+    return bits_left == 0;
+}
+
+static int piz_build_fast_table(const int64_t *hcode, const uint32_t *symbols,
+                                size_t symbol_count, uint32_t *fast) {
+    memset(fast, 0, sizeof(*fast) * HUF_DECSIZE);
+    for (size_t j = 0; j < symbol_count; ++j) {
+        int sym = (int)symbols[j];
+        int len = (int)(hcode[sym] & 63);
+        uint64_t code = (uint64_t)hcode[sym] >> 6;
+        if (len <= 0) continue;
+        if (code >> len) return 0;
+        if (len <= HUF_DECBITS) {
+            size_t base = (size_t)(code << (HUF_DECBITS - len));
+            size_t fill = (size_t)1u << (HUF_DECBITS - len);
+            for (size_t k = 0; k < fill; ++k) {
+                if (fast[base + k] != 0) return 0;
+                fast[base + k] = ((uint32_t)sym << 6) | (uint32_t)len;
+            }
+        }
+    }
+    return 1;
+}
+
+static PIZ_OPT_O3 int huf_uncompress(
+    const exr_allocator *a, exr_context *context, const uint8_t *in,
+    size_t in_len, uint16_t *out, size_t out_len) {
     uint32_t im_val, iM_val, nBits_val;
     int im, iM, nBits, ni, rlc;
     PizHufWorkspace local = {0};
@@ -455,6 +613,12 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
     uint64_t c = 0;
     int lc = 0;
     uint16_t *outb, *outp, *oe;
+    const uint32_t *fast;
+    const HufDec *longdec;
+    uint64_t ljbase[59], ljoffset[59];
+    uint32_t code_count[59], code_write[59], code_pos[59];
+    int max_len = 0;
+    uint64_t table_min = UINT64_MAX;
     int ret = 0;
 
     if (out_len == 0) return in_len == 0;
@@ -510,24 +674,82 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
                           w->symbols, w->symbols_capacity, &symbol_count))
         goto cleanup;
 
+    if (!w->ids || w->ids_capacity < symbol_count) {
+        uint32_t *p = (uint32_t *)exr_malloc(a, symbol_bytes);
+        if (!p) goto cleanup;
+        exr_free(a, w->ids);
+        w->ids = p;
+        w->ids_capacity = symbol_capacity;
+    }
+
+    memset(code_count, 0, sizeof(code_count));
+    for (int l = 0; l <= 58; ++l) ljbase[l] = UINT64_MAX;
+    for (size_t j = 0; j < symbol_count; ++j) {
+        int sym = (int)w->symbols[j];
+        int len = (int)(w->hcode[sym] & 63);
+        uint64_t code = (uint64_t)w->hcode[sym] >> 6;
+        ++code_count[len];
+        if (len > max_len) max_len = len;
+        if (code < ljbase[len]) ljbase[len] = code;
+    }
+    code_write[58] = 0;
+    for (int l = 57; l >= 0; --l)
+        code_write[l] = code_write[l + 1] + code_count[l + 1];
+    memcpy(code_pos, code_write, sizeof(code_pos));
+    for (size_t j = 0; j < symbol_count; ++j) {
+        int sym = (int)w->symbols[j];
+        int len = (int)(w->hcode[sym] & 63);
+        w->ids[code_pos[len]++] = (uint32_t)sym;
+    }
+    for (int l = 0; l <= 58; ++l) {
+        if (ljbase[l] != UINT64_MAX) {
+            ljoffset[l] = (uint64_t)code_write[l] - ljbase[l];
+            ljbase[l] <<= 64 - l;
+        } else {
+            ljbase[l] = UINT64_MAX;
+            ljoffset[l] = 0;
+        }
+    }
+    for (int l = HUF_DECBITS; l > 0; --l) {
+        if (ljbase[l] != UINT64_MAX) {
+            table_min = ljbase[l];
+            break;
+        }
+    }
     ni = (int)(in_len - (size_t)(ptr - in));
     if (nBits < 0 || nBits > 8 * ni) goto cleanup;
+    if (nBits >= 128 &&
+        piz_build_fast_table(w->hcode, w->symbols, symbol_count, w->fast) &&
+        piz_fast_huf_decode(ptr, in_len - (size_t)(ptr - in), nBits,
+                            w->fast, w->ids, symbol_count, ljbase, ljoffset,
+                            table_min, max_len, (uint32_t) iM, out, out_len)) {
+        ret = 1;
+        goto cleanup;
+    }
+
     if (!build_dec_table(a, w->hcode, w->fast, w->longdec,
                          w->counts, &w->long_storage, &w->long_capacity,
                          w->symbols, symbol_count))
         goto cleanup;
+    /* Keep the read-only decode tables in local pointers for the symbol loop. */
+    fast = w->fast;
+    longdec = w->longdec;
 
     rlc = iM;
     outb = out;
     outp = out;
     oe = out + out_len;
     ie = ptr + (nBits + 7) / 8;
+
+    /* The bounded two-window reader is substantially cheaper for ordinary
+     * streams. Keep the original reader below as a correctness fallback for
+     * unusual or malformed tables. */
     hrefill(&c, &lc, &ptr, ie);
 
     while (ptr < ie || lc >= HUF_DECBITS) {
         if (lc < HUF_DECBITS && ptr < ie) hrefill(&c, &lc, &ptr, ie);
         while (lc >= HUF_DECBITS) {
-            uint32_t code = w->fast[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
+            uint32_t code = fast[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
             if (code) {
                 int lit = (int)(code >> 6);
                 lc -= (int)(code & 63u);
@@ -555,10 +777,10 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
             } else {
                 uint32_t j;
                 const HufDec *pl =
-                    &w->longdec[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
+                    &longdec[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
                 if (!pl->p) goto cleanup;
                 for (j = 0; j < pl->lit; ++j) {
-                        int l = (int)(w->hcode[pl->p[j]] & 63);
+                    int l = (int)(w->hcode[pl->p[j]] & 63);
                     while (lc < l && ptr < ie) hgetchar(&c, &lc, &ptr);
                     if (lc >= l) {
                         uint64_t cv = ((uint64_t)w->hcode[pl->p[j]]) >> 6;
@@ -582,7 +804,7 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
         c >>= i;
         lc -= i;
         while (lc > 0) {
-            uint32_t code = w->fast[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
+            uint32_t code = fast[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
             if (code) {
                 lc -= (int)(code & 63u);
                 if (!get_code((int)(code >> 6), rlc, &c, &lc, &ptr, ie, &outp, outb,
@@ -590,7 +812,7 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
                     goto cleanup;
             } else {
                 const HufDec *pl =
-                    &w->longdec[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
+                    &longdec[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
                 if (!pl->p) goto cleanup;
                 goto cleanup;
             }
@@ -607,6 +829,7 @@ cleanup:
         exr_free(a, w->hcode);
         exr_free(a, w->lengths);
         exr_free(a, w->symbols);
+        exr_free(a, w->ids);
     }
     return ret;
 }
@@ -851,8 +1074,8 @@ static void wenc16(uint16_t a, uint16_t b, uint16_t *l, uint16_t *h) {
     *h = (uint16_t)d;
 }
 
-static void wav2_encode(uint16_t *in, int nx, int ox, int ny, int oy,
-                        uint16_t mx) {
+static PIZ_OPT_O3 void wav2_encode(uint16_t *in, int nx, int ox, int ny,
+                                   int oy, uint16_t mx) {
     int w14 = (mx < (1 << 14));
     int n = (nx > ny) ? ny : nx;
     int p = 1, p2 = 2;
@@ -1065,8 +1288,8 @@ static void huf_send_code(pizbw *w, int64_t sCode, int runCount, int64_t rCode) 
     }
 }
 
-static int huf_encode(const int64_t *hcode, const uint16_t *in, int ni, int rlc,
-                      uint8_t *out) {
+static PIZ_OPT_O3 int huf_encode(const int64_t *hcode, const uint16_t *in,
+                                 int ni, int rlc, uint8_t *out) {
     pizbw w;
     int s = in[0], cs = 0, i;
     w.p = out;
@@ -1087,8 +1310,9 @@ static int huf_encode(const int64_t *hcode, const uint16_t *in, int ni, int rlc,
 }
 
 /* Compress nRaw uint16 values; returns total bytes written to `out`. */
-static int huf_compress(const exr_allocator *a, const uint16_t *raw, int nRaw,
-                        uint8_t *out, int *err) {
+static PIZ_OPT_O3 int huf_compress(const exr_allocator *a,
+                                   const uint16_t *raw, int nRaw,
+                                   uint8_t *out, int *err) {
     int64_t *freq;
     int im = 0, iM = 0;
     uint8_t *tableStart, *tableEnd, *dataStart;
