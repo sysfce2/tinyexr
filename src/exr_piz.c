@@ -387,7 +387,10 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
         im > iM)
         return 0;
 
-    slot = exr_context_piz_slot(context);
+    /* The public context is shared by reader workers. Keep the reusable
+     * workspace on the serial path only; threaded decodes use the local
+     * workspace below so Huffman tables cannot race between workers. */
+    slot = exr_get_num_threads() <= 1 ? exr_context_piz_slot(context) : NULL;
     if (slot) {
         if (!*slot) {
             *slot = exr_calloc(a, 1, sizeof(*w));
