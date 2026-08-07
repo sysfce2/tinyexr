@@ -76,8 +76,15 @@ static uint16_t reverse_lut_from_bitmap(const uint8_t *bitmap, uint16_t *lut) {
 }
 
 static void apply_lut(const uint16_t *lut, uint16_t *data, size_t n) {
-    size_t i;
-    for (i = 0; i < n; ++i) data[i] = lut[data[i]];
+    uint16_t dvals[8];
+    while (n > 8) {
+        memcpy(dvals, data, sizeof(dvals));
+        for (int i = 0; i < 8; ++i) dvals[i] = lut[dvals[i]];
+        memcpy(data, dvals, sizeof(dvals));
+        data += 8;
+        n -= 8;
+    }
+    for (size_t i = 0; i < n; ++i) data[i] = lut[data[i]];
 }
 
 /* ---- inverse wavelet (faithful port of OpenEXR wdec14/wdec16/wav2Decode) -- */
@@ -99,6 +106,27 @@ static void wdec16(uint16_t l, uint16_t h, uint16_t *a, uint16_t *b) {
     int aa = (d + bb - WAV_A_OFFSET) & WAV_MOD_MASK;
     *b = (uint16_t)bb;
     *a = (uint16_t)aa;
+}
+
+static void wdec14_4(uint16_t *px, uint16_t *p01, uint16_t *p10,
+                     uint16_t *p11) {
+    int ai = (int)(int16_t)*px;
+    int bi = (int)(int16_t)*p10;
+    int ci = (int)(int16_t)*p01;
+    int di = (int)(int16_t)*p11;
+    int i00 = ai + (bi & 1) + (bi >> 1);
+    int i10 = i00 - bi;
+    int i01 = ci + (di & 1) + (di >> 1);
+    int i11 = i01 - di;
+
+    ai = i00 + (i01 & 1) + (i01 >> 1);
+    bi = ai - i01;
+    ci = i10 + (i11 & 1) + (i11 >> 1);
+    di = ci - i11;
+    *px = (uint16_t)ai;
+    *p01 = (uint16_t)bi;
+    *p10 = (uint16_t)ci;
+    *p11 = (uint16_t)di;
 }
 
 static void wav2_decode(uint16_t *in, int nx, int ox, int ny, int oy,
@@ -126,10 +154,7 @@ static void wav2_decode(uint16_t *in, int nx, int ox, int ny, int oy,
                 uint16_t *p10 = px + oy1;
                 uint16_t *p11 = p10 + ox1;
                 if (w14) {
-                    wdec14(*px, *p10, &i00, &i10);
-                    wdec14(*p01, *p11, &i01, &i11);
-                    wdec14(i00, i01, px, p01);
-                    wdec14(i10, i11, p10, p11);
+                    wdec14_4(px, p01, p10, p11);
                 } else {
                     wdec16(*px, *p10, &i00, &i10);
                     wdec16(*p01, *p11, &i01, &i11);
