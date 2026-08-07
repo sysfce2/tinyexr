@@ -29,6 +29,7 @@
 #define DFL_FAST_SIZE (1 << DFL_FAST_BITS)
 #define DFL_LONG_TABLE_SIZE (320 * 8)
 #define DFL_ENTRY_VALID UINT32_C(0x80000000)
+#define DFL_ENTRY_LITERAL UINT32_C(0x40000000)
 
 static const uint8_t dfl_codelen_order[DFL_CODELEN_CODES] = {
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
@@ -130,6 +131,7 @@ typedef struct {
 static uint32_t dfl_fast_entry(int sym, int len, int with_length_info) {
     uint32_t entry = DFL_ENTRY_VALID | ((uint32_t)sym << 4) |
                      (uint32_t)len;
+    if (sym < 256) entry |= DFL_ENTRY_LITERAL | ((uint32_t)sym << 16);
     if (with_length_info && sym >= 257 && sym <= 285) {
         int i = sym - 257;
         entry |= (uint32_t)dfl_length_base[i] << 15;
@@ -446,40 +448,41 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             uint32_t dentry;
 
             if (DFL_UNLIKELY(!(entry & DFL_ENTRY_VALID))) break;
-            sym = (entry >> 4) & 0x7FF;
             bits >>= entry & 0xF;
             count -= entry & 0xF;
-            if (DFL_LIKELY(sym < 256)) {
+            if (DFL_LIKELY(entry & DFL_ENTRY_LITERAL)) {
                 if (DFL_UNLIKELY(op >= out_end)) return 0;
-                *op++ = (uint8_t)sym;
+                *op++ = (uint8_t)(entry >> 16);
                 /* Literal runs are common after the EXR predictor. Decode one
                  * more fast literal without paying the outer-loop branch and
                  * refill checks. Leave a match/end marker for the normal path. */
                 if (DFL_LIKELY(count >= 15)) {
                     uint32_t next = litlen_t->fast_table[
                         (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
-                    int next_sym = (next >> 4) & 0x7FF;
-                    if (DFL_LIKELY((next & DFL_ENTRY_VALID) && next_sym < 256)) {
+                    if (DFL_LIKELY((next & (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL)) ==
+                                  (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL))) {
                         bits >>= next & 0xF;
                         count -= next & 0xF;
                         if (DFL_UNLIKELY(op >= out_end)) return 0;
-                        *op++ = (uint8_t)next_sym;
+                        *op++ = (uint8_t)(next >> 16);
                         if (DFL_LIKELY(count >= 15)) {
                             uint32_t next2 = litlen_t->fast_table[
                                 (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
-                            int next2_sym = (next2 >> 4) & 0x7FF;
-                            if (DFL_LIKELY((next2 & DFL_ENTRY_VALID) &&
-                                          next2_sym < 256)) {
+                            if (DFL_LIKELY((next2 & (DFL_ENTRY_VALID |
+                                                     DFL_ENTRY_LITERAL)) ==
+                                          (DFL_ENTRY_VALID |
+                                           DFL_ENTRY_LITERAL))) {
                                 bits >>= next2 & 0xF;
                                 count -= next2 & 0xF;
                                 if (DFL_UNLIKELY(op >= out_end)) return 0;
-                                *op++ = (uint8_t)next2_sym;
+                                *op++ = (uint8_t)(next2 >> 16);
                             }
                         }
                     }
                 }
                 continue;
             }
+            sym = (entry >> 4) & 0x7FF;
             if (sym == 256) {
                 reader->bits = bits;
                 reader->count = count;
