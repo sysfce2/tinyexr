@@ -664,6 +664,13 @@ static int decode_block_fast(dfl_br *reader, const dfl_huff *litlen_t,
         if ((size_t)(out_end - op) < (size_t)length) goto fallback;
         if (count <= 56)
             br_refill_fast_state(&bits, &count, &ptr, reader->end);
+        /* Preload the next literal/length entry before starting the match
+         * copy.  Its table-load latency can overlap the memory traffic, as in
+         * libdeflate's fast loop.  If the tail is too short, leave the exact
+         * loop to perform the normal refill and lookup. */
+        if ((size_t)(out_end - op) >= 258 && count >= 15 &&
+            dfl_lookup_litlen(litlen_t, bits, count, &entry))
+            have_entry = 1;
         if ((size_t)(out_end - op) >=
             (((size_t)length + 7u) & ~(size_t)7u))
             copy_match_slack(op, length, distance);
