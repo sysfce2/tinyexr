@@ -153,7 +153,7 @@ DFL_INLINE int dfl_lookup_litlen(const dfl_huff *table, uint64_t bits,
                                  int count, uint32_t *entry) {
     uint32_t idx = (uint32_t)(bits & (DFL_FAST_SIZE - 1));
     *entry = table->fast_table[idx];
-    if (*entry & DFL_ENTRY_VALID) return 1;
+    if (DFL_LIKELY(*entry & DFL_ENTRY_VALID)) return 1;
     if (count < DFL_MAX_BITS) return 0;
     {
         uint16_t offset = table->long_index[idx];
@@ -173,10 +173,10 @@ DFL_INLINE int dfl_lookup_dist(const dfl_huff *table, uint64_t bits,
                                int count, uint32_t *entry) {
     uint32_t idx = (uint32_t)(bits & (DFL_DIST_FAST_SIZE - 1));
     *entry = table->dist_fast_table[idx];
-    if (*entry & DFL_ENTRY_VALID) return 1;
+    if (DFL_LIKELY(*entry & DFL_ENTRY_VALID)) return 1;
     idx = (uint32_t)(bits & (DFL_FAST_SIZE - 1));
     *entry = table->fast_table[idx];
-    if (*entry & DFL_ENTRY_VALID) return 1;
+    if (DFL_LIKELY(*entry & DFL_ENTRY_VALID)) return 1;
     if (count < DFL_MAX_BITS) return 0;
     {
         uint16_t offset = table->long_index[idx];
