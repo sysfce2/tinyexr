@@ -816,12 +816,12 @@ static size_t lz_parse(const exr_allocator *a, const uint8_t *src, size_t n,
     int32_t *head = NULL, *prev = NULL;
     size_t i = 0, ntok = 0;
     int32_t k;
-    /* Size the hash table to the block (avoids memset'ing 128 KB for the tiny
-     * blocks ZIPS produces). hbits in [10,15]; shift selects the top bits. */
+    /* Size the hash table to the block (avoids memset'ing a full table for the
+     * tiny blocks ZIPS produces). hbits in [10,17]; shift selects the top bits. */
     int hbits = 10;
     size_t hsize;
     int shift;
-    while (hbits < 15 && ((size_t)1 << hbits) < n) ++hbits;
+    while (hbits < 17 && ((size_t)1 << hbits) < n) ++hbits;
     hsize = (size_t)1 << hbits;
     shift = 32 - hbits;
 
