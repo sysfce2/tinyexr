@@ -320,6 +320,10 @@ static void copy_match(uint8_t *dst, const uint8_t *src, int length,
         memset(dst, *src, (size_t)length);
         return;
     }
+    if (distance >= length) {
+        memcpy(dst, src, (size_t)length);
+        return;
+    }
     /* When distance >= 8 the 8-byte source window is fully written already, so
      * even self-overlapping LZ copies can advance a word at a time. */
     if (distance >= 8) {
@@ -422,6 +426,18 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                         count -= next & 0xF;
                         if (DFL_UNLIKELY(op >= out_end)) return 0;
                         *op++ = (uint8_t)next_sym;
+                        if (DFL_LIKELY(count >= 15)) {
+                            uint16_t next2 = litlen_t->fast_table[
+                                (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
+                            int next2_sym = (next2 >> 4) & 0x7FF;
+                            if (DFL_LIKELY((next2 & 0x8000) &&
+                                          next2_sym < 256)) {
+                                bits >>= next2 & 0xF;
+                                count -= next2 & 0xF;
+                                if (DFL_UNLIKELY(op >= out_end)) return 0;
+                                *op++ = (uint8_t)next2_sym;
+                            }
+                        }
                     }
                 }
                 continue;
@@ -456,7 +472,7 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                 reader->bits = bits;
                 reader->count = count;
                 reader->ptr = ptr;
-                dist_sym = decode_symbol_slow(reader, dist_t);
+                dist_sym = decode_symbol(reader, dist_t);
                 bits = reader->bits;
                 count = reader->count;
                 ptr = reader->ptr;
