@@ -868,14 +868,28 @@ DFL_INLINE size_t enc_match_len(const uint8_t *s1, const uint8_t *s2,
 }
 
 static int len_code(int L) {
-    int i;
-    for (i = 28; i >= 0; --i) if (L >= (int)dfl_length_base[i]) return i;
-    return 0;
+    if (L < 11) return L - 3;
+    if (L < 19) return 8 + ((L - 11) >> 1);
+    if (L < 35) return 12 + ((L - 19) >> 2);
+    if (L < 67) return 16 + ((L - 35) >> 3);
+    if (L < 131) return 20 + ((L - 67) >> 4);
+    if (L < 258) return 24 + ((L - 131) >> 5);
+    return 28;
 }
 static int dist_code(int D) {
-    int i;
-    for (i = 29; i >= 0; --i) if (D >= (int)dfl_dist_base[i]) return i;
-    return 0;
+    int msb;
+    if (D < 5) return D - 1;
+#if defined(__GNUC__) || defined(__clang__)
+    msb = 31 - __builtin_clz((unsigned int)D);
+#else
+    msb = 0;
+    while ((1u << (msb + 1)) <= (unsigned int)D) ++msb;
+#endif
+    {
+        int base = 1 << msb;
+        if (D == base) return (msb << 1) - 1;
+        return (msb << 1) + (D > base + (base >> 1));
+    }
 }
 
 typedef struct {
