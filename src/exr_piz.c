@@ -94,11 +94,15 @@ static uint16_t reverse_lut_from_bitmap(const uint8_t *bitmap, uint16_t *lut) {
 }
 
 static void apply_lut(const uint16_t *lut, uint16_t *data, size_t n) {
-    uint16_t dvals[8];
-    while (n > 8) {
-        memcpy(dvals, data, sizeof(dvals));
-        for (int i = 0; i < 8; ++i) dvals[i] = lut[dvals[i]];
-        memcpy(data, dvals, sizeof(dvals));
+    while (n >= 8) {
+        data[0] = lut[data[0]];
+        data[1] = lut[data[1]];
+        data[2] = lut[data[2]];
+        data[3] = lut[data[3]];
+        data[4] = lut[data[4]];
+        data[5] = lut[data[5]];
+        data[6] = lut[data[6]];
+        data[7] = lut[data[7]];
         data += 8;
         n -= 8;
     }
