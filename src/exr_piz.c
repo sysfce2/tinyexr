@@ -514,9 +514,19 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
                 if (lit != rlc) {
                     if (outp >= oe) goto cleanup;
                     *outp++ = (uint16_t)lit;
-                } else if (!get_code(lit, rlc, &c, &lc, &ptr, ie, &outp,
-                                     outb, oe)) {
-                    goto cleanup;
+                } else {
+                    uint8_t cs;
+                    uint16_t s;
+                    if (lc < 8) {
+                        if (ptr >= ie) goto cleanup;
+                        hgetchar(&c, &lc, &ptr);
+                    }
+                    lc -= 8;
+                    cs = (uint8_t)((c >> lc) & 0xffu);
+                    if (outp <= outb || (size_t)(oe - outp) < (size_t)cs)
+                        goto cleanup;
+                    s = outp[-1];
+                    while (cs-- > 0) *outp++ = s;
                 }
             } else {
                 uint32_t j;
