@@ -25,9 +25,11 @@
 #define DFL_LITLEN_CODES 288
 #define DFL_DIST_CODES 32
 #define DFL_CODELEN_CODES 19
-#define DFL_FAST_BITS 12
+#define DFL_FAST_BITS 11
 #define DFL_FAST_SIZE (1 << DFL_FAST_BITS)
-#define DFL_LONG_TABLE_SIZE (320 * 8)
+#define DFL_LONG_SLOT_BITS (DFL_MAX_BITS - DFL_FAST_BITS)
+#define DFL_LONG_SLOT_SIZE (1 << DFL_LONG_SLOT_BITS)
+#define DFL_LONG_TABLE_SIZE (320 * DFL_LONG_SLOT_SIZE)
 #define DFL_ENTRY_VALID UINT32_C(0x80000000)
 #define DFL_ENTRY_LITERAL UINT32_C(0x40000000)
 
@@ -116,8 +118,8 @@ DFL_INLINE void br_align(dfl_br *br) { br_consume(br, br->count & 7); }
 
 typedef struct {
     uint32_t fast_table[DFL_FAST_SIZE]; /* metadata-bearing decode entries */
-    /* Each occupied 12-bit prefix owns eight entries for the remaining
-     * 3 bits.  Only 13--15 bit codes need this table; the scalar list below
+    /* Each occupied 11-bit prefix owns sixteen entries for the remaining
+     * 4 bits.  Only 12--15 bit codes need this table; the scalar list below
      * remains available for truncated final buffers and malformed streams. */
     uint16_t long_index[DFL_FAST_SIZE];
     uint16_t long_table[DFL_LONG_TABLE_SIZE];
@@ -240,19 +242,20 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
             if (len <= DFL_MAX_BITS) {
                 int prefix = rev & (DFL_FAST_SIZE - 1);
                 int extra = len - DFL_FAST_BITS;
-                int suffix = (rev >> DFL_FAST_BITS) & 7;
-                int fill = 1 << (3 - extra);
+                int suffix = (rev >> DFL_FAST_BITS) &
+                             (DFL_LONG_SLOT_SIZE - 1);
+                int fill = 1 << (DFL_LONG_SLOT_BITS - extra);
                 uint16_t entry = (uint16_t)((sym << 4) | len | 0x8000);
                 uint16_t offset;
                 int k;
 
                 if (table->long_index[prefix] == 0) {
                     if (table->long_count >
-                        DFL_LONG_TABLE_SIZE - 8)
+                        DFL_LONG_TABLE_SIZE - DFL_LONG_SLOT_SIZE)
                         return 0;
                     offset = (uint16_t)table->long_count;
                     table->long_index[prefix] = (uint16_t)(offset + 1);
-                    table->long_count += 8;
+                    table->long_count += DFL_LONG_SLOT_SIZE;
                 } else {
                     offset = (uint16_t)(table->long_index[prefix] - 1);
                 }
@@ -341,7 +344,8 @@ DFL_INLINE int decode_symbol(dfl_br *reader, const dfl_huff *table) {
         uint16_t offset = table->long_index[idx];
         if (offset != 0) {
             uint16_t long_entry = table->long_table[
-                (offset - 1) | ((reader->bits >> DFL_FAST_BITS) & 7u)];
+                (offset - 1) |
+                ((reader->bits >> DFL_FAST_BITS) & (DFL_LONG_SLOT_SIZE - 1))];
             if (DFL_LIKELY(long_entry & 0x8000)) {
                 br_consume(reader, long_entry & 0xF);
                 return (long_entry >> 4) & 0x7FF;
