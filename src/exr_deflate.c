@@ -105,9 +105,9 @@ DFL_INLINE void br_refill_fast_state(uint64_t *bits, int *count,
         }
     }
 }
-/* In the guarded fast loop, only the low byte of count is meaningful.  This
- * lets the decoder subtract complete table entries and keeps their metadata
- * out of the dependency chain used for bit availability. */
+/* In the guarded fast loop, only the low byte of count is meaningful.  Keep
+ * the remaining bits available for refill state, while consuming the packed
+ * entry's low-byte bit count explicitly. */
 DFL_INLINE void br_refill_fast_meta(uint64_t *bits, uint32_t *count,
                                     const uint8_t **ptr,
                                     const uint8_t *end) {
@@ -143,9 +143,8 @@ DFL_INLINE void br_align(dfl_br *br) { br_consume(br, br->count & 7); }
 
 typedef struct {
     uint32_t fast_table[DFL_FAST_SIZE]; /* metadata-bearing decode entries */
-    /* Distance codes are much smaller than literal/length codes.  Keeping
-     * their primary table at eight bits matches the useful part of the
-     * libdeflate layout and avoids touching another 8 KiB in the hot loop. */
+    /* Distance codes are much smaller than literal/length codes.  An eight-bit
+     * primary table covers the common case without a larger 15-bit table. */
     uint32_t dist_fast_table[DFL_DIST_FAST_SIZE];
     /* Each occupied 11-bit prefix owns sixteen entries for the remaining
      * 4 bits.  Only 12--15 bit codes need this table; the scalar list below
@@ -760,13 +759,15 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
         while (DFL_LIKELY(count >= 15)) {
             int sym, length, extra, dist_sym, distance, length_sym;
+            int code_len;
             const uint8_t *match;
             uint32_t didx;
             uint32_t dentry;
 
             if (DFL_UNLIKELY(!(entry & DFL_ENTRY_VALID))) break;
-            bits >>= dfl_entry_code_len(entry, litlen_t);
-            count -= dfl_entry_code_len(entry, litlen_t);
+            code_len = dfl_entry_code_len(entry, litlen_t);
+            bits >>= code_len;
+            count -= code_len;
             if (DFL_LIKELY(entry & DFL_ENTRY_LITERAL)) {
                 int have_next = 0;
                 if (DFL_UNLIKELY(op >= out_end)) return 0;
@@ -780,8 +781,9 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                     if (DFL_LIKELY((next & (DFL_ENTRY_VALID |
                                            DFL_ENTRY_LITERAL)) ==
                                    (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL))) {
-                        bits >>= dfl_entry_code_len(next, litlen_t);
-                        count -= dfl_entry_code_len(next, litlen_t);
+                        code_len = dfl_entry_code_len(next, litlen_t);
+                        bits >>= code_len;
+                        count -= code_len;
                         if (DFL_UNLIKELY(op >= out_end)) return 0;
                         *op++ = (uint8_t)dfl_entry_sym(next);
                         if (DFL_LIKELY(count >= 15)) {
@@ -791,8 +793,9 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                                                      DFL_ENTRY_LITERAL)) ==
                                            (DFL_ENTRY_VALID |
                                             DFL_ENTRY_LITERAL))) {
-                                bits >>= dfl_entry_code_len(next2, litlen_t);
-                                count -= dfl_entry_code_len(next2, litlen_t);
+                                code_len = dfl_entry_code_len(next2, litlen_t);
+                                bits >>= code_len;
+                                count -= code_len;
                                 if (DFL_UNLIKELY(op >= out_end)) return 0;
                                 *op++ = (uint8_t)dfl_entry_sym(next2);
                             } else {
@@ -837,8 +840,9 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             dentry = dist_t->dist_fast_table[didx];
             if (DFL_LIKELY(dentry & DFL_ENTRY_VALID)) {
                 dist_sym = dfl_entry_sym(dentry);
-                bits >>= dfl_entry_code_len(dentry, dist_t);
-                count -= dfl_entry_code_len(dentry, dist_t);
+                code_len = dfl_entry_code_len(dentry, dist_t);
+                bits >>= code_len;
+                count -= code_len;
             } else {
                 reader->bits = bits;
                 reader->count = count;
