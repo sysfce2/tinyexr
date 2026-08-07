@@ -79,6 +79,24 @@ DFL_INLINE void br_refill_fast(dfl_br *br) {
         br_refill(br);
     }
 }
+DFL_INLINE void br_refill_fast_state(uint64_t *bits, int *count,
+                                     const uint8_t **ptr,
+                                     const uint8_t *end) {
+    if (DFL_LIKELY((size_t)(end - *ptr) >= 8)) {
+        uint64_t nb;
+        int adv;
+        memcpy(&nb, *ptr, 8);
+        *bits |= nb << *count;
+        adv = (64 - *count) / 8;
+        *ptr += adv;
+        *count += adv * 8;
+    } else {
+        while (*count <= 56 && *ptr < end) {
+            *bits |= (uint64_t)(*(*ptr)++) << *count;
+            *count += 8;
+        }
+    }
+}
 DFL_INLINE uint32_t br_peek(const dfl_br *br, int n) {
     return (uint32_t)(br->bits & ((1ULL << n) - 1));
 }
@@ -313,10 +331,17 @@ static int decode_dynamic_tables(dfl_br *reader, dfl_huff *litlen,
 static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                         const dfl_huff *dist_t, uint8_t **out,
                         uint8_t *out_start, uint8_t *out_end) {
+    /* Keep the hot symbol loop in registers. The reader object is synchronized
+     * only when a long-code fallback needs the generic decoder or at block end. */
+    uint64_t bits = reader->bits;
+    int count = reader->count;
+    const uint8_t *ptr = reader->ptr;
+    uint8_t *op = *out;
+
     for (;;) {
-        br_refill_fast(reader);
-        while (DFL_LIKELY(reader->count >= 15)) {
-            uint32_t idx = br_peek(reader, DFL_FAST_BITS);
+        br_refill_fast_state(&bits, &count, &ptr, reader->end);
+        while (DFL_LIKELY(count >= 15)) {
+            uint32_t idx = (uint32_t)(bits & (DFL_FAST_SIZE - 1));
             uint16_t entry = litlen_t->fast_table[idx];
             int sym, length, extra, dist_sym, distance, length_sym;
             const uint8_t *match;
@@ -325,52 +350,80 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
 
             if (DFL_UNLIKELY(!(entry & 0x8000))) break;
             sym = (entry >> 4) & 0x7FF;
-            br_consume(reader, entry & 0xF);
+            bits >>= entry & 0xF;
+            count -= entry & 0xF;
             if (DFL_LIKELY(sym < 256)) {
-                if (DFL_UNLIKELY(*out >= out_end)) return 0;
-                *(*out)++ = (uint8_t)sym;
+                if (DFL_UNLIKELY(op >= out_end)) return 0;
+                *op++ = (uint8_t)sym;
                 continue;
             }
-            if (sym == 256) return 1;
+            if (sym == 256) {
+                reader->bits = bits;
+                reader->count = count;
+                reader->ptr = ptr;
+                *out = op;
+                return 1;
+            }
             length_sym = sym - 257;
             if (DFL_UNLIKELY(length_sym >= 29)) return 0;
             length = dfl_length_base[length_sym];
             extra = dfl_length_extra[length_sym];
             if (extra > 0) {
-                if (DFL_UNLIKELY(reader->count < extra)) br_refill_fast(reader);
-                length += (int)br_read(reader, extra);
+                if (DFL_UNLIKELY(count < extra))
+                    br_refill_fast_state(&bits, &count, &ptr, reader->end);
+                length += (int)(bits & ((1ULL << extra) - 1));
+                bits >>= extra;
+                count -= extra;
             }
-            if (DFL_UNLIKELY(reader->count < 15)) br_refill_fast(reader);
-            didx = br_peek(reader, DFL_FAST_BITS);
+            if (DFL_UNLIKELY(count < 15))
+                br_refill_fast_state(&bits, &count, &ptr, reader->end);
+            didx = (uint32_t)(bits & (DFL_FAST_SIZE - 1));
             dentry = dist_t->fast_table[didx];
             if (DFL_LIKELY(dentry & 0x8000)) {
                 dist_sym = (dentry >> 4) & 0x7FF;
-                br_consume(reader, dentry & 0xF);
+                bits >>= dentry & 0xF;
+                count -= dentry & 0xF;
             } else {
+                reader->bits = bits;
+                reader->count = count;
+                reader->ptr = ptr;
                 dist_sym = decode_symbol_slow(reader, dist_t);
+                bits = reader->bits;
+                count = reader->count;
+                ptr = reader->ptr;
             }
             if (DFL_UNLIKELY(dist_sym < 0 || dist_sym >= 30)) return 0;
             distance = dfl_dist_base[dist_sym];
             extra = dfl_dist_extra[dist_sym];
             if (extra > 0) {
-                if (DFL_UNLIKELY(reader->count < extra)) br_refill_fast(reader);
-                distance += (int)br_read(reader, extra);
+                if (DFL_UNLIKELY(count < extra))
+                    br_refill_fast_state(&bits, &count, &ptr, reader->end);
+                distance += (int)(bits & ((1ULL << extra) - 1));
+                bits >>= extra;
+                count -= extra;
             }
-            if (DFL_UNLIKELY((size_t)(out_end - *out) < (size_t)length))
+            if (DFL_UNLIKELY((size_t)(out_end - op) < (size_t)length))
                 return 0;
-            if (DFL_UNLIKELY(*out - out_start < distance)) return 0;
-            match = *out - distance;
-            copy_match(*out, match, length, distance);
-            *out += length;
+            if (DFL_UNLIKELY(op - out_start < distance)) return 0;
+            match = op - distance;
+            copy_match(op, match, length, distance);
+            op += length;
         }
 
         {
+            reader->bits = bits;
+            reader->count = count;
+            reader->ptr = ptr;
             int sym = decode_symbol(reader, litlen_t);
+            bits = reader->bits;
+            count = reader->count;
+            ptr = reader->ptr;
             if (sym < 0) return 0;
             if (sym < 256) {
-                if (DFL_UNLIKELY(*out >= out_end)) return 0;
-                *(*out)++ = (uint8_t)sym;
+                if (DFL_UNLIKELY(op >= out_end)) return 0;
+                *op++ = (uint8_t)sym;
             } else if (sym == 256) {
+                *out = op;
                 return 1;
             } else {
                 int length_sym = sym - 257, length, extra, dist_sym, distance;
@@ -379,23 +432,35 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                 length = dfl_length_base[length_sym];
                 extra = dfl_length_extra[length_sym];
                 if (extra > 0) {
-                    if (reader->count < extra) br_refill_fast(reader);
-                    length += (int)br_read(reader, extra);
+                    if (count < extra)
+                        br_refill_fast_state(&bits, &count, &ptr, reader->end);
+                    length += (int)(bits & ((1ULL << extra) - 1));
+                    bits >>= extra;
+                    count -= extra;
                 }
+                reader->bits = bits;
+                reader->count = count;
+                reader->ptr = ptr;
                 dist_sym = decode_symbol(reader, dist_t);
+                bits = reader->bits;
+                count = reader->count;
+                ptr = reader->ptr;
                 if (dist_sym < 0 || dist_sym >= 30) return 0;
                 distance = dfl_dist_base[dist_sym];
                 extra = dfl_dist_extra[dist_sym];
                 if (extra > 0) {
-                    if (reader->count < extra) br_refill_fast(reader);
-                    distance += (int)br_read(reader, extra);
+                    if (count < extra)
+                        br_refill_fast_state(&bits, &count, &ptr, reader->end);
+                    distance += (int)(bits & ((1ULL << extra) - 1));
+                    bits >>= extra;
+                    count -= extra;
                 }
-                if (DFL_UNLIKELY((size_t)(out_end - *out) < (size_t)length))
+                if (DFL_UNLIKELY((size_t)(out_end - op) < (size_t)length))
                     return 0;
-                if (DFL_UNLIKELY(*out - out_start < distance)) return 0;
-                match = *out - distance;
-                copy_match(*out, match, length, distance);
-                *out += length;
+                if (DFL_UNLIKELY(op - out_start < distance)) return 0;
+                match = op - distance;
+                copy_match(op, match, length, distance);
+                op += length;
             }
         }
     }
