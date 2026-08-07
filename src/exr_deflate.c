@@ -758,7 +758,7 @@ static int start_dynamic_block(defl_huff *d, bitw *w) {
 /* Hash-chain probe depth and "good enough" match length. These trade ratio for
  * speed; the values below target libdeflate level-4-ish throughput (the codec
  * still emits valid DEFLATE, so correctness is unaffected). */
-#define ENC_MAX_CHAIN 4
+#define ENC_MAX_CHAIN 1
 #define ENC_NICE_LEN 32
 
 /* Length of the common prefix of s1[0..maxlen) and s2[0..maxlen), compared a
