@@ -382,6 +382,29 @@ DFL_INLINE void copy_match(uint8_t *dst, const uint8_t *src, int length,
         return;
     }
     if (distance >= length) {
+        switch (length) {
+            case 1: dst[0] = src[0]; return;
+            case 2: dst[0] = src[0]; dst[1] = src[1]; return;
+            case 3: dst[0] = src[0]; dst[1] = src[1];
+                    dst[2] = src[2]; return;
+            case 4: dst[0] = src[0]; dst[1] = src[1];
+                    dst[2] = src[2]; dst[3] = src[3]; return;
+            case 5: dst[0] = src[0]; dst[1] = src[1];
+                    dst[2] = src[2]; dst[3] = src[3];
+                    dst[4] = src[4]; return;
+            case 6: dst[0] = src[0]; dst[1] = src[1];
+                    dst[2] = src[2]; dst[3] = src[3];
+                    dst[4] = src[4]; dst[5] = src[5]; return;
+            case 7: dst[0] = src[0]; dst[1] = src[1];
+                    dst[2] = src[2]; dst[3] = src[3];
+                    dst[4] = src[4]; dst[5] = src[5];
+                    dst[6] = src[6]; return;
+            case 8: dst[0] = src[0]; dst[1] = src[1];
+                    dst[2] = src[2]; dst[3] = src[3];
+                    dst[4] = src[4]; dst[5] = src[5];
+                    dst[6] = src[6]; dst[7] = src[7]; return;
+            default: break;
+        }
         memcpy(dst, src, (size_t)length);
         return;
     }
