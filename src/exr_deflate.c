@@ -473,6 +473,7 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             bits >>= entry & 0xF;
             count -= entry & 0xF;
             if (DFL_LIKELY(entry & DFL_ENTRY_LITERAL)) {
+                int have_next = 0;
                 if (DFL_UNLIKELY(op >= out_end)) return 0;
                 *op++ = (uint8_t)(entry >> 16);
                 /* Literal runs are common after the EXR predictor. Decode one
@@ -498,11 +499,17 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                                 count -= next2 & 0xF;
                                 if (DFL_UNLIKELY(op >= out_end)) return 0;
                                 *op++ = (uint8_t)(next2 >> 16);
+                            } else {
+                                entry = next2;
+                                have_next = 1;
                             }
                         }
+                    } else {
+                        entry = next;
+                        have_next = 1;
                     }
                 }
-                if (DFL_LIKELY(count >= 15))
+                if (DFL_LIKELY(count >= 15) && !have_next)
                     entry = litlen_t->fast_table[
                         (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
                 continue;
