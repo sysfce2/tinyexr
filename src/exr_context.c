@@ -10,10 +10,15 @@
 struct exr_context {
     exr_allocator alloc;
     void *jph_state;
+    void *piz_state;
 };
 
 void **exr_context_jph_slot(exr_context *ctx) {
     return ctx ? &ctx->jph_state : NULL;
+}
+
+void **exr_context_piz_slot(exr_context *ctx) {
+    return ctx ? &ctx->piz_state : NULL;
 }
 
 const exr_allocator *exr_context_allocator(const exr_context *ctx) {
@@ -35,5 +40,6 @@ exr_result exr_context_create(const exr_allocator *alloc, exr_context **out) {
 void exr_context_destroy(exr_context *ctx) {
     if (!ctx) return;
     exr_jph_context_free(ctx);
+    exr_piz_context_free(ctx);
     exr_free(&ctx->alloc, ctx);
 }

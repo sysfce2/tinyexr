@@ -722,6 +722,8 @@ typedef struct exr_codec_ctx {
  * implementation owns the opaque state and may leave it NULL when unused. */
 void exr_jph_context_free(exr_context *ctx);
 void **exr_context_jph_slot(exr_context *ctx);
+void exr_piz_context_free(exr_context *ctx);
+void **exr_context_piz_slot(exr_context *ctx);
 const exr_allocator *exr_context_allocator(const exr_context *ctx);
 
 /* Decompress `src_size` bytes from `src` into `dst` (capacity dst_size, which
