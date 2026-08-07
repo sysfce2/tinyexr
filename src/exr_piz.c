@@ -16,7 +16,7 @@
 #define PIZ_USHORT_RANGE 65536
 #define PIZ_HUF_ENCSIZE (PIZ_USHORT_RANGE + 1) /* 65537 */
 
-#define HUF_DECBITS 14
+#define HUF_DECBITS 12
 #define HUF_DECSIZE (1 << HUF_DECBITS)
 #define HUF_DECMASK (HUF_DECSIZE - 1)
 #define SHORT_ZEROCODE_RUN 59
@@ -26,7 +26,6 @@
 typedef struct {
     uint32_t *p;  /* long-code symbol list */
     uint32_t lit; /* short: symbol; long: count */
-    uint32_t len; /* code length (0 => long-code bucket) */
 } HufDec;
 
 typedef struct {
@@ -37,7 +36,8 @@ typedef struct {
 typedef struct {
     int64_t *hcode;
     uint8_t *lengths;
-    HufDec *hdecod;
+    uint32_t *fast;
+    HufDec *longdec;
     uint32_t *counts;
     uint32_t *long_storage;
     size_t long_capacity;
@@ -54,7 +54,8 @@ void exr_piz_context_free(exr_context *ctx) {
     a = exr_context_allocator(ctx);
     exr_free(a, w->long_storage);
     exr_free(a, w->counts);
-    exr_free(a, w->hdecod);
+    exr_free(a, w->longdec);
+    exr_free(a, w->fast);
     exr_free(a, w->hcode);
     exr_free(a, w->lengths);
     exr_free(a, w);
@@ -264,16 +265,17 @@ static int unpack_enc_table(const uint8_t **pcode, int ni, int im, int iM,
 }
 
 static int build_dec_table(const exr_allocator *a, const int64_t *hcode, int im,
-                           int iM, HufDec *hdecod, uint32_t *counts,
+                           int iM, uint32_t *fast, HufDec *longdec,
+                           uint32_t *counts,
                            uint32_t **long_storage, size_t *long_capacity) {
     size_t total_long = 0;
     int i, sym;
 
     memset(counts, 0, HUF_DECSIZE * sizeof(*counts));
+    memset(fast, 0, HUF_DECSIZE * sizeof(*fast));
     for (i = 0; i < HUF_DECSIZE; ++i) {
-        hdecod[i].len = 0;
-        hdecod[i].lit = 0;
-        hdecod[i].p = NULL;
+        longdec[i].lit = 0;
+        longdec[i].p = NULL;
     }
     for (i = im; i <= iM; ++i) {
         uint64_t code_val = ((uint64_t)hcode[i]) >> 6;
@@ -282,18 +284,17 @@ static int build_dec_table(const exr_allocator *a, const int64_t *hcode, int im,
         if (code_val >> l) return 0;
         if (l > HUF_DECBITS) {
             size_t base = (size_t)(code_val >> (l - HUF_DECBITS));
-            if (hdecod[base].len) return 0;
+            if (fast[base] || longdec[base].p) return 0;
             counts[base]++;
         } else {
             size_t base = (size_t)(code_val << (HUF_DECBITS - l));
             size_t fill = (size_t)1u << (HUF_DECBITS - l), k;
             for (k = 0; k < fill; ++k) {
-                HufDec *pl = &hdecod[base + k];
-                if (counts[base + k] != 0 || pl->len || pl->p) {
+                if (counts[base + k] != 0 || fast[base + k] ||
+                    longdec[base + k].p) {
                     return 0;
                 }
-                pl->len = (uint32_t)l;
-                pl->lit = (uint32_t)i;
+                fast[base + k] = ((uint32_t)i << 6) | (uint32_t)l;
             }
         }
     }
@@ -319,8 +320,8 @@ static int build_dec_table(const exr_allocator *a, const int64_t *hcode, int im,
         uint32_t *storage = *long_storage;
         for (i = 0; i < HUF_DECSIZE; ++i) {
             if (counts[i] != 0) {
-                hdecod[i].p = storage;
-                hdecod[i].lit = counts[i];
+                longdec[i].p = storage;
+                longdec[i].lit = counts[i];
                 storage += counts[i];
                 counts[i] = 0;
             }
@@ -331,7 +332,7 @@ static int build_dec_table(const exr_allocator *a, const int64_t *hcode, int im,
         int l = (int)(hcode[sym] & 63);
         if (l > HUF_DECBITS) {
             size_t base = (size_t)(code_val >> (l - HUF_DECBITS));
-            hdecod[base].p[counts[base]++] = (uint32_t)sym;
+            longdec[base].p[counts[base]++] = (uint32_t)sym;
         }
     }
     return 1;
@@ -402,11 +403,14 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
         w->hcode = (int64_t *)exr_malloc(a, sizeof(*w->hcode) * PIZ_HUF_ENCSIZE);
     if (!w->lengths)
         w->lengths = (uint8_t *)exr_malloc(a, sizeof(*w->lengths) * PIZ_HUF_ENCSIZE);
-    if (!w->hdecod)
-        w->hdecod = (HufDec *)exr_malloc(a, sizeof(*w->hdecod) * HUF_DECSIZE);
+    if (!w->fast)
+        w->fast = (uint32_t *)exr_malloc(a, sizeof(*w->fast) * HUF_DECSIZE);
+    if (!w->longdec)
+        w->longdec = (HufDec *)exr_malloc(a, sizeof(*w->longdec) * HUF_DECSIZE);
     if (!w->counts)
         w->counts = (uint32_t *)exr_malloc(a, sizeof(*w->counts) * HUF_DECSIZE);
-    if (!w->hcode || !w->lengths || !w->hdecod || !w->counts) goto cleanup;
+    if (!w->hcode || !w->lengths || !w->fast || !w->longdec || !w->counts)
+        goto cleanup;
 
     ptr = in + 20;
     ni = (int)(in_len - 20);
@@ -415,7 +419,7 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
 
     ni = (int)(in_len - (size_t)(ptr - in));
     if (nBits < 0 || nBits > 8 * ni) goto cleanup;
-    if (!build_dec_table(a, w->hcode, im, iM, w->hdecod, w->counts,
+    if (!build_dec_table(a, w->hcode, im, iM, w->fast, w->longdec, w->counts,
                          &w->long_storage, &w->long_capacity))
         goto cleanup;
 
@@ -429,22 +433,25 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
     while (ptr < ie || lc >= HUF_DECBITS) {
         if (lc < HUF_DECBITS && ptr < ie) hrefill(&c, &lc, &ptr, ie);
         while (lc >= HUF_DECBITS) {
-            const HufDec *pl = &w->hdecod[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
-            if (pl->len) {
-                lc -= (int)pl->len;
+            uint32_t code = w->fast[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
+            if (code) {
+                int lit = (int)(code >> 6);
+                lc -= (int)(code & 63u);
                 /* Hot path: most symbols are plain literals (not the run-length
                  * code), which get_code() would emit as a single store. Inline
                  * that case to avoid a 9-argument call per decoded symbol; only
                  * the actual RLE marker falls through to get_code(). */
-                if ((int)pl->lit != rlc) {
+                if (lit != rlc) {
                     if (outp >= oe) goto cleanup;
-                    *outp++ = (uint16_t)pl->lit;
-                } else if (!get_code((int)pl->lit, rlc, &c, &lc, &ptr, ie, &outp,
+                    *outp++ = (uint16_t)lit;
+                } else if (!get_code(lit, rlc, &c, &lc, &ptr, ie, &outp,
                                      outb, oe)) {
                     goto cleanup;
                 }
             } else {
                 uint32_t j;
+                const HufDec *pl =
+                    &w->longdec[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
                 if (!pl->p) goto cleanup;
                 for (j = 0; j < pl->lit; ++j) {
                         int l = (int)(w->hcode[pl->p[j]] & 63);
@@ -471,13 +478,16 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
         c >>= i;
         lc -= i;
         while (lc > 0) {
-            const HufDec *pl = &w->hdecod[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
-            if (pl->len) {
-                lc -= (int)pl->len;
-                if (!get_code((int)pl->lit, rlc, &c, &lc, &ptr, ie, &outp, outb,
+            uint32_t code = w->fast[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
+            if (code) {
+                lc -= (int)(code & 63u);
+                if (!get_code((int)(code >> 6), rlc, &c, &lc, &ptr, ie, &outp, outb,
                               oe))
                     goto cleanup;
             } else {
+                const HufDec *pl =
+                    &w->longdec[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
+                if (!pl->p) goto cleanup;
                 goto cleanup;
             }
         }
@@ -488,7 +498,8 @@ cleanup:
     if (w == &local) {
         exr_free(a, w->long_storage);
         exr_free(a, w->counts);
-        exr_free(a, w->hdecod);
+        exr_free(a, w->longdec);
+        exr_free(a, w->fast);
         exr_free(a, w->hcode);
         exr_free(a, w->lengths);
     }
