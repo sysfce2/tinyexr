@@ -33,7 +33,6 @@
 #define DFL_LONG_SLOT_SIZE (1 << DFL_LONG_SLOT_BITS)
 #define DFL_LONG_TABLE_SIZE (320 * DFL_LONG_SLOT_SIZE)
 #define DFL_ENTRY_VALID UINT32_C(0x80000000)
-#define DFL_ENTRY_LITERAL UINT32_C(0x40000000)
 
 static const uint8_t dfl_codelen_order[DFL_CODELEN_CODES] = {
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
@@ -105,6 +104,28 @@ DFL_INLINE void br_refill_fast_state(uint64_t *bits, int *count,
         }
     }
 }
+/* In the guarded fast loop, only the low byte of count is meaningful.  This
+ * lets the decoder subtract complete table entries and keeps their metadata
+ * out of the dependency chain used for bit availability. */
+DFL_INLINE void br_refill_fast_meta(uint64_t *bits, uint32_t *count,
+                                    const uint8_t **ptr,
+                                    const uint8_t *end) {
+    uint32_t c = *count & 0xFFu;
+    if (c >= 56) return;
+    if (DFL_LIKELY((size_t)(end - *ptr) >= 8)) {
+        uint64_t nb;
+        memcpy(&nb, *ptr, 8);
+        *bits |= nb << c;
+        *ptr += 7 - ((c >> 3) & 7);
+        *count |= 56u;
+    } else {
+        while (c < 56 && *ptr < end) {
+            *bits |= (uint64_t)(*(*ptr)++) << c;
+            c += 8;
+        }
+        *count = (*count & ~UINT32_C(0xFF)) | c;
+    }
+}
 DFL_INLINE uint32_t br_peek(const dfl_br *br, int n) {
     return (uint32_t)(br->bits & ((1ULL << n) - 1));
 }
@@ -138,15 +159,21 @@ typedef struct {
 } dfl_huff;
 
 static uint32_t dfl_fast_entry(int sym, int len, int with_length_info) {
-    uint32_t entry = DFL_ENTRY_VALID | ((uint32_t)sym << 4) |
+    uint32_t entry = DFL_ENTRY_VALID | ((uint32_t)sym << 8) |
                      (uint32_t)len;
-    if (sym < 256) entry |= DFL_ENTRY_LITERAL | ((uint32_t)sym << 16);
     if (with_length_info && sym >= 257 && sym <= 285) {
         int i = sym - 257;
-        entry |= (uint32_t)dfl_length_base[i] << 15;
-        entry |= (uint32_t)dfl_length_extra[i] << 24;
+        entry |= (uint32_t)dfl_length_base[i] << 19;
+        entry |= (uint32_t)dfl_length_extra[i] << 28;
     }
     return entry;
+}
+
+DFL_INLINE int dfl_entry_sym(uint32_t entry) {
+    return (int)((entry >> 8) & 0x7FF);
+}
+DFL_INLINE int dfl_entry_is_literal(uint32_t entry) {
+    return dfl_entry_sym(entry) < 256;
 }
 
 DFL_INLINE int dfl_lookup_litlen(const dfl_huff *table, uint64_t bits,
@@ -399,7 +426,7 @@ DFL_INLINE int decode_symbol(dfl_br *reader, const dfl_huff *table) {
     entry = table->fast_table[idx];
     if (DFL_LIKELY(entry & DFL_ENTRY_VALID)) {
         br_consume(reader, entry & 0xF);
-        return (entry >> 4) & 0x7FF;
+        return dfl_entry_sym(entry);
     }
     if (reader->count >= DFL_MAX_BITS) {
         uint16_t offset = table->long_index[idx];
@@ -555,13 +582,13 @@ static int decode_block_fast(dfl_br *reader, const dfl_huff *litlen_t,
                              const dfl_huff *dist_t, uint8_t **out,
                              uint8_t *out_start, uint8_t *out_end) {
     uint64_t bits = reader->bits;
-    int count = reader->count;
+    uint32_t count = (uint32_t)reader->count;
     const uint8_t *ptr = reader->ptr;
     uint8_t *op = *out;
     uint32_t entry;
     int have_entry = 0;
     uint64_t saved_bits = bits;
-    int saved_count = count;
+    uint32_t saved_count = count;
     const uint8_t *saved_ptr = ptr;
     uint8_t *saved_op = op;
 
@@ -571,40 +598,40 @@ static int decode_block_fast(dfl_br *reader, const dfl_huff *litlen_t,
         uint32_t dentry;
 
         if (!have_entry) {
-            if (count <= 56)
-                br_refill_fast_state(&bits, &count, &ptr, reader->end);
-            if (count < 15 || (size_t)(out_end - op) < 258) break;
+            br_refill_fast_meta(&bits, &count, &ptr, reader->end);
+            if ((uint8_t)count < 15 || (size_t)(out_end - op) < 258) break;
         }
         saved_bits = bits;
         saved_count = count;
         saved_ptr = ptr;
         saved_op = op;
-        if (!have_entry && !dfl_lookup_litlen(litlen_t, bits, count, &entry))
+        if (!have_entry &&
+            !dfl_lookup_litlen(litlen_t, bits, (uint8_t)count, &entry))
             break;
         have_entry = 0;
 
-        if (entry & DFL_ENTRY_LITERAL) {
+        if (dfl_entry_is_literal(entry)) {
             bits >>= entry & 0xF;
-            count -= entry & 0xF;
-            *op++ = (uint8_t)(entry >> 16);
-            if (count >= 15) {
+            count -= entry;
+            *op++ = (uint8_t)dfl_entry_sym(entry);
+            if ((uint8_t)count >= 15) {
                 uint32_t next;
-                if (!dfl_lookup_litlen(litlen_t, bits, count, &next))
+                if (!dfl_lookup_litlen(litlen_t, bits, (uint8_t)count, &next))
                     goto fallback;
-                if ((next & (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL)) ==
-                    (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL)) {
+                if ((next & DFL_ENTRY_VALID) && dfl_entry_is_literal(next)) {
                     bits >>= next & 0xF;
-                    count -= next & 0xF;
-                    *op++ = (uint8_t)(next >> 16);
-                    if (count >= 15) {
+                    count -= next;
+                    *op++ = (uint8_t)dfl_entry_sym(next);
+                    if ((uint8_t)count >= 15) {
                         uint32_t next2;
-                        if (!dfl_lookup_litlen(litlen_t, bits, count, &next2))
+                        if (!dfl_lookup_litlen(litlen_t, bits, (uint8_t)count,
+                                               &next2))
                             goto fallback;
-                        if ((next2 & (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL)) ==
-                            (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL)) {
+                        if ((next2 & DFL_ENTRY_VALID) &&
+                            dfl_entry_is_literal(next2)) {
                             bits >>= next2 & 0xF;
-                            count -= next2 & 0xF;
-                            *op++ = (uint8_t)(next2 >> 16);
+                            count -= next2;
+                            *op++ = (uint8_t)dfl_entry_sym(next2);
                         } else {
                             entry = next2;
                             have_entry = 1;
@@ -617,35 +644,35 @@ static int decode_block_fast(dfl_br *reader, const dfl_huff *litlen_t,
             }
             continue;
         }
-        sym = (int)((entry >> 4) & 0x7FF);
+        sym = dfl_entry_sym(entry);
         bits >>= entry & 0xF;
-        count -= entry & 0xF;
+        count -= entry;
         if (sym == 256) {
             reader->bits = bits;
-            reader->count = count;
+            reader->count = (int)(uint8_t)count;
             reader->ptr = ptr;
             *out = op;
             return 1;
         }
         if (sym < 257 || sym > 285) break;
 
-        length = (int)((entry >> 15) & 0x1FF);
-        extra = (int)((entry >> 24) & 0x1F);
+        length = (int)((entry >> 19) & 0x1FF);
+        extra = (int)((entry >> 28) & 0x7);
         if (extra != 0) {
-            if (count < extra)
-                br_refill_fast_state(&bits, &count, &ptr, reader->end);
-            if (count < extra) goto fallback;
+            if ((uint8_t)count < extra)
+                br_refill_fast_meta(&bits, &count, &ptr, reader->end);
+            if ((uint8_t)count < extra) goto fallback;
             length += (int)(bits & ((1ULL << extra) - 1));
             bits >>= extra;
-            count -= extra;
+            count -= (uint32_t)extra;
         }
-        if (count < 15)
-            br_refill_fast_state(&bits, &count, &ptr, reader->end);
-        if (count < 15) goto fallback;
-        if (!dfl_lookup_dist(dist_t, bits, count, &dentry)) goto fallback;
-        dist_sym = (int)((dentry >> 4) & 0x7FF);
+        if ((uint8_t)count < 15)
+            br_refill_fast_meta(&bits, &count, &ptr, reader->end);
+        if ((uint8_t)count < 15) goto fallback;
+        if (!dfl_lookup_dist(dist_t, bits, (uint8_t)count, &dentry)) goto fallback;
+        dist_sym = dfl_entry_sym(dentry);
         bits >>= dentry & 0xF;
-        count -= dentry & 0xF;
+        count -= dentry;
         if (dist_sym < 0 || dist_sym >= 30) goto fallback;
         {
             uint32_t info = dist_t->distance_info[dist_sym];
@@ -653,23 +680,22 @@ static int decode_block_fast(dfl_br *reader, const dfl_huff *litlen_t,
             extra = (int)(info >> 15);
         }
         if (extra != 0) {
-            if (count < extra)
-                br_refill_fast_state(&bits, &count, &ptr, reader->end);
-            if (count < extra) goto fallback;
+            if ((uint8_t)count < extra)
+                br_refill_fast_meta(&bits, &count, &ptr, reader->end);
+            if ((uint8_t)count < extra) goto fallback;
             distance += (int)(bits & ((1ULL << extra) - 1));
             bits >>= extra;
-            count -= extra;
+            count -= (uint32_t)extra;
         }
         if (op - out_start < distance) goto fallback;
         if ((size_t)(out_end - op) < (size_t)length) goto fallback;
-        if (count <= 56)
-            br_refill_fast_state(&bits, &count, &ptr, reader->end);
+        br_refill_fast_meta(&bits, &count, &ptr, reader->end);
         /* Preload the next literal/length entry before starting the match
          * copy.  Its table-load latency can overlap the memory traffic, as in
          * libdeflate's fast loop.  If the tail is too short, leave the exact
          * loop to perform the normal refill and lookup. */
-        if ((size_t)(out_end - op) >= 258 && count >= 15 &&
-            dfl_lookup_litlen(litlen_t, bits, count, &entry))
+        if ((size_t)(out_end - op) >= 258 && (uint8_t)count >= 15 &&
+            dfl_lookup_litlen(litlen_t, bits, (uint8_t)count, &entry))
             have_entry = 1;
         if ((size_t)(out_end - op) >=
             (((size_t)length + 7u) & ~(size_t)7u))
@@ -681,7 +707,7 @@ static int decode_block_fast(dfl_br *reader, const dfl_huff *litlen_t,
 
 fallback:
     reader->bits = saved_bits;
-    reader->count = saved_count;
+    reader->count = (int)(uint8_t)saved_count;
     reader->ptr = saved_ptr;
     *out = saved_op;
     return 2;
@@ -711,33 +737,31 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             if (DFL_UNLIKELY(!(entry & DFL_ENTRY_VALID))) break;
             bits >>= entry & 0xF;
             count -= entry & 0xF;
-            if (DFL_LIKELY(entry & DFL_ENTRY_LITERAL)) {
+            if (DFL_LIKELY(dfl_entry_is_literal(entry))) {
                 int have_next = 0;
                 if (DFL_UNLIKELY(op >= out_end)) return 0;
-                *op++ = (uint8_t)(entry >> 16);
+                *op++ = (uint8_t)dfl_entry_sym(entry);
                 /* Literal runs are common after the EXR predictor. Decode one
                  * more fast literal without paying the outer-loop branch and
                  * refill checks. Leave a match/end marker for the normal path. */
                 if (DFL_LIKELY(count >= 15)) {
                     uint32_t next = litlen_t->fast_table[
                         (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
-                    if (DFL_LIKELY((next & (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL)) ==
-                                  (DFL_ENTRY_VALID | DFL_ENTRY_LITERAL))) {
+                    if (DFL_LIKELY((next & DFL_ENTRY_VALID) &&
+                                   dfl_entry_is_literal(next))) {
                         bits >>= next & 0xF;
                         count -= next & 0xF;
                         if (DFL_UNLIKELY(op >= out_end)) return 0;
-                        *op++ = (uint8_t)(next >> 16);
+                        *op++ = (uint8_t)dfl_entry_sym(next);
                         if (DFL_LIKELY(count >= 15)) {
                             uint32_t next2 = litlen_t->fast_table[
                                 (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
-                            if (DFL_LIKELY((next2 & (DFL_ENTRY_VALID |
-                                                     DFL_ENTRY_LITERAL)) ==
-                                          (DFL_ENTRY_VALID |
-                                           DFL_ENTRY_LITERAL))) {
+                            if (DFL_LIKELY((next2 & DFL_ENTRY_VALID) &&
+                                           dfl_entry_is_literal(next2))) {
                                 bits >>= next2 & 0xF;
                                 count -= next2 & 0xF;
                                 if (DFL_UNLIKELY(op >= out_end)) return 0;
-                                *op++ = (uint8_t)(next2 >> 16);
+                                *op++ = (uint8_t)dfl_entry_sym(next2);
                             } else {
                                 entry = next2;
                                 have_next = 1;
@@ -753,7 +777,7 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                         (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
                 continue;
             }
-            sym = (entry >> 4) & 0x7FF;
+            sym = dfl_entry_sym(entry);
             if (sym == 256) {
                 reader->bits = bits;
                 reader->count = count;
@@ -764,8 +788,8 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             length_sym = sym - 257;
             if (DFL_UNLIKELY(length_sym >= 29)) return 0;
             {
-                length = (entry >> 15) & 0x1FF;
-                extra = (entry >> 24) & 0x1F;
+                length = (entry >> 19) & 0x1FF;
+                extra = (entry >> 28) & 0x7;
             }
             if (extra > 0) {
                 if (DFL_UNLIKELY(count < extra))
@@ -779,7 +803,7 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             didx = (uint32_t)(bits & (DFL_DIST_FAST_SIZE - 1));
             dentry = dist_t->dist_fast_table[didx];
             if (DFL_LIKELY(dentry & DFL_ENTRY_VALID)) {
-                dist_sym = (dentry >> 4) & 0x7FF;
+                dist_sym = dfl_entry_sym(dentry);
                 bits >>= dentry & 0xF;
                 count -= dentry & 0xF;
             } else {
