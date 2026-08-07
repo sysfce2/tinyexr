@@ -351,8 +351,8 @@ DFL_INLINE int decode_symbol(dfl_br *reader, const dfl_huff *table) {
     return decode_symbol_slow(reader, table);
 }
 
-static void copy_match(uint8_t *dst, const uint8_t *src, int length,
-                       int distance) {
+DFL_INLINE void copy_match(uint8_t *dst, const uint8_t *src, int length,
+                           int distance) {
     (void)src;
     if (DFL_UNLIKELY(length <= 0)) return;
     src = dst - distance;
@@ -436,12 +436,13 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
     int count = reader->count;
     const uint8_t *ptr = reader->ptr;
     uint8_t *op = *out;
+    uint32_t entry;
 
     for (;;) {
         br_refill_fast_state(&bits, &count, &ptr, reader->end);
+        entry = litlen_t->fast_table[
+            (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
         while (DFL_LIKELY(count >= 15)) {
-            uint32_t idx = (uint32_t)(bits & (DFL_FAST_SIZE - 1));
-            uint32_t entry = litlen_t->fast_table[idx];
             int sym, length, extra, dist_sym, distance, length_sym;
             const uint8_t *match;
             uint32_t didx;
@@ -480,6 +481,9 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                         }
                     }
                 }
+                if (DFL_LIKELY(count >= 15))
+                    entry = litlen_t->fast_table[
+                        (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
                 continue;
             }
             sym = (entry >> 4) & 0x7FF;
@@ -537,6 +541,9 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                 return 0;
             if (DFL_UNLIKELY(op - out_start < distance)) return 0;
             match = op - distance;
+            br_refill_fast_state(&bits, &count, &ptr, reader->end);
+            entry = litlen_t->fast_table[
+                (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
             copy_match(op, match, length, distance);
             op += length;
         }
