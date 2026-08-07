@@ -36,6 +36,8 @@ typedef struct {
 typedef struct {
     int64_t *hcode;
     uint8_t *lengths;
+    uint32_t *symbols;
+    size_t symbols_capacity;
     uint32_t *fast;
     HufDec *longdec;
     uint32_t *counts;
@@ -73,6 +75,7 @@ void exr_piz_context_free(exr_context *ctx) {
     exr_free(a, w->fast);
     exr_free(a, w->hcode);
     exr_free(a, w->lengths);
+    exr_free(a, w->symbols);
     exr_free(a, w);
     *slot = NULL;
 }
@@ -235,23 +238,26 @@ static uint64_t hgetbits(int nb, uint64_t *c, int *lc, const uint8_t **in,
 }
 
 /* Only hcode[im..iM] can be non-zero (symbols outside that span have length 0);
- * the length-0 count n[0] is never used, so restricting both full-table scans to
- * [im..iM] is equivalent and avoids walking all 65537 slots per block. */
+ * the length-0 count n[0] is never used, so collecting non-zero symbols while
+ * unpacking avoids walking all 65537 slots again during table construction. */
 static void canonical_code_table(const uint8_t *lengths, int64_t *hcode,
-                                 int im, int iM) {
+                                 const uint32_t *symbols, size_t symbol_count) {
     int64_t n[59];
+    size_t j;
     int i;
     int64_t c = 0;
     for (i = 0; i <= 58; ++i) n[i] = 0;
-    for (i = im; i <= iM; ++i) n[lengths[i]]++;
+    for (j = 0; j < symbol_count; ++j)
+        n[lengths[symbols[j]]]++;
     for (i = 58; i > 0; --i) {
         int64_t nc = ((c + n[i]) >> 1);
         n[i] = c;
         c = nc;
     }
-    for (i = im; i <= iM; ++i) {
-        int l = (int)lengths[i];
-        hcode[i] = l > 0 ? l | (n[l]++ << 6) : 0;
+    for (j = 0; j < symbol_count; ++j) {
+        int symbol = (int)symbols[j];
+        int l = (int)lengths[symbol];
+        hcode[symbol] = l | (n[l]++ << 6);
     }
 }
 
@@ -273,12 +279,14 @@ static void canonical_code_table64(int64_t *hcode, int im, int iM) {
 }
 
 static int unpack_enc_table(const uint8_t **pcode, int ni, int im, int iM,
-                            uint8_t *lengths, int64_t *hcode) {
+                            uint8_t *lengths, int64_t *hcode,
+                            uint32_t *symbols, size_t symbols_capacity,
+                            size_t *symbol_count) {
     const uint8_t *p = *pcode;
     const uint8_t *end = *pcode + ni;
     uint64_t c = 0;
     int lc = 0;
-    int im0 = im;
+    size_t n_symbols = 0;
     memset(lengths + im, 0, (size_t)(iM - im + 1));
     for (; im <= iM; im++) {
         int64_t l;
@@ -295,20 +303,26 @@ static int unpack_enc_table(const uint8_t **pcode, int ni, int im, int iM,
             if (im + zerun > iM + 1) return 0;
             im += zerun - 1;
         } else {
+            if (l != 0) {
+                if (n_symbols >= symbols_capacity) return 0;
+                symbols[n_symbols++] = (uint32_t)im;
+            }
             lengths[im] = (uint8_t)l;
         }
     }
     *pcode = p;
-    canonical_code_table(lengths, hcode, im0, iM);
+    *symbol_count = n_symbols;
+    canonical_code_table(lengths, hcode, symbols, n_symbols);
     return 1;
 }
 
-static int build_dec_table(const exr_allocator *a, const int64_t *hcode, int im,
-                           int iM, uint32_t *fast, HufDec *longdec,
-                           uint32_t *counts,
-                           uint32_t **long_storage, size_t *long_capacity) {
+static int build_dec_table(const exr_allocator *a, const int64_t *hcode,
+                           uint32_t *fast, HufDec *longdec, uint32_t *counts,
+                           uint32_t **long_storage, size_t *long_capacity,
+                           const uint32_t *symbols, size_t symbol_count) {
     size_t total_long = 0;
-    int i, sym;
+    size_t j;
+    int i;
 
     memset(counts, 0, HUF_DECSIZE * sizeof(*counts));
     memset(fast, 0, HUF_DECSIZE * sizeof(*fast));
@@ -316,7 +330,8 @@ static int build_dec_table(const exr_allocator *a, const int64_t *hcode, int im,
         longdec[i].lit = 0;
         longdec[i].p = NULL;
     }
-    for (i = im; i <= iM; ++i) {
+    for (j = 0; j < symbol_count; ++j) {
+        i = (int)symbols[j];
         uint64_t code_val = ((uint64_t)hcode[i]) >> 6;
         int l = (int)(hcode[i] & 63);
         if (l == 0) continue;
@@ -366,7 +381,8 @@ static int build_dec_table(const exr_allocator *a, const int64_t *hcode, int im,
             }
         }
     }
-    for (sym = im; sym <= iM; ++sym) {
+    for (j = 0; j < symbol_count; ++j) {
+        int sym = (int)symbols[j];
         uint64_t code_val = ((uint64_t)hcode[sym]) >> 6;
         int l = (int)(hcode[sym] & 63);
         if (l > HUF_DECBITS) {
@@ -410,6 +426,8 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
     PizHufWorkspace *w = &local;
     void **slot;
     const uint8_t *ptr, *ie;
+    size_t symbol_capacity, symbol_bytes;
+    size_t symbol_count = 0;
     uint64_t c = 0;
     int lc = 0;
     uint16_t *outb, *outp, *oe;
@@ -442,24 +460,37 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
         w->hcode = (int64_t *)exr_malloc(a, sizeof(*w->hcode) * PIZ_HUF_ENCSIZE);
     if (!w->lengths)
         w->lengths = (uint8_t *)exr_malloc(a, sizeof(*w->lengths) * PIZ_HUF_ENCSIZE);
+    symbol_capacity = (size_t)(iM - im + 1);
+    if (exr_mul_ovf(symbol_capacity, sizeof(*w->symbols), &symbol_bytes))
+        goto cleanup;
+    if (!w->symbols || w->symbols_capacity < symbol_capacity) {
+        uint32_t *p = (uint32_t *)exr_malloc(a, symbol_bytes);
+        if (!p) goto cleanup;
+        exr_free(a, w->symbols);
+        w->symbols = p;
+        w->symbols_capacity = symbol_capacity;
+    }
     if (!w->fast)
         w->fast = (uint32_t *)exr_malloc(a, sizeof(*w->fast) * HUF_DECSIZE);
     if (!w->longdec)
         w->longdec = (HufDec *)exr_malloc(a, sizeof(*w->longdec) * HUF_DECSIZE);
     if (!w->counts)
         w->counts = (uint32_t *)exr_malloc(a, sizeof(*w->counts) * HUF_DECSIZE);
-    if (!w->hcode || !w->lengths || !w->fast || !w->longdec || !w->counts)
+    if (!w->hcode || !w->lengths || !w->symbols || !w->fast ||
+        !w->longdec || !w->counts)
         goto cleanup;
 
     ptr = in + 20;
     ni = (int)(in_len - 20);
-    if (!unpack_enc_table(&ptr, ni, im, iM, w->lengths, w->hcode))
+    if (!unpack_enc_table(&ptr, ni, im, iM, w->lengths, w->hcode,
+                          w->symbols, w->symbols_capacity, &symbol_count))
         goto cleanup;
 
     ni = (int)(in_len - (size_t)(ptr - in));
     if (nBits < 0 || nBits > 8 * ni) goto cleanup;
-    if (!build_dec_table(a, w->hcode, im, iM, w->fast, w->longdec,
-                         w->counts, &w->long_storage, &w->long_capacity))
+    if (!build_dec_table(a, w->hcode, w->fast, w->longdec,
+                         w->counts, &w->long_storage, &w->long_capacity,
+                         w->symbols, symbol_count))
         goto cleanup;
 
     rlc = iM;
@@ -541,6 +572,7 @@ cleanup:
         exr_free(a, w->fast);
         exr_free(a, w->hcode);
         exr_free(a, w->lengths);
+        exr_free(a, w->symbols);
     }
     return ret;
 }
