@@ -339,6 +339,112 @@ exr_result jph_inverse_53_i32_bounded_avx2(const int32_t *low,
     return EXR_SUCCESS;
 }
 
+/* The all-HALF profile is bounded before this kernel is selected, so its
+ * lifting intermediates fit in int32. Keep the hot horizontal pass in 32-bit
+ * AVX2 arithmetic, matching OpenJPH; the checked kernel above remains the
+ * source of truth for unrestricted int32 input. */
+EXR_TARGET("avx2")
+static inline exr_result jph_inverse_53_i32_bounded_fast_core(
+    const int32_t *low, size_t low_count, const int32_t *high,
+    size_t high_count, int32_t *out, size_t out_count, int32_t *ev,
+    int32_t *od) {
+    size_t i;
+    size_t expected_low = (out_count + 1u) / 2u;
+    size_t expected_high = out_count / 2u;
+    __m256i two = _mm256_set1_epi32(2);
+
+    if (low_count != expected_low || high_count != expected_high)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    if (out_count == 0u) return EXR_SUCCESS;
+    if (high_count == 0u) {
+        out[0] = low[0];
+        return EXR_SUCCESS;
+    }
+
+    ev[0] = (int32_t)((int64_t)low[0] -
+                      jph_sra64_ref((int64_t)high[0] + (int64_t)high[0] + 2,
+                                    2));
+    i = 1u;
+    for (; i + 8u <= high_count; i += 8u) {
+        __m256i dl = _mm256_loadu_si256((const __m256i *)(high + i - 1u));
+        __m256i dr = _mm256_loadu_si256((const __m256i *)(high + i));
+        __m256i lo = _mm256_loadu_si256((const __m256i *)(low + i));
+        __m256i q = _mm256_srai_epi32(
+            _mm256_add_epi32(_mm256_add_epi32(dl, dr), two), 2);
+        _mm256_storeu_si256((__m256i *)(ev + i), _mm256_sub_epi32(lo, q));
+    }
+    for (; i < low_count; ++i) {
+        int64_t dl = high[i - 1u];
+        int64_t dr = (i < high_count) ? high[i] : high[high_count - 1u];
+        ev[i] = (int32_t)((int64_t)low[i] -
+                          jph_sra64_ref(dl + dr + 2, 2));
+    }
+
+    i = 0u;
+    for (; i + 8u <= high_count; i += 8u) {
+        __m256i e0 = _mm256_loadu_si256((const __m256i *)(ev + i));
+        __m256i e1;
+        if (i + 8u < low_count) {
+            e1 = _mm256_loadu_si256((const __m256i *)(ev + i + 1u));
+        } else {
+            /* Even-length boundary: the final low sample is replicated. */
+            __m128i lo = _mm_loadu_si128((const __m128i *)(ev + i + 1u));
+            __m128i high_tail = _mm_set_epi32(
+                ev[i + 7u], ev[i + 7u], ev[i + 6u], ev[i + 5u]);
+            e1 = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(lo), high_tail, 1);
+        }
+        __m256i hi = _mm256_loadu_si256((const __m256i *)(high + i));
+        __m256i q = _mm256_srai_epi32(_mm256_add_epi32(e0, e1), 1);
+        _mm256_storeu_si256((__m256i *)(od + i), _mm256_add_epi32(hi, q));
+    }
+    for (; i < high_count; ++i) {
+        int64_t e0 = ev[i];
+        int64_t e1 = (i + 1u < low_count) ? ev[i + 1u] : e0;
+        od[i] = (int32_t)((int64_t)high[i] + jph_sra64_ref(e0 + e1, 1));
+    }
+
+    for (i = 0u; i + 4u <= high_count; i += 4u) {
+        __m128i e = _mm_loadu_si128((const __m128i *)(ev + i));
+        __m128i o = _mm_loadu_si128((const __m128i *)(od + i));
+        _mm_storeu_si128((__m128i *)(out + 2u * i),
+                         _mm_unpacklo_epi32(e, o));
+        _mm_storeu_si128((__m128i *)(out + 2u * i + 4u),
+                         _mm_unpackhi_epi32(e, o));
+    }
+    for (; i < high_count; ++i) {
+        out[2u * i] = ev[i];
+        out[2u * i + 1u] = od[i];
+    }
+    if (low_count > high_count) out[2u * high_count] = ev[high_count];
+    return EXR_SUCCESS;
+}
+
+EXR_TARGET("avx2")
+exr_result jph_inverse_53_i32_bounded_fast_avx2(
+    const int32_t *low, size_t low_count, const int32_t *high,
+    size_t high_count, int32_t *out, size_t out_count, int32_t *ev,
+    int32_t *od) {
+    return jph_inverse_53_i32_bounded_fast_core(
+        low, low_count, high, high_count, out, out_count, ev, od);
+}
+
+EXR_TARGET("avx2")
+exr_result jph_inverse_53_i32_bounded_rows_avx2(
+    const int32_t *data, size_t width, size_t rw, size_t rh, int32_t *temp,
+    int32_t *ev, int32_t *od) {
+    size_t y;
+    size_t low_count = (rw + 1u) / 2u;
+    size_t high_count = rw / 2u;
+    for (y = 0u; y < rh; ++y) {
+        exr_result rc = jph_inverse_53_i32_bounded_fast_core(
+            data + y * width, low_count, data + y * width + low_count,
+            high_count, temp + y * rw, rw, ev, od);
+        if (rc != EXR_SUCCESS) return rc;
+    }
+    return EXR_SUCCESS;
+}
+
 /* ---------------------------------------------------------------------------
  * Vertical (column) inverse reversible 5/3, int32, row-wise across all columns.
  * Bit-identical to the scalar exr_jph_inverse_53_vert_i32. `temp` holds lh
@@ -652,6 +758,28 @@ void jph_extract_signmag_i32_to_i32_avx2(int32_t *out, const uint32_t *buf,
     }
 }
 
+EXR_TARGET("avx2")
+void jph_extract_signmag_i64_to_i64_avx2(int64_t *out, const uint64_t *buf,
+                                         size_t n, unsigned shift) {
+    size_t i = 0u;
+    const __m256i magmask = _mm256_set1_epi64x(INT64_C(0x7fffffffffffffff));
+    const __m256i zero = _mm256_setzero_si256();
+    const __m128i sh = _mm_cvtsi32_si128((int)shift);
+    for (; i + 4u <= n; i += 4u) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(buf + i));
+        __m256i mag = _mm256_srl_epi64(_mm256_and_si256(v, magmask), sh);
+        __m256i sign = _mm256_sub_epi64(zero, _mm256_srli_epi64(v, 63));
+        __m256i r = _mm256_sub_epi64(_mm256_xor_si256(mag, sign), sign);
+        _mm256_storeu_si256((__m256i *)(out + i), r);
+    }
+    for (; i < n; ++i) {
+        uint64_t v = buf[i];
+        uint64_t mag = (v & UINT64_C(0x7fffffffffffffff)) >> shift;
+        out[i] = (v & UINT64_C(0x8000000000000000))
+                     ? -(int64_t)mag : (int64_t)mag;
+    }
+}
+
 static inline uint64_t jph_simd_fetch64_at(const uint64_t *buf,
                                            uint64_t real_bits, uint64_t c) {
     uint64_t v, avail;
@@ -673,9 +801,8 @@ static inline __m128i jph_simd_fetch128_at(const uint64_t *buf,
 }
 
 EXR_TARGET("avx2")
-static void jph_frwd_read_ff_avx2(JphFrwdAvx2 *msp) {
+static inline void jph_frwd_read_ff_avx2(JphFrwdAvx2 *msp) {
     __m128i offset, val, validity, all_xff, ff_bytes;
-    uint8_t tail[16];
     uint32_t flags, next_unstuff;
     int bytes, bits = 128;
     int cur_bytes, cur_bits, consumed_bits, upper;
@@ -684,8 +811,11 @@ static void jph_frwd_read_ff_avx2(JphFrwdAvx2 *msp) {
         val = _mm_loadu_si128((const __m128i *)msp->data);
         bytes = 16;
     } else {
+        /* tmp[32..47] is scratch beyond the active 32-byte bit window. It
+         * avoids a stack tail buffer on every codeblock decoder invocation. */
+        uint8_t *tail = msp->tmp + 32;
         bytes = msp->size > 0 ? msp->size : 0;
-        memset(tail, 0xff, sizeof(tail));
+        memset(tail, 0xff, 16u);
         if (bytes) memcpy(tail, msp->data, (size_t)bytes);
         val = _mm_loadu_si128((const __m128i *)tail);
     }
@@ -753,7 +883,7 @@ void jph_frwd_init_ff_avx2(JphFrwdAvx2 *msp, const uint8_t *data, int size) {
 }
 
 EXR_TARGET("avx2")
-static __m128i jph_frwd_fetch_ff_avx2(JphFrwdAvx2 *msp) {
+static inline __m128i jph_frwd_fetch_ff_avx2(JphFrwdAvx2 *msp) {
     if (msp->bits <= 128u) {
         jph_frwd_read_ff_avx2(msp);
         if (msp->bits <= 128u) jph_frwd_read_ff_avx2(msp);
@@ -762,7 +892,7 @@ static __m128i jph_frwd_fetch_ff_avx2(JphFrwdAvx2 *msp) {
 }
 
 EXR_TARGET("avx2")
-static void jph_frwd_advance_avx2(JphFrwdAvx2 *msp, uint32_t num_bits) {
+static inline void jph_frwd_advance_avx2(JphFrwdAvx2 *msp, uint32_t num_bits) {
     __m128i *p = (__m128i *)(msp->tmp + ((num_bits >> 3u) & 0x18u));
     __m128i v0, v1, c0, c1, t;
     msp->bits -= num_bits;
@@ -1116,24 +1246,18 @@ void jph_decode_two_quad32_frwd_avx2(uint32_t *row0, uint32_t *row1,
                                      const uint32_t u_q[2],
                                      JphFrwdAvx2 *magsgn, unsigned p) {
     __m256i row = _mm256_setzero_si256();
-    __m256i inf = _mm256_setr_epi32((int)inf_uq[0], (int)inf_uq[0],
-                                    (int)inf_uq[0], (int)inf_uq[0],
-                                    (int)inf_uq[2], (int)inf_uq[2],
-                                    (int)inf_uq[2], (int)inf_uq[2]);
-    __m256i Uq = _mm256_setr_epi32((int)u_q[0], (int)u_q[0],
-                                   (int)u_q[0], (int)u_q[0],
-                                   (int)u_q[1], (int)u_q[1],
-                                   (int)u_q[1], (int)u_q[1]);
+    const __m256i quad_dup = _mm256_setr_epi32(0, 0, 0, 0,
+                                                1, 1, 1, 1);
+    __m256i inf = _mm256_permutevar8x32_epi32(
+        _mm256_castsi128_si256(_mm_loadl_epi64(
+            (const __m128i *)(const void *)inf_uq)), quad_dup);
+    __m256i Uq = _mm256_permutevar8x32_epi32(
+        _mm256_castsi128_si256(_mm_loadl_epi64(
+            (const __m128i *)(const void *)u_q)), quad_dup);
     __m256i flags = _mm256_and_si256(
         inf, _mm256_set_epi32(0x8880, 0x4440, 0x2220, 0x1110,
                               0x8880, 0x4440, 0x2220, 0x1110));
     __m256i insig = _mm256_cmpeq_epi32(flags, _mm256_setzero_si256());
-    uint32_t vn_lane[8];
-
-    bottom_vn[0] = 0u;
-    bottom_vn[1] = 0u;
-    bottom_vn[2] = 0u;
-    bottom_vn[3] = 0u;
     if ((uint32_t)_mm256_movemask_epi8(insig) != UINT32_MAX) {
         __m256i m_n, inc_sum, ex_sum, ms_vec, byte_idx, bit_idx;
         __m256i d0, d1, bit_shift, shift, w0, tvn;
@@ -1210,22 +1334,161 @@ void jph_decode_two_quad32_frwd_avx2(uint32_t *row0, uint32_t *row1,
         w0 = _mm256_slli_epi32(ms_vec, 31);
         ms_vec = _mm256_or_si256(ms_vec, ones);
         tvn = _mm256_andnot_si256(insig, ms_vec);
-        _mm256_storeu_si256((__m256i *)vn_lane, tvn);
-        bottom_vn[0] = vn_lane[1];
-        bottom_vn[1] = vn_lane[3];
-        bottom_vn[2] = vn_lane[5];
-        bottom_vn[3] = vn_lane[7];
+        {
+            __m256i vn = _mm256_permutevar8x32_epi32(
+                tvn, _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7));
+            _mm_storeu_si128((__m128i *)bottom_vn,
+                             _mm256_castsi256_si128(vn));
+        }
 
         ms_vec = _mm256_add_epi32(ms_vec, twos);
         ms_vec = _mm256_slli_epi32(ms_vec, (int)p - 1);
         ms_vec = _mm256_or_si256(ms_vec, w0);
         row = _mm256_andnot_si256(insig, ms_vec);
+    } else {
+        _mm_storeu_si128((__m128i *)bottom_vn, _mm_setzero_si128());
     }
 
     row = _mm256_permutevar8x32_epi32(
         row, _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7));
     _mm_storeu_si128((__m128i *)row0, _mm256_castsi256_si128(row));
     _mm_storeu_si128((__m128i *)row1, _mm256_extracti128_si256(row, 1));
+}
+
+static inline uint32_t jph_sigprop_fetch32(const uint64_t *bits,
+                                           uint64_t real_bits,
+                                           uint64_t cursor) {
+    uint64_t v;
+    uint32_t off;
+    uint64_t avail;
+    if (cursor >= real_bits) return 0u;
+    off = (uint32_t)(cursor & 63u);
+    v = bits[cursor >> 6u] >> off;
+    if (off) v |= bits[(cursor >> 6u) + 1u] << (64u - off);
+    avail = real_bits - cursor;
+    if (avail < 32u) v &= (UINT64_C(1) << avail) - 1u;
+    return (uint32_t)v;
+}
+
+/* AVX2 significance-propagation update for one 4x4 quad group. The candidate
+ * discovery order and bit consumption are intentionally the same as the
+ * scalar loop in exr_jph.c; only the sign/sample placement is vectorized. */
+EXR_TARGET("avx2")
+void jph_sigprop_quad_avx2(uint32_t *dpp, uint32_t sstr,
+                           uint16_t *prev_sig, const uint16_t *cur_sig,
+                           uint32_t mstr, uint32_t prev, uint32_t pattern,
+                           const uint64_t *bits, uint64_t real_bits,
+                           uint64_t *cursor, unsigned p,
+                           uint32_t *out_prev) {
+    uint32_t ps = (uint32_t)prev_sig[0] | ((uint32_t)prev_sig[1] << 16u);
+    uint32_t ns = (uint32_t)cur_sig[mstr] |
+                  ((uint32_t)cur_sig[mstr + 1u] << 16u);
+    uint32_t u = (ps & 0x88888888u) >> 3u;
+    uint32_t cs = (uint32_t)cur_sig[0] | ((uint32_t)cur_sig[1] << 16u);
+    uint32_t mbr, t, new_sig;
+    uint32_t cwd = 0u, cnt = 0u;
+
+    u |= (ns & 0x11111111u) << 3u;
+    mbr = cs;
+    mbr |= (cs & 0x77777777u) << 1u;
+    mbr |= (cs & 0xeeeeeeeeu) >> 1u;
+    mbr |= u;
+    t = mbr;
+    mbr |= t << 4u;
+    mbr |= t >> 4u;
+    mbr |= prev >> 12u;
+    mbr &= pattern;
+    mbr &= ~cs;
+    new_sig = mbr;
+
+    if (new_sig) {
+        uint32_t col_mask = 0x0fu;
+        uint32_t inv_sig = ~cs & pattern;
+        cwd = jph_sigprop_fetch32(bits, real_bits, *cursor);
+        for (int bi = 0; bi < 16; bi += 4, col_mask <<= 4u) {
+            uint32_t sample_mask;
+            if ((col_mask & new_sig) == 0u) continue;
+            sample_mask = 0x1111u & col_mask;
+            if (new_sig & sample_mask) {
+                new_sig &= ~sample_mask;
+                if (cwd & 1u) new_sig |= (0x33u << bi) & inv_sig;
+                cwd >>= 1u;
+                ++cnt;
+            }
+            sample_mask <<= 1u;
+            if (new_sig & sample_mask) {
+                new_sig &= ~sample_mask;
+                if (cwd & 1u) new_sig |= (0x76u << bi) & inv_sig;
+                cwd >>= 1u;
+                ++cnt;
+            }
+            sample_mask <<= 1u;
+            if (new_sig & sample_mask) {
+                new_sig &= ~sample_mask;
+                if (cwd & 1u) new_sig |= (0xecu << bi) & inv_sig;
+                cwd >>= 1u;
+                ++cnt;
+            }
+            sample_mask <<= 1u;
+            if (new_sig & sample_mask) {
+                new_sig &= ~sample_mask;
+                if (cwd & 1u) new_sig |= (0xc8u << bi) & inv_sig;
+                cwd >>= 1u;
+                ++cnt;
+            }
+        }
+
+        if (new_sig) {
+            __m128i new_sig_vec, inc_sum, ex_sum, cwd_vec, v;
+            __m128i m = _mm_set1_epi64x(INT64_C(0x8040201008040201));
+            __m128i shuf = _mm_set_epi8(1, 1, 1, 1, 1, 1, 1, 1,
+                                        0, 0, 0, 0, 0, 0, 0, 0);
+            __m128i sample_mask = _mm_set_epi8(
+                -1, -1, -1, 12, -1, -1, -1, 8,
+                -1, -1, -1, 4, -1, -1, -1, 0);
+            __m128i val = _mm_set1_epi32((int)(3u << (p - 2u)));
+
+            new_sig_vec = _mm_set1_epi16((int16_t)new_sig);
+            new_sig_vec = _mm_shuffle_epi8(new_sig_vec, shuf);
+            new_sig_vec = _mm_and_si128(new_sig_vec, m);
+            new_sig_vec = _mm_cmpeq_epi8(new_sig_vec, m);
+            inc_sum = _mm_abs_epi8(new_sig_vec);
+            inc_sum = _mm_add_epi8(inc_sum, _mm_slli_si128(inc_sum, 1));
+            inc_sum = _mm_add_epi8(inc_sum, _mm_slli_si128(inc_sum, 2));
+            inc_sum = _mm_add_epi8(inc_sum, _mm_slli_si128(inc_sum, 4));
+            inc_sum = _mm_add_epi8(inc_sum, _mm_slli_si128(inc_sum, 8));
+            cnt += (uint32_t)_mm_extract_epi16(inc_sum, 7) >> 8u;
+            ex_sum = _mm_slli_si128(inc_sum, 1);
+
+            cwd_vec = _mm_set1_epi16((int16_t)cwd);
+            cwd_vec = _mm_shuffle_epi8(cwd_vec, shuf);
+            cwd_vec = _mm_and_si128(cwd_vec, m);
+            cwd_vec = _mm_cmpeq_epi8(cwd_vec, m);
+            cwd_vec = _mm_abs_epi8(cwd_vec);
+            v = _mm_shuffle_epi8(cwd_vec, ex_sum);
+
+            for (int c = 0; c < 4; ++c) {
+                __m128i old = _mm_loadu_si128((const __m128i *)dpp);
+                __m128i active = _mm_shuffle_epi8(new_sig_vec, sample_mask);
+                __m128i sign = _mm_shuffle_epi8(v, sample_mask);
+                sign = _mm_or_si128(_mm_slli_epi32(sign, 31), val);
+                active = _mm_cmpeq_epi32(active, _mm_set1_epi32(0xff));
+                old = _mm_or_si128(old, _mm_and_si128(sign, active));
+                _mm_storeu_si128((__m128i *)dpp, old);
+                dpp += sstr;
+                sample_mask = _mm_add_epi32(sample_mask, _mm_set1_epi32(1));
+            }
+        }
+        *cursor += cnt;
+    }
+
+    new_sig |= cs;
+    *prev_sig = (uint16_t)new_sig;
+    t = new_sig;
+    new_sig |= (t & 0x7777u) << 1u;
+    new_sig |= (t & 0xeeeeu) >> 1u;
+    prev = new_sig | u;
+    *out_prev = prev & 0xf000u;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1674,7 +1937,8 @@ void jph_encode_prepare_quad_from32_sse2(const int32_t *plane_data,
  * is [s0,s1,s2,s3] = (col,row),(col,row+1),(col+1,row),(col+1,row+1).
  * ------------------------------------------------------------------------- */
 EXR_TARGET("avx2")
-void jph_enc_proc_pixel_8q_avx2(const int32_t *tile, uint32_t shift, uint32_t p,
+void jph_enc_proc_pixel_8q_avx2(const int32_t *row0, const int32_t *row1,
+                                int contiguous, uint32_t shift, uint32_t p,
                                 int32_t eq[32], int32_t sarr[32],
                                 int32_t rho8[8], int32_t eqmax8[8],
                                 uint64_t *max_val) {
@@ -1687,10 +1951,15 @@ void jph_enc_proc_pixel_8q_avx2(const int32_t *tile, uint32_t shift, uint32_t p,
 
     /* src[0]=row0 cols0-7, src[1]=row1 cols0-7, src[2]=row0 cols8-15,
      * src[3]=row1 cols8-15 (matches OpenJPH proc_pixel src_vec layout). */
-    src[0] = _mm256_loadu_si256((const __m256i *)(tile + 0));
-    src[2] = _mm256_loadu_si256((const __m256i *)(tile + 8));
-    src[1] = _mm256_loadu_si256((const __m256i *)(tile + 16));
-    src[3] = _mm256_loadu_si256((const __m256i *)(tile + 24));
+    src[0] = _mm256_loadu_si256((const __m256i *)(row0 + 0));
+    src[2] = _mm256_loadu_si256((const __m256i *)(row0 + 8));
+    if (contiguous) {
+        src[1] = _mm256_loadu_si256((const __m256i *)(row0 + 16));
+        src[3] = _mm256_loadu_si256((const __m256i *)(row0 + 24));
+    } else {
+        src[1] = _mm256_loadu_si256((const __m256i *)(row1 + 0));
+        src[3] = _mm256_loadu_si256((const __m256i *)(row1 + 8));
+    }
 
     for (i = 0; i < 4; ++i) {
         __m256i sm = _mm256_srai_epi32(src[i], 31);          /* -1 if neg */

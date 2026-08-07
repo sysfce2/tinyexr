@@ -157,7 +157,7 @@ static oexr_result exr_bench(exr_src &s, IMF::Compression comp, double mpix) {
     }
     r.size = buf.size();
 
-    try { /* encode timing */
+    if (!std::getenv("EXR_BENCH_DECODE_ONLY")) try { /* encode timing */
         double t0 = now_sec();
         long it = 0;
         do {
@@ -175,7 +175,7 @@ static oexr_result exr_bench(exr_src &s, IMF::Compression comp, double mpix) {
         return r;
     }
 
-    try { /* decode timing */
+    if (!std::getenv("EXR_BENCH_ENCODE_ONLY")) try { /* decode timing */
         std::vector<std::vector<char> > store;
         IMATH_NAMESPACE::Box2i dw = s.header.dataWindow();
         double t0 = now_sec();
@@ -200,24 +200,32 @@ static oexr_result exr_bench(exr_src &s, IMF::Compression comp, double mpix) {
 
 static void compare(const char *path) {
     int txw = 0, txh = 0;
-    bool tx_ok = bench_tx_load(path, &txw, &txh) != 0;
+    const bool tx_only = std::getenv("EXR_BENCH_TINY_ONLY") != nullptr;
+    const bool exr_only = std::getenv("EXR_BENCH_OPENEXR_ONLY") != nullptr;
+    bool tx_ok = !exr_only && bench_tx_load(path, &txw, &txh) != 0;
     if (!tx_ok) printf("  (tinyexr could not load %s)\n", path);
 
-    exr_src es = exr_load_src(path);
+    exr_src es;
+    if (tx_only) es.ok = false;
+    else es = exr_load_src(path);
 
     int w = tx_ok ? txw : es.width;
     int h = tx_ok ? txh : es.height;
     double mpix = (double)w * (double)h / 1e6;
 
     printf("\n== tinyexr vs OpenEXR: %s (%dx%d) ==\n", path, w, h);
-    printf("  %-9s | %9s %9s | %9s %9s | %9s %9s\n", "codec", "tx enc",
-           "exr enc", "tx dec", "exr dec", "tx KB", "exr KB");
-    printf("  %-9s | %9s %9s | %9s %9s | %9s %9s\n", "", "MP/s", "MP/s", "MP/s",
-           "MP/s", "", "");
+    printf("  %-9s | %9s %9s | %9s %9s | %9s %9s | %9s\n", "codec", "tx enc",
+           "exr enc", "tx dec", "exr dec", "tx KB", "exr KB", "tx peak");
+    printf("  %-9s | %9s %9s | %9s %9s | %9s %9s | %9s\n", "", "MP/s", "MP/s", "MP/s",
+           "MP/s", "", "", "KB");
 
     int n = bench_tx_codec_count();
+    const bool htj2k_only = std::getenv("EXR_BENCH_HTJ2K_ONLY") != nullptr;
+    const char *codec_only = std::getenv("EXR_BENCH_CODEC");
     for (int i = 0; i < n; ++i) {
         const char *name = bench_tx_codec_name(i);
+        if (htj2k_only && std::strncmp(name, "htj2k", 5) != 0) continue;
+        if (codec_only && std::strcmp(name, codec_only) != 0) continue;
         bench_tx_result tr;
         tr.ok = 0;
         oexr_result er;
@@ -236,6 +244,8 @@ static void compare(const char *path) {
         printf("| ");
         if (tr.ok) printf("%9.0f ", tr.size / 1024.0); else printf("%9s ", "-");
         if (er.ok) printf("%9.0f ", er.size / 1024.0); else printf("%9s ", "-");
+        if (tr.ok) printf("| %9.0f ", tr.peak_bytes / 1024.0);
+        else printf("| %9s ", "-");
         printf("\n");
     }
 

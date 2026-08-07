@@ -16,8 +16,8 @@
 
 /* ---- whole-file load --------------------------------------------------- */
 
-exr_result exr_load_from_file(const char *path, const exr_allocator *alloc,
-                              exr_image *out) {
+exr_result exr_load_from_file_ctx(exr_context *context, const char *path,
+                                  const exr_allocator *alloc, exr_image *out) {
     FILE *fp;
     long sz;
     size_t n;
@@ -40,15 +40,21 @@ exr_result exr_load_from_file(const char *path, const exr_allocator *alloc,
     fclose(fp);
     if (n != (size_t)sz) { exr_free(alloc, buf); return EXR_ERROR_IO; }
 
-    rc = exr_load_from_memory(buf, (size_t)sz, alloc, out);
+    rc = exr_load_from_memory_ctx(context, buf, (size_t)sz, alloc, out);
     exr_free(alloc, buf);
     return rc;
 }
 
+exr_result exr_load_from_file(const char *path, const exr_allocator *alloc,
+                              exr_image *out) {
+    return exr_load_from_file_ctx(NULL, path, alloc, out);
+}
+
 /* Open a mid-level reader on a file path: slurp the file into an allocator
  * buffer the reader then owns (freed by exr_reader_close). */
-exr_result exr_reader_open_file(const char *path, const exr_allocator *alloc,
-                               exr_reader **out) {
+exr_result exr_reader_open_file_ctx(exr_context *context, const char *path,
+                                    const exr_allocator *alloc,
+                                    exr_reader **out) {
     FILE *fp;
     long sz;
     size_t n;
@@ -70,10 +76,15 @@ exr_result exr_reader_open_file(const char *path, const exr_allocator *alloc,
     fclose(fp);
     if (n != (size_t)sz) { exr_free(alloc, buf); return EXR_ERROR_IO; }
 
-    rc = exr_reader_open_memory(buf, (size_t)sz, alloc, out);
+    rc = exr_reader_open_memory_ctx(context, buf, (size_t)sz, alloc, out);
     if (!EXR_OK(rc)) { exr_free(alloc, buf); return rc; }
     (*out)->free_mem = 1; /* hand buffer ownership to the reader */
     return EXR_SUCCESS;
+}
+
+exr_result exr_reader_open_file(const char *path, const exr_allocator *alloc,
+                               exr_reader **out) {
+    return exr_reader_open_file_ctx(NULL, path, alloc, out);
 }
 
 /* ---- whole-file save --------------------------------------------------- */
@@ -89,19 +100,25 @@ static exr_result write_all(const char *path, const void *data, size_t size) {
     return EXR_SUCCESS;
 }
 
-exr_result exr_save_to_file(const char *path, const exr_image *img,
-                            exr_compression compression) {
+exr_result exr_save_to_file_ctx(exr_context *context, const char *path,
+                                const exr_image *img,
+                                exr_compression compression) {
     void *data = NULL;
     size_t size = 0;
     exr_result rc;
     const exr_allocator *a = exr_default_allocator();
 
     if (!path || !img) return EXR_ERROR_INVALID_ARGUMENT;
-    rc = exr_save_to_memory(&data, &size, a, img, compression);
+    rc = exr_save_to_memory_ctx(context, &data, &size, a, img, compression);
     if (!EXR_OK(rc)) return rc;
     rc = write_all(path, data, size);
     exr_free(a, data);
     return rc;
+}
+
+exr_result exr_save_to_file(const char *path, const exr_image *img,
+                            exr_compression compression) {
+    return exr_save_to_file_ctx(NULL, path, img, compression);
 }
 
 exr_result exr_writer_finalize_to_file(exr_writer *w, const char *path) {

@@ -16,14 +16,16 @@
  * Open / close
  * ========================================================================== */
 
-exr_result exr_reader_open_memory(const void *data, size_t size,
-                                  const exr_allocator *alloc, exr_reader **out) {
+exr_result exr_reader_open_memory_ctx(exr_context *context, const void *data,
+                                      size_t size, const exr_allocator *alloc,
+                                      exr_reader **out) {
     exr_reader *r;
     if (!data || !out) return EXR_ERROR_INVALID_ARGUMENT;
     if (!alloc) alloc = exr_default_allocator();
     r = (exr_reader *)exr_calloc(alloc, 1, sizeof(*r));
     if (!r) return EXR_ERROR_OUT_OF_MEMORY;
     r->alloc = *alloc;
+    r->context = context;
     r->kind = EXR_SRC_MEMORY;
     r->mem = (const uint8_t *)data;
     r->mem_size = size;
@@ -32,8 +34,15 @@ exr_result exr_reader_open_memory(const void *data, size_t size,
     return EXR_SUCCESS;
 }
 
-exr_result exr_reader_open_source(const exr_data_source *src,
+exr_result exr_reader_open_memory(const void *data, size_t size,
                                   const exr_allocator *alloc, exr_reader **out) {
+    return exr_reader_open_memory_ctx(NULL, data, size, alloc, out);
+}
+
+exr_result exr_reader_open_source_ctx(exr_context *context,
+                                      const exr_data_source *src,
+                                      const exr_allocator *alloc,
+                                      exr_reader **out) {
     exr_reader *r;
     uint8_t *buf;
     exr_result rc;
@@ -53,6 +62,7 @@ exr_result exr_reader_open_source(const exr_data_source *src,
     }
     (void)rc;
     r->alloc = *alloc;
+    r->context = context;
     r->kind = EXR_SRC_CALLBACK;
     r->src = *src;
     r->mem = buf;
@@ -61,6 +71,11 @@ exr_result exr_reader_open_source(const exr_data_source *src,
     r->free_mem = 1;
     *out = r;
     return EXR_SUCCESS;
+}
+
+exr_result exr_reader_open_source(const exr_data_source *src,
+                                  const exr_allocator *alloc, exr_reader **out) {
+    return exr_reader_open_source_ctx(NULL, src, alloc, out);
 }
 
 /* Fill the streaming buffer up to total_size. Returns EXR_WOULD_BLOCK (with
@@ -682,6 +697,7 @@ static exr_result decode_scanline_chunk(exr_reader *r, exr_int_part *p,
     block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
     if (!block) return EXR_ERROR_OUT_OF_MEMORY;
     ctx.alloc = a;
+    ctx.context = r->context;
     ctx.compression = h->compression;
     ctx.channels = h->channels;
     ctx.num_channels = h->num_channels;
@@ -820,6 +836,7 @@ static exr_result read_scanline_part(exr_reader *r, exr_int_part *p,
         }
 
         ctx.alloc = a;
+        ctx.context = r->context;
         ctx.compression = h->compression;
         ctx.channels = h->channels;
         ctx.num_channels = h->num_channels;
@@ -923,6 +940,7 @@ static exr_result decode_tile_chunk(exr_reader *r, exr_int_part *p,
     block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
     if (!block) return EXR_ERROR_OUT_OF_MEMORY;
     ctx.alloc = a;
+    ctx.context = r->context;
     ctx.compression = h->compression;
     ctx.channels = h->channels;
     ctx.num_channels = h->num_channels;
@@ -1063,6 +1081,7 @@ static exr_result read_tiled_part(exr_reader *r, exr_int_part *p,
             }
 
             ctx.alloc = a;
+            ctx.context = r->context;
             ctx.compression = h->compression;
             ctx.channels = h->channels;
             ctx.num_channels = h->num_channels;
@@ -1210,6 +1229,7 @@ exr_result exr_reader_read_scanlines(exr_reader *r, int32_t part,
             block_cap = dst_size;
         }
         ctx.alloc = a;
+        ctx.context = r->context;
         ctx.compression = h->compression;
         ctx.channels = h->channels;
         ctx.num_channels = h->num_channels;
@@ -1371,6 +1391,7 @@ exr_result exr_reader_read_tile(exr_reader *r, int32_t part, int32_t tile_x,
     block = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
     if (!block) { rc = EXR_ERROR_OUT_OF_MEMORY; goto fail; }
     ctx.alloc = a;
+    ctx.context = r->context;
     ctx.compression = h->compression;
     ctx.channels = h->channels;
     ctx.num_channels = h->num_channels;
@@ -1604,6 +1625,7 @@ exr_result exr_reader_block_raw(exr_reader *r, int32_t part, uint32_t idx,
     if (!EXR_OK(rc)) return rc;
 
     ctx.alloc = a;
+    ctx.context = r->context;
     ctx.compression = h->compression;
     ctx.channels = h->channels;
     ctx.num_channels = h->num_channels;

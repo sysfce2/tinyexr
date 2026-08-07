@@ -406,21 +406,27 @@ static exr_result load_all_parts(exr_reader *r, const exr_allocator *a,
     return EXR_SUCCESS;
 }
 
-exr_result exr_load_from_memory(const void *data, size_t size,
-                                const exr_allocator *alloc, exr_image *out) {
+exr_result exr_load_from_memory_ctx(exr_context *context, const void *data,
+                                    size_t size, const exr_allocator *alloc,
+                                    exr_image *out) {
     exr_reader *r = NULL;
     exr_result rc;
     if (!data || !out) return EXR_ERROR_INVALID_ARGUMENT;
     if (!alloc) alloc = exr_default_allocator();
     memset(out, 0, sizeof(*out));
 
-    rc = exr_reader_open_memory(data, size, alloc, &r);
+    rc = exr_reader_open_memory_ctx(context, data, size, alloc, &r);
     if (!EXR_OK(rc)) return rc;
 
     rc = load_all_parts(r, alloc, out);
     if (!EXR_OK(rc)) exr_image_free(out);
     exr_reader_close(r);
     return rc;
+}
+
+exr_result exr_load_from_memory(const void *data, size_t size,
+                                const exr_allocator *alloc, exr_image *out) {
+    return exr_load_from_memory_ctx(NULL, data, size, alloc, out);
 }
 
 /* exr_load_from_file lives in src/exr_stdio.c (the only stdio translation unit). */

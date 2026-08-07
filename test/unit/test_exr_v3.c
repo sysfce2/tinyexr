@@ -616,6 +616,43 @@ static void roundtrip_if_present(const char *path, exr_compression comp,
     roundtrip(path, comp, name);
 }
 
+static void context_roundtrip_tests(void) {
+    exr_context *ctx = NULL;
+    exr_image src, back;
+    void *buf = NULL;
+    size_t sz = 0;
+    exr_result rc;
+    int i;
+
+    memset(&src, 0, sizeof(src));
+    memset(&back, 0, sizeof(back));
+    rc = exr_context_create(NULL, &ctx);
+    CHECK(EXR_OK(rc) && ctx != NULL, "create reusable EXR context");
+    if (!EXR_OK(rc) || !ctx) return;
+    rc = exr_load_from_file_ctx(ctx, "asakusa.exr", NULL, &src);
+    CHECK(EXR_OK(rc), "context load");
+    if (EXR_OK(rc)) {
+        for (i = 0; i < 2; ++i) {
+            rc = exr_save_to_memory_ctx(ctx, &buf, &sz, NULL, &src,
+                                        EXR_COMPRESSION_HTJ2K256);
+            CHECK(EXR_OK(rc), "context HTJ2K save");
+            if (!EXR_OK(rc)) break;
+            rc = exr_load_from_memory_ctx(ctx, buf, sz, NULL, &back);
+            CHECK(EXR_OK(rc) && images_equal(&src, &back),
+                  "context HTJ2K load/reuse");
+            exr_image_free(&back);
+            free(buf);
+            buf = NULL;
+            sz = 0;
+        }
+    }
+    free(buf);
+    exr_image_free(&src);
+    exr_image_free(&back);
+    exr_context_destroy(ctx);
+    printf("  ok: reusable context HTJ2K encode/decode\n");
+}
+
 /* Build a tiled image from a scanline source in-memory, save tiled, reload. */
 static void tiled_roundtrip(const char *path, exr_compression comp,
                             const char *name) {
@@ -3908,6 +3945,7 @@ int main(void) {
      * codeblock data desyncs by one byte (regression guard). */
     roundtrip("asakusa.exr", EXR_COMPRESSION_HTJ2K256, "HTJ2K256");
     roundtrip("asakusa.exr", EXR_COMPRESSION_HTJ2K32, "HTJ2K32");
+    context_roundtrip_tests();
     tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZIP, "ZIP");
     tiled_roundtrip("asakusa.exr", EXR_COMPRESSION_ZSTD, "ZSTD");
     zstd_corruption_rejects("asakusa.exr");

@@ -23,7 +23,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate texcomp-web fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate texcomp-web fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare bench-htj2k arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
 
 all: $(TARGET)
 
@@ -64,6 +64,8 @@ V3_INC   = -Iinclude -Isrc -Ideps/zstd
 V3_CSTD  = -std=c11
 V3_WARN  = -Wall -Wextra -Werror
 V3_DEFS  =
+V3_OPT   ?= -O2
+V3_ARCH  ?=
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
@@ -169,7 +171,7 @@ build/vkew.o: third_party/vkew/vkew.c third_party/vkew/vkew.h | build
 build/exr_gpu_cuda.o: src/exr_gpu_cuda.c include/exr_gpu.h include/exr.h \
                       src/exr_internal.h src/exr_gpu_kernels.cuh.inc \
                       src/exr_gpu_jph_kernels.cuh.inc | build
-	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) -g -c $< -o $@
 
 # Vulkan backend TU: extra prereqs (public header, embedded SPIR-V, vkew).
 build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
@@ -177,7 +179,7 @@ build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
 
 build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
-	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) -g -c $< -o $@
 
 build/tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_INC) -O2 -g -w -c $< -o $@
@@ -663,14 +665,21 @@ OPENEXR_LDPATH = $(OPENEXR_LIBDIR)/OpenEXR:$(OPENEXR_LIBDIR)/OpenEXRCore:$(OPENE
 build/bench_tx.o: benchmark/bench_tx.c benchmark/bench_tx.h include/exr.h | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O3 -c benchmark/bench_tx.c -o $@
 
-bench-compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/bench_compare.cpp | build
+build/bench_compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/bench_compare.cpp | build
 	@test -d $(OPENEXR_LIBDIR)/OpenEXR || { \
 	  echo "OpenEXR build not found at $(OPENEXR_BUILD)"; \
 	  echo "build OpenEXR first, or set OPENEXR_ROOT=/path/to/openexr"; exit 1; }
 	$(CXX) -std=c++14 -Wall -Ibenchmark $(OPENEXR_INC) -O3 \
 	  benchmark/bench_compare.cpp build/bench_tx.o $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) \
 	  $(OPENEXR_LIBS) $(THREAD_LIBS) -lm -o build/bench_compare
+
+bench-compare: build/bench_compare
 	LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+
+# HTJ2K-only comparison; set ARGS and optionally pin the process externally.
+
+bench-htj2k: build/bench_compare
+	EXR_BENCH_HTJ2K_ONLY=1 LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
 
 # Coverage-guided fuzzer (clang+libFuzzer over the whole library).
 #   ./build/fuzz_v3 -max_total_time=60 test/unit/regression

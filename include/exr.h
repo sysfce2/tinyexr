@@ -28,7 +28,7 @@ extern "C" {
  * ========================================================================== */
 
 #define EXR_VERSION_MAJOR 3
-#define EXR_VERSION_MINOR 0
+#define EXR_VERSION_MINOR 1
 #define EXR_VERSION_PATCH 0
 
 /* ============================================================================
@@ -61,6 +61,14 @@ typedef struct exr_allocator {
     void *(*alloc)(void *user, size_t size);
     void (*free)(void *user, void *ptr);
 } exr_allocator;
+
+/* Reusable, single-owner codec context.  The context retains internal codec
+ * scratch between operations; it does not own caller-provided images or the
+ * buffers returned by the load/save APIs.  A context is not thread-safe. */
+typedef struct exr_context exr_context;
+
+exr_result exr_context_create(const exr_allocator *alloc, exr_context **out);
+void exr_context_destroy(exr_context *ctx);
 
 /* ============================================================================
  * Enumerations mirroring the OpenEXR format
@@ -278,6 +286,11 @@ exr_result exr_load_from_file(const char *path, const exr_allocator *alloc,
                               exr_image *out);
 exr_result exr_load_from_memory(const void *data, size_t size,
                                 const exr_allocator *alloc, exr_image *out);
+exr_result exr_load_from_file_ctx(exr_context *ctx, const char *path,
+                                  const exr_allocator *alloc, exr_image *out);
+exr_result exr_load_from_memory_ctx(exr_context *ctx, const void *data,
+                                    size_t size, const exr_allocator *alloc,
+                                    exr_image *out);
 
 /* Save an image. The image's parts/channels/pixels must be populated by the
  * caller (typically built by hand or returned from a loader). */
@@ -286,6 +299,14 @@ exr_result exr_save_to_file(const char *path, const exr_image *img,
 exr_result exr_save_to_memory(void **out_data, size_t *out_size,
                               const exr_allocator *alloc, const exr_image *img,
                               exr_compression compression);
+exr_result exr_save_to_file_ctx(exr_context *ctx, const char *path,
+                                const exr_image *img,
+                                exr_compression compression);
+exr_result exr_save_to_memory_ctx(exr_context *ctx, void **out_data,
+                                  size_t *out_size,
+                                  const exr_allocator *alloc,
+                                  const exr_image *img,
+                                  exr_compression compression);
 
 /* ============================================================================
  * Mid-level reader
@@ -311,10 +332,20 @@ exr_result exr_reader_open_memory(const void *data, size_t size,
                                   const exr_allocator *alloc, exr_reader **out);
 exr_result exr_reader_open_source(const exr_data_source *src,
                                   const exr_allocator *alloc, exr_reader **out);
+exr_result exr_reader_open_memory_ctx(exr_context *ctx, const void *data,
+                                      size_t size, const exr_allocator *alloc,
+                                      exr_reader **out);
+exr_result exr_reader_open_source_ctx(exr_context *ctx,
+                                     const exr_data_source *src,
+                                     const exr_allocator *alloc,
+                                     exr_reader **out);
 /* Convenience: open a reader on a file path (stdio). Defined in the optional
  * exr_stdio.c module; unavailable in freestanding builds that omit it. */
 exr_result exr_reader_open_file(const char *path, const exr_allocator *alloc,
                                 exr_reader **out);
+exr_result exr_reader_open_file_ctx(exr_context *ctx, const char *path,
+                                    const exr_allocator *alloc,
+                                    exr_reader **out);
 void exr_reader_close(exr_reader *r);
 
 /* Parse the file/version + all part headers + offset tables (no pixel I/O).
@@ -355,6 +386,8 @@ exr_result exr_reader_supply(exr_reader *r, const void *data, size_t size);
 typedef struct exr_writer exr_writer;
 
 exr_result exr_writer_create(const exr_allocator *alloc, exr_writer **out);
+exr_result exr_writer_create_ctx(exr_context *ctx, const exr_allocator *alloc,
+                                 exr_writer **out);
 void exr_writer_destroy(exr_writer *w);
 
 /* Add a part described by hdr (its channel list + windows + compression).

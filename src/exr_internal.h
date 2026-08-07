@@ -232,6 +232,16 @@ exr_result jph_inverse_53_i32_bounded_avx2(const int32_t *low, size_t low_count,
                                            size_t high_count, int32_t *out,
                                            size_t out_count, int64_t *ev,
                                            int64_t *od);
+/* Bounded all-HALF variant using 32-bit lifting and int32 scratch. The caller
+ * may use the existing int64 scratch allocations as storage because this path
+ * only needs int32-sized elements. */
+exr_result jph_inverse_53_i32_bounded_fast_avx2(
+    const int32_t *low, size_t low_count, const int32_t *high,
+    size_t high_count, int32_t *out, size_t out_count, int32_t *ev,
+    int32_t *od);
+exr_result jph_inverse_53_i32_bounded_rows_avx2(
+    const int32_t *data, size_t width, size_t rw, size_t rh, int32_t *temp,
+    int32_t *ev, int32_t *od);
 /* Forward reversible 5/3 1D lifting (int64), bit-identical to the scalar
  * jph_forward_53_i64; ev/od are caller scratch of >= ceil(n/2) int64 each. */
 exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
@@ -265,6 +275,8 @@ void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
  * coefficients directly, avoiding an int64 codeblock round trip. */
 void jph_extract_signmag_i32_to_i32_avx2(int32_t *out, const uint32_t *buf,
                                          size_t n, unsigned shift);
+void jph_extract_signmag_i64_to_i64_avx2(int64_t *out, const uint64_t *buf,
+                                         size_t n, unsigned shift);
 /* AVX2 cleanup-pass MagSgn reconstruction for the <=15-bit path. Decodes four
  * HT quads (8 columns x 2 rows) from interleaved scratch inf/u words and writes
  * OpenJPH sign-magnitude codeblock words. bottom_vn receives left/right bottom
@@ -294,6 +306,13 @@ void jph_decode_two_quad32_frwd_avx2(uint32_t *row0, uint32_t *row1,
                                      const uint16_t *inf_uq,
                                      const uint32_t u_q[2],
                                      JphFrwdAvx2 *magsgn, unsigned p);
+
+void jph_sigprop_quad_avx2(uint32_t *dpp, uint32_t sstr,
+                           uint16_t *prev_sig, const uint16_t *cur_sig,
+                           uint32_t mstr, uint32_t prev, uint32_t pattern,
+                           const uint64_t *bits, uint64_t real_bits,
+                           uint64_t *cursor, unsigned p,
+                           uint32_t *out_prev);
 /* AVX2 vertical (column) forward reversible 5/3 (int64), row-wise across all
  * columns; bit-identical to jph_forward_53_vert_i64. data's interleaved rows
  * (stride width) -> subband layout in temp (stride rw): lh low-rows, hh high. */
@@ -332,7 +351,8 @@ void jph_encode_prepare_quad_from32_sse2(const int32_t *plane_data,
  * from a zero-padded contiguous tile (row0[16] then row1[16]), folding the max
  * |coefficient| into *max_val. Outputs are sample-major: index [k*8+q] is sample
  * k (0..3) of quad q (0..7). Bit-identical to jph_prep_quad_body_sse2 per quad. */
-void jph_enc_proc_pixel_8q_avx2(const int32_t *tile, uint32_t shift, uint32_t p,
+void jph_enc_proc_pixel_8q_avx2(const int32_t *row0, const int32_t *row1,
+                                int contiguous, uint32_t shift, uint32_t p,
                                 int32_t eq[32], int32_t sarr[32],
                                 int32_t rho8[8], int32_t eqmax8[8],
                                 uint64_t *max_val);
@@ -560,6 +580,7 @@ typedef enum exr_src_kind {
 
 struct exr_reader {
     exr_allocator alloc;
+    exr_context *context;
 
     exr_src_kind kind;
     const uint8_t *mem; /* memory path: whole file (may be owned) */
@@ -687,6 +708,7 @@ exr_result exr_deep_encode_block(const exr_allocator *a, exr_compression comp,
 
 typedef struct exr_codec_ctx {
     const exr_allocator *alloc;
+    exr_context *context;
     exr_compression compression;
     const exr_channel *channels;
     int32_t num_channels;
@@ -695,6 +717,12 @@ typedef struct exr_codec_ctx {
     int32_t width;
     int32_t num_lines; /* scanlines in this block */
 } exr_codec_ctx;
+
+/* Codec-specific lifetime hook for the generic public context.  The JPH
+ * implementation owns the opaque state and may leave it NULL when unused. */
+void exr_jph_context_free(exr_context *ctx);
+void **exr_context_jph_slot(exr_context *ctx);
+const exr_allocator *exr_context_allocator(const exr_context *ctx);
 
 /* Decompress `src_size` bytes from `src` into `dst` (capacity dst_size, which
  * must equal the exact uncompressed block size). */

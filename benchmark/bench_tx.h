@@ -23,6 +23,7 @@ typedef struct {
     double enc_mpix;
     double dec_mpix;
     size_t size; /* compressed bytes */
+    size_t peak_bytes; /* peak live TinyEXR allocation during the run */
     int ok;
 } bench_tx_result;
 

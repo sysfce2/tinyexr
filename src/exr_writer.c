@@ -496,6 +496,7 @@ static exr_result encode_scanline_one(sl_enc_ctx *c, uint32_t ci) {
     if (!block) return EXR_ERROR_OUT_OF_MEMORY;
     gather_scanline_block(c->h, c->order, c->images, y0, nlines, block);
     cx.alloc = c->a;
+    cx.context = NULL;
     cx.compression = c->comp;
     cx.channels = c->sorted;
     cx.num_channels = c->h->num_channels;
@@ -550,6 +551,7 @@ static exr_result encode_tile_one(tl_enc_ctx *c, uint32_t idx) {
     gather_tile_block(c->h, c->order, c->images, abs_x0, abs_y0, tile_w, tile_h,
                       block);
     cx.alloc = c->a;
+    cx.context = NULL;
     cx.compression = c->comp;
     cx.channels = c->sorted;
     cx.num_channels = c->h->num_channels;
@@ -715,7 +717,8 @@ static exr_result encode_parallel_tiled(
 
 /* ---- serialize a set of parts -------------------------------------------- */
 
-static exr_result serialize(const exr_allocator *a, const exr_part *parts,
+static exr_result serialize(exr_context *context, const exr_allocator *a,
+                            const exr_part *parts,
                             int num_parts, int comp_override, uint8_t **out_data,
                             size_t *out_size) {
     obuf b;
@@ -975,6 +978,7 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
                         gather_level_tile(h, orders[p], pyr.img[L], lw, x0, y0, tw,
                                           th, block);
                         cx.alloc = a;
+                        cx.context = context;
                         cx.compression = comp;
                         cx.channels = sorted_chans[p];
                         cx.num_channels = h->num_channels;
@@ -1034,6 +1038,7 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
                             gather_level_tile(h, orders[p], limg, lw, x0, y0, tw,
                                               th, block);
                             cx.alloc = a;
+                            cx.context = NULL;
                             cx.compression = comp;
                             cx.channels = sorted_chans[p];
                             cx.num_channels = h->num_channels;
@@ -1100,6 +1105,7 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
                     {
                         exr_codec_ctx cx;
                         cx.alloc = a;
+                        cx.context = context;
                         cx.compression = comp;
                         cx.channels = sorted_chans[p];
                         cx.num_channels = h->num_channels;
@@ -1156,7 +1162,8 @@ static exr_result serialize(const exr_allocator *a, const exr_part *parts,
                                       nlines, block);
                 {
                     exr_codec_ctx cx;
-                    cx.alloc = a;
+    cx.alloc = a;
+                    cx.context = context;
                     cx.compression = comp;
                     cx.channels = sorted_chans[p];
                     cx.num_channels = h->num_channels;
@@ -1214,16 +1221,26 @@ done:
 
 /* ---- high-level save ----------------------------------------------------- */
 
-exr_result exr_save_to_memory(void **out_data, size_t *out_size,
-                              const exr_allocator *alloc, const exr_image *img,
-                              exr_compression compression) {
+exr_result exr_save_to_memory_ctx(exr_context *context, void **out_data,
+                                  size_t *out_size,
+                                  const exr_allocator *alloc,
+                                  const exr_image *img,
+                                  exr_compression compression) {
     if (!out_data || !out_size || !img || img->num_parts <= 0)
         return EXR_ERROR_INVALID_ARGUMENT;
     if (!alloc) alloc = exr_default_allocator();
     *out_data = NULL;
     *out_size = 0;
-    return serialize(alloc, img->parts, img->num_parts, (int)compression,
+    return serialize(context, alloc, img->parts, img->num_parts,
+                     (int)compression,
                      (uint8_t **)out_data, out_size);
+}
+
+exr_result exr_save_to_memory(void **out_data, size_t *out_size,
+                              const exr_allocator *alloc, const exr_image *img,
+                              exr_compression compression) {
+    return exr_save_to_memory_ctx(NULL, out_data, out_size, alloc, img,
+                                  compression);
 }
 
 /* exr_save_to_file lives in src/exr_stdio.c (the only stdio translation unit). */
@@ -1232,6 +1249,7 @@ exr_result exr_save_to_memory(void **out_data, size_t *out_size,
 
 struct exr_writer {
     exr_allocator alloc;
+    exr_context *context;
     exr_part *parts;
     int num_parts, cap;
 
@@ -1268,15 +1286,22 @@ const exr_allocator *exr_writer_allocator(const exr_writer *w) {
     return &w->alloc;
 }
 
-exr_result exr_writer_create(const exr_allocator *alloc, exr_writer **out) {
+exr_result exr_writer_create_ctx(exr_context *context,
+                                 const exr_allocator *alloc,
+                                 exr_writer **out) {
     exr_writer *w;
     if (!out) return EXR_ERROR_INVALID_ARGUMENT;
     if (!alloc) alloc = exr_default_allocator();
     w = (exr_writer *)exr_calloc(alloc, 1, sizeof(*w));
     if (!w) return EXR_ERROR_OUT_OF_MEMORY;
     w->alloc = *alloc;
+    w->context = context;
     *out = w;
     return EXR_SUCCESS;
+}
+
+exr_result exr_writer_create(const exr_allocator *alloc, exr_writer **out) {
+    return exr_writer_create_ctx(NULL, alloc, out);
 }
 
 static void stream_free_state(exr_writer *w);
@@ -1347,7 +1372,7 @@ exr_result exr_writer_finalize_to_memory(exr_writer *w, void **out_data,
     if (!w || !out_data || !out_size) return EXR_ERROR_INVALID_ARGUMENT;
     *out_data = NULL;
     *out_size = 0;
-    return serialize(&w->alloc, w->parts, w->num_parts, -1,
+    return serialize(w->context, &w->alloc, w->parts, w->num_parts, -1,
                      (uint8_t **)out_data, out_size);
 }
 
@@ -1732,7 +1757,8 @@ exr_result exr_writer_write_scanline_block(exr_writer *w, int32_t part,
     if (!block) return EXR_ERROR_OUT_OF_MEMORY;
     gather_block_local(h, w->sorder[part], channel_rows, h->data_window.min_x, y0,
                        pt->width, nlines, block);
-    cx.alloc = a;
+                    cx.alloc = a;
+                    cx.context = w->context;
     cx.compression = w->scomp;
     cx.channels = w->ssorted[part];
     cx.num_channels = h->num_channels;
@@ -1787,6 +1813,7 @@ exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
     if (!EXR_OK(rc)) return rc;
     if (block_size != blk_size) return EXR_ERROR_INVALID_ARGUMENT;
     cx.alloc = a;
+    cx.context = w->context;
     cx.compression = w->scomp;
     cx.channels = w->ssorted[part];
     cx.num_channels = h->num_channels;
@@ -1860,6 +1887,7 @@ exr_result exr_writer_write_tile(exr_writer *w, int32_t part, int32_t tile_x,
     gather_block_local(h, w->sorder[part], channel_data, abs_x0, abs_y0, tw, th,
                        block);
     cx.alloc = a;
+    cx.context = w->context;
     cx.compression = w->scomp;
     cx.channels = w->ssorted[part];
     cx.num_channels = h->num_channels;
