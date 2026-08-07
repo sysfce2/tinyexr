@@ -421,6 +421,39 @@ DFL_INLINE void copy_match(uint8_t *dst, const uint8_t *src, int length,
     while (length-- > 0) *dst++ = *src++;
 }
 
+/* The ZIP codec's private scratch buffer has a small validated tail slack.
+ * Use it to round the final word copy, avoiding the scalar tail that is
+ * otherwise needed for exact-size caller buffers. */
+DFL_INLINE void copy_match_slack(uint8_t *dst, int length, int distance) {
+    const uint8_t *src = dst - distance;
+    size_t rounded = ((size_t)length + 7u) & ~(size_t)7u;
+
+    if (distance == 1) {
+        memset(dst, *src, (size_t)length);
+        return;
+    }
+    if (distance < 8) {
+        copy_match(dst, src, length, distance);
+        return;
+    }
+    while (rounded >= 40) {
+        memcpy(dst, src, 8);
+        memcpy(dst + 8, src + 8, 8);
+        memcpy(dst + 16, src + 16, 8);
+        memcpy(dst + 24, src + 24, 8);
+        memcpy(dst + 32, src + 32, 8);
+        dst += 40;
+        src += 40;
+        rounded -= 40;
+    }
+    while (rounded >= 8) {
+        memcpy(dst, src, 8);
+        dst += 8;
+        src += 8;
+        rounded -= 8;
+    }
+}
+
 static int decode_dynamic_tables(dfl_br *reader, dfl_huff *litlen,
                                  dfl_huff *dist) {
     int hlit, hdist, hclen, total, i;
@@ -595,7 +628,11 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             br_refill_fast_state(&bits, &count, &ptr, reader->end);
             entry = litlen_t->fast_table[
                 (uint32_t)(bits & (DFL_FAST_SIZE - 1))];
-            copy_match(op, match, length, distance);
+            if ((size_t)(out_end - op) >=
+                (((size_t)length + 7u) & ~(size_t)7u))
+                copy_match_slack(op, length, distance);
+            else
+                copy_match(op, match, length, distance);
             op += length;
         }
 

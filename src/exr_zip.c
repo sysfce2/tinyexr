@@ -19,12 +19,18 @@ exr_result exr_zip_inflate_only(const uint8_t *src, size_t src_size,
 exr_result exr_zip_decompress(const exr_allocator *a, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size) {
     uint8_t *tmp;
+    size_t tmp_size;
     exr_result rc;
 
-    tmp = (uint8_t *)exr_malloc(a, dst_size ? dst_size : 1);
+    if (exr_add_ovf(dst_size, 8, &tmp_size)) return EXR_ERROR_OUT_OF_MEMORY;
+    tmp = (uint8_t *)exr_malloc(a, tmp_size ? tmp_size : 1);
     if (!tmp) return EXR_ERROR_OUT_OF_MEMORY;
 
-    rc = exr_zip_inflate_only(src, src_size, tmp, dst_size);
+    {
+        size_t out_size = 0;
+        rc = exr_zlib_inflate(src, src_size, tmp, tmp_size, &out_size);
+        if (EXR_OK(rc) && out_size != dst_size) rc = EXR_ERROR_CORRUPT;
+    }
     if (EXR_OK(rc)) {
         exr_predictor_decode(tmp, dst_size);
         exr_interleave_decode(tmp, dst, dst_size);
