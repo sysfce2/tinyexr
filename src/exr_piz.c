@@ -41,6 +41,16 @@ typedef struct {
     uint32_t *counts;
     uint32_t *long_storage;
     size_t long_capacity;
+    uint16_t *rev_lut;
+    uint16_t *tmp;
+    size_t tmp_capacity;
+    PizChan *channels;
+    size_t channels_capacity;
+    int *emitted;
+    size_t emitted_capacity;
+    uint8_t *bitmap;
+    uint16_t bitmap_max;
+    int bitmap_valid;
 } PizHufWorkspace;
 
 void exr_piz_context_free(exr_context *ctx) {
@@ -53,6 +63,11 @@ void exr_piz_context_free(exr_context *ctx) {
     if (!w) return;
     a = exr_context_allocator(ctx);
     exr_free(a, w->long_storage);
+    exr_free(a, w->emitted);
+    exr_free(a, w->channels);
+    exr_free(a, w->tmp);
+    exr_free(a, w->rev_lut);
+    exr_free(a, w->bitmap);
     exr_free(a, w->counts);
     exr_free(a, w->longdec);
     exr_free(a, w->fast);
@@ -444,8 +459,8 @@ static int huf_uncompress(const exr_allocator *a, exr_context *context,
 
     ni = (int)(in_len - (size_t)(ptr - in));
     if (nBits < 0 || nBits > 8 * ni) goto cleanup;
-    if (!build_dec_table(a, w->hcode, im, iM, w->fast, w->longdec, w->counts,
-                         &w->long_storage, &w->long_capacity))
+    if (!build_dec_table(a, w->hcode, im, iM, w->fast, w->longdec,
+                         w->counts, &w->long_storage, &w->long_capacity))
         goto cleanup;
 
     rlc = iM;
@@ -548,6 +563,9 @@ exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
     int c, line;
     uint8_t *out;
     int *emitted = NULL;
+    PizHufWorkspace local = {0};
+    PizHufWorkspace *scratch = &local;
+    void **slot = NULL;
     exr_result rc = EXR_SUCCESS;
 
     if (ctx->num_channels <= 0 || ctx->num_channels > 1024)
@@ -569,11 +587,33 @@ exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
         return EXR_ERROR_CORRUPT;
     }
 
-    rev_lut = (uint16_t *)exr_malloc(a, sizeof(uint16_t) * PIZ_USHORT_RANGE);
-    cd = (PizChan *)exr_calloc(a, (size_t)ctx->num_channels, sizeof(PizChan));
-    emitted = (int *)exr_calloc(a, (size_t)ctx->num_channels, sizeof(int));
-    if (!rev_lut || !cd || !emitted) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
-    maxValue = reverse_lut_from_bitmap(bitmap, rev_lut);
+    /* Reader workers share the public context, so only the serial path may
+     * reuse its PIZ scratch. Threaded decodes use a private workspace. */
+    slot = exr_get_num_threads() <= 1 ? exr_context_piz_slot(ctx->context) : NULL;
+    if (slot) {
+        if (!*slot) {
+            *slot = exr_calloc(a, 1, sizeof(*scratch));
+            if (!*slot) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        }
+        scratch = (PizHufWorkspace *)*slot;
+    }
+    if (!scratch->rev_lut)
+        scratch->rev_lut = (uint16_t *)exr_malloc(
+            a, sizeof(uint16_t) * PIZ_USHORT_RANGE);
+    if (!scratch->rev_lut) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+    if (!scratch->bitmap)
+        scratch->bitmap = (uint8_t *)exr_malloc(a, PIZ_BITMAP_SIZE);
+    if (!scratch->bitmap) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+    rev_lut = scratch->rev_lut;
+    if (scratch->bitmap_valid &&
+        memcmp(scratch->bitmap, bitmap, PIZ_BITMAP_SIZE) == 0) {
+        maxValue = scratch->bitmap_max;
+    } else {
+        maxValue = reverse_lut_from_bitmap(bitmap, rev_lut);
+        memcpy(scratch->bitmap, bitmap, PIZ_BITMAP_SIZE);
+        scratch->bitmap_max = maxValue;
+        scratch->bitmap_valid = 1;
+    }
 
     /* total uint16 samples across channels (FLOAT/UINT = 2 lanes, HALF = 1) */
     for (c = 0; c < ctx->num_channels; ++c) {
@@ -586,10 +626,6 @@ exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
         if (nx < 0) nx = 0;
         if (ny < 0) ny = 0;
         lanes = (ctx->channels[c].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
-        cd[c].start = NULL;
-        cd[c].nx = nx;
-        cd[c].ny = ny;
-        cd[c].size = lanes;
         if (exr_mul_ovf((size_t)nx * (size_t)ny, (size_t)lanes, &s)) {
             rc = EXR_ERROR_CORRUPT;
             goto done;
@@ -602,8 +638,62 @@ exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
         goto done;
     }
 
-    tmp = (uint16_t *)exr_calloc(a, total, sizeof(uint16_t));
-    if (!tmp) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+    if (total > scratch->tmp_capacity) {
+        size_t bytes;
+        uint16_t *p;
+        if (exr_mul_ovf(total, sizeof(uint16_t), &bytes)) {
+            rc = EXR_ERROR_CORRUPT;
+            goto done;
+        }
+        p = (uint16_t *)exr_malloc(a, bytes);
+        if (!p) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        exr_free(a, scratch->tmp);
+        scratch->tmp = p;
+        scratch->tmp_capacity = total;
+    }
+    tmp = scratch->tmp;
+
+    if ((size_t)ctx->num_channels > scratch->channels_capacity) {
+        size_t bytes;
+        PizChan *p;
+        if (exr_mul_ovf((size_t)ctx->num_channels, sizeof(PizChan), &bytes)) {
+            rc = EXR_ERROR_CORRUPT;
+            goto done;
+        }
+        p = (PizChan *)exr_malloc(a, bytes);
+        if (!p) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        exr_free(a, scratch->channels);
+        scratch->channels = p;
+        scratch->channels_capacity = (size_t)ctx->num_channels;
+    }
+    cd = scratch->channels;
+    for (c = 0; c < ctx->num_channels; ++c) {
+        int xs = ctx->channels[c].x_sampling, ys = ctx->channels[c].y_sampling;
+        int nx = exr_num_samples(xmin, xmax, xs);
+        int ny = exr_num_samples(ctx->y, ctx->y + ctx->num_lines - 1, ys);
+        if (nx < 0) nx = 0;
+        if (ny < 0) ny = 0;
+        cd[c].start = NULL;
+        cd[c].nx = nx;
+        cd[c].ny = ny;
+        cd[c].size = (ctx->channels[c].pixel_type == EXR_PIXEL_HALF) ? 1 : 2;
+    }
+
+    if ((size_t)ctx->num_channels > scratch->emitted_capacity) {
+        size_t bytes;
+        int *p;
+        if (exr_mul_ovf((size_t)ctx->num_channels, sizeof(int), &bytes)) {
+            rc = EXR_ERROR_CORRUPT;
+            goto done;
+        }
+        p = (int *)exr_malloc(a, bytes);
+        if (!p) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        exr_free(a, scratch->emitted);
+        scratch->emitted = p;
+        scratch->emitted_capacity = (size_t)ctx->num_channels;
+    }
+    emitted = scratch->emitted;
+    memset(emitted, 0, (size_t)ctx->num_channels * sizeof(*emitted));
 
     if ((size_t)(ptr_end - ptr) < 4) { rc = EXR_ERROR_CORRUPT; goto done; }
     huf_length = exr_rd_u32(ptr);
@@ -636,7 +726,7 @@ exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
         int yy = ctx->y + line;
         for (c = 0; c < ctx->num_channels; ++c) {
             int ys = ctx->channels[c].y_sampling;
-            int row, x, line_samples;
+            int row, line_samples;
             const uint16_t *ld;
             if ((yy % ys) != 0) continue;
             row = emitted[c]++;
@@ -647,20 +737,31 @@ exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
                 rc = EXR_ERROR_CORRUPT;
                 goto done;
             }
-            for (x = 0; x < line_samples; ++x) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            /* The decoded samples are native uint16_t values.  EXR's byte
+             * layout is little-endian, so copy a complete row on the common
+             * host instead of repacking every sample one byte at a time. */
+            memcpy(out, ld, (size_t)line_samples * 2);
+            out += (size_t)line_samples * 2;
+#else
+            for (int x = 0; x < line_samples; ++x) {
                 out[0] = (uint8_t)(ld[x] & 0xff);
                 out[1] = (uint8_t)(ld[x] >> 8);
                 out += 2;
             }
+#endif
         }
     }
     if ((size_t)(out - dst) != dst_size) rc = EXR_ERROR_CORRUPT;
 
 done:
-    exr_free(a, rev_lut);
-    exr_free(a, tmp);
-    exr_free(a, cd);
-    exr_free(a, emitted);
+    if (scratch == &local) {
+        exr_free(a, scratch->emitted);
+        exr_free(a, scratch->channels);
+        exr_free(a, scratch->tmp);
+        exr_free(a, scratch->rev_lut);
+        exr_free(a, scratch->bitmap);
+    }
     return rc;
 }
 
