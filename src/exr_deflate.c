@@ -27,6 +27,7 @@
 #define DFL_CODELEN_CODES 19
 #define DFL_FAST_BITS 12
 #define DFL_FAST_SIZE (1 << DFL_FAST_BITS)
+#define DFL_LONG_TABLE_SIZE (320 * 8)
 
 static const uint8_t dfl_codelen_order[DFL_CODELEN_CODES] = {
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
@@ -113,6 +114,12 @@ DFL_INLINE void br_align(dfl_br *br) { br_consume(br, br->count & 7); }
 
 typedef struct {
     uint16_t fast_table[DFL_FAST_SIZE]; /* (sym<<4)|len|0x8000 */
+    /* Each occupied 12-bit prefix owns eight entries for the remaining
+     * 3 bits.  Only 13--15 bit codes need this table; the scalar list below
+     * remains available for truncated final buffers and malformed streams. */
+    uint16_t long_index[DFL_FAST_SIZE];
+    uint16_t long_table[DFL_LONG_TABLE_SIZE];
+    int long_count;
     uint16_t slow_table[640];
     int slow_count;
     int max_bits;
@@ -122,7 +129,10 @@ static void ht_fixed_litlen(dfl_huff *t) {
     int sym;
     t->max_bits = 9;
     t->slow_count = 0;
+    t->long_count = 0;
     memset(t->fast_table, 0, sizeof(t->fast_table));
+    memset(t->long_index, 0, sizeof(t->long_index));
+    memset(t->long_table, 0, sizeof(t->long_table));
     memset(t->slow_table, 0, sizeof(t->slow_table));
     for (sym = 0; sym <= 287; sym++) {
         int len, code, rev = 0, i, fill;
@@ -143,7 +153,10 @@ static void ht_fixed_dist(dfl_huff *t) {
     int sym;
     t->max_bits = 5;
     t->slow_count = 0;
+    t->long_count = 0;
     memset(t->fast_table, 0, sizeof(t->fast_table));
+    memset(t->long_index, 0, sizeof(t->long_index));
+    memset(t->long_table, 0, sizeof(t->long_table));
     memset(t->slow_table, 0, sizeof(t->slow_table));
     for (sym = 0; sym < 32; sym++) {
         int rev = 0, i, fill;
@@ -179,7 +192,10 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
     }
     table->max_bits = max_len;
     table->slow_count = 0;
+    table->long_count = 0;
     memset(table->fast_table, 0, sizeof(table->fast_table));
+    memset(table->long_index, 0, sizeof(table->long_index));
+    memset(table->long_table, 0, sizeof(table->long_table));
 
     code = 0;
     for (bits = 1; bits <= max_len; bits++) {
@@ -196,11 +212,39 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
             uint16_t entry = (uint16_t)((sym << 4) | len | 0x8000);
             int fill = 1 << (DFL_FAST_BITS - len), k;
             for (k = 0; k < fill; k++) table->fast_table[rev | (k << len)] = entry;
-        } else if (slow_total < 320) {
-            slow_codes[slow_total] = (uint16_t)rev;
-            slow_syms[slow_total] = (uint16_t)sym;
-            slow_lens[slow_total] = (uint8_t)len;
-            slow_total++;
+        } else {
+            if (len <= DFL_MAX_BITS) {
+                int prefix = rev & (DFL_FAST_SIZE - 1);
+                int extra = len - DFL_FAST_BITS;
+                int suffix = (rev >> DFL_FAST_BITS) & 7;
+                int fill = 1 << (3 - extra);
+                uint16_t entry = (uint16_t)((sym << 4) | len | 0x8000);
+                uint16_t offset;
+                int k;
+
+                if (table->long_index[prefix] == 0) {
+                    if (table->long_count >
+                        DFL_LONG_TABLE_SIZE - 8)
+                        return 0;
+                    offset = (uint16_t)table->long_count;
+                    table->long_index[prefix] = (uint16_t)(offset + 1);
+                    table->long_count += 8;
+                } else {
+                    offset = (uint16_t)(table->long_index[prefix] - 1);
+                }
+                for (k = 0; k < fill; ++k) {
+                    uint16_t *slot = &table->long_table[offset + suffix +
+                                                        (k << extra)];
+                    if (*slot != 0) return 0;
+                    *slot = entry;
+                }
+            }
+            if (slow_total < 320) {
+                slow_codes[slow_total] = (uint16_t)rev;
+                slow_syms[slow_total] = (uint16_t)sym;
+                slow_lens[slow_total] = (uint8_t)len;
+                slow_total++;
+            }
         }
     }
 
@@ -252,6 +296,17 @@ DFL_INLINE int decode_symbol(dfl_br *reader, const dfl_huff *table) {
     if (DFL_LIKELY(entry & 0x8000)) {
         br_consume(reader, entry & 0xF);
         return (entry >> 4) & 0x7FF;
+    }
+    if (reader->count >= DFL_MAX_BITS) {
+        uint16_t offset = table->long_index[idx];
+        if (offset != 0) {
+            entry = table->long_table[(offset - 1) |
+                                      ((reader->bits >> DFL_FAST_BITS) & 7u)];
+            if (DFL_LIKELY(entry & 0x8000)) {
+                br_consume(reader, entry & 0xF);
+                return (entry >> 4) & 0x7FF;
+            }
+        }
     }
     return decode_symbol_slow(reader, table);
 }
