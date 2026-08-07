@@ -66,7 +66,7 @@ DFL_INLINE void br_refill(dfl_br *br) {
     }
 }
 DFL_INLINE void br_refill_fast(dfl_br *br) {
-    if (DFL_LIKELY(br->ptr + 8 <= br->end)) {
+    if (DFL_LIKELY((size_t)(br->end - br->ptr) >= 8)) {
         uint64_t nb;
         memcpy(&nb, br->ptr, 8);
         br->bits |= nb << br->count;
@@ -356,7 +356,8 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                 if (DFL_UNLIKELY(reader->count < extra)) br_refill_fast(reader);
                 distance += (int)br_read(reader, extra);
             }
-            if (DFL_UNLIKELY(*out + length > out_end)) return 0;
+            if (DFL_UNLIKELY((size_t)(out_end - *out) < (size_t)length))
+                return 0;
             if (DFL_UNLIKELY(*out - out_start < distance)) return 0;
             match = *out - distance;
             copy_match(*out, match, length, distance);
@@ -389,7 +390,8 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
                     if (reader->count < extra) br_refill_fast(reader);
                     distance += (int)br_read(reader, extra);
                 }
-                if (DFL_UNLIKELY(*out + length > out_end)) return 0;
+                if (DFL_UNLIKELY((size_t)(out_end - *out) < (size_t)length))
+                    return 0;
                 if (DFL_UNLIKELY(*out - out_start < distance)) return 0;
                 match = *out - distance;
                 copy_match(*out, match, length, distance);
