@@ -27,6 +27,8 @@
 #define DFL_CODELEN_CODES 19
 #define DFL_FAST_BITS 11
 #define DFL_FAST_SIZE (1 << DFL_FAST_BITS)
+#define DFL_DIST_FAST_BITS 8
+#define DFL_DIST_FAST_SIZE (1 << DFL_DIST_FAST_BITS)
 #define DFL_LONG_SLOT_BITS (DFL_MAX_BITS - DFL_FAST_BITS)
 #define DFL_LONG_SLOT_SIZE (1 << DFL_LONG_SLOT_BITS)
 #define DFL_LONG_TABLE_SIZE (320 * DFL_LONG_SLOT_SIZE)
@@ -118,6 +120,10 @@ DFL_INLINE void br_align(dfl_br *br) { br_consume(br, br->count & 7); }
 
 typedef struct {
     uint32_t fast_table[DFL_FAST_SIZE]; /* metadata-bearing decode entries */
+    /* Distance codes are much smaller than literal/length codes.  Keeping
+     * their primary table at eight bits matches the useful part of the
+     * libdeflate layout and avoids touching another 8 KiB in the hot loop. */
+    uint32_t dist_fast_table[DFL_DIST_FAST_SIZE];
     /* Each occupied 11-bit prefix owns sixteen entries for the remaining
      * 4 bits.  Only 12--15 bit codes need this table; the scalar list below
      * remains available for truncated final buffers and malformed streams. */
@@ -149,6 +155,7 @@ static void ht_fixed_litlen(dfl_huff *t) {
     t->long_count = 0;
     memset(t->distance_info, 0, sizeof(t->distance_info));
     memset(t->fast_table, 0, sizeof(t->fast_table));
+    memset(t->dist_fast_table, 0, sizeof(t->dist_fast_table));
     memset(t->long_index, 0, sizeof(t->long_index));
     memset(t->long_table, 0, sizeof(t->long_table));
     memset(t->slow_table, 0, sizeof(t->slow_table));
@@ -174,6 +181,7 @@ static void ht_fixed_dist(dfl_huff *t) {
     t->long_count = 0;
     memset(t->distance_info, 0, sizeof(t->distance_info));
     memset(t->fast_table, 0, sizeof(t->fast_table));
+    memset(t->dist_fast_table, 0, sizeof(t->dist_fast_table));
     memset(t->long_index, 0, sizeof(t->long_index));
     memset(t->long_table, 0, sizeof(t->long_table));
     memset(t->slow_table, 0, sizeof(t->slow_table));
@@ -190,6 +198,9 @@ static void ht_fixed_dist(dfl_huff *t) {
             if (idx < DFL_FAST_SIZE)
                 t->fast_table[idx] = dfl_fast_entry(sym, 5, 0);
         }
+        fill = 1 << (DFL_DIST_FAST_BITS - 5);
+        for (i = 0; i < fill; i++)
+            t->dist_fast_table[rev | (i << 5)] = dfl_fast_entry(sym, 5, 0);
     }
 }
 static int reverse_bits(int code, int len) {
@@ -220,6 +231,7 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
     table->long_count = 0;
     memset(table->distance_info, 0, sizeof(table->distance_info));
     memset(table->fast_table, 0, sizeof(table->fast_table));
+    memset(table->dist_fast_table, 0, sizeof(table->dist_fast_table));
     memset(table->long_index, 0, sizeof(table->long_index));
     memset(table->long_table, 0, sizeof(table->long_table));
 
@@ -238,6 +250,11 @@ static int ht_build(dfl_huff *table, const uint8_t *lens, int count) {
             uint32_t entry = dfl_fast_entry(sym, len, count > DFL_DIST_CODES);
             int fill = 1 << (DFL_FAST_BITS - len), k;
             for (k = 0; k < fill; k++) table->fast_table[rev | (k << len)] = entry;
+            if (count <= DFL_DIST_CODES && len <= DFL_DIST_FAST_BITS) {
+                int dist_fill = 1 << (DFL_DIST_FAST_BITS - len);
+                for (k = 0; k < dist_fill; k++)
+                    table->dist_fast_table[rev | (k << len)] = entry;
+            }
         } else {
             if (len <= DFL_MAX_BITS) {
                 int prefix = rev & (DFL_FAST_SIZE - 1);
@@ -513,8 +530,8 @@ static int decode_block(dfl_br *reader, const dfl_huff *litlen_t,
             }
             if (DFL_UNLIKELY(count < 15))
                 br_refill_fast_state(&bits, &count, &ptr, reader->end);
-            didx = (uint32_t)(bits & (DFL_FAST_SIZE - 1));
-            dentry = dist_t->fast_table[didx];
+            didx = (uint32_t)(bits & (DFL_DIST_FAST_SIZE - 1));
+            dentry = dist_t->dist_fast_table[didx];
             if (DFL_LIKELY(dentry & DFL_ENTRY_VALID)) {
                 dist_sym = (dentry >> 4) & 0x7FF;
                 bits >>= dentry & 0xF;
