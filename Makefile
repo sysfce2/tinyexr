@@ -686,6 +686,10 @@ OPENEXR_LIBS   = -L$(OPENEXR_LIBDIR)/OpenEXR -L$(OPENEXR_LIBDIR)/OpenEXRCore \
                  -lImath-3_2 -pthread
 OPENEXR_LDPATH = $(OPENEXR_LIBDIR)/OpenEXR:$(OPENEXR_LIBDIR)/OpenEXRCore:$(OPENEXR_LIBDIR)/Iex:$(OPENEXR_LIBDIR)/IlmThread
 OPENEXR_LDPATH := $(OPENEXR_LDPATH):$(OPENEXR_IMATH_LIBDIR)
+OPENEXR_RUNPATH = LD_LIBRARY_PATH=$(OPENEXR_LDPATH)
+ifeq ($(shell uname -s),Darwin)
+  OPENEXR_RUNPATH = DYLD_LIBRARY_PATH=$(OPENEXR_LDPATH)
+endif
 
 # The tinyexr side (bench_tx.c) is compiled as C because exr.h and OpenEXR's
 # C core declare the same global enum names and cannot share a translation unit.
@@ -701,12 +705,12 @@ build/bench_compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/
 	  $(OPENEXR_LIBS) $(THREAD_LIBS) -lm -o build/bench_compare
 
 bench-compare: build/bench_compare
-	LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+	$(OPENEXR_RUNPATH) ./build/bench_compare $(ARGS)
 
 # HTJ2K-only comparison; set ARGS and optionally pin the process externally.
 
 bench-htj2k: build/bench_compare
-	EXR_BENCH_HTJ2K_ONLY=1 LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+	EXR_BENCH_HTJ2K_ONLY=1 $(OPENEXR_RUNPATH) ./build/bench_compare $(ARGS)
 
 # Coverage-guided fuzzer (clang+libFuzzer over the whole library).
 #   ./build/fuzz_v3 -max_total_time=60 test/unit/regression
