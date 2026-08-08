@@ -101,6 +101,35 @@ void jph_extract_signmag_i32_to_i64_neon(int64_t *out, const uint32_t *buf,
     }
 }
 
+/* Sign-magnitude -> signed int64 for the full-precision HT path.  The
+ * magnitude is shifted with variable-lane vshl because the pass-dependent
+ * shift is not an immediate NEON operand. */
+void jph_extract_signmag_i64_to_i64_neon(int64_t *out, const uint64_t *buf,
+                                         size_t n, unsigned shift) {
+    const uint64x2_t magmask = vdupq_n_u64(UINT64_C(0x7fffffffffffffff));
+    const uint64x2_t signbit = vdupq_n_u64(UINT64_C(0x8000000000000000));
+    const int64x2_t sh = vdupq_n_s64(-(int64_t)shift);
+    const uint64x2_t one = vdupq_n_u64(1);
+    size_t i = 0;
+    for (; i + 2 <= n; i += 2) {
+        uint64x2_t v = vld1q_u64(buf + i);
+        uint64x2_t mag = vshlq_u64(vandq_u64(v, magmask), sh);
+        uint64x2_t neg = vreinterpretq_u64_s64(
+            vnegq_s64(vreinterpretq_s64_u64(mag)));
+        uint64x2_t isneg = vceqq_u64(vshrq_n_u64(vandq_u64(v, signbit), 63),
+                                     one);
+        vst1q_s64(out + i,
+                  vbslq_s64(isneg, vreinterpretq_s64_u64(neg),
+                            vreinterpretq_s64_u64(mag)));
+    }
+    for (; i < n; ++i) {
+        uint64_t v = buf[i];
+        uint64_t mag = (v & UINT64_C(0x7fffffffffffffff)) >> shift;
+        out[i] = (v & UINT64_C(0x8000000000000000)) ? -(int64_t)mag
+                                                     : (int64_t)mag;
+    }
+}
+
 /* ----------------------------------------------------------------------------
  * Reversible 5/3 lifting. floor(v / 2^s) is just an arithmetic right shift on
  * AArch64 (vshrq_n_s64 / the scalar helper below round toward -inf for any

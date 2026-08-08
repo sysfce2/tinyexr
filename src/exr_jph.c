@@ -4116,6 +4116,13 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     width, shift);
                 continue;
             }
+#elif defined(EXR_NEON)
+            jph_extract_signmag_i64_to_i64_neon(
+                out + (size_t)y * out_stride,
+                (const uint64_t *)(const void *)out +
+                    (size_t)y * out_stride,
+                width, shift);
+            continue;
 #endif
             uint32_t x;
             for (x = 0u; x < width; ++x) {

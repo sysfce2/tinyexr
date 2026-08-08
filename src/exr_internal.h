@@ -414,6 +414,8 @@ void jph_nlt_type3_i32_neon(int32_t *data, size_t count, int32_t biasm1);
 void jph_pack_i32_to_half_neon(uint8_t *dst, const int32_t *src, size_t n);
 void jph_extract_signmag_i32_to_i64_neon(int64_t *out, const uint32_t *buf,
                                          size_t n, unsigned shift);
+void jph_extract_signmag_i64_to_i64_neon(int64_t *out, const uint64_t *buf,
+                                         size_t n, unsigned shift);
 exr_result jph_inverse_53_i32_neon(const int32_t *low, size_t low_count,
                                    const int32_t *high, size_t high_count,
                                    int32_t *out, size_t out_count,
