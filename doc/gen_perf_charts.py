@@ -149,6 +149,54 @@ def wide_chart(path, title, subtitle, cats, series, ymax, ytick):
     print("wrote", path)
 
 
+def arm_chart(path, title, subtitle, cats, series, ymax=350, ytick=70):
+    """Generate the Apple-Silicon chart used by README and the ARM section."""
+    w, h = 760, 400
+    x0, x1 = 60.0, 742.0
+    y0, ytop = 328.0, 64.0
+    span = y0 - ytop
+
+    def y(v):
+        return y0 - (v / ymax) * span
+
+    out = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="760" height="400" '
+        'viewBox="0 0 760 400" font-family="-apple-system,Segoe UI,Roboto,sans-serif">',
+        '<rect width="760" height="400" fill="#fff"/>',
+        '<text x="60" y="26" font-size="17" font-weight="700" fill="#111">%s</text>' % title,
+        '<text x="60" y="44" font-size="12" fill="#666">%s</text>' % subtitle,
+    ]
+    tick = 0
+    while tick <= ymax + 1e-9:
+        gy = y(tick)
+        out.append('<line x1="60" y1="%.1f" x2="742" y2="%.1f" stroke="#eee"/>' % (gy, gy))
+        out.append('<text x="52" y="%.1f" font-size="11" fill="#888" text-anchor="end">%s</text>' % (gy + 4, _fmt(tick)))
+        tick += ytick
+    out.append('<text x="16" y="196" font-size="12" fill="#666" transform="rotate(-90 16 196)" text-anchor="middle">megapixels / s</text>')
+    group_w = (x1 - x0) / len(cats)
+    bw = min(29.5, group_w * 0.78 / len(series))
+    for ci, cat in enumerate(cats):
+        gx = x0 + ci * group_w
+        inner = len(series) * bw
+        start = gx + (group_w - inner) / 2.0
+        for si, (label, color, values) in enumerate(series):
+            value = values[ci]
+            bx, by = start + si * bw, y(value)
+            out.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s" rx="2"/>' % (bx, by, bw, y0 - by, color))
+            out.append('<text x="%.1f" y="%.1f" font-size="9" fill="#444" text-anchor="middle">%s</text>' % (bx + bw / 2.0, by - 4, _fmt(value)))
+        out.append('<text x="%.1f" y="346" font-size="12" fill="#333" text-anchor="middle">%s</text>' % (gx + group_w / 2.0, cat))
+    out.append('<line x1="60" y1="328.0" x2="742" y2="328.0" stroke="#bbb"/>')
+    lx = 60
+    for label, color, _ in series:
+        out.append('<rect x="%d" y="370" width="12" height="12" fill="%s" rx="2"/>' % (lx, color))
+        out.append('<text x="%d" y="380" font-size="12" fill="#333">%s</text>' % (lx + 17, label))
+        lx += 24 + int(7.0 * len(label))
+    out.append('</svg>')
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+    print("wrote", path)
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
 
@@ -201,6 +249,20 @@ def main():
          ("tinyexr (libdeflate)", CY["libdeflate"], [42.4, 31.8, 43.7, 24.1, 23.5]),
          ("OpenEXR", CY["openexr"], [30.7, 24.4, 43.8, 29.8, 27.9])],
         ymax=90, ytick=18,
+    )
+
+    # Apple M1 decode comparison. The tuned series uses the opt-in
+    # EXR_JPH_HOST_NEON=1 build; the portable series is the default arm64
+    # build. Values are the latest repeated in-memory asakusa.exr run.
+    arm_chart(
+        os.path.join(here, "perf-arm-decode.svg"),
+        "Decode throughput - Apple M1 (higher is better)",
+        "Apple M1, asakusa.exr 660x440, in-memory, single thread; NEON auto-dispatch.",
+        ["rle", "zips", "zip", "piz", "pxr24", "b44", "htj2k256", "htj2k32"],
+        [("tinyexr (portable)", CY["intree"], [159, 56, 71, 68, 82, 310, 35.7, 35.7]),
+         ("tinyexr (M1 tuned)", "#7c3aed", [159, 56, 71, 68, 82, 310, 37.6, 37.7]),
+         ("OpenEXR/OpenJPH", CY["openexr"], [85, 60, 78, 64, 81, 213, 38.7, 37.5])],
+        ymax=350, ytick=70,
     )
 
 

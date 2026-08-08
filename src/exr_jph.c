@@ -6,7 +6,9 @@
  * entropy decoder includes VLC/UVLC table generation, reverse/MEL/MagSgn
  * bitstream readers, quad-based VLC decoding, and coefficient reconstruction.
  * The scalar decoder handles the cleanup, significance propagation, and
- * magnitude refinement passes used by OpenEXR HTJ2K chunks.
+ * magnitude refinement passes used by OpenEXR HTJ2K chunks. ARM builds add a
+ * NEON two-quad cleanup fast path while retaining this scalar logic as the
+ * reference implementation.
  *
  * Table derivation and decoder structure are derived from OpenJPH
  * (BSD-2-Clause, Aous Naman / Kakadu / UNSW). The VLC/UVLC tables match
