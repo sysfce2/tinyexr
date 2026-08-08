@@ -77,6 +77,14 @@ ifeq ($(EXR_JPH_HOST_AVX2),1)
   V3_DEFS += -DEXR_JPH_HOST_AVX2=1
   JPH_HOST_OPT = -O3 -mavx2 -mfma -mbmi2 -mtune=znver1
 endif
+# Opt-in Apple Silicon tuning for the NEON HTJ2K translation unit.  Clang's
+# generic arm64 scheduler leaves a measurable amount of throughput on the
+# table in the entropy cleanup loop; this mode is intended for binaries built
+# specifically for an Apple M-series host, not portable distribution builds.
+EXR_JPH_HOST_NEON ?= 0
+ifeq ($(EXR_JPH_HOST_NEON),1)
+  JPH_HOST_OPT += -O3 -mcpu=apple-m1
+endif
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
@@ -686,6 +694,10 @@ OPENEXR_LIBS   = -L$(OPENEXR_LIBDIR)/OpenEXR -L$(OPENEXR_LIBDIR)/OpenEXRCore \
                  -lImath-3_2 -pthread
 OPENEXR_LDPATH = $(OPENEXR_LIBDIR)/OpenEXR:$(OPENEXR_LIBDIR)/OpenEXRCore:$(OPENEXR_LIBDIR)/Iex:$(OPENEXR_LIBDIR)/IlmThread
 OPENEXR_LDPATH := $(OPENEXR_LDPATH):$(OPENEXR_IMATH_LIBDIR)
+OPENEXR_RUNPATH = LD_LIBRARY_PATH=$(OPENEXR_LDPATH)
+ifeq ($(shell uname -s),Darwin)
+  OPENEXR_RUNPATH = DYLD_LIBRARY_PATH=$(OPENEXR_LDPATH)
+endif
 
 # The tinyexr side (bench_tx.c) is compiled as C because exr.h and OpenEXR's
 # C core declare the same global enum names and cannot share a translation unit.
@@ -701,12 +713,12 @@ build/bench_compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/
 	  $(OPENEXR_LIBS) $(THREAD_LIBS) -lm -o build/bench_compare
 
 bench-compare: build/bench_compare
-	LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+	$(OPENEXR_RUNPATH) ./build/bench_compare $(ARGS)
 
 # HTJ2K-only comparison; set ARGS and optionally pin the process externally.
 
 bench-htj2k: build/bench_compare
-	EXR_BENCH_HTJ2K_ONLY=1 LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+	EXR_BENCH_HTJ2K_ONLY=1 $(OPENEXR_RUNPATH) ./build/bench_compare $(ARGS)
 
 # Coverage-guided fuzzer (clang+libFuzzer over the whole library).
 #   ./build/fuzz_v3 -max_total_time=60 test/unit/regression

@@ -6,7 +6,9 @@
  * entropy decoder includes VLC/UVLC table generation, reverse/MEL/MagSgn
  * bitstream readers, quad-based VLC decoding, and coefficient reconstruction.
  * The scalar decoder handles the cleanup, significance propagation, and
- * magnitude refinement passes used by OpenEXR HTJ2K chunks.
+ * magnitude refinement passes used by OpenEXR HTJ2K chunks. ARM builds add a
+ * NEON two-quad cleanup fast path while retaining this scalar logic as the
+ * reference implementation.
  *
  * Table derivation and decoder structure are derived from OpenJPH
  * (BSD-2-Clause, Aous Naman / Kakadu / UNSW). The VLC/UVLC tables match
@@ -19,6 +21,10 @@
 #include "exr_internal.h"
 
 #include <limits.h>
+
+#if defined(EXR_NEON)
+#include <arm_neon.h>
+#endif
 
 #if defined(EXR_X86)
 #include <immintrin.h>
@@ -3490,6 +3496,41 @@ static inline void jph_quad_ms_end(JphQuadMs *q, JphMagSgn *m) {
     m->cursor = q->base + q->off;
 }
 
+/* ARM path for the common 32-bit cleanup case.  The entropy fields are
+ * deliberately extracted scalarly (their widths are data-dependent), while
+ * NEON handles the four-lane bottom-v_n packing/store.  Keeping the reader
+ * cursor in one place is important: malformed streams must consume exactly
+ * the same bits as the scalar reference. */
+#if defined(EXR_NEON)
+static inline void jph_decode_two_quad32_neon(
+    uint32_t *row0, uint32_t *row1, uint32_t bottom_vn[4],
+    const uint16_t *inf_uq, const uint32_t u_q[2], JphMagSgn *magsgn,
+    uint32_t p) {
+    uint32_t vn[4] = {0u, 0u, 0u, 0u};
+    for (uint32_t qn = 0u; qn < 2u; ++qn) {
+        JphQuadMs q;
+        uint32_t inf = inf_uq[2u * qn];
+        uint32_t U_q = u_q[qn];
+        uint32_t ignore;
+        jph_quad_ms_begin(&q, magsgn);
+        row0[2u * qn + 0u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 0u, U_q, p, &ignore);
+        row1[2u * qn + 0u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 1u, U_q, p, &vn[2u * qn]);
+        row0[2u * qn + 1u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 2u, U_q, p, &ignore);
+        row1[2u * qn + 1u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 3u, U_q, p,
+                               &vn[2u * qn + 1u]);
+        jph_quad_ms_end(&q, magsgn);
+    }
+    {
+        uint32x4_t v = vld1q_u32(vn);
+        vst1q_u32(bottom_vn, v);
+    }
+}
+#endif
+
 /* uint64 words needed for jph_unstuff_bits over `size` bytes (+ fetch slack). */
 static size_t jph_magsgn_words(uint32_t size) { return (size_t)size / 8u + 3u; }
 
@@ -3780,23 +3821,20 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
             uint32_t inf = sp[0];
             uint32_t u_q = sp[1];
             uint64_t v_n;
-            exr_result sample_rc;
-            if (u_q > mmsbp2) {
+            if (u_q > mmsbp2 || u_q > 62u) {
                 rc = EXR_ERROR_CORRUPT;
                 goto done;
             }
             dp[0] = jph_decode_magsgn_sample64_frwd(&magsgn, inf, 0u, u_q, p,
-                                                    &v_n, &sample_rc);
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                                                    &v_n, NULL);
             if (1u < height) {
                 dp[out_stride] =
                     jph_decode_magsgn_sample64_frwd(&magsgn, inf, 1u, u_q, p,
-                                                     &v_n, &sample_rc);
+                                                     &v_n, NULL);
             } else {
                 (void)jph_decode_magsgn_sample64_frwd(&magsgn, inf, 1u, u_q,
-                                                      p, &v_n, &sample_rc);
+                                                      p, &v_n, NULL);
             }
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             vp[0] = prev_v_n | v_n;
             prev_v_n = 0u;
             ++dp;
@@ -3806,16 +3844,14 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                 break;
             }
             dp[0] = jph_decode_magsgn_sample64_frwd(&magsgn, inf, 2u, u_q, p,
-                                                    &v_n, &sample_rc);
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                                                    &v_n, NULL);
             if (1u < height) {
                 dp[out_stride] = jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 3u, u_q, p, &v_n, &sample_rc);
+                    &magsgn, inf, 3u, u_q, p, &v_n, NULL);
             } else {
                 (void)jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 3u, u_q, p, &v_n, &sample_rc);
+                    &magsgn, inf, 3u, u_q, p, &v_n, NULL);
             }
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             prev_v_n = v_n;
             ++dp;
             ++x;
@@ -3840,27 +3876,24 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                 uint64_t emax_src;
                 uint32_t emax, kappa, u_q_eff;
                 uint64_t v_n;
-                exr_result sample_rc;
                 gamma &= gamma - 0x10u;
                 emax_src = vp[0] | vp[1] | 2u; /* nonzero (| 2u) */
                 emax = 63u - (uint32_t)jph_clz64(emax_src);
                 kappa = gamma ? emax : 1u;
                 u_q_eff = u_q + kappa;
-                if (u_q_eff > mmsbp2) {
+                if (u_q_eff > mmsbp2 || u_q_eff > 62u) {
                     rc = EXR_ERROR_CORRUPT;
                     goto done;
                 }
                 dp[0] = jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 0u, u_q_eff, p, &v_n, &sample_rc);
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                    &magsgn, inf, 0u, u_q_eff, p, &v_n, NULL);
                 if (y + 1u < height) {
                     dp[out_stride] = jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 1u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 1u, u_q_eff, p, &v_n, NULL);
                 } else {
                     (void)jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 1u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 1u, u_q_eff, p, &v_n, NULL);
                 }
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 vp[0] = prev_v_n | v_n;
                 prev_v_n = 0u;
                 ++dp;
@@ -3870,16 +3903,14 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     break;
                 }
                 dp[0] = jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 2u, u_q_eff, p, &v_n, &sample_rc);
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                    &magsgn, inf, 2u, u_q_eff, p, &v_n, NULL);
                 if (y + 1u < height) {
                     dp[out_stride] = jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 3u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 3u, u_q_eff, p, &v_n, NULL);
                 } else {
                     (void)jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 3u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 3u, u_q_eff, p, &v_n, NULL);
                 }
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 prev_v_n = v_n;
                 ++dp;
                 ++x;
@@ -3914,6 +3945,9 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     jph_build_sigma_row_avx2(sdp, ssp, sstr, width);
                     continue;
                 }
+#elif defined(EXR_NEON)
+                jph_build_sigma_row_neon(sdp, ssp, sstr, width);
+                continue;
 #endif
                 for (x = 0u; x < width; x += 4u, ssp += 4u, ++sdp) {
                     uint32_t t0 = 0u, t1 = 0u;
@@ -4116,6 +4150,13 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     width, shift);
                 continue;
             }
+#elif defined(EXR_NEON)
+            jph_extract_signmag_i64_to_i64_neon(
+                out + (size_t)y * out_stride,
+                (const uint64_t *)(const void *)out +
+                    (size_t)y * out_stride,
+                width, shift);
+            continue;
 #endif
             uint32_t x;
             for (x = 0u; x < width; ++x) {
@@ -4476,6 +4517,26 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
         prev_v_n = 0;
         sp = scratch;
         dp = buf;
+#if defined(EXR_NEON)
+        while (x + 4u <= width && mmsbp2 <= 31u) {
+            uint32_t u_q[2] = {sp[1], sp[3]};
+            uint32_t bottom_vn[4];
+            if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2) {
+                rc = EXR_ERROR_CORRUPT;
+                goto done;
+            }
+            jph_decode_two_quad32_neon(dp, dp + sstr, bottom_vn, sp, u_q,
+                                       &magsgn, p);
+            for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                prev_v_n = bottom_vn[2u * qn + 1u];
+                ++vp;
+            }
+            dp += 4u;
+            x += 4u;
+            sp += 4u;
+        }
+#endif
 #if defined(EXR_X86)
         if (use_frwd32) {
             while (x < width) {
@@ -4600,6 +4661,40 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
             prev_v_n = 0;
             sp = scratch + (y >> 1u) * sstr;
             dp = buf + (size_t)y * sstr;
+#if defined(EXR_NEON)
+            while (x + 4u <= width && mmsbp2 <= 31u) {
+                uint32_t u_q[2];
+                uint32_t bottom_vn[4];
+                uint32x2_t emax_src = vorr_u32(vld1_u32(vp),
+                                               vld1_u32(vp + 1u));
+                uint32x2_t emax = vsub_u32(vdup_n_u32(31u),
+                                           vclz_u32(vorr_u32(
+                                               emax_src, vdup_n_u32(2u))));
+                uint32_t emax0 = vget_lane_u32(emax, 0);
+                uint32_t emax1 = vget_lane_u32(emax, 1);
+                for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                    uint32_t inf = sp[2u * qn];
+                    uint32_t gamma = inf & 0xF0u;
+                    gamma &= gamma - 0x10u;
+                    u_q[qn] = (uint32_t)sp[2u * qn + 1u] +
+                              (gamma ? (qn ? emax1 : emax0) : 1u);
+                }
+                if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2) {
+                    rc = EXR_ERROR_CORRUPT;
+                    goto done;
+                }
+                jph_decode_two_quad32_neon(dp, dp + sstr, bottom_vn, sp, u_q,
+                                           &magsgn, p);
+                for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                    vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                    prev_v_n = bottom_vn[2u * qn + 1u];
+                    ++vp;
+                }
+                dp += 4u;
+                x += 4u;
+                sp += 4u;
+            }
+#endif
 #if defined(EXR_X86)
             if (use_frwd32) {
                 while (x < width) {
@@ -4793,6 +4888,9 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
                     jph_build_sigma_row_avx2(sdp, ssp, sstr, width);
                     continue;
                 }
+#elif defined(EXR_NEON)
+                jph_build_sigma_row_neon(sdp, ssp, sstr, width);
+                continue;
 #endif
                 for (x = 0u; x < width; x += 4u, ssp += 4u, ++sdp) {
                     uint32_t t0 = 0u, t1 = 0u;

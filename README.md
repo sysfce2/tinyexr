@@ -27,8 +27,8 @@ on the deflate family:
 
 ![Encode throughput: tinyexr libdeflate on/off vs OpenEXR](doc/perf-libdeflate-htj2k-encode.png)
 
-On **ARM64 (Apple M1 / NEON)**, single-thread in-tree throughput — same shape:
-TinyEXR leads the cheap codecs (none / rle / b44) and is near parity on HTJ2K:
+On **ARM64 (Apple M1 / NEON)**, single-thread throughput is now on-par with
+OpenEXR/OpenJPH for HTJ2K when using the opt-in M1 scheduler tuning:
 
 ![Decode throughput, single thread (Apple M1 / NEON)](doc/perf-arm-decode.png)
 
@@ -248,8 +248,6 @@ Contribution is welcome!
   (`exr_part_yc_to_rgba_float`, used by the `examples/wasm` binding), but the
   streaming `web/viewer/` still renders such images as grayscale `Y` pending a
   whole-part hook through the reconstruction helper.
-- [ ] ARM/NEON throughput benchmarks (NEON kernels are correctness-verified under
-  qemu but not yet benchmarked).
 - [ ] Larger-image / higher-channel-count performance sweeps.
 - [ ] Multipart in the high-level spectral cube API (part 0 only today).
 - DWAA/DWAB — intentionally unsupported (not planned).

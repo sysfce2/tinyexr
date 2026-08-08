@@ -65,9 +65,10 @@ exr_result exr_rle_decompress(const exr_allocator *a, const uint8_t *src,
 #define RLE_MAX_RUN 127
 static size_t rle_encode(const uint8_t *in, size_t n, uint8_t *out) {
     const uint8_t *in_end = in + n;
-    const uint8_t *run_start = in, *run_end = in + 1;
+    const uint8_t *run_start = in;
     uint8_t *w = out;
     while (run_start < in_end) {
+        const uint8_t *run_end = run_start + 1;
         while (run_end < in_end && *run_start == *run_end &&
                (size_t)(run_end - run_start) - 1 < RLE_MAX_RUN)
             ++run_end;
@@ -76,15 +77,20 @@ static size_t rle_encode(const uint8_t *in, size_t n, uint8_t *out) {
             *w++ = *run_start;
             run_start = run_end;
         } else {
+            const uint8_t *literal_start = run_start;
+            /* Stop before a compressible run; leave it for the next loop. */
+            run_end = run_start;
             while (run_end < in_end &&
-                   ((run_end + 1 >= in_end || *run_end != *(run_end + 1)) ||
-                    (run_end + 2 >= in_end || *(run_end + 1) != *(run_end + 2))) &&
-                   (size_t)(run_end - run_start) < RLE_MAX_RUN)
+                   (size_t)(run_end - literal_start) < RLE_MAX_RUN) {
+                if (run_end + 2 < in_end && run_end[0] == run_end[1] &&
+                    run_end[1] == run_end[2])
+                    break;
                 ++run_end;
-            *w++ = (uint8_t)(signed char)(run_start - run_end);
-            while (run_start < run_end) *w++ = *run_start++;
+            }
+            *w++ = (uint8_t)(signed char)(literal_start - run_end);
+            while (literal_start < run_end) *w++ = *literal_start++;
+            run_start = run_end;
         }
-        ++run_end;
     }
     return (size_t)(w - out);
 }

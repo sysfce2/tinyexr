@@ -2768,6 +2768,31 @@ static void jph_simd_check(void) {
         CHECK(ok, "JPH extract signmag NEON == scalar");
         free(src); free(r0); free(r1);
     }
+    {   /* full-width sign-magnitude extraction used by mixed FLOAT HTJ2K. */
+        const size_t en = 1003;
+        uint64_t *src = (uint64_t *)malloc(en * 8);
+        int64_t *r0 = (int64_t *)malloc(en * 8), *r1 = (int64_t *)malloc(en * 8);
+        int ok = 1; unsigned shifts[4] = {0u, 7u, 31u, 62u}; int s;
+        if (src && r0 && r1) {
+            size_t i; uint64_t rr = UINT64_C(0x9e3779b97f4a7c15);
+            for (i = 0; i < en; ++i) {
+                rr = rr * UINT64_C(6364136223846793005) + 1u;
+                src[i] = rr;
+            }
+            for (s = 0; s < 4; ++s) {
+                size_t x; unsigned shift = shifts[s];
+                for (x = 0; x < en; ++x) {
+                    uint64_t v = src[x];
+                    int64_t mag = (int64_t)((v & UINT64_C(0x7fffffffffffffff)) >> shift);
+                    r0[x] = (v & UINT64_C(0x8000000000000000)) ? -mag : mag;
+                }
+                jph_extract_signmag_i64_to_i64_neon(r1, src, en, shift);
+                if (memcmp(r0, r1, en * 8) != 0) ok = 0;
+            }
+        }
+        CHECK(ok, "JPH extract signmag i64 NEON == scalar");
+        free(src); free(r0); free(r1);
+    }
     {   /* inverse 5/3 1D: i32 (range-checked) and i64, NEON == scalar. */
         int32_t *low = (int32_t *)malloc(2048 * 4), *high = (int32_t *)malloc(2048 * 4);
         int32_t *o0 = (int32_t *)malloc(4096 * 4), *o1 = (int32_t *)malloc(4096 * 4);
