@@ -4663,14 +4663,19 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
             while (x + 4u <= width && mmsbp2 <= 31u) {
                 uint32_t u_q[2];
                 uint32_t bottom_vn[4];
+                uint32x2_t emax_src = vorr_u32(vld1_u32(vp),
+                                               vld1_u32(vp + 1u));
+                uint32x2_t emax = vsub_u32(vdup_n_u32(31u),
+                                           vclz_u32(vorr_u32(
+                                               emax_src, vdup_n_u32(2u))));
+                uint32_t emax0 = vget_lane_u32(emax, 0);
+                uint32_t emax1 = vget_lane_u32(emax, 1);
                 for (uint32_t qn = 0u; qn < 2u; ++qn) {
                     uint32_t inf = sp[2u * qn];
                     uint32_t gamma = inf & 0xF0u;
-                    uint32_t emax_src = vp[qn] | vp[qn + 1u] | 2u;
-                    uint32_t emax = 31u - (uint32_t)jph_clz32(emax_src);
                     gamma &= gamma - 0x10u;
                     u_q[qn] = (uint32_t)sp[2u * qn + 1u] +
-                              (gamma ? emax : 1u);
+                              (gamma ? (qn ? emax1 : emax0) : 1u);
                 }
                 if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2) {
                     rc = EXR_ERROR_CORRUPT;
