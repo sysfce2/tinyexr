@@ -77,6 +77,14 @@ ifeq ($(EXR_JPH_HOST_AVX2),1)
   V3_DEFS += -DEXR_JPH_HOST_AVX2=1
   JPH_HOST_OPT = -O3 -mavx2 -mfma -mbmi2 -mtune=znver1
 endif
+# Opt-in Apple Silicon tuning for the NEON HTJ2K translation unit.  Clang's
+# generic arm64 scheduler leaves a measurable amount of throughput on the
+# table in the entropy cleanup loop; this mode is intended for binaries built
+# specifically for an Apple M-series host, not portable distribution builds.
+EXR_JPH_HOST_NEON ?= 0
+ifeq ($(EXR_JPH_HOST_NEON),1)
+  JPH_HOST_OPT += -O3 -mcpu=apple-m1
+endif
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
