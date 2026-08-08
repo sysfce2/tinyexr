@@ -20,6 +20,10 @@
 
 #include <limits.h>
 
+#if defined(EXR_NEON)
+#include <arm_neon.h>
+#endif
+
 #if defined(EXR_X86)
 #include <immintrin.h>
 #if defined(__GNUC__) || defined(__clang__)
@@ -3490,6 +3494,41 @@ static inline void jph_quad_ms_end(JphQuadMs *q, JphMagSgn *m) {
     m->cursor = q->base + q->off;
 }
 
+/* ARM path for the common 32-bit cleanup case.  The entropy fields are
+ * deliberately extracted scalarly (their widths are data-dependent), while
+ * NEON handles the four-lane bottom-v_n packing/store.  Keeping the reader
+ * cursor in one place is important: malformed streams must consume exactly
+ * the same bits as the scalar reference. */
+#if defined(EXR_NEON)
+static inline void jph_decode_two_quad32_neon(
+    uint32_t *row0, uint32_t *row1, uint32_t bottom_vn[4],
+    const uint16_t *inf_uq, const uint32_t u_q[2], JphMagSgn *magsgn,
+    uint32_t p) {
+    uint32_t vn[4] = {0u, 0u, 0u, 0u};
+    for (uint32_t qn = 0u; qn < 2u; ++qn) {
+        JphQuadMs q;
+        uint32_t inf = inf_uq[2u * qn];
+        uint32_t U_q = u_q[qn];
+        uint32_t ignore;
+        jph_quad_ms_begin(&q, magsgn);
+        row0[2u * qn + 0u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 0u, U_q, p, &ignore);
+        row1[2u * qn + 0u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 1u, U_q, p, &vn[2u * qn]);
+        row0[2u * qn + 1u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 2u, U_q, p, &ignore);
+        row1[2u * qn + 1u] =
+            jph_quad_ms_sample(&q, magsgn, inf, 3u, U_q, p,
+                               &vn[2u * qn + 1u]);
+        jph_quad_ms_end(&q, magsgn);
+    }
+    {
+        uint32x4_t v = vld1q_u32(vn);
+        vst1q_u32(bottom_vn, v);
+    }
+}
+#endif
+
 /* uint64 words needed for jph_unstuff_bits over `size` bytes (+ fetch slack). */
 static size_t jph_magsgn_words(uint32_t size) { return (size_t)size / 8u + 3u; }
 
@@ -4476,6 +4515,26 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
         prev_v_n = 0;
         sp = scratch;
         dp = buf;
+#if defined(EXR_NEON)
+        while (x + 4u <= width && mmsbp2 <= 31u) {
+            uint32_t u_q[2] = {sp[1], sp[3]};
+            uint32_t bottom_vn[4];
+            if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2) {
+                rc = EXR_ERROR_CORRUPT;
+                goto done;
+            }
+            jph_decode_two_quad32_neon(dp, dp + sstr, bottom_vn, sp, u_q,
+                                       &magsgn, p);
+            for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                prev_v_n = bottom_vn[2u * qn + 1u];
+                ++vp;
+            }
+            dp += 4u;
+            x += 4u;
+            sp += 4u;
+        }
+#endif
 #if defined(EXR_X86)
         if (use_frwd32) {
             while (x < width) {
@@ -4600,6 +4659,35 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
             prev_v_n = 0;
             sp = scratch + (y >> 1u) * sstr;
             dp = buf + (size_t)y * sstr;
+#if defined(EXR_NEON)
+            while (x + 4u <= width && mmsbp2 <= 31u) {
+                uint32_t u_q[2];
+                uint32_t bottom_vn[4];
+                for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                    uint32_t inf = sp[2u * qn];
+                    uint32_t gamma = inf & 0xF0u;
+                    uint32_t emax_src = vp[qn] | vp[qn + 1u] | 2u;
+                    uint32_t emax = 31u - (uint32_t)jph_clz32(emax_src);
+                    gamma &= gamma - 0x10u;
+                    u_q[qn] = (uint32_t)sp[2u * qn + 1u] +
+                              (gamma ? emax : 1u);
+                }
+                if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2) {
+                    rc = EXR_ERROR_CORRUPT;
+                    goto done;
+                }
+                jph_decode_two_quad32_neon(dp, dp + sstr, bottom_vn, sp, u_q,
+                                           &magsgn, p);
+                for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                    vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                    prev_v_n = bottom_vn[2u * qn + 1u];
+                    ++vp;
+                }
+                dp += 4u;
+                x += 4u;
+                sp += 4u;
+            }
+#endif
 #if defined(EXR_X86)
             if (use_frwd32) {
                 while (x < width) {
