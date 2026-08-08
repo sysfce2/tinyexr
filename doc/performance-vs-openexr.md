@@ -17,11 +17,11 @@ multi-threaded.
 
 ## TL;DR
 
-- **Single-thread decode:** TinyEXR wins big on the cheap codecs — **3.4×** on
+- **Single-thread decode:** TinyEXR wins big on the cheap codecs — **3.5×** on
   uncompressed and **2.5×** on RLE. On the DEFLATE family / PIZ, OpenEXR leads
-  (≈1.2× ZIP, ≈1.8× PXR24, ≈2–2.7× ZIPS/PIZ) because of its **libdeflate**
-  backend and tuned PIZ. HTJ2K is now closer: TinyEXR is ~77% of the latest
-  same-machine OpenJPH baseline (≈1.30× decode gap).
+  (≈1.2× ZIP, ≈1.8× PXR24, ≈2.1× ZIPS) because of its **libdeflate** backend;
+  the new PIZ Huffman path is effectively tied (33.8 vs 35.6 MP/s).
+  HTJ2K is also closer in the Ryzen/AVX2 build path.
 - **Single-thread encode:** TinyEXR ties or wins on RLE/PIZ/B44; OpenEXR is
   ≈1.5× on ZIP/ZIPS, ≈1.8× on PXR24, and ≈3× on HTJ2K.
 - **libdeflate (default on hosted, `DEFLATE=auto`):** with the same backend
@@ -38,12 +38,12 @@ multi-threaded.
 
 ![Decode throughput, single thread](perf-decode.svg)
 
-`none` (uncompressed) is off the chart on purpose: **TinyEXR 2699 vs OpenEXR
-789 MP/s** (~3.4×) — no thread-pool or framebuffer-copy overhead. TinyEXR also
-leads **RLE** (230 vs 93, ~2.5×). On the compressed codecs OpenEXR is ahead —
-ZIP ~1.2×, PXR24 ~1.8×, ZIPS ~2.1×, PIZ ~2.7×, and HTJ2K ~1.30× — dominated by
-its libdeflate inflate (and tuned PIZ/JPH). A TinyEXR ZIP-decode profile is
-~95 % inflate; the predictor and de-interleave passes are already vectorized.
+`none` (uncompressed) is off the chart on purpose: **TinyEXR 1384 vs OpenEXR
+392 MP/s** (~3.5×) — no thread-pool or framebuffer-copy overhead. TinyEXR also
+leads **RLE** (115 vs 47, ~2.5×). With the hosted/libdeflate build, OpenEXR is
+ahead on ZIP/ZIPS and PXR24, while the new PIZ path is effectively tied:
+**33.8 vs 35.6 MP/s**. A TinyEXR ZIP-decode profile is still dominated by
+inflate; the predictor and de-interleave passes are already vectorized.
 
 ### Encode
 
@@ -119,11 +119,16 @@ builds.
 
 ![Decode: in-tree vs libdeflate on the natural-image corpus](perf-libdeflate-corpus-decode.svg)
 
-*(`doc/gen_perf_charts.py` regenerates the data-bearing SVGs.)*
+*(`doc/gen_perf_charts.py` regenerates the data-bearing SVGs, including the
+README chart; run `convert -background white doc/perf-libdeflate-htj2k-decode.svg
+doc/perf-libdeflate-htj2k-decode.png` to refresh its PNG.)*
 
-**PIZ decode** got a separate ~**+14%** (≈80→92 Mpix/s on the corpus) from
-inlining the Huffman literal store and restricting the canonical-code-table
-scan to the live symbol range.
+**PIZ decode** now uses an OpenEXR-style two-window Huffman reader: a 12-bit
+short-code table, canonical base/offset lookup for long codes, and a reusable
+symbol-ID table. It retains the original bounded reader as a correctness
+fallback. On the Ryzen 9 3950X snapshot this brings PIZ decode to **33.8 MP/s
+vs OpenEXR 35.6 MP/s** on `asakusa.exr`, while preserving identical 742 KB
+output and passing the streaming/regression corpus.
 
 ![PIZ decode before/after the in-tree optimization](perf-piz-decode.svg)
 
@@ -149,19 +154,19 @@ wide HTJ2K lead from its SIMD JPH entropy encoder.
 
 ### Full single-thread numbers
 
-In-tree default:
+Hosted default (`DEFLATE=auto`, `V3_OPT=-O3`), refreshed on 2026-08-08:
 
 | codec | tx enc | exr enc | tx dec | exr dec |
 |-------|-------:|--------:|-------:|--------:|
-| none  | 102.3 | 85.3 | 2699 | 789 |
-| rle   | 55.1 | 46.3 | 230  | 92.6 |
-| zips  | 10.3 | 15.5 | 23.2 | 48.9 |
-| zip   | 9.6  | 14.7 | 50.4 | 61.9 |
-| piz   | 23.6 | 25.4 | 24.6 | 67.5 |
-| pxr24 | 9.2  | 16.4 | 48.0 | 88.0 |
-| b44   | 31.7 | 34.8 | 145  | 178 |
-| htj2k256 | 13.9 | 33.2* | 45.2 | 58.8* |
-| htj2k32  | 16.6 | 31.6* | 43.1 | 56.2* |
+| none  | 50.6 | 41.9 | 1380 | 389 |
+| rle   | 30.5 | 22.5 | 114  | 45.5 |
+| zips  | 8.5  | 7.8  | 31.8 | 24.4 |
+| zip   | 7.9  | 7.5  | 42.4 | 30.7 |
+| piz   | 12.8 | 12.8 | 33.8 | 35.6 |
+| pxr24 | 8.5  | 8.2  | 43.7 | 43.8 |
+| b44   | 18.1 | 17.4 | 102  | 86.8 |
+| htj2k256 | 18.7 | 16.4 | 24.1 | 29.8* |
+| htj2k32  | 17.2 | 15.6 | 23.5 | 27.9* |
 
 `*` HTJ2K OpenEXR/OpenJPH values are the latest available same-machine baseline;
 that OpenJPH build has the default x86 SIMD path enabled and selects its AVX2

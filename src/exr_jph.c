@@ -1643,12 +1643,46 @@ static exr_result jph_tag_tree_prepare(const exr_allocator *a,
     return exr_jph_tag_tree_init(a, tree, width, height);
 }
 
+#if defined(EXR_X86)
+JPH_TARGET_AVX2 static exr_result jph_validate_forward_stuffing_avx2(
+    const uint8_t *data, size_t size, uint8_t max_after_ff) {
+    size_t i = 0u;
+    int prev_ff = 0;
+    const __m256i ff = _mm256_set1_epi8((char)0xff);
+    if (size < 32u) return EXR_ERROR_INVALID_ARGUMENT;
+    while (i + 32u <= size) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(data + i));
+        uint32_t marks = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(v, ff));
+        if (prev_ff && data[i] > max_after_ff) return EXR_ERROR_CORRUPT;
+        while (marks) {
+            uint32_t j = (uint32_t)__builtin_ctz(marks);
+            if (i + (size_t)j + 1u < size &&
+                data[i + (size_t)j + 1u] > max_after_ff)
+                return EXR_ERROR_CORRUPT;
+            marks &= marks - 1u;
+        }
+        prev_ff = data[i + 31u] == 0xffu;
+        i += 32u;
+    }
+    for (; i < size; ++i) {
+        if (prev_ff && data[i] > max_after_ff) return EXR_ERROR_CORRUPT;
+        prev_ff = data[i] == 0xffu;
+    }
+    return EXR_SUCCESS;
+}
+#endif
+
 static exr_result jph_validate_forward_stuffing(const uint8_t *data,
                                                 size_t size,
                                                 uint8_t max_after_ff) {
     size_t i = 0u;
     int prev_ff = 0;
     if (!data && size) return EXR_ERROR_INVALID_ARGUMENT;
+#if defined(EXR_X86)
+    if (size >= 32u && (exr_cpu_caps() & EXR_SIMD_AVX2) != 0u)
+        return jph_validate_forward_stuffing_avx2(data, size, max_after_ff);
+#endif
 
     /* Find 0xff bytes a machine word at a time.  Only bytes immediately after
      * a marker need the format-specific comparison, so this remains exact for
@@ -3514,11 +3548,10 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
     uint64_t *dp;
     uint64_t prev_v_n;
     int i;
-    int use_avx2 = 0;
     exr_result rc;
 
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    int use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
 #endif
 
     /* Defense-in-depth: HT codeblocks are at most 128x32 (callers/validation

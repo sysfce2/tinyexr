@@ -63,9 +63,20 @@ ptexatlas-c11-gate:
 V3_INC   = -Iinclude -Isrc -Ideps/zstd
 V3_CSTD  = -std=c11
 V3_WARN  = -Wall -Wextra -Werror
-V3_DEFS  =
+# Enable the validated AVX2 four-quad HALF cleanup kernel on x86. The source
+# keeps the scalar path and runtime capability check for baseline portability.
+V3_DEFS  = -DEXR_JPH_ENABLE_AVX2_FOUR_QUAD16=1
 V3_OPT   ?= -O2
 V3_ARCH  ?=
+# Opt-in Ryzen/AVX2 tuning for the HTJ2K translation unit.  The portable
+# default remains baseline code with runtime CPU dispatch; this mode produces
+# a host-specific object and therefore requires an AVX2-capable x86 CPU.
+EXR_JPH_HOST_AVX2 ?= 0
+JPH_HOST_OPT =
+ifeq ($(EXR_JPH_HOST_AVX2),1)
+  V3_DEFS += -DEXR_JPH_HOST_AVX2=1
+  JPH_HOST_OPT = -O3 -mavx2 -mfma -mbmi2 -mtune=znver1
+endif
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
@@ -177,6 +188,13 @@ build/exr_gpu_cuda.o: src/exr_gpu_cuda.c include/exr_gpu.h include/exr.h \
 build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
                        src/exr_internal.h src/exr_vk_shaders.spv.inc | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
+
+# Keep the host-tuned JPH build isolated to this TU.  Runtime capability
+# checks remain in exr_jph.c; EXR_JPH_HOST_AVX2=1 is intentionally a host-only
+# build mode and must not be used for baseline-distributed binaries.
+build/exr_jph.o: src/exr_jph.c src/exr_jph_avx2_inline.h include/exr.h \
+                 src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) $(JPH_HOST_OPT) -g -c $< -o $@
 
 build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) -g -c $< -o $@
@@ -653,12 +671,21 @@ OPENEXR_ROOT  ?= $(HOME)/work/openexr
 OPENEXR_BUILD ?= $(OPENEXR_ROOT)/_build
 OPENEXR_INC    = -I$(OPENEXR_ROOT)/src/lib/OpenEXR -I$(OPENEXR_ROOT)/src/lib/OpenEXRCore \
                  -I$(OPENEXR_ROOT)/src/lib/Iex -I$(OPENEXR_ROOT)/src/lib/IlmThread \
-                 -I$(OPENEXR_BUILD)/cmake $(shell pkg-config --cflags Imath 2>/dev/null)
+                 -I$(OPENEXR_BUILD)/cmake \
+                 -I$(OPENEXR_BUILD)/OpenEXR_ImathIncludeCompat \
+                 -I$(OPENEXR_BUILD)/_deps/imath-src/src \
+                 -I$(OPENEXR_BUILD)/_deps/imath-src/src/Imath \
+                 -I$(OPENEXR_BUILD)/_deps/imath-build/config \
+                 $(shell pkg-config --cflags Imath 2>/dev/null)
 OPENEXR_LIBDIR = $(OPENEXR_BUILD)/src/lib
+OPENEXR_IMATH_LIBDIR = $(OPENEXR_BUILD)/_deps/imath-build/src/Imath
 OPENEXR_LIBS   = -L$(OPENEXR_LIBDIR)/OpenEXR -L$(OPENEXR_LIBDIR)/OpenEXRCore \
                  -L$(OPENEXR_LIBDIR)/Iex -L$(OPENEXR_LIBDIR)/IlmThread \
-                 -lOpenEXR-4_0 -lOpenEXRCore-4_0 -lIex-4_0 -lIlmThread-4_0 -pthread
+                 -L$(OPENEXR_IMATH_LIBDIR) \
+                 -lOpenEXR-4_0 -lOpenEXRCore-4_0 -lIex-4_0 -lIlmThread-4_0 \
+                 -lImath-3_2 -pthread
 OPENEXR_LDPATH = $(OPENEXR_LIBDIR)/OpenEXR:$(OPENEXR_LIBDIR)/OpenEXRCore:$(OPENEXR_LIBDIR)/Iex:$(OPENEXR_LIBDIR)/IlmThread
+OPENEXR_LDPATH := $(OPENEXR_LDPATH):$(OPENEXR_IMATH_LIBDIR)
 
 # The tinyexr side (bench_tx.c) is compiled as C because exr.h and OpenEXR's
 # C core declare the same global enum names and cannot share a translation unit.
