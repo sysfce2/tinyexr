@@ -3780,23 +3780,20 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
             uint32_t inf = sp[0];
             uint32_t u_q = sp[1];
             uint64_t v_n;
-            exr_result sample_rc;
-            if (u_q > mmsbp2) {
+            if (u_q > mmsbp2 || u_q > 62u) {
                 rc = EXR_ERROR_CORRUPT;
                 goto done;
             }
             dp[0] = jph_decode_magsgn_sample64_frwd(&magsgn, inf, 0u, u_q, p,
-                                                    &v_n, &sample_rc);
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                                                    &v_n, NULL);
             if (1u < height) {
                 dp[out_stride] =
                     jph_decode_magsgn_sample64_frwd(&magsgn, inf, 1u, u_q, p,
-                                                     &v_n, &sample_rc);
+                                                     &v_n, NULL);
             } else {
                 (void)jph_decode_magsgn_sample64_frwd(&magsgn, inf, 1u, u_q,
-                                                      p, &v_n, &sample_rc);
+                                                      p, &v_n, NULL);
             }
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             vp[0] = prev_v_n | v_n;
             prev_v_n = 0u;
             ++dp;
@@ -3806,16 +3803,14 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                 break;
             }
             dp[0] = jph_decode_magsgn_sample64_frwd(&magsgn, inf, 2u, u_q, p,
-                                                    &v_n, &sample_rc);
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                                                    &v_n, NULL);
             if (1u < height) {
                 dp[out_stride] = jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 3u, u_q, p, &v_n, &sample_rc);
+                    &magsgn, inf, 3u, u_q, p, &v_n, NULL);
             } else {
                 (void)jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 3u, u_q, p, &v_n, &sample_rc);
+                    &magsgn, inf, 3u, u_q, p, &v_n, NULL);
             }
-            if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
             prev_v_n = v_n;
             ++dp;
             ++x;
@@ -3840,27 +3835,24 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                 uint64_t emax_src;
                 uint32_t emax, kappa, u_q_eff;
                 uint64_t v_n;
-                exr_result sample_rc;
                 gamma &= gamma - 0x10u;
                 emax_src = vp[0] | vp[1] | 2u; /* nonzero (| 2u) */
                 emax = 63u - (uint32_t)jph_clz64(emax_src);
                 kappa = gamma ? emax : 1u;
                 u_q_eff = u_q + kappa;
-                if (u_q_eff > mmsbp2) {
+                if (u_q_eff > mmsbp2 || u_q_eff > 62u) {
                     rc = EXR_ERROR_CORRUPT;
                     goto done;
                 }
                 dp[0] = jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 0u, u_q_eff, p, &v_n, &sample_rc);
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                    &magsgn, inf, 0u, u_q_eff, p, &v_n, NULL);
                 if (y + 1u < height) {
                     dp[out_stride] = jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 1u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 1u, u_q_eff, p, &v_n, NULL);
                 } else {
                     (void)jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 1u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 1u, u_q_eff, p, &v_n, NULL);
                 }
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 vp[0] = prev_v_n | v_n;
                 prev_v_n = 0u;
                 ++dp;
@@ -3870,16 +3862,14 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     break;
                 }
                 dp[0] = jph_decode_magsgn_sample64_frwd(
-                    &magsgn, inf, 2u, u_q_eff, p, &v_n, &sample_rc);
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
+                    &magsgn, inf, 2u, u_q_eff, p, &v_n, NULL);
                 if (y + 1u < height) {
                     dp[out_stride] = jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 3u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 3u, u_q_eff, p, &v_n, NULL);
                 } else {
                     (void)jph_decode_magsgn_sample64_frwd(
-                        &magsgn, inf, 3u, u_q_eff, p, &v_n, &sample_rc);
+                        &magsgn, inf, 3u, u_q_eff, p, &v_n, NULL);
                 }
-                if (sample_rc != EXR_SUCCESS) { rc = sample_rc; goto done; }
                 prev_v_n = v_n;
                 ++dp;
                 ++x;
