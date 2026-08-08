@@ -3548,11 +3548,10 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
     uint64_t *dp;
     uint64_t prev_v_n;
     int i;
-    int use_avx2 = 0;
     exr_result rc;
 
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    int use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
 #endif
 
     /* Defense-in-depth: HT codeblocks are at most 128x32 (callers/validation
