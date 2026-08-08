@@ -130,6 +130,44 @@ void jph_extract_signmag_i64_to_i64_neon(int64_t *out, const uint64_t *buf,
     }
 }
 
+/* Build four-column SPP significance masks.  Four groups (16 columns) are
+ * handled per iteration; vld2 extracts the even scratch entries consumed by
+ * the OpenJPH sigma layout, while the scalar tail preserves edge semantics. */
+void jph_build_sigma_row_neon(uint16_t *dst, const uint16_t *src,
+                              uint32_t stride, uint32_t width) {
+    const uint16x8_t mask30 = vdupq_n_u16(0x30u);
+    const uint16x8_t maskc0 = vdupq_n_u16(0xc0u);
+    uint32_t x = 0u;
+    for (; x + 16u <= width; x += 16u, src += 16u, dst += 4u) {
+        uint16x8x2_t top = vld2q_u16(src);
+        uint16x8x2_t bot = vld2q_u16(src + stride);
+        uint16x8_t tn = vextq_u16(top.val[0], top.val[0], 1);
+        uint16x8_t bn = vextq_u16(bot.val[0], bot.val[0], 1);
+        uint16x8_t t0 = vorrq_u16(
+            vorrq_u16(vshrq_n_u16(vandq_u16(top.val[0], mask30), 4),
+                      vshrq_n_u16(vandq_u16(top.val[0], maskc0), 2)),
+            vorrq_u16(vshlq_n_u16(vandq_u16(tn, mask30), 4),
+                      vshlq_n_u16(vandq_u16(tn, maskc0), 6)));
+        uint16x8_t t1 = vorrq_u16(
+            vorrq_u16(vshrq_n_u16(vandq_u16(bot.val[0], mask30), 2),
+                      vandq_u16(bot.val[0], maskc0)),
+            vorrq_u16(vshlq_n_u16(vandq_u16(bn, mask30), 6),
+                      vshlq_n_u16(vandq_u16(bn, maskc0), 8)));
+        vst1_u16(dst, vget_low_u16(vorrq_u16(t0, t1)));
+    }
+    for (; x < width; x += 4u, ++dst, src += 4u) {
+        uint32_t a = ((src[0] & 0x30u) >> 4u) |
+                     ((src[0] & 0xc0u) >> 2u) |
+                     ((src[2] & 0x30u) << 4u) |
+                     ((src[2] & 0xc0u) << 6u);
+        uint32_t b = ((src[stride] & 0x30u) >> 2u) |
+                     (src[stride] & 0xc0u) |
+                     ((src[2u + stride] & 0x30u) << 6u) |
+                     ((src[2u + stride] & 0xc0u) << 8u);
+        *dst = (uint16_t)(a | b);
+    }
+}
+
 /* ----------------------------------------------------------------------------
  * Reversible 5/3 lifting. floor(v / 2^s) is just an arithmetic right shift on
  * AArch64 (vshrq_n_s64 / the scalar helper below round toward -inf for any

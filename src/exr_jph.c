@@ -3904,6 +3904,9 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                     jph_build_sigma_row_avx2(sdp, ssp, sstr, width);
                     continue;
                 }
+#elif defined(EXR_NEON)
+                jph_build_sigma_row_neon(sdp, ssp, sstr, width);
+                continue;
 #endif
                 for (x = 0u; x < width; x += 4u, ssp += 4u, ++sdp) {
                     uint32_t t0 = 0u, t1 = 0u;
@@ -4790,6 +4793,9 @@ static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
                     jph_build_sigma_row_avx2(sdp, ssp, sstr, width);
                     continue;
                 }
+#elif defined(EXR_NEON)
+                jph_build_sigma_row_neon(sdp, ssp, sstr, width);
+                continue;
 #endif
                 for (x = 0u; x < width; x += 4u, ssp += 4u, ++sdp) {
                     uint32_t t0 = 0u, t1 = 0u;

@@ -416,6 +416,8 @@ void jph_extract_signmag_i32_to_i64_neon(int64_t *out, const uint32_t *buf,
                                          size_t n, unsigned shift);
 void jph_extract_signmag_i64_to_i64_neon(int64_t *out, const uint64_t *buf,
                                          size_t n, unsigned shift);
+void jph_build_sigma_row_neon(uint16_t *dst, const uint16_t *src,
+                              uint32_t stride, uint32_t width);
 exr_result jph_inverse_53_i32_neon(const int32_t *low, size_t low_count,
                                    const int32_t *high, size_t high_count,
                                    int32_t *out, size_t out_count,
