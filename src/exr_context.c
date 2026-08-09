@@ -39,7 +39,9 @@ exr_result exr_context_create(const exr_allocator *alloc, exr_context **out) {
 
 void exr_context_destroy(exr_context *ctx) {
     if (!ctx) return;
+#ifndef EXR_NO_JPH
     exr_jph_context_free(ctx);
+#endif
     exr_piz_context_free(ctx);
     exr_free(&ctx->alloc, ctx);
 }

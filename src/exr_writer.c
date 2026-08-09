@@ -583,7 +583,9 @@ static int encode_warmup_for_parallel(exr_compression comp) {
          * VLC/UVLC encode tables. */
         exr_cpu_caps();
         exr_simd_init();
+#ifndef EXR_NO_JPH
         exr_jph_warmup_encode_tables();
+#endif
         return 1;
     }
     return 0;
@@ -1822,12 +1824,14 @@ exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
     cx.width = pt->width;
     cx.num_lines = nlines;
     rc = EXR_ERROR_UNSUPPORTED;
+#ifndef EXR_NO_JPH
     if (w->gpu_jph_fn &&
         (w->scomp == EXR_COMPRESSION_HTJ2K256 ||
          w->scomp == EXR_COMPRESSION_HTJ2K32)) {
         rc = exr_jph_compress_gpu(&cx, block, blk_size, &payload, &payload_size,
                                   w->gpu_jph_fn, w->gpu_jph_user);
     }
+#endif
     if (rc == EXR_ERROR_UNSUPPORTED) /* not HTJ2K, or a non-i32 block: CPU path */
         rc = exr_compress_block(&cx, block, blk_size, &payload, &payload_size);
     if (!EXR_OK(rc)) return rc;
