@@ -211,6 +211,19 @@ jobs:
       - name: Replay regression corpus under ASan/UBSan/LSan
         run: make fuzz-corpus
 
+  tinyexr-v3-tsan:
+    name: linux-x64-tsan-v3-c
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run threaded tests under ThreadSanitizer
+        run: make test-c-tsan
+
   freestanding:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on }}

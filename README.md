@@ -149,15 +149,17 @@ for (uint32_t i = 0; i < n; ++i) {
     exr_reader_decode_block(r, 0, i, blk, bi.uncompressed_size);
     for (int c = 0; c < header->num_channels; ++c) {
         /* per-channel planar samples for this block */
-        exr_block_extract_channel(header, &bi, blk, bi.uncompressed_size, c, dst);
+        exr_block_extract_channel(header, &bi, blk, bi.uncompressed_size,
+                                  c, dst[c].data, dst[c].size);
     }
     free(blk);
 }
 exr_reader_close(r);
 ```
 
-Deep parts use the two-step `exr_reader_decode_deep_counts` (to size buffers)
-then `exr_reader_decode_deep_samples`.
+Deep parts use the two-step `exr_reader_decode_deep_counts` (which validates the
+count capacity and returns the total sample count) followed by
+`exr_reader_decode_deep_samples` with an `exr_buffer` per channel.
 
 **Encode** — describe parts with `exr_writer_add_part`, then stream blocks to a
 file (or a custom seekable `exr_data_sink`); the offset table is backpatched at
@@ -169,7 +171,8 @@ exr_writer_create(NULL, &w);
 exr_writer_add_part(w, &header, NULL);            /* geometry/channels/tiling */
 exr_writer_begin_stream_file(w, "out.exr", EXR_COMPRESSION_ZIP);
 for (int y = ymin; y <= ymax; y += lines_per_block)
-    exr_writer_write_scanline_block(w, 0, y, channel_rows);  /* block-local */
+    exr_writer_write_scanline_block(w, 0, y, channel_rows,
+                                    header.num_channels); /* sized buffers */
 exr_writer_end_stream(w);                          /* backpatch + close */
 exr_writer_destroy(w);
 ```

@@ -765,7 +765,8 @@ EXRV_EXPORT int exrv_decode_block(int h, int i) {
             continue; /* skip subsampled channels */
         type = hd->channels[ci].pixel_type;
         if (!EXR_OK(exr_block_extract_channel(hd, &bi, block,
-                                              bi.uncompressed_size, ci, chan)))
+                                              bi.uncompressed_size, ci, chan,
+                                              chan_cap)))
             goto done;
         scatter_channel(s, &bi, k, chan, type);
     }

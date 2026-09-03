@@ -93,7 +93,7 @@ V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectr
 ZSTD_SRC = deps/zstd/tinyexr_zstd.c
 ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
-SAN      = -fsanitize=address,undefined
+SAN      = -fsanitize=address,undefined -fno-sanitize-recover=all
 
 # ---- zlib (DEFLATE) backend for ZIP/ZIPS/PXR24 ----------------------------
 # DEFLATE = auto | libdeflate | intree    (default: auto)
@@ -215,7 +215,7 @@ build/libdeflate/%.o: deps/libdeflate/%.c | build
 	@mkdir -p $(dir $@)
 	$(CC) -Ideps/libdeflate -O3 -g -w -c $< -o $@
 
-build/test-libdeflate/%.o: deps/libdeflate/%.c | build
+build/test-libdeflate/%.o: deps/libdeflate/%.c build/.v3-test-flags | build
 	@mkdir -p $(dir $@)
 	$(CC) -Ideps/libdeflate -O1 -g $(SAN) -w -c $< -o $@
 
@@ -264,16 +264,29 @@ c11-gate: | build
 	done
 	@echo "pure-C11 gate: OK"
 
-build/test-%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
+.PHONY: FORCE
+FORCE:
+
+# Sanitized objects are shared by test-c and fuzz-corpus. Track the complete
+# compile configuration so changing SAN/THREADS/DEFLATE cannot silently reuse
+# objects built with stale recovery or backend flags.
+build/.v3-test-flags: FORCE | build
+	@{ printf '%s\n' 'CC=$(CC)' 'SAN=$(SAN)' 'DEFS=$(V3_DEFS)' \
+	    'INC=$(V3_INC)' 'ARCH=$(V3_ARCH)' 'THREADS=$(THREADS)'; } > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+
+build/test-%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h build/.v3-test-flags | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) -c $< -o $@
 
-build/test-tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h | build
+build/test-tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h build/.v3-test-flags | build
 	$(CC) $(V3_CSTD) $(V3_INC) -O1 -g $(SAN) -w -c $< -o $@
 
 test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/unit/test_exr_v3.c | build
+	python3 test/fuzzer/gen_bad_corpus.py build/fuzz-corpus-v3
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) \
 	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_v3
-	ASAN_OPTIONS=detect_leaks=0 ./build/test_exr_v3
+	ASAN_OPTIONS=detect_leaks=1 ./build/test_exr_v3
 
 # ---- tools/texcomp: pure-C11 BC/ETC/ASTC texture compression --------------
 # One translation unit per codec, plus texcomp.c for the shared core
@@ -648,9 +661,9 @@ test-c-threads:
 # glibc/TSan combos only intercept pthread_* and crash on thrd_create/mtx_*.
 # The threaded build also runs cleanly under ASan+UBSan via `make test-c-threads`.
 test-c-tsan: | build
-	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_THREADS $(V3_INC) -O1 -g \
-	  -fsanitize=thread test/unit/test_exr_v3.c $(V3_SRC) $(ZSTD_SRC) \
-	  -pthread -lm -o build/test_exr_v3_tsan
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) -DEXR_USE_THREADS $(V3_INC) -O1 -g \
+	  -DEXR_THREADS_PTHREAD -fsanitize=thread test/unit/test_exr_v3.c $(V3_SRC) $(ZSTD_SRC) \
+	  $(LD_SRC) -pthread -lm -o build/test_exr_v3_tsan
 	./build/test_exr_v3_tsan
 
 bench: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) benchmark/bench.c | build
@@ -725,7 +738,7 @@ bench-htj2k: build/bench_compare
 fuzz: test/fuzzer/fuzz_v3.c | build
 	clang $(V3_CSTD) $(V3_INC) -O1 -g -w -fsanitize=fuzzer,address,undefined \
 	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_v3
-	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -max_total_time=60 test/unit/regression"
+	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -dict=test/fuzzer/exr.dict -max_total_time=60 test/unit/regression"
 
 # Same fuzzer but with libdeflate as the default zlib backend, so the shipped
 # DEFLATE=auto decode path (ZIP/ZIPS/PXR24 -> libdeflate) is fuzzed too.
@@ -754,19 +767,21 @@ fuzz-jph-corpus: test/fuzzer/fuzz_jph.c | build
 
 # Deterministic corpus replay under ASan+UBSan (no libFuzzer needed; CI gate).
 fuzz-corpus: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/fuzzer/fuzz_v3.c | build
+	python3 test/fuzzer/gen_bad_corpus.py build/fuzz-corpus-v3
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \
 	  test/fuzzer/fuzz_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) -lm \
 	  -o build/fuzz_replay
-	./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
+	./build/fuzz_replay test/unit/regression/* build/fuzz-corpus-v3/* asakusa.exr data/deepscanline.exr
 
 # Some local sandboxes/debug wrappers use ptrace. LeakSanitizer cannot run
 # under ptrace, so this target preserves ASan+UBSan corpus coverage there while
 # keeping fuzz-corpus as the strict LSan gate for CI/native hosts.
 fuzz-corpus-asan: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/fuzzer/fuzz_v3.c | build
+	python3 test/fuzzer/gen_bad_corpus.py build/fuzz-corpus-v3
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \
 	  test/fuzzer/fuzz_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) -lm \
 	  -o build/fuzz_replay
-	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
+	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_replay test/unit/regression/* build/fuzz-corpus-v3/* asakusa.exr data/deepscanline.exr
 
 # Parse/load every *.exr under $(EXR_IMAGES) and classify PASS/XFAIL/FAIL.
 # Override the corpus dir with: make parse-test EXR_IMAGES=/path/to/images

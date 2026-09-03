@@ -98,6 +98,177 @@ static int file_readable(const char *path) {
     return 1;
 }
 
+static unsigned char *read_test_file(const char *path, size_t *size) {
+    FILE *fp = fopen(path, "rb");
+    long n;
+    unsigned char *p;
+    if (!fp || fseek(fp, 0, SEEK_END) != 0 || (n = ftell(fp)) < 0 ||
+        fseek(fp, 0, SEEK_SET) != 0) {
+        if (fp) fclose(fp);
+        return NULL;
+    }
+    p = (unsigned char *)malloc((size_t)n ? (size_t)n : 1);
+    if (!p || ((size_t)n && fread(p, 1, (size_t)n, fp) != (size_t)n)) {
+        free(p); fclose(fp); return NULL;
+    }
+    fclose(fp);
+    *size = (size_t)n;
+    return p;
+}
+
+static void hardening_api_tests(void) {
+    unsigned char *file;
+    size_t size = 0;
+    exr_reader *r = NULL;
+    exr_part part;
+    exr_result first, second;
+    uint32_t blocks = 0;
+    exr_context *ctx = NULL;
+    exr_image img;
+
+    file = read_test_file("build/fuzz-corpus-v3/multipart-tiled-mismatch",
+                          &size);
+    memset(&part, 0, sizeof(part));
+    first = file && EXR_OK(exr_reader_open_memory(file, size, NULL, &r))
+                ? exr_reader_read_part(r, 0, &part)
+                : EXR_ERROR_IO;
+    second = r ? exr_reader_num_blocks(r, 0, &blocks) : EXR_ERROR_IO;
+    CHECK(first < 0 && second == first && exr_reader_num_parts(r) == 0,
+          "terminal header parse error is latched and exposes no parts");
+    exr_reader_close(r);
+    free(file);
+
+    file = read_test_file("test/unit/regression/2by2.exr", &size);
+    memset(&img, 0, sizeof(img));
+    CHECK(EXR_OK(exr_context_create(NULL, &ctx)), "create context for limits");
+    CHECK(EXR_OK(exr_context_set_max_image_bytes(ctx, 1)),
+          "set image byte limit");
+    first = file ? exr_load_from_memory_ctx(ctx, file, size, NULL, &img)
+                 : EXR_ERROR_IO;
+    CHECK(first == EXR_ERROR_LIMIT_EXCEEDED,
+          "materialized image byte limit rejects before plane allocation");
+    exr_image_free(&img);
+    CHECK(EXR_OK(exr_context_set_max_file_bytes(ctx, 0)),
+          "disable file byte limit");
+    CHECK(EXR_OK(exr_context_set_max_header_bytes(ctx, 8)),
+          "set header byte limit");
+    r = NULL;
+    if (file && EXR_OK(exr_reader_open_memory_ctx(ctx, file, size, NULL, &r))) {
+        CHECK(exr_reader_parse_header(r) == EXR_ERROR_LIMIT_EXCEEDED,
+              "header byte limit rejects metadata incrementally");
+    } else {
+        CHECK(0, "open memory reader for header byte limit");
+    }
+    exr_reader_close(r);
+    CHECK(EXR_OK(exr_context_set_max_file_bytes(ctx, 1)),
+          "set owned file byte limit");
+    r = NULL;
+    CHECK(exr_reader_open_file_ctx(ctx, "test/unit/regression/2by2.exr",
+                                   NULL, &r) == EXR_ERROR_LIMIT_EXCEEDED &&
+              r == NULL,
+          "owned file byte limit rejects before buffering");
+    exr_context_destroy(ctx);
+
+    r = NULL;
+    if (file && EXR_OK(exr_reader_open_memory(file, size, NULL, &r)) &&
+        EXR_OK(exr_reader_parse_header(r))) {
+        exr_block_info bi;
+        void *block = NULL;
+        if (EXR_OK(exr_reader_block_info(r, 0, 0, &bi))) {
+            block = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
+            if (block && EXR_OK(exr_reader_decode_block(
+                             r, 0, 0, block, bi.uncompressed_size))) {
+                unsigned char dst[1];
+                CHECK(exr_block_extract_channel(
+                          exr_reader_part_header(r, 0), &bi, block,
+                          bi.uncompressed_size, 0, dst, 0) ==
+                          EXR_ERROR_INVALID_ARGUMENT,
+                      "channel extraction rejects undersized destination");
+            }
+            free(block);
+        }
+    }
+    exr_reader_close(r);
+    free(file);
+
+    {
+        exr_header h;
+        exr_channel ch;
+        exr_writer *w = NULL;
+        memset(&h, 0, sizeof(h));
+        memset(&ch, 0, sizeof(ch));
+        strcpy(ch.name, "R");
+        ch.pixel_type = EXR_PIXEL_HALF;
+        ch.x_sampling = ch.y_sampling = 1;
+        h.part_type = EXR_PART_SCANLINE;
+        h.compression = EXR_COMPRESSION_NONE;
+        h.line_order = EXR_LINEORDER_INCREASING_Y;
+        h.pixel_aspect_ratio = 1.0f;
+        h.screen_window_width = 1.0f;
+        h.data_window.max_x = h.data_window.max_y = 0;
+        h.display_window = h.data_window;
+        h.num_channels = 1;
+        h.channels = &ch;
+        CHECK(EXR_OK(exr_writer_create(NULL, &w)), "create writer for validation");
+        h.data_window.min_x = INT32_MIN;
+        h.data_window.max_x = INT32_MAX;
+        CHECK(exr_writer_add_part(w, &h, NULL) == EXR_ERROR_INVALID_ARGUMENT,
+              "writer rejects overflowing data window");
+        h.data_window.min_x = h.data_window.max_x = 0;
+        ch.y_sampling = 0;
+        CHECK(exr_writer_add_part(w, &h, NULL) == EXR_ERROR_INVALID_ARGUMENT,
+              "writer rejects zero channel sampling");
+        ch.y_sampling = 1;
+        CHECK(EXR_OK(exr_writer_add_part(w, &h, NULL)),
+              "writer accepts valid header");
+        CHECK(exr_writer_set_channel(w, 0, "R", NULL) ==
+                  EXR_ERROR_INVALID_ARGUMENT,
+              "writer rejects null channel pixels");
+        {
+            void *encoded = NULL;
+            size_t encoded_size = 0;
+            CHECK(exr_writer_finalize_to_memory(w, &encoded, &encoded_size) ==
+                      EXR_ERROR_INVALID_ARGUMENT && encoded == NULL,
+                  "writer rejects an unset channel before serialization");
+            free(encoded);
+        }
+        exr_writer_destroy(w);
+    }
+    {
+        exr_header h;
+        exr_channel ch;
+        exr_writer *w = NULL;
+        uint16_t pixel = 0;
+        void *encoded = NULL;
+        size_t encoded_size = 0;
+        memset(&h, 0, sizeof(h));
+        memset(&ch, 0, sizeof(ch));
+        strcpy(ch.name, "channel_name_longer_than_thirty_one_bytes");
+        ch.pixel_type = EXR_PIXEL_HALF;
+        ch.x_sampling = ch.y_sampling = 1;
+        h.part_type = EXR_PART_SCANLINE;
+        h.compression = EXR_COMPRESSION_NONE;
+        h.line_order = EXR_LINEORDER_INCREASING_Y;
+        h.pixel_aspect_ratio = 1.0f;
+        h.screen_window_width = 1.0f;
+        h.display_window = h.data_window;
+        h.num_channels = 1;
+        h.channels = &ch;
+        if (EXR_OK(exr_writer_create(NULL, &w)) &&
+            EXR_OK(exr_writer_add_part(w, &h, NULL)) &&
+            EXR_OK(exr_writer_set_channel(w, 0, ch.name, &pixel)))
+            first = exr_writer_finalize_to_memory(w, &encoded, &encoded_size);
+        else
+            first = EXR_ERROR_INVALID_ARGUMENT;
+        CHECK(EXR_OK(first) && encoded_size >= 8 &&
+                  (exr_rd_u32((const uint8_t *)encoded + 4) &
+                   EXR_VERSION_FLAG_LONG_NAMES),
+              "writer emits long-name version flag automatically");
+        free(encoded);
+        exr_writer_destroy(w);
+    }
+}
+
 static int images_equal(const exr_image *a, const exr_image *b) {
     int p, c;
     if (a->num_parts != b->num_parts) return 0;
@@ -256,6 +427,8 @@ static void jph_encode_subsampling_roundtrip(void) {
     part.header.data_window.max_x = 3;
     part.header.data_window.max_y = 1;
     part.header.display_window = part.header.data_window;
+    part.header.pixel_aspect_ratio = 1.0f;
+    part.header.screen_window_width = 1.0f;
     part.width = 4;
     part.height = 2;
     part.images = images;
@@ -362,6 +535,8 @@ static void jph_encode_rct_roundtrip(void) {
             part.header.data_window.max_x = W - 1;
             part.header.data_window.max_y = H - 1;
             part.header.display_window = part.header.data_window;
+            part.header.pixel_aspect_ratio = 1.0f;
+            part.header.screen_window_width = 1.0f;
             part.width = W; part.height = H;
             part.images = images;
             images[0] = cases[k].b; images[1] = cases[k].g; images[2] = cases[k].r;
@@ -410,6 +585,8 @@ static void jph_encode_uint_roundtrip(void) {
     part.header.data_window.max_x = 2;
     part.header.data_window.max_y = 1;
     part.header.display_window = part.header.data_window;
+    part.header.pixel_aspect_ratio = 1.0f;
+    part.header.screen_window_width = 1.0f;
     part.width = 3;
     part.height = 2;
     part.images = images;
@@ -1519,7 +1696,8 @@ static void stream_decode_check(const char *path, exr_compression comp,
             size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
             int row0 = bi.y0 - ymin, col0 = bi.x0 - xmin, rr;
             if (!EXR_OK(exr_block_extract_channel(h, &bi, dst,
-                                                  bi.uncompressed_size, c, tmp))) {
+                                                  bi.uncompressed_size, c, tmp,
+                                                  (size_t)bi.width * bi.height * 4 + 1))) {
                 ok = 0;
                 break;
             }
@@ -1586,7 +1764,7 @@ static void stream_encode_check(const char *path, exr_compression comp,
         int W = src.parts[0].width, H = src.parts[0].height;
         int tsx = 64, tsy = 64;
         int nxt = (W + tsx - 1) / tsx, nyt = (H + tsy - 1) / tsy, txi, tyi;
-        const void **cd = (const void **)malloc((size_t)h->num_channels * sizeof(void *));
+        exr_const_buffer *cd = (exr_const_buffer *)malloc((size_t)h->num_channels * sizeof(*cd));
         uint8_t **tb = (uint8_t **)malloc((size_t)h->num_channels * sizeof(void *));
         for (tyi = 0; ok && tyi < nyt; ++tyi)
             for (txi = 0; ok && txi < nxt; ++txi) {
@@ -1601,10 +1779,11 @@ static void stream_encode_check(const char *path, exr_compression comp,
                                (uint8_t *)src.parts[0].images[c] +
                                    ((size_t)(y0 + rr) * W + x0) * ps,
                                (size_t)tw * ps);
-                    cd[c] = tb[c];
+                    cd[c].data = tb[c];
+                    cd[c].size = (size_t)tw * th * ps;
                 }
                 if (!EXR_OK(exr_writer_write_tile(w, 0, txi, tyi, 0, 0,
-                                                  (const void *const *)cd)))
+                                                  cd, (size_t)h->num_channels)))
                     ok = 0;
                 for (c = 0; c < h->num_channels; ++c) free(tb[c]);
             }
@@ -1614,15 +1793,17 @@ static void stream_encode_check(const char *path, exr_compression comp,
         int W = src.parts[0].width;
         int ymin = h->data_window.min_y, ymax = h->data_window.max_y;
         int lpb = exr_lines_per_block(comp), y0;
-        const void **cd = (const void **)malloc((size_t)h->num_channels * sizeof(void *));
+        exr_const_buffer *cd = (exr_const_buffer *)malloc((size_t)h->num_channels * sizeof(*cd));
         for (y0 = ymin; ok && y0 <= ymax; y0 += lpb) {
             for (c = 0; c < h->num_channels; ++c) {
                 size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
-                cd[c] = (uint8_t *)src.parts[0].images[c] +
-                        (size_t)(y0 - ymin) * W * ps;
+                int nl = lpb < ymax - y0 + 1 ? lpb : ymax - y0 + 1;
+                cd[c].data = (uint8_t *)src.parts[0].images[c] +
+                             (size_t)(y0 - ymin) * W * ps;
+                cd[c].size = (size_t)nl * W * ps;
             }
             if (!EXR_OK(exr_writer_write_scanline_block(w, 0, y0,
-                                                        (const void *const *)cd)))
+                                                        cd, (size_t)h->num_channels)))
                 ok = 0;
         }
         free(cd);
@@ -1699,7 +1880,9 @@ static void stream_tiled_levels_check(const char *path, exr_tile_level_mode lvl,
             chan[i][c] = (uint8_t *)malloc((size_t)bis[i].width * bis[i].height * ps);
             if (!EXR_OK(exr_block_extract_channel(h, &bis[i], blk,
                                                   bis[i].uncompressed_size, c,
-                                                  chan[i][c])))
+                                                  chan[i][c],
+                                                  (size_t)bis[i].width *
+                                                      bis[i].height * ps)))
                 ok = 0;
         }
         free(blk);
@@ -1709,11 +1892,20 @@ static void stream_tiled_levels_check(const char *path, exr_tile_level_mode lvl,
     if (ok && EXR_OK(exr_writer_create(NULL, &w)) &&
         EXR_OK(exr_writer_add_part(w, h, NULL)) &&
         EXR_OK(exr_writer_begin_stream_file(w, tmp, EXR_COMPRESSION_ZIP))) {
-        for (i = 0; ok && i < nb; ++i)
+        for (i = 0; ok && i < nb; ++i) {
+            exr_const_buffer *cb = (exr_const_buffer *)calloc((size_t)nch,
+                                                               sizeof(*cb));
+            for (c = 0; c < nch; ++c) {
+                size_t ps = h->channels[c].pixel_type == EXR_PIXEL_HALF ? 2u : 4u;
+                cb[c].data = chan[i][c];
+                cb[c].size = (size_t)bis[i].width * bis[i].height * ps;
+            }
             if (!EXR_OK(exr_writer_write_tile(w, 0, bis[i].tile_x, bis[i].tile_y,
                                               bis[i].level_x, bis[i].level_y,
-                                              (const void *const *)chan[i])))
+                                              cb, (size_t)nch)))
                 ok = 0;
+            free(cb);
+        }
         if (ok && !EXR_OK(exr_writer_end_stream(w))) ok = 0;
         exr_writer_destroy(w);
     } else {
@@ -1904,16 +2096,22 @@ static void stream_deep_check(const char *path, exr_compression comp,
     }
     lpb = exr_lines_per_block(comp);
     {
-        const void **cs = (const void **)malloc((size_t)h->num_channels * sizeof(void *));
+        exr_const_buffer *cs = (exr_const_buffer *)malloc((size_t)h->num_channels * sizeof(*cs));
         for (y0 = ymin; ok && y0 <= ymax; y0 += lpb) {
             size_t fp = (size_t)(y0 - ymin) * W;
+            size_t rows = (size_t)((lpb < ymax - y0 + 1) ? lpb : ymax - y0 + 1);
+            size_t count_n = (size_t)W * rows, kk;
+            uint64_t block_total = 0;
             const int32_t *counts = src.parts[0].deep_sample_counts + fp;
+            for (kk = 0; kk < count_n; ++kk) block_total += (uint64_t)counts[kk];
             for (c = 0; c < h->num_channels; ++c) {
                 size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
-                cs[c] = (uint8_t *)src.parts[0].deep_images[c] + prefix[fp] * ps;
+                cs[c].data = (uint8_t *)src.parts[0].deep_images[c] + prefix[fp] * ps;
+                cs[c].size = (size_t)block_total * ps;
             }
             if (!EXR_OK(exr_writer_write_deep_scanline_block(
-                    w, 0, y0, counts, (const void *const *)cs)))
+                    w, 0, y0, counts, count_n, cs,
+                    (size_t)h->num_channels)))
                 ok = 0;
         }
         free(cs);
@@ -1987,7 +2185,7 @@ static exr_result stream_drive_decode(exr_reader *rs, const uint8_t *file,
         if (rc != EXR_WOULD_BLOCK) return rc;
         if (!EXR_OK(exr_reader_pending(rs, &pr))) return EXR_ERROR_CORRUPT;
         step = pr.size < 65536u ? (size_t)pr.size : 65536u;
-        if (!EXR_OK(exr_reader_supply(rs, file + pr.offset, step)))
+        if (!EXR_OK(exr_reader_supply(rs, pr.offset, file + pr.offset, step)))
             return EXR_ERROR_CORRUPT;
         *fed += 1;
         if (++guard > 2000000) return EXR_ERROR_CORRUPT;
@@ -2033,6 +2231,14 @@ static void stream_would_block_check(const char *path, exr_compression comp,
     dsrc.total_size = sz;
     if (!EXR_OK(exr_reader_open_source(&dsrc, NULL, &rs))) {
         g_fail++; exr_reader_close(rm); free(buf); return;
+    }
+    {
+        exr_pending_read pr;
+        exr_result rc = exr_reader_parse_header(rs);
+        ok = rc == EXR_WOULD_BLOCK &&
+             EXR_OK(exr_reader_pending(rs, &pr)) &&
+             exr_reader_supply(rs, pr.offset + 1u, buf + pr.offset,
+                               pr.size ? 1u : 0u) == EXR_ERROR_INVALID_ARGUMENT;
     }
     for (b = 0; b < nb && ok; ++b) {
         exr_block_info bi;
@@ -3442,6 +3648,8 @@ static void zlib_backend_parity_tests(void) {
     part.header.data_window.max_x = W - 1;
     part.header.data_window.max_y = H - 1;
     part.header.display_window = part.header.data_window;
+    part.header.pixel_aspect_ratio = 1.0f;
+    part.header.screen_window_width = 1.0f;
     part.width = W;
     part.height = H;
     part.images = images;
@@ -3937,6 +4145,9 @@ int main(void) {
         "test/unit/regression/poc-e7fa6404daa861369d2172fe68e08f9d38c0989f57da7bcfb510bab67e19ca9f",
     };
     size_t i;
+
+    printf("== hardening API regressions ==\n");
+    hardening_api_tests();
 
     printf("== valid corpus ==\n");
     expect_load("asakusa.exr", 1, 660, 440, 4);
