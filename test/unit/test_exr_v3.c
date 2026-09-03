@@ -2850,7 +2850,12 @@ static void jph_simd_check(void) {
                 rng = rng * 1664525u + 1013904223u;
                 rh = 1u + (rng % RHMAX);
                 lh = (rh + 1u) / 2u; hh = rh / 2u;
-                shiftbits = (int)(trial % 40u);
+                /* Keep the reference lifting arithmetic defined: the scalar
+                 * path adds neighboring int64 values before dividing, so
+                 * full-width random values would invoke signed overflow while
+                 * the AVX2 path wraps in two's-complement lanes. Four spare
+                 * high bits still exercise a broad signed int64 domain. */
+                shiftbits = 4 + (int)(trial % 36u);
                 /* --- 1D AVX2 == scalar --- */
                 oc = rw; lc = (oc + 1u) / 2u; hc = oc / 2u;
                 for (i = 0; i < lc; ++i) {

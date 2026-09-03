@@ -286,7 +286,7 @@ test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/unit/test_e
 	python3 test/fuzzer/gen_bad_corpus.py build/fuzz-corpus-v3
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) \
 	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_v3
-	ASAN_OPTIONS=detect_leaks=1 ./build/test_exr_v3
+	ASAN_OPTIONS="$${ASAN_OPTIONS:-detect_leaks=1}" ./build/test_exr_v3
 
 # ---- tools/texcomp: pure-C11 BC/ETC/ASTC texture compression --------------
 # One translation unit per codec, plus texcomp.c for the shared core
